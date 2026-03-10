@@ -7,5 +7,11 @@
   "execution": {
     "active_engine": "codex",
     "fallback_engine": "local"
+  },
+  "routing_confidence_weights": {
+    "success_rate": 0.5,
+    "failure_penalty": 0.3,
+    "fallback_penalty": 0.1,
+    "sample_size": 0.1
   }
 }

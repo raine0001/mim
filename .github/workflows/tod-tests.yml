@@ -1,0 +1,36 @@
+name: TOD Tests
+
+on:
+  pull_request:
+    branches: ["main"]
+  push:
+    branches: ["main"]
+
+jobs:
+  tod-tests:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run TOD reliability tests and generate summary
+        run: python3 scripts/run_tod_tests.py
+
+      - name: Append test history and dashboard snapshot
+        run: python3 scripts/append_tod_test_history.py
+
+      - name: Upload TOD reliability artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tod-reliability-artifacts
+          path: |
+            tod-tests-summary.json
+            tod/history/tod-tests-history.json
+            tod/history/reliability-dashboard.json

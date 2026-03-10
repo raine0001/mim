@@ -330,6 +330,142 @@ function Resolve-ResultCategory {
     return "failure"
 }
 
+function Resolve-RecoveryQuality {
+    param(
+        [pscustomobject]$ResultEnvelope,
+        [bool]$FallbackUsed,
+        [string]$SelectionReason
+    )
+
+    if ($null -eq $ResultEnvelope) {
+        return "manual_intervention"
+    }
+
+    if ($null -ne $ResultEnvelope.review_precheck -and -not [bool]$ResultEnvelope.review_precheck.ready_for_review) {
+        return "guardrail_block"
+    }
+
+    if (-not [bool]$ResultEnvelope.success) {
+        return "unrecovered_failure"
+    }
+
+    if ($FallbackUsed) {
+        return "recovered_on_fallback"
+    }
+
+    $retryCount = 0
+    if ($null -ne $ResultEnvelope.execution_metadata -and ($ResultEnvelope.execution_metadata.PSObject.Properties.Name -contains "retry_count")) {
+        $retryCount = [int]$ResultEnvelope.execution_metadata.retry_count
+    }
+    if ($retryCount -gt 0 -or $SelectionReason -match "retry") {
+        return "recovered_on_retry"
+    }
+
+    if ([bool]$ResultEnvelope.needs_escalation) {
+        return "manual_intervention"
+    }
+
+    return "clean_success"
+}
+
+function Get-RoutingMetricWindow {
+    param(
+        [string]$ConfigPath,
+        [string]$EngineName,
+        [int]$Window
+    )
+
+    $result = [pscustomobject]@{
+        runs = 0
+        pass_rate = 0.0
+        fallback_rate = 0.0
+    }
+
+    try {
+        $config = Get-TodConfig -ConfigPath $ConfigPath
+        $resp = Invoke-MimGet -Endpoint "/routing/engines?window=$Window" -Config $config
+        if ($null -ne $resp.engine_metrics) {
+            $metric = $resp.engine_metrics.PSObject.Properties[$EngineName]
+            if ($null -ne $metric) {
+                $data = $metric.Value
+                $result.runs = [int]$data.runs
+                $result.pass_rate = [double]$data.pass_rate
+                $result.fallback_rate = [double]$data.fallback_rate
+            }
+        }
+    }
+    catch {
+        Write-TodApiLog -Level "WARN" -Message "Could not load /routing/engines window=$Window: $($_.Exception.Message)"
+    }
+
+    return $result
+}
+
+function Get-RoutingMetric7d {
+    param(
+        [string]$ConfigPath,
+        [string]$EngineName
+    )
+
+    $result = [pscustomobject]@{
+        runs = 0
+        pass_rate = 0.0
+        fallback_rate = 0.0
+    }
+
+    try {
+        $config = Get-TodConfig -ConfigPath $ConfigPath
+        $resp = Invoke-MimGet -Endpoint "/routing/history?limit=500" -Config $config
+        $cutoff = (Get-Date).ToUniversalTime().AddDays(-7)
+        $rows = @($resp | Where-Object {
+            $_.selected_engine -eq $EngineName -and
+            $null -ne $_.timestamp -and
+            ([datetime]$_.timestamp).ToUniversalTime() -ge $cutoff
+        })
+
+        $runs = $rows.Count
+        if ($runs -gt 0) {
+            $passes = @($rows | Where-Object { $_.routing_final_outcome -eq "success" }).Count
+            $fallbacks = @($rows | Where-Object { [bool]$_.fallback_used }).Count
+            $result.runs = $runs
+            $result.pass_rate = [double]($passes / $runs)
+            $result.fallback_rate = [double]($fallbacks / $runs)
+        }
+    }
+    catch {
+        Write-TodApiLog -Level "WARN" -Message "Could not derive 7-day routing metrics: $($_.Exception.Message)"
+    }
+
+    return $result
+}
+
+function Get-RoutingConfidenceWeights {
+    param([string]$ConfigPath)
+
+    $weights = [pscustomobject]@{
+        success_rate = 0.5
+        failure_penalty = 0.3
+        fallback_penalty = 0.1
+        sample_size = 0.1
+    }
+
+    try {
+        $config = Get-TodConfig -ConfigPath $ConfigPath
+        if ($null -ne $config.routing_confidence_weights) {
+            $source = $config.routing_confidence_weights
+            if ($source.PSObject.Properties.Name -contains "success_rate") { $weights.success_rate = [double]$source.success_rate }
+            if ($source.PSObject.Properties.Name -contains "failure_penalty") { $weights.failure_penalty = [double]$source.failure_penalty }
+            if ($source.PSObject.Properties.Name -contains "fallback_penalty") { $weights.fallback_penalty = [double]$source.fallback_penalty }
+            if ($source.PSObject.Properties.Name -contains "sample_size") { $weights.sample_size = [double]$source.sample_size }
+        }
+    }
+    catch {
+        Write-TodApiLog -Level "WARN" -Message "Could not parse routing_confidence_weights; using defaults"
+    }
+
+    return $weights
+}
+
 function Publish-RoutingMetric {
     param(
         [string]$ConfigPath,
@@ -362,41 +498,33 @@ function Publish-RoutingMetric {
         }
     }
 
-    $basePolicyScore = 0.55
-    if ($fallbackUsed) {
-        $basePolicyScore = 0.45
-    }
+    $w20 = Get-RoutingMetricWindow -ConfigPath $ConfigPath -EngineName ([string]$FinalResult.execution_engine) -Window 20
+    $w50 = Get-RoutingMetricWindow -ConfigPath $ConfigPath -EngineName ([string]$FinalResult.execution_engine) -Window 50
+    $w7d = Get-RoutingMetric7d -ConfigPath $ConfigPath -EngineName ([string]$FinalResult.execution_engine)
 
-    $engineSuccessRate = 0.0
-    $recentFailurePenalty = 0.0
-    $fallbackPenalty = 0.0
-    $sampleSizeWeight = 0.0
+    $engineSuccessRate = ($w20.pass_rate * 0.5) + ($w50.pass_rate * 0.35) + ($w7d.pass_rate * 0.15)
+    $fallbackPenalty = ($w20.fallback_rate * 0.5) + ($w50.fallback_rate * 0.35) + ($w7d.fallback_rate * 0.15)
+    $failurePenalty = 1.0 - $engineSuccessRate
 
-    try {
-        $engineMetricsResp = Invoke-MimGet -Endpoint "/routing/engines?window=200" -Config $config
-        if ($null -ne $engineMetricsResp.engine_metrics) {
-            $metric = $engineMetricsResp.engine_metrics.PSObject.Properties[$FinalResult.execution_engine]
-            if ($null -ne $metric) {
-                $engineData = $metric.Value
-                $runs = [int]$engineData.runs
-                $engineSuccessRate = [double]$engineData.pass_rate
-                $fallbackPenalty = [double]$engineData.fallback_rate * 0.2
-                $recentFailurePenalty = [double](1.0 - $engineSuccessRate) * 0.3
-                $sampleSizeWeight = [Math]::Min(0.2, $runs / 500.0)
-            }
-        }
-    }
-    catch {
-        Write-TodApiLog -Level "WARN" -Message "Could not read /routing/engines for confidence input: $($_.Exception.Message)"
-    }
+    $runs50 = [Math]::Max(0, [int]$w50.runs)
+    $sampleSizeWeight = [Math]::Min(1.0, $runs50 / 50.0)
 
-    $routingConfidence = $basePolicyScore + ($engineSuccessRate * 0.3) - $recentFailurePenalty - $fallbackPenalty + $sampleSizeWeight
+    $weights = Get-RoutingConfidenceWeights -ConfigPath $ConfigPath
+
+    $routingConfidence =
+        ($engineSuccessRate * $weights.success_rate) -
+        ($failurePenalty * $weights.failure_penalty) -
+        ($fallbackPenalty * $weights.fallback_penalty) +
+        ($sampleSizeWeight * $weights.sample_size)
+
     if (-not [bool]$FinalResult.success) {
-        $routingConfidence = $routingConfidence - 0.2
+        $routingConfidence = $routingConfidence - 0.15
     }
     if ($routingConfidence -lt 0.0) { $routingConfidence = 0.0 }
     if ($routingConfidence -gt 1.0) { $routingConfidence = 1.0 }
     $routingConfidence = [Math]::Round($routingConfidence, 4)
+
+    $recoveryQuality = Resolve-RecoveryQuality -ResultEnvelope $FinalResult -FallbackUsed $fallbackUsed -SelectionReason $SelectionReason
 
     $policyVersion = "routing-policy-v1"
     if ($null -ne $config.routing_policy_version -and -not [string]::IsNullOrWhiteSpace([string]$config.routing_policy_version)) {
@@ -430,6 +558,26 @@ function Publish-RoutingMetric {
             test_results = $FinalResult.test_results
             needs_escalation = $FinalResult.needs_escalation
             failures = $FinalResult.failures
+            recovery_quality = $recoveryQuality
+            confidence_inputs = @{
+                windows = @{
+                    last_20_runs = @{ runs = $w20.runs; pass_rate = [Math]::Round($w20.pass_rate, 4); fallback_rate = [Math]::Round($w20.fallback_rate, 4) }
+                    last_50_runs = @{ runs = $w50.runs; pass_rate = [Math]::Round($w50.pass_rate, 4); fallback_rate = [Math]::Round($w50.fallback_rate, 4) }
+                    last_7_days = @{ runs = $w7d.runs; pass_rate = [Math]::Round($w7d.pass_rate, 4); fallback_rate = [Math]::Round($w7d.fallback_rate, 4) }
+                }
+                weights = @{ 
+                    success_rate = $weights.success_rate
+                    failure_penalty = $weights.failure_penalty
+                    fallback_penalty = $weights.fallback_penalty
+                    sample_size = $weights.sample_size
+                }
+                computed = @{
+                    success_rate = [Math]::Round($engineSuccessRate, 4)
+                    failure_penalty = [Math]::Round($failurePenalty, 4)
+                    fallback_penalty = [Math]::Round($fallbackPenalty, 4)
+                    sample_size_weight = [Math]::Round($sampleSizeWeight, 4)
+                }
+            }
         }
     }
 
