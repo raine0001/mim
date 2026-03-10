@@ -67,6 +67,20 @@ Decision semantics:
 - `warn`: schema/capabilities drift (re-index or cache refresh recommended)
 - `escalate`: contract version incompatible
 
+### Export TOD reliability state (for future MIM integration)
+
+```powershell
+pwsh -File TOD.ps1 -Action reliability-state -ConfigPath ./config/tod.config.json
+```
+
+This returns a structured reliability envelope with:
+
+- `contract_version` and `schema_version`
+- capability metadata for reliability/export integration
+- latest summary snapshot (`tod-tests-summary.json`)
+- trend history head (`tod/history/tod-tests-history.json`)
+- dashboard metrics (`tod/history/reliability-dashboard.json`)
+
 ### Invoke execution engine (Task 30)
 
 ```powershell
