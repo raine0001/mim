@@ -1,0 +1,11 @@
+{
+  "mode": "hybrid",
+  "mim_base_url": "http://192.168.1.120:8000",
+  "timeout_seconds": 15,
+  "fallback_to_local": true,
+  "default_actor": "tod",
+  "execution": {
+    "active_engine": "codex",
+    "fallback_engine": "local"
+  }
+}

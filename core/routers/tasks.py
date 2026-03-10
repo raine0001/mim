@@ -1,0 +1,65 @@
+from fastapi import APIRouter, Depends
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from core.db import get_db
+from core.journal import write_journal
+from core.models import Task
+from core.schemas import TaskCreate
+
+router = APIRouter()
+
+
+@router.post("")
+async def create_task(payload: TaskCreate, db: AsyncSession = Depends(get_db)) -> dict:
+    task = Task(
+        title=payload.title,
+        details=payload.scope,
+        dependencies=payload.dependencies,
+        acceptance_criteria=payload.acceptance_criteria,
+        assigned_to=payload.assigned_to,
+        state=payload.status,
+        objective_id=payload.objective_id,
+    )
+    db.add(task)
+    await db.flush()
+    await write_journal(
+        db,
+        actor="tod",
+        action="create_task",
+        target_type="task",
+        target_id=str(task.id),
+        summary=f"Task created: {task.title}",
+    )
+    await db.commit()
+    await db.refresh(task)
+    return {
+        "task_id": task.id,
+        "objective_id": task.objective_id,
+        "title": task.title,
+        "scope": task.details,
+        "dependencies": task.dependencies,
+        "acceptance_criteria": task.acceptance_criteria,
+        "status": task.state,
+        "assigned_to": task.assigned_to,
+        "created_at": task.created_at,
+    }
+
+
+@router.get("")
+async def list_tasks(db: AsyncSession = Depends(get_db)) -> list[dict]:
+    rows = (await db.execute(select(Task).order_by(Task.id.desc()))).scalars().all()
+    return [
+        {
+            "task_id": item.id,
+            "objective_id": item.objective_id,
+            "title": item.title,
+            "scope": item.details,
+            "dependencies": item.dependencies,
+            "acceptance_criteria": item.acceptance_criteria,
+            "status": item.state,
+            "assigned_to": item.assigned_to,
+            "created_at": item.created_at,
+        }
+        for item in rows
+    ]
