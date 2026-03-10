@@ -1,0 +1,10 @@
+[Unit]
+Description=Run MIM production backup daily
+
+[Timer]
+OnCalendar=*-*-* 02:30:00
+Persistent=true
+Unit=mim-backup-prod.service
+
+[Install]
+WantedBy=timers.target

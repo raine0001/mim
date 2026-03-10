@@ -1,8 +1,3 @@
-Set-StrictMode -Version Latest
-$ErrorActionPreference = "Stop"
-
-. "$PSScriptRoot/client/mim_api_client.ps1"
-
 param(
     [Parameter(Mandatory = $true)]
     [string]$Action,
@@ -37,6 +32,11 @@ param(
     [string]$TaskMetadataJson = "",
     [int]$Top = 20
 )
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+. "$PSScriptRoot/client/mim_api_client.ps1"
 
 switch ($Action.ToLowerInvariant()) {
     "ping-mim" {

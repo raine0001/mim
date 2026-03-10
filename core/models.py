@@ -137,3 +137,113 @@ class Actor(Base, TimestampMixin):
     name: Mapped[str] = mapped_column(String(120), unique=True)
     role: Mapped[str] = mapped_column(String(80), default="user")
     identity_metadata: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class RoutingExecutionMetric(Base, TimestampMixin):
+    __tablename__ = "routing_execution_metrics"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    task_id: Mapped[int | None] = mapped_column(nullable=True)
+    objective_id: Mapped[int | None] = mapped_column(nullable=True)
+    selected_engine: Mapped[str] = mapped_column(String(120), index=True)
+    fallback_engine: Mapped[str] = mapped_column(String(120), default="")
+    fallback_used: Mapped[bool] = mapped_column(default=False)
+    routing_source: Mapped[str] = mapped_column(String(120), default="tod.invoke-engine")
+    routing_confidence: Mapped[float] = mapped_column(default=0.0)
+    policy_version: Mapped[str] = mapped_column(String(80), default="routing-policy-v1")
+    engine_version: Mapped[str] = mapped_column(String(120), default="unknown")
+    routing_selection_reason: Mapped[str] = mapped_column(Text, default="")
+    routing_final_outcome: Mapped[str] = mapped_column(String(40), default="unknown")
+    latency_ms: Mapped[int] = mapped_column(default=0)
+    result_category: Mapped[str] = mapped_column(String(80), default="unknown")
+    failure_category: Mapped[str] = mapped_column(String(120), default="")
+    review_outcome: Mapped[str] = mapped_column(String(40), default="unknown")
+    blocked_pre_invocation: Mapped[bool] = mapped_column(default=False)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class RoutingEngineSummary(Base, TimestampMixin):
+    __tablename__ = "routing_engine_summaries"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    engine_name: Mapped[str] = mapped_column(String(120), unique=True, index=True)
+    runs: Mapped[int] = mapped_column(default=0)
+    pass_rate: Mapped[float] = mapped_column(default=0.0)
+    review_correction_rate: Mapped[float] = mapped_column(default=0.0)
+    blocked_rate: Mapped[float] = mapped_column(default=0.0)
+    avg_latency_ms: Mapped[float] = mapped_column(default=0.0)
+    fallback_rate: Mapped[float] = mapped_column(default=0.0)
+    weighted_recent_score: Mapped[float] = mapped_column(default=0.0)
+    sample_window: Mapped[int] = mapped_column(default=200)
+
+
+class Goal(Base, TimestampMixin):
+    __tablename__ = "goals"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    objective_id: Mapped[int | None] = mapped_column(ForeignKey("objectives.id", ondelete="SET NULL"), nullable=True)
+    task_id: Mapped[int | None] = mapped_column(ForeignKey("tasks.id", ondelete="SET NULL"), nullable=True)
+    goal_type: Mapped[str] = mapped_column(String(80), default="task_execution")
+    goal_description: Mapped[str] = mapped_column(Text)
+    requested_by: Mapped[str] = mapped_column(String(120), default="tod")
+    priority: Mapped[str] = mapped_column(String(40), default="normal")
+    status: Mapped[str] = mapped_column(String(40), default="new")
+
+
+class Action(Base):
+    __tablename__ = "actions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    goal_id: Mapped[int] = mapped_column(ForeignKey("goals.id", ondelete="CASCADE"), index=True)
+    engine: Mapped[str] = mapped_column(String(120), default="unknown")
+    action_type: Mapped[str] = mapped_column(String(120), default="execute")
+    input_ref: Mapped[str] = mapped_column(Text, default="")
+    expected_state_delta: Mapped[dict] = mapped_column(JSON, default=dict)
+    validation_method: Mapped[str] = mapped_column(String(120), default="hint")
+    sequence_index: Mapped[int] = mapped_column(default=1, index=True)
+    depends_on_action_id: Mapped[int | None] = mapped_column(nullable=True)
+    parent_action_id: Mapped[int | None] = mapped_column(nullable=True)
+    retry_of_action_id: Mapped[int | None] = mapped_column(nullable=True)
+    retry_count: Mapped[int] = mapped_column(default=0)
+    replaced_action_id: Mapped[int | None] = mapped_column(nullable=True)
+    replacement_action_id: Mapped[int | None] = mapped_column(nullable=True)
+    recovery_classification: Mapped[str] = mapped_column(String(40), default="")
+    chain_event: Mapped[str] = mapped_column(String(40), default="")
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    status: Mapped[str] = mapped_column(String(40), default="started")
+
+
+class GoalPlan(Base):
+    __tablename__ = "goal_plans"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    goal_id: Mapped[int] = mapped_column(ForeignKey("goals.id", ondelete="CASCADE"), unique=True, index=True)
+    ordered_action_ids: Mapped[list[int]] = mapped_column(JSON, default=list)
+    current_step_index: Mapped[int] = mapped_column(default=0)
+    derived_status: Mapped[str] = mapped_column(String(40), default="unknown")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class StateSnapshot(Base):
+    __tablename__ = "state_snapshots"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    goal_id: Mapped[int] = mapped_column(ForeignKey("goals.id", ondelete="CASCADE"), index=True)
+    action_id: Mapped[int] = mapped_column(ForeignKey("actions.id", ondelete="CASCADE"), index=True)
+    snapshot_phase: Mapped[str] = mapped_column(String(20), index=True)
+    state_type: Mapped[str] = mapped_column(String(80), default="json")
+    state_payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class ValidationResult(Base):
+    __tablename__ = "validation_results"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    goal_id: Mapped[int] = mapped_column(ForeignKey("goals.id", ondelete="CASCADE"), index=True)
+    action_id: Mapped[int] = mapped_column(ForeignKey("actions.id", ondelete="CASCADE"), index=True)
+    validation_method: Mapped[str] = mapped_column(String(120), default="hint")
+    validation_status: Mapped[str] = mapped_column(String(40), default="unknown")
+    validation_details: Mapped[dict] = mapped_column(JSON, default=dict)
+    validated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

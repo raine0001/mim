@@ -16,6 +16,10 @@ class Settings(BaseSettings):
     app_name: str = "MIM Core"
     app_version: str = "0.1.0"
     environment: str = "local"
+    release_tag: str = "dev"
+    config_profile: str = "default"
+    build_git_sha: str = "unknown"
+    build_timestamp: str = "unknown"
 
     database_url: str = Field(
         default="postgresql+asyncpg://postgres:postgres@localhost:5432/mim",

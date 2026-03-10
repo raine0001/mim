@@ -1,0 +1,16 @@
+[Unit]
+Description=MIM Test Compose Stack
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/home/testpilot/mim
+ExecStart=/usr/bin/docker compose -f /home/testpilot/mim/docker/test/compose.yaml --env-file /home/testpilot/mim/env/.env.test up -d
+ExecStop=/usr/bin/docker compose -f /home/testpilot/mim/docker/test/compose.yaml --env-file /home/testpilot/mim/env/.env.test down
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target

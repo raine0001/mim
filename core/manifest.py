@@ -1,12 +1,13 @@
 from datetime import datetime, timezone
 from hashlib import sha256
 from pathlib import Path
+import subprocess
 
 from core.config import PROJECT_ROOT, settings
 
 CONTRACT_VERSION = "tod-mim-shared-contract-v1"
 MANIFEST_VERSION = "1"
-SCHEMA_VERSION = "2026-03-09-01"
+SCHEMA_VERSION = "2026-03-10-03"
 
 SIGNATURE_FILES = [
     "core/models.py",
@@ -27,6 +28,18 @@ CAPABILITIES = [
     "results",
     "reviews",
     "journal",
+    "routing_history",
+    "routing_engines",
+    "routing_stats",
+    "routing_engine_detail",
+    "routing_task_stats",
+    "goals",
+    "actions",
+    "custody_chain",
+    "goal_plans",
+    "goal_timeline",
+    "goal_status",
+    "goal_recovery",
 ]
 
 RECENT_CHANGES = [
@@ -34,6 +47,9 @@ RECENT_CHANGES = [
     "Added journal endpoint",
     "Aligned structured workflow schema",
     "Added manifest endpoint and metadata",
+    "Added goal/action/state/validation custody chain",
+    "Added multi-step goal execution planning and timeline/status endpoints",
+    "Added retry/skip/replace/resume recovery operations for goal chains",
 ]
 
 
@@ -72,6 +88,22 @@ def build_repo_signature() -> str:
     return f"sha256:{sha256(seed.encode('utf-8')).hexdigest()}"
 
 
+def _resolve_git_sha() -> str:
+    if settings.build_git_sha and settings.build_git_sha != "unknown":
+        return settings.build_git_sha
+
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(PROJECT_ROOT), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return result.stdout.strip()
+    except Exception:
+        return "unknown"
+
+
 def build_manifest() -> dict:
     return {
         "system_name": "MIM",
@@ -82,6 +114,10 @@ def build_manifest() -> dict:
         "app_name": settings.app_name,
         "app_version": settings.app_version,
         "environment": settings.environment,
+        "release_tag": settings.release_tag,
+        "config_profile": settings.config_profile,
+        "git_sha": _resolve_git_sha(),
+        "build_timestamp": settings.build_timestamp,
         "repo_signature": build_repo_signature(),
         "capabilities": CAPABILITIES,
         "recent_changes": RECENT_CHANGES,
@@ -95,6 +131,24 @@ def build_manifest() -> dict:
             "/tasks",
             "/results",
             "/reviews",
+            "/routing/history",
+            "/routing/engines",
+            "/routing/engines/{engine_name}",
+            "/routing/stats",
+            "/routing/tasks/{task_id}",
+            "/routing/tasks/{task_id}/stats",
+            "/goals",
+            "/goals/{goal_id}",
+            "/goals/{goal_id}/plan",
+            "/goals/{goal_id}/timeline",
+            "/goals/{goal_id}/status",
+            "/goals/{goal_id}/resume",
+            "/actions/{action_id}",
+            "/actions/{action_id}/retry",
+            "/actions/{action_id}/skip",
+            "/actions/{action_id}/replace",
+            "/goals/{goal_id}/custody",
+            "/tasks/{task_id}/custody",
             "/journal",
             "/memory",
             "/tools",
@@ -149,6 +203,59 @@ def build_manifest() -> dict:
                 "target_id",
                 "summary",
                 "timestamp",
+            ],
+            "Goal": [
+                "goal_id",
+                "objective_id",
+                "task_id",
+                "goal_type",
+                "goal_description",
+                "requested_by",
+                "priority",
+                "status",
+                "created_at",
+            ],
+            "Action": [
+                "action_id",
+                "goal_id",
+                "engine",
+                "action_type",
+                "input_ref",
+                "expected_state_delta",
+                "validation_method",
+                "retry_of_action_id",
+                "retry_count",
+                "replaced_action_id",
+                "replacement_action_id",
+                "recovery_classification",
+                "chain_event",
+                "started_at",
+                "completed_at",
+                "status",
+            ],
+            "StateSnapshot": [
+                "snapshot_id",
+                "goal_id",
+                "action_id",
+                "snapshot_phase",
+                "state_type",
+                "state_payload",
+                "captured_at",
+            ],
+            "ValidationResult": [
+                "validation_id",
+                "goal_id",
+                "action_id",
+                "validation_method",
+                "validation_status",
+                "validation_details",
+                "validated_at",
+            ],
+            "GoalPlan": [
+                "goal_id",
+                "ordered_action_ids",
+                "current_step_index",
+                "derived_status",
             ],
         },
     }

@@ -1,0 +1,53 @@
+services:
+  mim_db_test:
+    image: postgres:16
+    container_name: mim_db_test
+    restart: unless-stopped
+    env_file:
+      - ../../env/.env.test
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - ../../runtime/test/data/postgres:/var/lib/postgresql/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  mim_app_test:
+    build:
+      context: ../../
+      dockerfile: Dockerfile
+    container_name: mim_app_test
+    restart: unless-stopped
+    depends_on:
+      - mim_db_test
+    env_file:
+      - ../../env/.env.test
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      APP_NAME: ${APP_NAME}
+      APP_VERSION: ${APP_VERSION}
+      ENVIRONMENT: ${ENVIRONMENT}
+      ALLOW_OPENAI: ${ALLOW_OPENAI}
+      ALLOW_WEB_ACCESS: ${ALLOW_WEB_ACCESS}
+      ALLOW_LOCAL_DEVICES: ${ALLOW_LOCAL_DEVICES}
+    ports:
+      - "127.0.0.1:8001:8000"
+    volumes:
+      - ../../runtime/test/logs:/srv/mim/test/logs
+      - ../../runtime/test/reports:/srv/mim/test/reports
+      - ../../runtime/test/artifacts:/srv/mim/test/artifacts
+      - ../../runtime/test/uploads:/srv/mim/test/uploads
+      - ../../runtime/test/tmp:/srv/mim/test/tmp
+      - ../../runtime/test/work:/srv/mim/test/work
+    tmpfs:
+      - /tmp
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"

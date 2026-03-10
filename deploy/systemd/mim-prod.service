@@ -1,0 +1,16 @@
+[Unit]
+Description=MIM Production Compose Stack
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/home/testpilot/mim
+ExecStart=/usr/bin/docker compose -f /home/testpilot/mim/docker/prod/compose.yaml --env-file /home/testpilot/mim/env/.env.prod up -d
+ExecStop=/usr/bin/docker compose -f /home/testpilot/mim/docker/prod/compose.yaml --env-file /home/testpilot/mim/env/.env.prod down
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target

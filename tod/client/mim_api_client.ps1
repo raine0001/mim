@@ -54,11 +54,12 @@ function Get-TodExecutionConfig {
     $activeEngine = "local"
     $fallbackEngine = "local"
 
-    if ($null -ne $config.execution) {
-        if ($config.execution.active_engine) {
+    $hasExecution = $config.PSObject.Properties.Name -contains "execution"
+    if ($hasExecution -and $null -ne $config.execution) {
+        if (($config.execution.PSObject.Properties.Name -contains "active_engine") -and $config.execution.active_engine) {
             $activeEngine = $config.execution.active_engine
         }
-        if ($config.execution.fallback_engine) {
+        if (($config.execution.PSObject.Properties.Name -contains "fallback_engine") -and $config.execution.fallback_engine) {
             $fallbackEngine = $config.execution.fallback_engine
         }
     }
@@ -98,6 +99,149 @@ function New-ExecutionResultEnvelope {
         execution_metadata = [pscustomobject]$ExecutionMetadata
         completed_at = (Get-Date).ToUniversalTime().ToString("o")
     }
+}
+
+function ConvertTo-StringArray {
+    param([object]$Value)
+
+    if ($null -eq $Value) { return @() }
+    if ($Value -is [string]) {
+        if ([string]::IsNullOrWhiteSpace($Value)) { return @() }
+        return @($Value)
+    }
+
+    if ($Value -is [System.Collections.IEnumerable]) {
+        $items = @()
+        foreach ($item in $Value) {
+            if ($null -ne $item -and -not [string]::IsNullOrWhiteSpace([string]$item)) {
+                $items += [string]$item
+            }
+        }
+        return $items
+    }
+
+    return @([string]$Value)
+}
+
+function Normalize-ExecutionResult {
+    param(
+        [object]$RawResult,
+        [string]$EngineName
+    )
+
+    if ($null -eq $RawResult) {
+        return New-ExecutionResultEnvelope `
+            -Engine $EngineName `
+            -Success $false `
+            -Summary "Execution engine returned null result" `
+            -RawOutput "" `
+            -Failures @("null_result") `
+            -Recommendations "Ensure engine wrapper returns an execution result object" `
+            -NeedsEscalation $true
+    }
+
+    $summary = [string]$RawResult.summary
+    if ([string]::IsNullOrWhiteSpace($summary)) {
+        $summary = "Execution completed with no summary"
+    }
+
+    $rawOutput = [string]$RawResult.raw_output
+    if ([string]::IsNullOrWhiteSpace($rawOutput)) {
+        $rawOutput = ""
+    }
+
+    $success = $false
+    if ($null -ne $RawResult.success) {
+        $success = [bool]$RawResult.success
+    }
+
+    $testResults = [string]$RawResult.test_results
+    if ([string]::IsNullOrWhiteSpace($testResults)) {
+        $testResults = "not-run"
+    }
+
+    $recommendations = [string]$RawResult.recommendations
+    if ([string]::IsNullOrWhiteSpace($recommendations)) {
+        $recommendations = ""
+    }
+
+    $engine = [string]$RawResult.execution_engine
+    if ([string]::IsNullOrWhiteSpace($engine)) {
+        $engine = $EngineName
+    }
+
+    $metadata = @{}
+    if ($null -ne $RawResult.execution_metadata) {
+        $metadata = @{}
+        $RawResult.execution_metadata.PSObject.Properties | ForEach-Object {
+            $metadata[$_.Name] = $_.Value
+        }
+    }
+
+    return New-ExecutionResultEnvelope `
+        -Engine $engine `
+        -Success $success `
+        -Summary $summary `
+        -RawOutput $rawOutput `
+        -FilesChanged (ConvertTo-StringArray -Value $RawResult.files_changed) `
+        -TestsRun (ConvertTo-StringArray -Value $RawResult.tests_run) `
+        -TestResults $testResults `
+        -Failures (ConvertTo-StringArray -Value $RawResult.failures) `
+        -Recommendations $recommendations `
+        -NeedsEscalation ([bool]$RawResult.needs_escalation) `
+        -ExecutionMetadata $metadata
+}
+
+function Invoke-ReviewPrecheck {
+    param([pscustomobject]$ResultEnvelope)
+
+    $blockingIssues = @()
+
+    if (-not $ResultEnvelope.success) {
+        $blockingIssues += "execution_not_successful"
+    }
+
+    $failureCount = 0
+    if ($null -ne $ResultEnvelope.failures) {
+        $failureCount = @($ResultEnvelope.failures | Where-Object { $null -ne $_ -and -not [string]::IsNullOrWhiteSpace([string]$_) }).Count
+    }
+    if ($failureCount -gt 0) {
+        $blockingIssues += "execution_failures_present"
+    }
+
+    if ([string]::IsNullOrWhiteSpace($ResultEnvelope.summary)) {
+        $blockingIssues += "missing_summary"
+    }
+
+    if ($ResultEnvelope.test_results -eq "fail") {
+        $blockingIssues += "tests_failed"
+    }
+
+    if ($ResultEnvelope.needs_escalation) {
+        $blockingIssues += "needs_escalation_flag"
+    }
+
+    return [pscustomobject]@{
+        ready_for_review = ($blockingIssues.Count -eq 0)
+        blocking_issues = $blockingIssues
+    }
+}
+
+function Finalize-ExecutionResult {
+    param(
+        [object]$RawResult,
+        [string]$EngineName
+    )
+
+    $normalized = Normalize-ExecutionResult -RawResult $RawResult -EngineName $EngineName
+    $precheck = Invoke-ReviewPrecheck -ResultEnvelope $normalized
+    $normalized | Add-Member -NotePropertyName review_precheck -NotePropertyValue $precheck -Force
+
+    if (-not $precheck.ready_for_review) {
+        $normalized.needs_escalation = $true
+    }
+
+    return $normalized
 }
 
 function Invoke-CodexExecutionEngine {
@@ -152,6 +296,151 @@ function Invoke-SelectedExecutionEngine {
     }
 }
 
+function Resolve-FailureCategory {
+    param([pscustomobject]$ResultEnvelope)
+
+    if ($null -eq $ResultEnvelope) { return "execution_error" }
+
+    if ($null -ne $ResultEnvelope.failures -and $ResultEnvelope.failures.Count -gt 0) {
+        $first = [string]$ResultEnvelope.failures[0]
+        if ($first -match "timeout|timed out") { return "timeout" }
+        if ($first -match "contract|schema|incompatible") { return "contract_drift_breaking" }
+        if ($first -match "validation|invalid") { return "validation_failure" }
+        if ($first -match "unsupported execution engine|no eligible") { return "no_eligible_engine" }
+        return "execution_error"
+    }
+
+    if ($null -ne $ResultEnvelope.review_precheck -and -not [bool]$ResultEnvelope.review_precheck.ready_for_review) {
+        return "review_rejection"
+    }
+
+    if (-not [bool]$ResultEnvelope.success) {
+        return "execution_error"
+    }
+
+    return ""
+}
+
+function Resolve-ResultCategory {
+    param([pscustomobject]$ResultEnvelope)
+
+    if ($null -eq $ResultEnvelope) { return "failure" }
+    if ([bool]$ResultEnvelope.success -and -not [bool]$ResultEnvelope.needs_escalation) { return "success" }
+    if ([bool]$ResultEnvelope.success -and [bool]$ResultEnvelope.needs_escalation) { return "success_with_escalation" }
+    return "failure"
+}
+
+function Publish-RoutingMetric {
+    param(
+        [string]$ConfigPath,
+        [pscustomobject]$TaskMetadata,
+        [pscustomobject]$EngineConfig,
+        [pscustomobject]$FinalResult,
+        [double]$LatencyMs,
+        [string]$SelectionReason
+    )
+
+    $config = Get-TodConfig -ConfigPath $ConfigPath
+    $mode = Resolve-TodMode -Mode $config.mode
+    if ($mode -eq "local") { return }
+
+    $fallbackUsed = $false
+    if ($null -ne $FinalResult.execution_metadata) {
+        $hasFallbackFrom = $FinalResult.execution_metadata.PSObject.Properties.Name -contains "fallback_from"
+        if ($hasFallbackFrom) {
+            $fallbackUsed = $true
+        }
+    }
+
+    $reviewOutcome = "unknown"
+    if ($null -ne $FinalResult.review_precheck) {
+        if ([bool]$FinalResult.review_precheck.ready_for_review) {
+            $reviewOutcome = "pass"
+        }
+        else {
+            $reviewOutcome = "fail"
+        }
+    }
+
+    $basePolicyScore = 0.55
+    if ($fallbackUsed) {
+        $basePolicyScore = 0.45
+    }
+
+    $engineSuccessRate = 0.0
+    $recentFailurePenalty = 0.0
+    $fallbackPenalty = 0.0
+    $sampleSizeWeight = 0.0
+
+    try {
+        $engineMetricsResp = Invoke-MimGet -Endpoint "/routing/engines?window=200" -Config $config
+        if ($null -ne $engineMetricsResp.engine_metrics) {
+            $metric = $engineMetricsResp.engine_metrics.PSObject.Properties[$FinalResult.execution_engine]
+            if ($null -ne $metric) {
+                $engineData = $metric.Value
+                $runs = [int]$engineData.runs
+                $engineSuccessRate = [double]$engineData.pass_rate
+                $fallbackPenalty = [double]$engineData.fallback_rate * 0.2
+                $recentFailurePenalty = [double](1.0 - $engineSuccessRate) * 0.3
+                $sampleSizeWeight = [Math]::Min(0.2, $runs / 500.0)
+            }
+        }
+    }
+    catch {
+        Write-TodApiLog -Level "WARN" -Message "Could not read /routing/engines for confidence input: $($_.Exception.Message)"
+    }
+
+    $routingConfidence = $basePolicyScore + ($engineSuccessRate * 0.3) - $recentFailurePenalty - $fallbackPenalty + $sampleSizeWeight
+    if (-not [bool]$FinalResult.success) {
+        $routingConfidence = $routingConfidence - 0.2
+    }
+    if ($routingConfidence -lt 0.0) { $routingConfidence = 0.0 }
+    if ($routingConfidence -gt 1.0) { $routingConfidence = 1.0 }
+    $routingConfidence = [Math]::Round($routingConfidence, 4)
+
+    $policyVersion = "routing-policy-v1"
+    if ($null -ne $config.routing_policy_version -and -not [string]::IsNullOrWhiteSpace([string]$config.routing_policy_version)) {
+        $policyVersion = [string]$config.routing_policy_version
+    }
+
+    $engineVersion = "unknown"
+    if ($null -ne $FinalResult.execution_metadata -and ($FinalResult.execution_metadata.PSObject.Properties.Name -contains "engine_version")) {
+        $engineVersion = [string]$FinalResult.execution_metadata.engine_version
+    }
+
+    $payload = @{
+        task_id = $TaskMetadata.task_id
+        objective_id = $TaskMetadata.objective_id
+        selected_engine = [string]$FinalResult.execution_engine
+        fallback_engine = [string]$EngineConfig.fallback_engine
+        fallback_used = $fallbackUsed
+        routing_source = "tod.invoke-engine"
+        routing_confidence = $routingConfidence
+        policy_version = $policyVersion
+        engine_version = $engineVersion
+        routing_selection_reason = $SelectionReason
+        routing_final_outcome = $(if ([bool]$FinalResult.success) { "success" } else { "fail" })
+        latency_ms = [int][Math]::Round($LatencyMs, 0)
+        result_category = Resolve-ResultCategory -ResultEnvelope $FinalResult
+        failure_category = Resolve-FailureCategory -ResultEnvelope $FinalResult
+        review_outcome = $reviewOutcome
+        blocked_pre_invocation = $false
+        metadata_json = @{
+            tests_run = $FinalResult.tests_run
+            test_results = $FinalResult.test_results
+            needs_escalation = $FinalResult.needs_escalation
+            failures = $FinalResult.failures
+        }
+    }
+
+    try {
+        Invoke-MimPost -Endpoint "/routing/history" -Payload $payload -Config $config | Out-Null
+    }
+    catch {
+        Write-TodApiLog -Level "WARN" -Message "Failed to publish routing metric: $($_.Exception.Message)"
+    }
+}
+
 function Invoke-ExecutionEngine {
     param(
         [string]$PackagePath,
@@ -166,8 +455,13 @@ function Invoke-ExecutionEngine {
     $engineConfig = Get-TodExecutionConfig -ConfigPath $ConfigPath
     Write-TodApiLog -Message "Invoke-ExecutionEngine active=$($engineConfig.active_engine) fallback=$($engineConfig.fallback_engine) package=$PackagePath"
 
+    $startedAt = Get-Date
+    $selectionReason = "active engine from config"
+    $finalResult = $null
+
     try {
-        return Invoke-SelectedExecutionEngine -Engine $engineConfig.active_engine -PackagePath $PackagePath -TaskMetadata $TaskMetadata
+        $activeResult = Invoke-SelectedExecutionEngine -Engine $engineConfig.active_engine -PackagePath $PackagePath -TaskMetadata $TaskMetadata
+        $finalResult = Finalize-ExecutionResult -RawResult $activeResult -EngineName $engineConfig.active_engine
     }
     catch {
         $activeError = $_.Exception.Message
@@ -177,11 +471,12 @@ function Invoke-ExecutionEngine {
             try {
                 $fallbackResult = Invoke-SelectedExecutionEngine -Engine $engineConfig.fallback_engine -PackagePath $PackagePath -TaskMetadata $TaskMetadata
                 $fallbackResult.execution_metadata | Add-Member -NotePropertyName fallback_from -NotePropertyValue $engineConfig.active_engine -Force
-                return $fallbackResult
+                $selectionReason = "fallback selected after active failure: $activeError"
+                $finalResult = Finalize-ExecutionResult -RawResult $fallbackResult -EngineName $engineConfig.fallback_engine
             }
             catch {
                 $fallbackError = $_.Exception.Message
-                return New-ExecutionResultEnvelope `
+                $combinedFailure = New-ExecutionResultEnvelope `
                     -Engine $engineConfig.active_engine `
                     -Success $false `
                     -Summary "Execution failed on active and fallback engines" `
@@ -195,24 +490,34 @@ function Invoke-ExecutionEngine {
                         package_path = $PackagePath
                         task_id = $TaskMetadata.task_id
                     }
+                $selectionReason = "active and fallback failed"
+                $finalResult = Finalize-ExecutionResult -RawResult $combinedFailure -EngineName $engineConfig.active_engine
             }
         }
-
-        return New-ExecutionResultEnvelope `
-            -Engine $engineConfig.active_engine `
-            -Success $false `
-            -Summary "Execution failed on active engine and no fallback available" `
-            -RawOutput $activeError `
-            -Failures @($activeError) `
-            -Recommendations "Configure fallback engine or fix active engine" `
-            -NeedsEscalation $true `
-            -ExecutionMetadata @{
-                active_engine = $engineConfig.active_engine
-                fallback_engine = $engineConfig.fallback_engine
-                package_path = $PackagePath
-                task_id = $TaskMetadata.task_id
-            }
+        else {
+            $singleFailure = New-ExecutionResultEnvelope `
+                -Engine $engineConfig.active_engine `
+                -Success $false `
+                -Summary "Execution failed on active engine and no fallback available" `
+                -RawOutput $activeError `
+                -Failures @($activeError) `
+                -Recommendations "Configure fallback engine or fix active engine" `
+                -NeedsEscalation $true `
+                -ExecutionMetadata @{
+                    active_engine = $engineConfig.active_engine
+                    fallback_engine = $engineConfig.fallback_engine
+                    package_path = $PackagePath
+                    task_id = $TaskMetadata.task_id
+                }
+            $selectionReason = "active engine failed with no fallback"
+            $finalResult = Finalize-ExecutionResult -RawResult $singleFailure -EngineName $engineConfig.active_engine
+        }
     }
+
+    $latencyMs = ((Get-Date) - $startedAt).TotalMilliseconds
+    Publish-RoutingMetric -ConfigPath $ConfigPath -TaskMetadata $TaskMetadata -EngineConfig $engineConfig -FinalResult $finalResult -LatencyMs $latencyMs -SelectionReason $selectionReason
+
+    return $finalResult
 }
 
 function Get-MimManifest {

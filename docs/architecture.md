@@ -46,3 +46,7 @@ MIM v1 is a local-first intelligence server with optional integrations.
 3. `source .venv/bin/activate`
 4. `python scripts/init_db.py`
 5. `uvicorn core.app:app --host 0.0.0.0 --port 8000`
+
+## Environments
+
+For isolated `prod` and `test` container stacks on the same workstation, see `docs/deployment-environments.md`.

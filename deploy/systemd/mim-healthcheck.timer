@@ -1,0 +1,11 @@
+[Unit]
+Description=Run MIM healthcheck every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Persistent=true
+Unit=mim-healthcheck.service
+
+[Install]
+WantedBy=timers.target

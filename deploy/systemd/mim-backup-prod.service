@@ -1,0 +1,9 @@
+[Unit]
+Description=MIM Production Backup Job
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/testpilot/mim
+ExecStart=/home/testpilot/mim/scripts/backup_prod.sh

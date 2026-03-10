@@ -1,0 +1,30 @@
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: mim_prod
+      POSTGRES_USER: mim_prod
+      POSTGRES_PASSWORD: change_me_prod
+    volumes:
+      - ./pgdata:/var/lib/postgresql/data
+
+  app:
+    build:
+      context: /home/testpilot/mim
+      dockerfile: Dockerfile
+    depends_on:
+      - db
+    environment:
+      DATABASE_URL: postgresql+asyncpg://mim_prod:change_me_prod@db:5432/mim_prod
+      APP_NAME: MIM Core Restore Test
+      APP_VERSION: restore-test
+      ENVIRONMENT: restore-test
+      RELEASE_TAG: restore-test
+      CONFIG_PROFILE: restore-test
+      BUILD_GIT_SHA: restore-test
+      BUILD_TIMESTAMP: 20260310T040733Z
+      ALLOW_OPENAI: "false"
+      ALLOW_WEB_ACCESS: "false"
+      ALLOW_LOCAL_DEVICES: "true"
+    ports:
+      - "127.0.0.1:8010:8000"

@@ -89,6 +89,13 @@ Envelope fields:
 - `execution_engine`, `success`, `summary`, `raw_output`
 - `files_changed`, `tests_run`, `test_results`, `failures`, `recommendations`
 - `needs_escalation`, `execution_metadata`, `completed_at`
+- `review_precheck.ready_for_review`, `review_precheck.blocking_issues`
+
+Task 32 behavior:
+
+- malformed/partial engine outputs are normalized safely
+- required result fields are always present in the envelope
+- pre-review checks run automatically before returning the result
 
 ### Create objective
 

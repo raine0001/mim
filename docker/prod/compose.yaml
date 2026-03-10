@@ -1,0 +1,53 @@
+services:
+  mim_db_prod:
+    image: postgres:16
+    container_name: mim_db_prod
+    restart: unless-stopped
+    env_file:
+      - ../../env/.env.prod
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - ../../runtime/prod/data/postgres:/var/lib/postgresql/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  mim_app_prod:
+    build:
+      context: ../../
+      dockerfile: Dockerfile
+    container_name: mim_app_prod
+    restart: unless-stopped
+    depends_on:
+      - mim_db_prod
+    env_file:
+      - ../../env/.env.prod
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      APP_NAME: ${APP_NAME}
+      APP_VERSION: ${APP_VERSION}
+      ENVIRONMENT: ${ENVIRONMENT}
+      ALLOW_OPENAI: ${ALLOW_OPENAI}
+      ALLOW_WEB_ACCESS: ${ALLOW_WEB_ACCESS}
+      ALLOW_LOCAL_DEVICES: ${ALLOW_LOCAL_DEVICES}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ../../runtime/prod/logs:/srv/mim/prod/logs
+      - ../../runtime/prod/reports:/srv/mim/prod/reports
+      - ../../runtime/prod/artifacts:/srv/mim/prod/artifacts
+      - ../../runtime/prod/uploads:/srv/mim/prod/uploads
+      - ../../runtime/prod/tmp:/srv/mim/prod/tmp
+      - ../../runtime/prod/work:/srv/mim/prod/work
+    tmpfs:
+      - /tmp
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"

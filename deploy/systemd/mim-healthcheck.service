@@ -1,0 +1,9 @@
+[Unit]
+Description=MIM Prod/Test Healthcheck
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/testpilot/mim
+ExecStart=/home/testpilot/mim/scripts/health_check.sh both

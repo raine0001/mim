@@ -1,0 +1,2 @@
+2026-03-10T04:07:58Z restore_test=pass tables=0 sql=mim_prod_20260310T035422Z.sql data=mim_prod_data_20260310T035422Z.tgz
+2026-03-10T04:09:12Z restore_test=pass tables=12 core_tables=5 sql=mim_prod_20260310T040844Z.sql data=mim_prod_data_20260310T040844Z.tgz
