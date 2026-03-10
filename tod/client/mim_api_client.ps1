@@ -395,7 +395,7 @@ function Get-RoutingMetricWindow {
         }
     }
     catch {
-        Write-TodApiLog -Level "WARN" -Message "Could not load /routing/engines window=$Window: $($_.Exception.Message)"
+        Write-TodApiLog -Level "WARN" -Message "Could not load /routing/engines window=${Window}: $($_.Exception.Message)"
     }
 
     return $result
@@ -1140,5 +1140,95 @@ function Get-MimJournal {
             return @(Read-TodState -Name "journal")
         }
         throw
+    }
+}
+
+function Get-TodReliabilityState {
+    param([string]$ConfigPath)
+
+    $config = Get-TodConfig -ConfigPath $ConfigPath
+    $todRoot = Split-Path -Path $PSScriptRoot -Parent
+    $repoRoot = Split-Path -Path $todRoot -Parent
+
+    $summaryPath = Join-Path $repoRoot "tod-tests-summary.json"
+    $historyPath = Join-Path $todRoot "history/tod-tests-history.json"
+    $dashboardPath = Join-Path $todRoot "history/reliability-dashboard.json"
+
+    $summary = $null
+    $history = @()
+    $dashboard = $null
+
+    if (Test-Path $summaryPath) {
+        try {
+            $summary = Get-Content -Raw -Path $summaryPath | ConvertFrom-Json
+        }
+        catch {
+            Write-TodApiLog -Level "WARN" -Message "Could not parse tod-tests-summary.json"
+        }
+    }
+
+    if (Test-Path $historyPath) {
+        try {
+            $history = @(Get-Content -Raw -Path $historyPath | ConvertFrom-Json)
+        }
+        catch {
+            Write-TodApiLog -Level "WARN" -Message "Could not parse tod-tests-history.json"
+            $history = @()
+        }
+    }
+
+    if (Test-Path $dashboardPath) {
+        try {
+            $dashboard = Get-Content -Raw -Path $dashboardPath | ConvertFrom-Json
+        }
+        catch {
+            Write-TodApiLog -Level "WARN" -Message "Could not parse reliability-dashboard.json"
+        }
+    }
+
+    $latestHistory = $null
+    if ($history.Count -gt 0) {
+        $latestHistory = $history[-1]
+    }
+
+    return [pscustomobject]@{
+        contract_version = "tod-reliability-signals-v1"
+        schema_version = "2026-03-10-01"
+        generated_at = (Get-Date).ToUniversalTime().ToString("o")
+        mode = (Resolve-TodMode -Mode $config.mode)
+        capabilities = @(
+            "reliability_state_export",
+            "reliability_trend_history",
+            "routing_confidence_windowed_weights",
+            "recovery_quality_categorization",
+            "mim_integration_ready_preview"
+        )
+        paths = [pscustomobject]@{
+            summary = $summaryPath
+            history = $historyPath
+            dashboard = $dashboardPath
+        }
+        latest_snapshot = $summary
+        latest_history_entry = $latestHistory
+        dashboard = $dashboard
+        trend_window = [pscustomobject]@{
+            history_entries = $history.Count
+            last_20_runs_available = ($history.Count -ge 20)
+            last_50_runs_available = ($history.Count -ge 50)
+            last_7_days_hint = "Derived from routing metric timestamps when available"
+        }
+        integration_contract_for_mim = [pscustomobject]@{
+            planned_endpoint = "tod.reliability-state"
+            payload_version = "v1"
+            required_fields = @(
+                "timestamp",
+                "commit_sha",
+                "pass_count",
+                "fail_count",
+                "retry_count",
+                "guardrail_blocks",
+                "engine_stats"
+            )
+        }
     }
 }

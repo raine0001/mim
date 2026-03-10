@@ -75,6 +75,10 @@ switch ($Action.ToLowerInvariant()) {
         Sync-Mim -ConfigPath $ConfigPath -ExpectedContractVersion $ExpectedContractVersion -ExpectedSchemaVersion $ExpectedSchemaVersion -ExpectedCapabilities $ExpectedCapabilities | ConvertTo-Json -Depth 12
         break
     }
+    "reliability-state" {
+        Get-TodReliabilityState -ConfigPath $ConfigPath | ConvertTo-Json -Depth 12
+        break
+    }
     "invoke-engine" {
         $taskMetadata = [pscustomobject]@{
             task_id = $TaskId
@@ -90,6 +94,6 @@ switch ($Action.ToLowerInvariant()) {
         break
     }
     default {
-        throw "Unsupported action '$Action'. Supported: ping-mim, new-objective, list-objectives, add-task, list-tasks, add-result, review-task, show-journal, sync-mim, invoke-engine"
+        throw "Unsupported action '$Action'. Supported: ping-mim, new-objective, list-objectives, add-task, list-tasks, add-result, review-task, show-journal, sync-mim, reliability-state, invoke-engine"
     }
 }
