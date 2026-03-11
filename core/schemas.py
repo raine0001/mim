@@ -1031,6 +1031,16 @@ class ImprovementProposalOut(BaseModel):
     latest_artifact: ImprovementArtifactOut | None = None
 
 
+class MaintenanceCycleRequest(BaseModel):
+    actor: str = "workspace"
+    source: str = "objective50"
+    stale_after_seconds: int = Field(default=900, ge=1, le=86400)
+    max_strategies: int = Field(default=5, ge=1, le=50)
+    max_actions: int = Field(default=5, ge=1, le=50)
+    auto_execute: bool = True
+    metadata_json: dict = Field(default_factory=dict)
+
+
 WorkspaceInterruptionType = Literal[
     "human_detected_in_workspace",
     "operator_pause",

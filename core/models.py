@@ -729,3 +729,32 @@ class WorkspaceImprovementArtifact(Base, TimestampMixin):
     status: Mapped[str] = mapped_column(String(40), default="pending_review", index=True)
     candidate_payload_json: Mapped[dict] = mapped_column(JSON, default=dict)
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class WorkspaceMaintenanceRun(Base, TimestampMixin):
+    __tablename__ = "workspace_maintenance_runs"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    source: Mapped[str] = mapped_column(String(80), default="objective50", index=True)
+    actor: Mapped[str] = mapped_column(String(120), default="workspace")
+    status: Mapped[str] = mapped_column(String(40), default="completed", index=True)
+    detected_signals_json: Mapped[list[dict]] = mapped_column(JSON, default=list)
+    created_strategy_ids_json: Mapped[list[int]] = mapped_column(JSON, default=list)
+    executed_action_ids_json: Mapped[list[int]] = mapped_column(JSON, default=list)
+    maintenance_outcomes_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    stabilized: Mapped[bool] = mapped_column(default=False)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class WorkspaceMaintenanceAction(Base, TimestampMixin):
+    __tablename__ = "workspace_maintenance_actions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("workspace_maintenance_runs.id", ondelete="CASCADE"), index=True)
+    strategy_id: Mapped[int | None] = mapped_column(ForeignKey("workspace_environment_strategies.id", ondelete="SET NULL"), nullable=True, index=True)
+    action_type: Mapped[str] = mapped_column(String(120), default="auto_execute_rescan", index=True)
+    target_scope: Mapped[str] = mapped_column(String(160), default="workspace", index=True)
+    safety_mode: Mapped[str] = mapped_column(String(60), default="scan_only")
+    status: Mapped[str] = mapped_column(String(40), default="succeeded", index=True)
+    reason: Mapped[str] = mapped_column(Text, default="")
+    details_json: Mapped[dict] = mapped_column(JSON, default=dict)

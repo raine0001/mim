@@ -7,7 +7,7 @@ from core.config import PROJECT_ROOT, settings
 
 CONTRACT_VERSION = "tod-mim-shared-contract-v1"
 MANIFEST_VERSION = "1"
-SCHEMA_VERSION = "2026-03-11-40"
+SCHEMA_VERSION = "2026-03-11-41"
 
 SIGNATURE_FILES = [
     "core/models.py",
@@ -25,9 +25,11 @@ SIGNATURE_FILES = [
     "core/environment_strategy_service.py",
     "core/decision_record_service.py",
     "core/improvement_service.py",
+    "core/maintenance_service.py",
     "core/routers/environment_strategy.py",
     "core/routers/decision_records.py",
     "core/routers/improvement.py",
+    "core/routers/maintenance.py",
     "docs/tod-mim-bridge.md",
     "docs/objective-21-unified-input-gateway.md",
     "docs/objective-22-mim-tod-execution-feedback-integration.md",
@@ -70,6 +72,9 @@ SIGNATURE_FILES = [
     "docs/objective-49-self-improvement-proposal-engine.md",
     "docs/objective-49-promotion-readiness-report.md",
     "docs/objective-49-prod-promotion-report.md",
+    "docs/objective-50-environment-maintenance-autonomy.md",
+    "docs/objective-50-promotion-readiness-report.md",
+    "docs/objective-50-prod-promotion-report.md",
     "core/routers/workspace.py",
     "core/routers/constraints.py",
     "core/routers/constraint_learning.py",
@@ -152,6 +157,7 @@ CAPABILITIES = [
     "human_preference_strategy_integration",
     "decision_record_trace",
     "self_improvement_proposal_engine",
+    "environment_maintenance_autonomy",
 ]
 
 RECENT_CHANGES = [
@@ -198,6 +204,7 @@ RECENT_CHANGES = [
     "Added Objective 47 environment strategy formation with persistent strategy lifecycle, strategy-driven horizon weighting, and strategy inspectability APIs",
     "Added Objective 48 preference-aware strategy integration with routine pattern strategy generation and unified decision record reasoning trace",
     "Added Objective 49 self-improvement proposal engine with rule-based friction pattern detection and review-gated improvement artifacts",
+    "Added Objective 50 proactive environment maintenance autonomy with degraded-state detection, auto maintenance strategies, and bounded corrective execution audit trail",
 ]
 
 
@@ -347,6 +354,9 @@ def build_manifest() -> dict:
             "/improvement/proposals/{proposal_id}",
             "/improvement/proposals/{proposal_id}/accept",
             "/improvement/proposals/{proposal_id}/reject",
+            "/maintenance/cycle",
+            "/maintenance/runs",
+            "/maintenance/runs/{run_id}",
             "/operator/inbox",
             "/operator/executions",
             "/operator/executions/{execution_id}",
@@ -889,6 +899,31 @@ def build_manifest() -> dict:
                 "status",
                 "candidate_payload",
                 "metadata_json",
+                "created_at",
+            ],
+            "MaintenanceRun": [
+                "run_id",
+                "source",
+                "actor",
+                "status",
+                "detected_signals",
+                "created_strategy_ids",
+                "executed_action_ids",
+                "maintenance_outcomes",
+                "stabilized",
+                "metadata_json",
+                "created_at",
+            ],
+            "MaintenanceAction": [
+                "action_id",
+                "run_id",
+                "strategy_id",
+                "action_type",
+                "target_scope",
+                "safety_mode",
+                "status",
+                "reason",
+                "details_json",
                 "created_at",
             ],
         },
