@@ -7,7 +7,7 @@ from core.config import PROJECT_ROOT, settings
 
 CONTRACT_VERSION = "tod-mim-shared-contract-v1"
 MANIFEST_VERSION = "1"
-SCHEMA_VERSION = "2026-03-11-32"
+SCHEMA_VERSION = "2026-03-11-33"
 
 SIGNATURE_FILES = [
     "core/models.py",
@@ -42,6 +42,7 @@ SIGNATURE_FILES = [
     "docs/objective-39-policy-based-autonomous-priority-selection.md",
     "docs/objective-40-human-preference-and-routine-memory.md",
     "docs/objective-41-closed-loop-autonomous-task-execution.md",
+    "docs/objective-42-multi-capability-coordination.md",
     "core/routers/workspace.py",
     "core/routers/preferences.py",
     "core/preferences.py",
@@ -109,6 +110,7 @@ CAPABILITIES = [
     "policy_based_autonomous_priority_selection",
     "human_preference_and_routine_memory",
     "closed_loop_autonomous_task_execution",
+    "multi_capability_coordination",
 ]
 
 RECENT_CHANGES = [
@@ -147,6 +149,7 @@ RECENT_CHANGES = [
     "Added Objective 39 policy-based autonomous proposal priority scoring and next-proposal scheduler endpoint",
     "Added Objective 40 human preference and routine memory with preference APIs and policy integration",
     "Added Objective 41 closed-loop autonomous controller with policy outcomes, safety throttle expansion, interruption-aware pausing, and result verification audit",
+    "Added Objective 42 safe multi-capability chain coordination with dependency policy, step verification, stop-on-failure escalation, and explainable chain audit trail",
 ]
 
 
@@ -301,6 +304,10 @@ def build_manifest() -> dict:
             "/workspace/chains/{chain_id}/approve",
             "/workspace/chains/{chain_id}/audit",
             "/workspace/chains/{chain_id}/advance",
+            "/workspace/capability-chains",
+            "/workspace/capability-chains/{chain_id}",
+            "/workspace/capability-chains/{chain_id}/advance",
+            "/workspace/capability-chains/{chain_id}/audit",
             "/workspace/interruptions",
             "/workspace/interruptions/{interruption_id}",
             "/workspace/executions/{execution_id}/pause",

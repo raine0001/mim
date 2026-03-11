@@ -811,6 +811,26 @@ class WorkspaceAutonomousChainApprovalRequest(BaseModel):
     metadata_json: dict = Field(default_factory=dict)
 
 
+class WorkspaceCapabilityChainCreateRequest(BaseModel):
+    actor: str = "workspace"
+    reason: str = ""
+    chain_name: str = Field(min_length=1, max_length=160)
+    chain_type: str = "safe_capability_chain"
+    source: str = "objective42"
+    steps: list[dict] = Field(default_factory=list)
+    policy_json: dict = Field(default_factory=dict)
+    stop_on_failure: bool = True
+    escalate_on_failure: bool = True
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class WorkspaceCapabilityChainAdvanceRequest(BaseModel):
+    actor: str = "workspace"
+    reason: str = ""
+    force: bool = False
+    metadata_json: dict = Field(default_factory=dict)
+
+
 WorkspaceInterruptionType = Literal[
     "human_detected_in_workspace",
     "operator_pause",

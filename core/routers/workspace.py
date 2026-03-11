@@ -9,9 +9,9 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from core.db import SessionLocal, get_db
 from core.journal import write_journal
-from core.models import CapabilityExecution, CapabilityRegistration, InputEvent, Task, WorkspaceActionPlan, WorkspaceAutonomousChain, WorkspaceInterruptionEvent, WorkspaceMonitoringState, WorkspaceObjectMemory, WorkspaceObjectRelation, WorkspaceObservation, WorkspaceProposal, WorkspaceReplanSignal, WorkspaceTargetResolution, WorkspaceZone, WorkspaceZoneRelation
+from core.models import CapabilityExecution, CapabilityRegistration, InputEvent, SpeechOutputAction, Task, WorkspaceActionPlan, WorkspaceAutonomousChain, WorkspaceCapabilityChain, WorkspaceInterruptionEvent, WorkspaceMonitoringState, WorkspaceObjectMemory, WorkspaceObjectRelation, WorkspaceObservation, WorkspaceProposal, WorkspaceReplanSignal, WorkspaceTargetResolution, WorkspaceZone, WorkspaceZoneRelation
 from core.preferences import DEFAULT_USER_ID, apply_learning_signal, get_user_preference_payload, get_user_preference_value
-from core.schemas import WorkspaceActionPlanAbortRequest, WorkspaceActionPlanCreateRequest, WorkspaceActionPlanDecisionRequest, WorkspaceActionPlanExecuteRequest, WorkspaceActionPlanHandoffRequest, WorkspaceActionPlanReplanRequest, WorkspaceActionPlanSimulationRequest, WorkspaceAutonomousChainAdvanceRequest, WorkspaceAutonomousChainApprovalRequest, WorkspaceAutonomousChainCreateRequest, WorkspaceAutonomyOverrideRequest, WorkspaceExecutionPauseRequest, WorkspaceExecutionPredictChangeRequest, WorkspaceExecutionProposalActionRequest, WorkspaceExecutionProposalCreateRequest, WorkspaceExecutionResumeRequest, WorkspaceExecutionStopRequest, WorkspaceMonitoringStartRequest, WorkspaceMonitoringStopRequest, WorkspaceProposalActionRequest, WorkspaceProposalPriorityPolicyUpdateRequest, WorkspaceTargetConfirmRequest, WorkspaceTargetResolveRequest
+from core.schemas import WorkspaceActionPlanAbortRequest, WorkspaceActionPlanCreateRequest, WorkspaceActionPlanDecisionRequest, WorkspaceActionPlanExecuteRequest, WorkspaceActionPlanHandoffRequest, WorkspaceActionPlanReplanRequest, WorkspaceActionPlanSimulationRequest, WorkspaceAutonomousChainAdvanceRequest, WorkspaceAutonomousChainApprovalRequest, WorkspaceAutonomousChainCreateRequest, WorkspaceAutonomyOverrideRequest, WorkspaceCapabilityChainAdvanceRequest, WorkspaceCapabilityChainCreateRequest, WorkspaceExecutionPauseRequest, WorkspaceExecutionPredictChangeRequest, WorkspaceExecutionProposalActionRequest, WorkspaceExecutionProposalCreateRequest, WorkspaceExecutionResumeRequest, WorkspaceExecutionStopRequest, WorkspaceMonitoringStartRequest, WorkspaceMonitoringStopRequest, WorkspaceProposalActionRequest, WorkspaceProposalPriorityPolicyUpdateRequest, WorkspaceTargetConfirmRequest, WorkspaceTargetResolveRequest
 
 router = APIRouter()
 
@@ -120,6 +120,13 @@ AUTONOMY_PROPOSAL_RISK_SCORE: dict[str, float] = {
 }
 
 PROPOSAL_PRIORITY_POLICY_VERSION = "proposal-priority-v1"
+CAPABILITY_CHAIN_POLICY_VERSION = "capability-chain-policy-v1"
+SAFE_CAPABILITY_CHAIN_COMBINATIONS = {
+    ("workspace_scan", "observation_update"),
+    ("workspace_scan", "target_resolution"),
+    ("target_resolution", "speech_output"),
+    ("rescan_zone", "proposal_resolution"),
+}
 PROPOSAL_PRIORITY_DEFAULT = {
     "weights": {
         "urgency": 0.28,
@@ -1279,6 +1286,265 @@ def _append_chain_audit(row: WorkspaceAutonomousChain, *, actor: str, event: str
     )
     row.audit_trail_json = trail[-200:]
     flag_modified(row, "audit_trail_json")
+
+
+def _to_workspace_capability_chain_out(row: WorkspaceCapabilityChain) -> dict:
+    return {
+        "chain_id": row.id,
+        "chain_name": row.chain_name,
+        "chain_type": row.chain_type,
+        "status": row.status,
+        "source": row.source,
+        "policy": row.policy_json if isinstance(row.policy_json, dict) else {},
+        "steps": row.steps_json if isinstance(row.steps_json, list) else [],
+        "current_step_index": int(row.current_step_index),
+        "completed_step_ids": row.completed_step_ids if isinstance(row.completed_step_ids, list) else [],
+        "failed_step_ids": row.failed_step_ids if isinstance(row.failed_step_ids, list) else [],
+        "stop_on_failure": bool(row.stop_on_failure),
+        "escalate_on_failure": bool(row.escalate_on_failure),
+        "last_advanced_at": row.last_advanced_at,
+        "audit_trail": _coerced_json_list(row.audit_trail_json),
+        "metadata_json": row.metadata_json if isinstance(row.metadata_json, dict) else {},
+        "created_at": row.created_at,
+    }
+
+
+def _append_capability_chain_audit(row: WorkspaceCapabilityChain, *, actor: str, event: str, reason: str, metadata_json: dict) -> None:
+    trail = list(_coerced_json_list(row.audit_trail_json))
+    trail.append(
+        {
+            "actor": actor,
+            "event": event,
+            "reason": reason,
+            "metadata_json": metadata_json,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+    row.audit_trail_json = trail[-300:]
+    flag_modified(row, "audit_trail_json")
+
+
+def _normalized_capability_chain_steps(raw_steps: list[dict]) -> list[dict]:
+    normalized: list[dict] = []
+    for index, item in enumerate(raw_steps):
+        if not isinstance(item, dict):
+            continue
+        capability = str(item.get("capability", "")).strip()
+        if not capability:
+            continue
+        step_id = str(item.get("step_id", f"step-{index + 1}")).strip() or f"step-{index + 1}"
+        depends_on_raw = item.get("depends_on", [])
+        depends_on = [str(dep).strip() for dep in depends_on_raw if str(dep).strip()] if isinstance(depends_on_raw, list) else []
+        normalized.append(
+            {
+                "step_id": step_id,
+                "capability": capability,
+                "depends_on": depends_on,
+                "params": item.get("params", {}) if isinstance(item.get("params", {}), dict) else {},
+                "verify": item.get("verify", {}) if isinstance(item.get("verify", {}), dict) else {},
+            }
+        )
+    return normalized
+
+
+def _validate_capability_chain_policy(steps: list[dict]) -> tuple[bool, str]:
+    if len(steps) < 2:
+        return False, "capability chain must include at least two steps"
+    capabilities = tuple(str(item.get("capability", "")).strip() for item in steps)
+    if len(capabilities) != 2:
+        return False, "objective42 supports two-step safe chains only"
+    if capabilities not in SAFE_CAPABILITY_CHAIN_COMBINATIONS:
+        return False, "capability chain combination is not allowed by safety policy"
+    return True, "allowed"
+
+
+def _validate_capability_chain_dependencies(steps: list[dict]) -> tuple[bool, str]:
+    known_step_ids = [str(item.get("step_id", "")).strip() for item in steps]
+    seen: set[str] = set()
+    for item in steps:
+        step_id = str(item.get("step_id", "")).strip()
+        depends_on = item.get("depends_on", []) if isinstance(item.get("depends_on", []), list) else []
+        for dependency in depends_on:
+            if dependency not in known_step_ids:
+                return False, f"dependency '{dependency}' is not present in chain"
+            if dependency not in seen:
+                return False, f"dependency '{dependency}' must refer to a previous step"
+            if dependency == step_id:
+                return False, "step cannot depend on itself"
+        seen.add(step_id)
+    return True, "valid"
+
+
+async def _execute_capability_chain_step(*, chain: WorkspaceCapabilityChain, step: dict, db: AsyncSession) -> tuple[bool, str, dict]:
+    capability = str(step.get("capability", "")).strip()
+    params = step.get("params", {}) if isinstance(step.get("params", {}), dict) else {}
+    metadata = chain.metadata_json if isinstance(chain.metadata_json, dict) else {}
+    context = metadata.get("context", {}) if isinstance(metadata.get("context", {}), dict) else {}
+    verification: dict = {"capability": capability, "step_id": step.get("step_id")}
+
+    if capability == "workspace_scan":
+        zone = str(params.get("zone", "workspace")).strip() or "workspace"
+        label = str(params.get("label", f"scan-{chain.id}")).strip() or f"scan-{chain.id}"
+        confidence = max(0.0, min(1.0, float(params.get("confidence", 0.9) or 0.9)))
+        observation = WorkspaceObservation(
+            zone=zone,
+            label=label,
+            confidence=confidence,
+            source="objective42",
+            lifecycle_status="active",
+            metadata_json={"chain_id": chain.id, "step_id": step.get("step_id")},
+        )
+        db.add(observation)
+        await db.flush()
+
+        existing_object = (
+            await db.execute(
+                select(WorkspaceObjectMemory)
+                .where(WorkspaceObjectMemory.canonical_name == label)
+                .order_by(WorkspaceObjectMemory.id.desc())
+            )
+        ).scalars().first()
+        if existing_object:
+            existing_object.zone = zone
+            existing_object.confidence = max(float(existing_object.confidence), confidence)
+            existing_object.status = "active"
+            existing_object.last_seen_at = datetime.now(timezone.utc)
+            object_memory_id = existing_object.id
+        else:
+            object_row = WorkspaceObjectMemory(
+                canonical_name=label,
+                candidate_labels=[label.lower()],
+                confidence=confidence,
+                zone=zone,
+                status="active",
+                location_history=[],
+                metadata_json={"chain_id": chain.id, "step_id": step.get("step_id")},
+            )
+            db.add(object_row)
+            await db.flush()
+            object_memory_id = object_row.id
+
+        context.update(
+            {
+                "last_scan_zone": zone,
+                "last_scan_label": label,
+                "last_observation_id": observation.id,
+                "last_object_memory_id": object_memory_id,
+            }
+        )
+        chain.metadata_json = {**metadata, "context": context}
+        verification.update({"observation_id": observation.id, "object_memory_id": object_memory_id, "observation_count": 1})
+        return True, "scan_recorded", verification
+
+    if capability == "observation_update":
+        zone = str(params.get("zone", context.get("last_scan_zone", "workspace"))).strip() or "workspace"
+        label = str(params.get("label", context.get("last_scan_label", ""))).strip()
+        stmt = select(WorkspaceObservation).where(WorkspaceObservation.zone == zone)
+        if label:
+            stmt = stmt.where(WorkspaceObservation.label == label)
+        rows = (await db.execute(stmt.order_by(WorkspaceObservation.id.desc()))).scalars().all()
+        if not rows:
+            return False, "observation_missing", {**verification, "zone": zone, "label": label}
+        verification.update({"zone": zone, "label": label, "observation_count": len(rows), "latest_observation_id": rows[0].id})
+        return True, "observation_verified", verification
+
+    if capability == "target_resolution":
+        target_label = str(params.get("target_label", context.get("last_scan_label", ""))).strip()
+        preferred_zone = str(params.get("preferred_zone", context.get("last_scan_zone", ""))).strip()
+        if not target_label:
+            return False, "target_label_required", verification
+
+        object_row = (
+            await db.execute(
+                select(WorkspaceObjectMemory)
+                .where(WorkspaceObjectMemory.canonical_name == target_label)
+                .order_by(WorkspaceObjectMemory.last_seen_at.desc())
+            )
+        ).scalars().first()
+        if not object_row:
+            return False, "target_not_found", {**verification, "target_label": target_label}
+
+        resolution = WorkspaceTargetResolution(
+            requested_target=target_label,
+            requested_zone=preferred_zone or object_row.zone,
+            match_outcome="single_match",
+            policy_outcome="target_ready_auto",
+            status="confirmed",
+            confidence=float(object_row.confidence),
+            related_object_id=object_row.id,
+            candidate_object_ids=[object_row.id],
+            suggested_actions=["observe"],
+            source="objective42",
+            metadata_json={"chain_id": chain.id, "step_id": step.get("step_id")},
+        )
+        db.add(resolution)
+        await db.flush()
+        context.update({"last_target_resolution_id": resolution.id, "last_target_label": target_label})
+        chain.metadata_json = {**metadata, "context": context}
+        verification.update({"target_resolution_id": resolution.id, "target_label": target_label, "confidence": float(object_row.confidence)})
+        return True, "target_resolved", verification
+
+    if capability == "speech_output":
+        message = str(params.get("message", f"Target {context.get('last_target_label', 'ready')} confirmed.")).strip()
+        if not message:
+            return False, "speech_message_required", verification
+        speech = SpeechOutputAction(
+            requested_text=message,
+            voice_profile="default",
+            channel="system",
+            priority="normal",
+            delivery_status="queued",
+            metadata_json={"chain_id": chain.id, "step_id": step.get("step_id")},
+        )
+        db.add(speech)
+        await db.flush()
+        verification.update({"speech_action_id": speech.id, "message": message})
+        return True, "speech_queued", verification
+
+    if capability == "rescan_zone":
+        zone = str(params.get("zone", context.get("last_scan_zone", "workspace"))).strip() or "workspace"
+        confidence = max(0.0, min(1.0, float(params.get("confidence", 0.8) or 0.8)))
+        proposal = WorkspaceProposal(
+            proposal_type="rescan_zone",
+            title=f"Rescan zone {zone}",
+            description=f"Objective42 chain requests bounded rescan for {zone}.",
+            status="pending",
+            confidence=confidence,
+            source="objective42",
+            related_zone=zone,
+            related_object_id=None,
+            source_execution_id=None,
+            trigger_json={"chain_id": chain.id, "step_id": step.get("step_id")},
+            metadata_json={"chain_id": chain.id, "step_id": step.get("step_id")},
+        )
+        db.add(proposal)
+        await db.flush()
+        await _refresh_workspace_proposal_priority(proposal=proposal, db=db)
+        context.update({"last_rescan_proposal_id": proposal.id, "last_scan_zone": zone})
+        chain.metadata_json = {**metadata, "context": context}
+        verification.update({"proposal_id": proposal.id, "proposal_status": proposal.status, "zone": zone})
+        return True, "rescan_proposal_created", verification
+
+    if capability == "proposal_resolution":
+        proposal_id_raw = params.get("proposal_id", context.get("last_rescan_proposal_id"))
+        proposal_id = int(proposal_id_raw) if str(proposal_id_raw).isdigit() else 0
+        if proposal_id <= 0:
+            return False, "proposal_id_required", verification
+        proposal = await db.get(WorkspaceProposal, proposal_id)
+        if not proposal:
+            return False, "proposal_not_found", {**verification, "proposal_id": proposal_id}
+        proposal.status = "resolved"
+        proposal.metadata_json = {
+            **(proposal.metadata_json if isinstance(proposal.metadata_json, dict) else {}),
+            "resolved_by": "objective42_chain",
+            "chain_id": chain.id,
+            "step_id": step.get("step_id"),
+            "resolved_at": datetime.now(timezone.utc).isoformat(),
+        }
+        verification.update({"proposal_id": proposal.id, "proposal_status": proposal.status})
+        return True, "proposal_resolved", verification
+
+    return False, "unsupported_capability", verification
 
 
 async def _get_or_create_monitoring_state(db: AsyncSession) -> WorkspaceMonitoringState:
@@ -2645,6 +2911,206 @@ async def list_workspace_autonomous_chains(
     rows = (await db.execute(stmt)).scalars().all()[:limit]
     return {
         "chains": [_to_workspace_autonomous_chain_out(row) for row in rows],
+    }
+
+
+@router.get("/capability-chains")
+async def list_workspace_capability_chains(
+    status: str = "",
+    limit: int = Query(default=100, ge=1, le=500),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    stmt = select(WorkspaceCapabilityChain).order_by(WorkspaceCapabilityChain.id.desc())
+    if status.strip():
+        stmt = stmt.where(WorkspaceCapabilityChain.status == status.strip())
+    rows = (await db.execute(stmt)).scalars().all()[:limit]
+    return {"chains": [_to_workspace_capability_chain_out(row) for row in rows]}
+
+
+@router.post("/capability-chains")
+async def create_workspace_capability_chain(
+    payload: WorkspaceCapabilityChainCreateRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    steps = _normalized_capability_chain_steps(payload.steps)
+    if len(steps) < 2:
+        raise HTTPException(status_code=422, detail="capability chain must include at least two valid steps")
+
+    allowed, policy_reason = _validate_capability_chain_policy(steps)
+    if not allowed:
+        raise HTTPException(status_code=422, detail=policy_reason)
+
+    deps_ok, deps_reason = _validate_capability_chain_dependencies(steps)
+    if not deps_ok:
+        raise HTTPException(status_code=422, detail=deps_reason)
+
+    policy = {
+        "version": CAPABILITY_CHAIN_POLICY_VERSION,
+        "allowed_combinations": [list(item) for item in sorted(SAFE_CAPABILITY_CHAIN_COMBINATIONS)],
+        "combination": [steps[0].get("capability"), steps[1].get("capability")],
+        **(payload.policy_json if isinstance(payload.policy_json, dict) else {}),
+    }
+
+    row = WorkspaceCapabilityChain(
+        chain_name=payload.chain_name,
+        chain_type=payload.chain_type,
+        status="pending",
+        source=payload.source,
+        policy_json=policy,
+        steps_json=steps,
+        current_step_index=0,
+        completed_step_ids=[],
+        failed_step_ids=[],
+        stop_on_failure=payload.stop_on_failure,
+        escalate_on_failure=payload.escalate_on_failure,
+        audit_trail_json=[],
+        metadata_json={"created_by": payload.actor, "reason": payload.reason, **payload.metadata_json},
+    )
+    db.add(row)
+    await db.flush()
+
+    _append_capability_chain_audit(
+        row,
+        actor=payload.actor,
+        event="capability_chain_created",
+        reason=payload.reason,
+        metadata_json={"policy_version": CAPABILITY_CHAIN_POLICY_VERSION, "steps": steps},
+    )
+
+    await write_journal(
+        db,
+        actor=payload.actor,
+        action="workspace_capability_chain_create",
+        target_type="workspace_capability_chain",
+        target_id=str(row.id),
+        summary=f"Created workspace capability chain {row.id}",
+        metadata_json={"chain_name": row.chain_name, "policy": policy},
+    )
+    await db.commit()
+    await db.refresh(row)
+    return _to_workspace_capability_chain_out(row)
+
+
+@router.get("/capability-chains/{chain_id}")
+async def get_workspace_capability_chain(chain_id: int, db: AsyncSession = Depends(get_db)) -> dict:
+    row = await db.get(WorkspaceCapabilityChain, chain_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="workspace capability chain not found")
+    return _to_workspace_capability_chain_out(row)
+
+
+@router.get("/capability-chains/{chain_id}/audit")
+async def get_workspace_capability_chain_audit(chain_id: int, db: AsyncSession = Depends(get_db)) -> dict:
+    row = await db.get(WorkspaceCapabilityChain, chain_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="workspace capability chain not found")
+    return {
+        "chain_id": row.id,
+        "status": row.status,
+        "audit_trail": _coerced_json_list(row.audit_trail_json),
+    }
+
+
+@router.post("/capability-chains/{chain_id}/advance")
+async def advance_workspace_capability_chain(
+    chain_id: int,
+    payload: WorkspaceCapabilityChainAdvanceRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    row = await db.get(WorkspaceCapabilityChain, chain_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="workspace capability chain not found")
+    if row.status in {"completed", "failed", "canceled"}:
+        raise HTTPException(status_code=422, detail="workspace capability chain is terminal")
+
+    steps = row.steps_json if isinstance(row.steps_json, list) else []
+    if row.current_step_index >= len(steps):
+        row.status = "completed"
+        await db.commit()
+        await db.refresh(row)
+        return _to_workspace_capability_chain_out(row)
+
+    step = steps[row.current_step_index] if isinstance(steps[row.current_step_index], dict) else {}
+    step_id = str(step.get("step_id", f"step-{row.current_step_index + 1}")).strip()
+    depends_on = step.get("depends_on", []) if isinstance(step.get("depends_on", []), list) else []
+    completed_step_ids = row.completed_step_ids if isinstance(row.completed_step_ids, list) else []
+    unmet = [dep for dep in depends_on if dep not in completed_step_ids]
+    if unmet and not payload.force:
+        raise HTTPException(status_code=422, detail=f"capability chain dependency unmet: {', '.join(unmet)}")
+
+    success, result, verification = await _execute_capability_chain_step(chain=row, step=step, db=db)
+    row.last_advanced_at = datetime.now(timezone.utc)
+
+    if success:
+        completed = list(completed_step_ids)
+        if step_id not in completed:
+            completed.append(step_id)
+        row.completed_step_ids = completed
+        row.current_step_index = int(row.current_step_index) + 1
+        row.status = "completed" if row.current_step_index >= len(steps) else "active"
+        _append_capability_chain_audit(
+            row,
+            actor=payload.actor,
+            event="capability_step_completed",
+            reason=payload.reason or result,
+            metadata_json={"step_id": step_id, "verification": verification, **payload.metadata_json},
+        )
+    else:
+        failed = row.failed_step_ids if isinstance(row.failed_step_ids, list) else []
+        if step_id not in failed:
+            failed.append(step_id)
+        row.failed_step_ids = failed
+        if row.stop_on_failure and not payload.force:
+            row.status = "failed"
+        else:
+            row.current_step_index = int(row.current_step_index) + 1
+            row.status = "completed" if row.current_step_index >= len(steps) else "active"
+        metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
+        if row.escalate_on_failure:
+            row.metadata_json = {
+                **metadata,
+                "escalation": {
+                    "required": True,
+                    "reason": result,
+                    "step_id": step_id,
+                    "at": datetime.now(timezone.utc).isoformat(),
+                },
+            }
+        _append_capability_chain_audit(
+            row,
+            actor=payload.actor,
+            event="capability_step_failed",
+            reason=payload.reason or result,
+            metadata_json={"step_id": step_id, "verification": verification, "escalated": row.escalate_on_failure, **payload.metadata_json},
+        )
+
+    await write_journal(
+        db,
+        actor=payload.actor,
+        action="workspace_capability_chain_advance",
+        target_type="workspace_capability_chain",
+        target_id=str(row.id),
+        summary=f"Advanced workspace capability chain {row.id}: {result}",
+        metadata_json={
+            "step_id": step_id,
+            "result": result,
+            "success": success,
+            "status": row.status,
+            "verification": verification,
+            **payload.metadata_json,
+        },
+    )
+    await db.commit()
+    await db.refresh(row)
+    return {
+        **_to_workspace_capability_chain_out(row),
+        "last_step": {
+            "step_id": step_id,
+            "capability": step.get("capability", ""),
+            "result": result,
+            "success": success,
+            "verification": verification,
+        },
     }
 
 

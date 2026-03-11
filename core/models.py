@@ -518,6 +518,26 @@ class WorkspaceAutonomousChain(Base, TimestampMixin):
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
+class WorkspaceCapabilityChain(Base, TimestampMixin):
+    __tablename__ = "workspace_capability_chains"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    chain_name: Mapped[str] = mapped_column(String(160), index=True)
+    chain_type: Mapped[str] = mapped_column(String(80), default="safe_capability_chain", index=True)
+    status: Mapped[str] = mapped_column(String(40), default="pending", index=True)
+    source: Mapped[str] = mapped_column(String(80), default="objective42")
+    policy_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    steps_json: Mapped[list[dict]] = mapped_column(JSON, default=list)
+    current_step_index: Mapped[int] = mapped_column(default=0)
+    completed_step_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    failed_step_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    stop_on_failure: Mapped[bool] = mapped_column(default=True)
+    escalate_on_failure: Mapped[bool] = mapped_column(default=True)
+    last_advanced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    audit_trail_json: Mapped[list[dict]] = mapped_column(JSON, default=list)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
 class WorkspaceInterruptionEvent(Base, TimestampMixin):
     __tablename__ = "workspace_interruption_events"
 
