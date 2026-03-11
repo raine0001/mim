@@ -7,7 +7,7 @@ from core.config import PROJECT_ROOT, settings
 
 CONTRACT_VERSION = "tod-mim-shared-contract-v1"
 MANIFEST_VERSION = "1"
-SCHEMA_VERSION = "2026-03-11-36"
+SCHEMA_VERSION = "2026-03-11-38"
 
 SIGNATURE_FILES = [
     "core/models.py",
@@ -19,6 +19,11 @@ SIGNATURE_FILES = [
     "core/routers/manifest.py",
     "core/config.py",
     "core/manifest.py",
+    "core/horizon_planning.py",
+    "core/horizon_planning_service.py",
+    "core/routers/horizon_planning.py",
+    "core/environment_strategy_service.py",
+    "core/routers/environment_strategy.py",
     "docs/tod-mim-bridge.md",
     "docs/objective-21-unified-input-gateway.md",
     "docs/objective-22-mim-tod-execution-feedback-integration.md",
@@ -49,6 +54,12 @@ SIGNATURE_FILES = [
     "docs/objective-45-promotion-readiness-report.md",
     "docs/objective-45-prod-promotion-report.md",
     "docs/mim-core-charter.md",
+    "docs/objective-46-long-horizon-planning.md",
+    "docs/objective-46-promotion-readiness-report.md",
+    "docs/objective-46-prod-promotion-report.md",
+    "docs/objective-47-environment-strategy-formation.md",
+    "docs/objective-47-promotion-readiness-report.md",
+    "docs/objective-47-prod-promotion-report.md",
     "core/routers/workspace.py",
     "core/routers/constraints.py",
     "core/routers/constraint_learning.py",
@@ -126,6 +137,8 @@ CAPABILITIES = [
     "human_aware_workspace_behavior",
     "constraint_evaluation_engine",
     "constraint_weight_learning",
+    "long_horizon_planning",
+    "environment_strategy_formation",
 ]
 
 RECENT_CHANGES = [
@@ -168,6 +181,8 @@ RECENT_CHANGES = [
     "Added Objective 43 human-aware workspace behavior signals and policy gating for shared-workspace pause/confirm/replan decisions with inspectable state",
     "Added Objective 44 centralized constraint evaluation engine with structured decision outcomes, explanation metadata, and reusable integration hooks",
     "Added Objective 45 proposal-only constraint weight learning loop with outcome recording, rolling success stats, and auditable soft adjustment proposals",
+    "Added Objective 46 long-horizon multi-goal planning with future-state scoring, checkpointed execution states, and replan-on-drift inspectability",
+    "Added Objective 47 environment strategy formation with persistent strategy lifecycle, strategy-driven horizon weighting, and strategy inspectability APIs",
 ]
 
 
@@ -299,6 +314,16 @@ def build_manifest() -> dict:
             "/constraints/learning/stats",
             "/constraints/learning/proposals/generate",
             "/constraints/learning/proposals",
+            "/planning/horizon/plans",
+            "/planning/horizon/plans/current",
+            "/planning/horizon/plans/{plan_id}",
+            "/planning/horizon/plans/{plan_id}/checkpoints/advance",
+            "/planning/horizon/plans/{plan_id}/future-drift",
+            "/planning/strategies/generate",
+            "/planning/strategies",
+            "/planning/strategies/{strategy_id}",
+            "/planning/strategies/{strategy_id}/resolve",
+            "/planning/strategies/{strategy_id}/deactivate",
             "/operator/inbox",
             "/operator/executions",
             "/operator/executions/{execution_id}",
@@ -762,6 +787,39 @@ def build_manifest() -> dict:
                 "hard_constraint",
                 "rationale",
                 "status",
+                "metadata_json",
+                "created_at",
+            ],
+            "HorizonPlan": [
+                "plan_id",
+                "actor",
+                "source",
+                "status",
+                "planning_horizon_minutes",
+                "ranked_goals",
+                "staged_action_graph",
+                "expected_future_constraints",
+                "scoring_context",
+                "explanation",
+                "checkpoints",
+                "next_checkpoint",
+                "metadata_json",
+                "created_at",
+            ],
+            "EnvironmentStrategy": [
+                "strategy_id",
+                "source",
+                "strategy_type",
+                "target_scope",
+                "priority",
+                "current_status",
+                "success_criteria",
+                "contributing_goals",
+                "contributing_checkpoints",
+                "status_reason",
+                "evidence",
+                "influence_weight",
+                "influenced_plan_ids",
                 "metadata_json",
                 "created_at",
             ],

@@ -872,6 +872,92 @@ class ConstraintLearningGenerateProposalsRequest(BaseModel):
     metadata_json: dict = Field(default_factory=dict)
 
 
+class HorizonPlanGoalCandidate(BaseModel):
+    goal_key: str = Field(min_length=1, max_length=120)
+    title: str = Field(min_length=1, max_length=200)
+    priority: str = "normal"
+    goal_type: str = "general"
+    dependencies: list[str] = Field(default_factory=list)
+    estimated_steps: int = Field(default=1, ge=1, le=100)
+    expected_value: float = Field(default=0.5, ge=0.0, le=1.0)
+    urgency: float = Field(default=0.5, ge=0.0, le=1.0)
+    requires_fresh_map: bool = False
+    requires_high_confidence: bool = False
+    is_physical: bool = False
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class HorizonPlanCreateRequest(BaseModel):
+    actor: str = "workspace"
+    source: str = "objective46"
+    planning_horizon_minutes: int = Field(default=120, ge=10, le=1440)
+    goal_candidates: list[HorizonPlanGoalCandidate] = Field(default_factory=list)
+    expected_future_constraints: list[dict] = Field(default_factory=list)
+    priority_policy: dict = Field(default_factory=dict)
+    map_freshness_seconds: int = Field(default=0, ge=0, le=86400)
+    object_confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+    human_aware_state: dict = Field(default_factory=dict)
+    operator_preferences: dict = Field(default_factory=dict)
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class HorizonCheckpointAdvanceRequest(BaseModel):
+    actor: str = "workspace"
+    reason: str = ""
+    outcome: Literal[
+        "checkpoint_reached",
+        "needs_re_evaluation",
+        "replanned",
+        "complete",
+    ] = "checkpoint_reached"
+    checkpoint_id: int | None = Field(default=None, ge=1)
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class HorizonFutureDriftRequest(BaseModel):
+    actor: str = "workspace"
+    reason: str = ""
+    drift_type: str = Field(min_length=1, max_length=120)
+    observed_value: str = ""
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class EnvironmentStrategyCondition(BaseModel):
+    condition_type: str = Field(min_length=1, max_length=120)
+    target_scope: str = Field(default="workspace", max_length=160)
+    severity: float = Field(default=0.5, ge=0.0, le=1.0)
+    occurrence_count: int = Field(default=1, ge=1, le=10000)
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class EnvironmentStrategyGenerateRequest(BaseModel):
+    actor: str = "workspace"
+    source: str = "objective47"
+    observed_conditions: list[EnvironmentStrategyCondition] = Field(default_factory=list)
+    min_severity: float = Field(default=0.4, ge=0.0, le=1.0)
+    max_strategies: int = Field(default=5, ge=1, le=25)
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class EnvironmentStrategyResolveRequest(BaseModel):
+    actor: str = "operator"
+    reason: str = ""
+    status: Literal[
+        "active",
+        "stable",
+        "blocked",
+        "completed",
+        "superseded",
+    ] = "stable"
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class EnvironmentStrategyDeactivateRequest(BaseModel):
+    actor: str = "operator"
+    reason: str = ""
+    metadata_json: dict = Field(default_factory=dict)
+
+
 WorkspaceInterruptionType = Literal[
     "human_detected_in_workspace",
     "operator_pause",

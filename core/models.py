@@ -614,3 +614,67 @@ class ConstraintAdjustmentProposal(Base, TimestampMixin):
     rationale: Mapped[str] = mapped_column(Text, default="")
     status: Mapped[str] = mapped_column(String(40), default="proposed", index=True)
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class WorkspaceHorizonPlan(Base, TimestampMixin):
+    __tablename__ = "workspace_horizon_plans"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    actor: Mapped[str] = mapped_column(String(120), default="workspace")
+    source: Mapped[str] = mapped_column(String(80), default="objective46", index=True)
+    status: Mapped[str] = mapped_column(String(40), default="planned", index=True)
+    planning_horizon_minutes: Mapped[int] = mapped_column(default=60)
+    ranked_goals_json: Mapped[list[dict]] = mapped_column(JSON, default=list)
+    staged_action_graph_json: Mapped[list[dict]] = mapped_column(JSON, default=list)
+    expected_future_constraints_json: Mapped[list[dict]] = mapped_column(JSON, default=list)
+    scoring_context_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    explanation_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class WorkspaceHorizonCheckpoint(Base, TimestampMixin):
+    __tablename__ = "workspace_horizon_checkpoints"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    plan_id: Mapped[int] = mapped_column(ForeignKey("workspace_horizon_plans.id", ondelete="CASCADE"), index=True)
+    checkpoint_key: Mapped[str] = mapped_column(String(120), index=True)
+    sequence_index: Mapped[int] = mapped_column(default=1)
+    checkpoint_type: Mapped[str] = mapped_column(String(80), default="goal_step")
+    status: Mapped[str] = mapped_column(String(40), default="planned", index=True)
+    related_goal_key: Mapped[str] = mapped_column(String(120), default="", index=True)
+    trigger_conditions_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    replan_if_json: Mapped[list[dict]] = mapped_column(JSON, default=list)
+    explanation: Mapped[str] = mapped_column(Text, default="")
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class WorkspaceHorizonReplanEvent(Base, TimestampMixin):
+    __tablename__ = "workspace_horizon_replan_events"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    plan_id: Mapped[int] = mapped_column(ForeignKey("workspace_horizon_plans.id", ondelete="CASCADE"), index=True)
+    actor: Mapped[str] = mapped_column(String(120), default="workspace")
+    reason: Mapped[str] = mapped_column(Text, default="")
+    drift_type: Mapped[str] = mapped_column(String(120), default="", index=True)
+    observed_value: Mapped[str] = mapped_column(String(120), default="")
+    expected_value: Mapped[str] = mapped_column(String(120), default="")
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class WorkspaceEnvironmentStrategy(Base, TimestampMixin):
+    __tablename__ = "workspace_environment_strategies"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    source: Mapped[str] = mapped_column(String(80), default="objective47", index=True)
+    strategy_type: Mapped[str] = mapped_column(String(120), index=True)
+    target_scope: Mapped[str] = mapped_column(String(160), default="workspace", index=True)
+    priority: Mapped[str] = mapped_column(String(40), default="normal", index=True)
+    current_status: Mapped[str] = mapped_column(String(40), default="active", index=True)
+    success_criteria: Mapped[str] = mapped_column(Text, default="")
+    contributing_goal_keys_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    contributing_checkpoint_keys_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    status_reason: Mapped[str] = mapped_column(Text, default="")
+    evidence_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    influence_weight: Mapped[float] = mapped_column(default=0.5)
+    influenced_plan_ids_json: Mapped[list[int]] = mapped_column(JSON, default=list)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
