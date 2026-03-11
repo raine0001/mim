@@ -4,6 +4,7 @@
   "timeout_seconds": 15,
   "fallback_to_local": true,
   "default_actor": "tod",
+  "execution_feedback_auth_key": "",
   "execution": {
     "active_engine": "codex",
     "fallback_engine": "local"

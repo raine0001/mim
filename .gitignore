@@ -10,3 +10,8 @@ node_modules/
 tod-tests-summary.json
 tod/state/
 runtime/prod/backups/
+*.log
+coverage/
+state.json
+runtime/**/state.json
+

@@ -247,3 +247,296 @@ class ValidationResult(Base):
     validation_status: Mapped[str] = mapped_column(String(40), default="unknown")
     validation_details: Mapped[dict] = mapped_column(JSON, default=dict)
     validated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class InputEvent(Base, TimestampMixin):
+    __tablename__ = "input_events"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    source: Mapped[str] = mapped_column(String(20), index=True)
+    raw_input: Mapped[str] = mapped_column(Text, default="")
+    parsed_intent: Mapped[str] = mapped_column(String(120), default="unknown")
+    confidence: Mapped[float] = mapped_column(default=0.0)
+    target_system: Mapped[str] = mapped_column(String(120), default="mim")
+    requested_goal: Mapped[str] = mapped_column(Text, default="")
+    safety_flags: Mapped[list[str]] = mapped_column(JSON, default=list)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    normalized: Mapped[bool] = mapped_column(default=True)
+
+
+class InputEventResolution(Base, TimestampMixin):
+    __tablename__ = "input_event_resolutions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    input_event_id: Mapped[int] = mapped_column(ForeignKey("input_events.id", ondelete="CASCADE"), unique=True, index=True)
+    internal_intent: Mapped[str] = mapped_column(String(80), index=True)
+    confidence_tier: Mapped[str] = mapped_column(String(20), default="unknown")
+    outcome: Mapped[str] = mapped_column(String(40), default="requires_confirmation")
+    resolution_status: Mapped[str] = mapped_column(String(40), default="requires_confirmation")
+    safety_decision: Mapped[str] = mapped_column(String(40), default="requires_confirmation")
+    reason: Mapped[str] = mapped_column(Text, default="")
+    clarification_prompt: Mapped[str] = mapped_column(Text, default="")
+    escalation_reasons: Mapped[list[str]] = mapped_column(JSON, default=list)
+    capability_name: Mapped[str] = mapped_column(String(120), default="")
+    capability_registered: Mapped[bool] = mapped_column(default=False)
+    capability_enabled: Mapped[bool] = mapped_column(default=False)
+    goal_id: Mapped[int | None] = mapped_column(ForeignKey("goals.id", ondelete="SET NULL"), nullable=True)
+    proposed_goal_description: Mapped[str] = mapped_column(Text, default="")
+    proposed_actions: Mapped[list[dict]] = mapped_column(JSON, default=list)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class CapabilityRegistration(Base, TimestampMixin):
+    __tablename__ = "capability_registrations"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    capability_name: Mapped[str] = mapped_column(String(120), unique=True, index=True)
+    category: Mapped[str] = mapped_column(String(60), default="action")
+    description: Mapped[str] = mapped_column(Text, default="")
+    requires_confirmation: Mapped[bool] = mapped_column(default=True)
+    enabled: Mapped[bool] = mapped_column(default=True)
+    safety_policy: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class SpeechOutputAction(Base, TimestampMixin):
+    __tablename__ = "speech_output_actions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    requested_text: Mapped[str] = mapped_column(Text)
+    voice_profile: Mapped[str] = mapped_column(String(80), default="default")
+    channel: Mapped[str] = mapped_column(String(80), default="system")
+    priority: Mapped[str] = mapped_column(String(20), default="normal")
+    delivery_status: Mapped[str] = mapped_column(String(40), default="queued")
+    failure_reason: Mapped[str] = mapped_column(Text, default="")
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class CapabilityExecution(Base, TimestampMixin):
+    __tablename__ = "capability_executions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    input_event_id: Mapped[int] = mapped_column(ForeignKey("input_events.id", ondelete="CASCADE"), index=True)
+    resolution_id: Mapped[int | None] = mapped_column(ForeignKey("input_event_resolutions.id", ondelete="SET NULL"), nullable=True)
+    goal_id: Mapped[int | None] = mapped_column(ForeignKey("goals.id", ondelete="SET NULL"), nullable=True)
+    capability_name: Mapped[str] = mapped_column(String(120), index=True)
+    arguments_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    safety_mode: Mapped[str] = mapped_column(String(40), default="standard")
+    requested_executor: Mapped[str] = mapped_column(String(120), default="tod")
+    dispatch_decision: Mapped[str] = mapped_column(String(40), default="requires_confirmation")
+    status: Mapped[str] = mapped_column(String(40), default="pending")
+    reason: Mapped[str] = mapped_column(Text, default="")
+    feedback_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class WorkspaceObservation(Base, TimestampMixin):
+    __tablename__ = "workspace_observations"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+    zone: Mapped[str] = mapped_column(String(120), index=True)
+    label: Mapped[str] = mapped_column(String(160), index=True)
+    confidence: Mapped[float] = mapped_column(default=0.0)
+    source: Mapped[str] = mapped_column(String(40), default="vision")
+    execution_id: Mapped[int | None] = mapped_column(ForeignKey("capability_executions.id", ondelete="SET NULL"), nullable=True, index=True)
+    lifecycle_status: Mapped[str] = mapped_column(String(40), default="active", index=True)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+    observation_count: Mapped[int] = mapped_column(default=1)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class WorkspaceObjectMemory(Base, TimestampMixin):
+    __tablename__ = "workspace_object_memories"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    canonical_name: Mapped[str] = mapped_column(String(160), index=True)
+    candidate_labels: Mapped[list[str]] = mapped_column(JSON, default=list)
+    confidence: Mapped[float] = mapped_column(default=0.0)
+    zone: Mapped[str] = mapped_column(String(120), index=True)
+    status: Mapped[str] = mapped_column(String(40), default="active", index=True)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+    last_execution_id: Mapped[int | None] = mapped_column(ForeignKey("capability_executions.id", ondelete="SET NULL"), nullable=True, index=True)
+    location_history: Mapped[list[dict]] = mapped_column(JSON, default=list)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class WorkspaceZone(Base, TimestampMixin):
+    __tablename__ = "workspace_zones"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    zone_name: Mapped[str] = mapped_column(String(120), unique=True, index=True)
+    display_name: Mapped[str] = mapped_column(String(160), default="")
+    hazard_level: Mapped[int] = mapped_column(default=0)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class WorkspaceZoneRelation(Base, TimestampMixin):
+    __tablename__ = "workspace_zone_relations"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    from_zone_id: Mapped[int] = mapped_column(ForeignKey("workspace_zones.id", ondelete="CASCADE"), index=True)
+    to_zone_id: Mapped[int] = mapped_column(ForeignKey("workspace_zones.id", ondelete="CASCADE"), index=True)
+    relation_type: Mapped[str] = mapped_column(String(60), index=True)
+    confidence: Mapped[float] = mapped_column(default=1.0)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class WorkspaceObjectRelation(Base, TimestampMixin):
+    __tablename__ = "workspace_object_relations"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    subject_object_id: Mapped[int] = mapped_column(ForeignKey("workspace_object_memories.id", ondelete="CASCADE"), index=True)
+    object_object_id: Mapped[int] = mapped_column(ForeignKey("workspace_object_memories.id", ondelete="CASCADE"), index=True)
+    relation_type: Mapped[str] = mapped_column(String(60), default="near", index=True)
+    relation_status: Mapped[str] = mapped_column(String(40), default="active", index=True)
+    confidence: Mapped[float] = mapped_column(default=0.0)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+    source_execution_id: Mapped[int | None] = mapped_column(ForeignKey("capability_executions.id", ondelete="SET NULL"), nullable=True, index=True)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class WorkspaceProposal(Base, TimestampMixin):
+    __tablename__ = "workspace_proposals"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    proposal_type: Mapped[str] = mapped_column(String(80), index=True)
+    title: Mapped[str] = mapped_column(String(220))
+    description: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(40), default="pending", index=True)
+    confidence: Mapped[float] = mapped_column(default=0.0)
+    source: Mapped[str] = mapped_column(String(80), default="workspace_state")
+    related_zone: Mapped[str] = mapped_column(String(120), default="", index=True)
+    related_object_id: Mapped[int | None] = mapped_column(ForeignKey("workspace_object_memories.id", ondelete="SET NULL"), nullable=True, index=True)
+    source_execution_id: Mapped[int | None] = mapped_column(ForeignKey("capability_executions.id", ondelete="SET NULL"), nullable=True, index=True)
+    trigger_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class WorkspaceTargetResolution(Base, TimestampMixin):
+    __tablename__ = "workspace_target_resolutions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    requested_target: Mapped[str] = mapped_column(String(160), index=True)
+    requested_zone: Mapped[str] = mapped_column(String(120), default="", index=True)
+    match_outcome: Mapped[str] = mapped_column(String(40), default="no_match", index=True)
+    policy_outcome: Mapped[str] = mapped_column(String(60), default="target_not_found", index=True)
+    status: Mapped[str] = mapped_column(String(40), default="pending", index=True)
+    confidence: Mapped[float] = mapped_column(default=0.0)
+    related_object_id: Mapped[int | None] = mapped_column(ForeignKey("workspace_object_memories.id", ondelete="SET NULL"), nullable=True, index=True)
+    candidate_object_ids: Mapped[list[int]] = mapped_column(JSON, default=list)
+    suggested_actions: Mapped[list[str]] = mapped_column(JSON, default=list)
+    source: Mapped[str] = mapped_column(String(80), default="api")
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class WorkspaceActionPlan(Base, TimestampMixin):
+    __tablename__ = "workspace_action_plans"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    target_resolution_id: Mapped[int] = mapped_column(ForeignKey("workspace_target_resolutions.id", ondelete="CASCADE"), index=True)
+    target_label: Mapped[str] = mapped_column(String(160), index=True)
+    target_zone: Mapped[str] = mapped_column(String(120), default="", index=True)
+    action_type: Mapped[str] = mapped_column(String(80), index=True)
+    safety_mode: Mapped[str] = mapped_column(String(60), default="operator_controlled")
+    planning_outcome: Mapped[str] = mapped_column(String(80), default="plan_requires_review", index=True)
+    status: Mapped[str] = mapped_column(String(40), default="pending_approval", index=True)
+    steps_json: Mapped[list[dict]] = mapped_column(JSON, default=list)
+    motion_plan_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    simulation_outcome: Mapped[str] = mapped_column(String(80), default="not_run", index=True)
+    simulation_status: Mapped[str] = mapped_column(String(40), default="not_run", index=True)
+    simulation_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    simulation_gate_passed: Mapped[bool] = mapped_column(default=False)
+    execution_capability: Mapped[str] = mapped_column(String(120), default="")
+    execution_status: Mapped[str] = mapped_column(String(40), default="not_started", index=True)
+    execution_id: Mapped[int | None] = mapped_column(ForeignKey("capability_executions.id", ondelete="SET NULL"), nullable=True, index=True)
+    execution_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    abort_status: Mapped[str] = mapped_column(String(40), default="not_aborted", index=True)
+    abort_reason: Mapped[str] = mapped_column(Text, default="")
+    queued_task_id: Mapped[int | None] = mapped_column(ForeignKey("tasks.id", ondelete="SET NULL"), nullable=True, index=True)
+    source: Mapped[str] = mapped_column(String(80), default="api")
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class WorkspaceMonitoringState(Base, TimestampMixin):
+    __tablename__ = "workspace_monitoring_states"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    desired_running: Mapped[bool] = mapped_column(default=False)
+    runtime_status: Mapped[str] = mapped_column(String(40), default="stopped", index=True)
+    scan_trigger_mode: Mapped[str] = mapped_column(String(40), default="interval")
+    interval_seconds: Mapped[int] = mapped_column(default=30)
+    freshness_threshold_seconds: Mapped[int] = mapped_column(default=900)
+    cooldown_seconds: Mapped[int] = mapped_column(default=10)
+    max_scan_rate: Mapped[int] = mapped_column(default=6)
+    priority_zones: Mapped[list[str]] = mapped_column(JSON, default=list)
+    last_scan_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    scan_count: Mapped[int] = mapped_column(default=0)
+    last_scan_reason: Mapped[str] = mapped_column(String(120), default="")
+    last_deltas_json: Mapped[list[dict]] = mapped_column(JSON, default=list)
+    last_proposal_ids: Mapped[list[int]] = mapped_column(JSON, default=list)
+    last_snapshot_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    last_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_stopped_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class WorkspaceAutonomousChain(Base, TimestampMixin):
+    __tablename__ = "workspace_autonomous_chains"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    chain_type: Mapped[str] = mapped_column(String(80), default="proposal_sequence", index=True)
+    status: Mapped[str] = mapped_column(String(40), default="pending", index=True)
+    source: Mapped[str] = mapped_column(String(80), default="objective36")
+    trigger_reason: Mapped[str] = mapped_column(Text, default="")
+    step_proposal_ids: Mapped[list[int]] = mapped_column(JSON, default=list)
+    step_policy_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    stop_on_failure: Mapped[bool] = mapped_column(default=True)
+    cooldown_seconds: Mapped[int] = mapped_column(default=0)
+    requires_approval: Mapped[bool] = mapped_column(default=True)
+    approved_by: Mapped[str] = mapped_column(String(120), default="")
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_advanced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    current_step_index: Mapped[int] = mapped_column(default=0)
+    completed_step_ids: Mapped[list[int]] = mapped_column(JSON, default=list)
+    failed_step_ids: Mapped[list[int]] = mapped_column(JSON, default=list)
+    audit_trail_json: Mapped[list[dict]] = mapped_column(JSON, default=list)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class WorkspaceInterruptionEvent(Base, TimestampMixin):
+    __tablename__ = "workspace_interruption_events"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    execution_id: Mapped[int | None] = mapped_column(ForeignKey("capability_executions.id", ondelete="SET NULL"), nullable=True, index=True)
+    action_plan_id: Mapped[int | None] = mapped_column(ForeignKey("workspace_action_plans.id", ondelete="SET NULL"), nullable=True, index=True)
+    chain_id: Mapped[int | None] = mapped_column(ForeignKey("workspace_autonomous_chains.id", ondelete="SET NULL"), nullable=True, index=True)
+    interruption_type: Mapped[str] = mapped_column(String(80), index=True)
+    source: Mapped[str] = mapped_column(String(80), default="operator")
+    requested_outcome: Mapped[str] = mapped_column(String(40), default="require_operator_decision")
+    applied_outcome: Mapped[str] = mapped_column(String(40), default="require_operator_decision")
+    status: Mapped[str] = mapped_column(String(40), default="active", index=True)
+    reason: Mapped[str] = mapped_column(Text, default="")
+    actor: Mapped[str] = mapped_column(String(120), default="workspace")
+    resolved_by: Mapped[str] = mapped_column(String(120), default="")
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class WorkspaceReplanSignal(Base, TimestampMixin):
+    __tablename__ = "workspace_replan_signals"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    execution_id: Mapped[int | None] = mapped_column(ForeignKey("capability_executions.id", ondelete="SET NULL"), nullable=True, index=True)
+    action_plan_id: Mapped[int | None] = mapped_column(ForeignKey("workspace_action_plans.id", ondelete="SET NULL"), nullable=True, index=True)
+    chain_id: Mapped[int | None] = mapped_column(ForeignKey("workspace_autonomous_chains.id", ondelete="SET NULL"), nullable=True, index=True)
+    signal_type: Mapped[str] = mapped_column(String(80), index=True)
+    predicted_outcome: Mapped[str] = mapped_column(String(60), default="continue_monitor", index=True)
+    confidence: Mapped[float] = mapped_column(default=0.0)
+    source: Mapped[str] = mapped_column(String(80), default="predictive_monitor")
+    status: Mapped[str] = mapped_column(String(40), default="active", index=True)
+    reason: Mapped[str] = mapped_column(Text, default="")
+    actor: Mapped[str] = mapped_column(String(120), default="workspace")
+    resolved_by: Mapped[str] = mapped_column(String(120), default="")
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)

@@ -1,5 +1,7 @@
 from datetime import datetime
 
+from typing import Literal
+
 from pydantic import BaseModel, Field, field_validator
 
 
@@ -367,3 +369,482 @@ class ActionReplaceCreate(BaseModel):
 
 class GoalResumeCreate(BaseModel):
     recovery_classification: str = "recovered"
+
+
+InputSource = Literal["text", "ui", "api", "voice", "vision"]
+
+
+class NormalizedInputCreate(BaseModel):
+    source: InputSource
+    raw_input: str = ""
+    parsed_intent: str = "unknown"
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    target_system: str = "mim"
+    requested_goal: str = ""
+    safety_flags: list[str] = Field(default_factory=list)
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class NormalizedInputOut(BaseModel):
+    input_id: int
+    source: InputSource
+    raw_input: str
+    parsed_intent: str
+    confidence: float
+    target_system: str
+    requested_goal: str
+    safety_flags: list[str]
+    metadata_json: dict
+    normalized: bool
+    created_at: datetime
+
+
+class TextInputAdapterRequest(BaseModel):
+    text: str = Field(min_length=1)
+    parsed_intent: str = "unknown"
+    confidence: float = Field(default=0.8, ge=0.0, le=1.0)
+    target_system: str = "mim"
+    requested_goal: str = ""
+    safety_flags: list[str] = Field(default_factory=list)
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class UiInputAdapterRequest(BaseModel):
+    command: str = Field(min_length=1)
+    parsed_intent: str = "unknown"
+    confidence: float = Field(default=0.8, ge=0.0, le=1.0)
+    target_system: str = "mim"
+    requested_goal: str = ""
+    safety_flags: list[str] = Field(default_factory=list)
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class ApiInputAdapterRequest(BaseModel):
+    payload: dict = Field(default_factory=dict)
+    raw_input: str = ""
+    parsed_intent: str = "unknown"
+    confidence: float = Field(default=0.9, ge=0.0, le=1.0)
+    target_system: str = "mim"
+    requested_goal: str = ""
+    safety_flags: list[str] = Field(default_factory=list)
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class VoiceInputAdapterRequest(BaseModel):
+    transcript: str = Field(min_length=1)
+    parsed_intent: str = "unknown"
+    confidence: float = Field(default=0.7, ge=0.0, le=1.0)
+    target_system: str = "mim"
+    requested_goal: str = ""
+    safety_flags: list[str] = Field(default_factory=list)
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class SpeechOutputRequest(BaseModel):
+    message: str = Field(min_length=1)
+    voice_profile: str = "default"
+    channel: str = "system"
+    priority: str = "normal"
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class SpeechOutputOut(BaseModel):
+    status: str
+    spoken_text: str
+    output_action_id: int
+    requested_text: str
+    voice_profile: str
+    channel: str
+    priority: str
+    delivery_status: str
+    failure_reason: str
+    metadata_json: dict
+
+
+class VisionObservationRequest(BaseModel):
+    raw_observation: str = Field(min_length=1)
+    detected_labels: list[str] = Field(default_factory=list)
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    target_system: str = "mim"
+    proposed_goal: str = ""
+    safety_flags: list[str] = Field(default_factory=lambda: ["requires_confirmation"])
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class CapabilityRegistrationCreate(BaseModel):
+    capability_name: str = Field(min_length=1, max_length=120)
+    category: str = "action"
+    description: str = ""
+    requires_confirmation: bool = True
+    enabled: bool = True
+    safety_policy: dict = Field(default_factory=dict)
+
+
+class CapabilityRegistrationOut(BaseModel):
+    capability_id: int
+    capability_name: str
+    category: str
+    description: str
+    requires_confirmation: bool
+    enabled: bool
+    safety_policy: dict
+    created_at: datetime
+
+
+class EventResolutionOut(BaseModel):
+    resolution_id: int
+    input_event_id: int
+    internal_intent: str
+    confidence_tier: str
+    outcome: str
+    resolution_status: str
+    safety_decision: str
+    reason: str
+    clarification_prompt: str
+    escalation_reasons: list[str]
+    capability_name: str
+    capability_registered: bool
+    capability_enabled: bool
+    goal_id: int | None
+    proposed_goal_description: str
+    proposed_actions: list[dict]
+    metadata_json: dict
+    created_at: datetime
+
+
+class PromoteEventToGoalRequest(BaseModel):
+    requested_by: str = "gateway"
+    force: bool = False
+
+
+class ExecutionDispatchRequest(BaseModel):
+    arguments_json: dict = Field(default_factory=dict)
+    safety_mode: str = "standard"
+    requested_executor: str = "tod"
+    force: bool = False
+
+
+class CapabilityExecutionOut(BaseModel):
+    execution_id: int
+    input_event_id: int
+    resolution_id: int | None
+    goal_id: int | None
+    capability_name: str
+    arguments_json: dict
+    safety_mode: str
+    requested_executor: str
+    dispatch_decision: str
+    status: str
+    reason: str
+    feedback_json: dict
+    created_at: datetime
+
+
+class ExecutionFeedbackUpdateRequest(BaseModel):
+    status: str = ""
+    reason: str = ""
+    runtime_outcome: str = ""
+    recovery_state: str = ""
+    correlation_json: dict = Field(default_factory=dict)
+    feedback_json: dict = Field(default_factory=dict)
+    actor: str = "executor"
+
+
+class ExecutionFeedbackOut(BaseModel):
+    execution_id: int
+    status: str
+    reason: str
+    feedback_json: dict
+
+
+class CapabilityExecutionHandoffOut(BaseModel):
+    execution_id: int
+    goal_ref: dict
+    action_ref: dict
+    capability_name: str
+    arguments_json: dict
+    safety_mode: str
+    requested_executor: str
+    dispatch_decision: str
+    status: str
+    correlation_metadata: dict
+
+
+class OperatorExecutionActionRequest(BaseModel):
+    actor: str = "operator"
+    reason: str = ""
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class WorkspaceObservationOut(BaseModel):
+    observation_id: int
+    timestamp: datetime
+    zone: str
+    detected_object: str
+    confidence: float
+    effective_confidence: float
+    freshness_state: str
+    source: str
+    related_execution_id: int | None
+    lifecycle_status: str
+    observation_count: int
+    metadata_json: dict
+
+
+class WorkspaceObservationListOut(BaseModel):
+    observations: list[WorkspaceObservationOut]
+
+
+class WorkspaceObjectMemoryOut(BaseModel):
+    object_memory_id: int
+    canonical_name: str
+    aliases: list[str]
+    confidence: float
+    effective_confidence: float
+    zone: str
+    first_seen_at: datetime
+    last_seen_at: datetime
+    status: str
+    last_execution_id: int | None
+    location_history: list[dict]
+    metadata_json: dict
+
+
+class WorkspaceObjectMemoryListOut(BaseModel):
+    objects: list[WorkspaceObjectMemoryOut]
+
+
+class WorkspaceProposalActionRequest(BaseModel):
+    actor: str = "operator"
+    reason: str = ""
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class WorkspaceTargetResolveRequest(BaseModel):
+    target_label: str = Field(min_length=1)
+    preferred_zone: str = ""
+    source: str = "api"
+    unsafe_zones: list[str] = Field(default_factory=list)
+    create_proposal: bool = True
+
+
+class WorkspaceTargetConfirmRequest(BaseModel):
+    actor: str = "operator"
+    reason: str = ""
+    metadata_json: dict = Field(default_factory=dict)
+
+
+WorkspaceActionType = Literal[
+    "observe",
+    "rescan",
+    "speak",
+    "prepare_reach_plan",
+    "request_confirmation",
+]
+
+
+class WorkspaceActionPlanCreateRequest(BaseModel):
+    target_resolution_id: int = Field(ge=1)
+    action_type: WorkspaceActionType = "prepare_reach_plan"
+    source: str = "api"
+    notes: str = ""
+    motion_plan_overrides: dict = Field(default_factory=dict)
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class WorkspaceActionPlanDecisionRequest(BaseModel):
+    actor: str = "operator"
+    reason: str = ""
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class WorkspaceActionPlanHandoffRequest(BaseModel):
+    actor: str = "operator"
+    reason: str = ""
+    requested_executor: str = "tod"
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class WorkspaceActionPlanSimulationRequest(BaseModel):
+    actor: str = "operator"
+    reason: str = ""
+    collision_risk_threshold: float = Field(default=0.45, ge=0.0, le=1.0)
+    metadata_json: dict = Field(default_factory=dict)
+
+
+WorkspaceExecutionCapability = Literal[
+    "reach_target",
+    "arm_move_safe",
+]
+
+
+class WorkspaceActionPlanExecuteRequest(BaseModel):
+    actor: str = "operator"
+    reason: str = ""
+    requested_executor: str = "tod"
+    capability_name: WorkspaceExecutionCapability = "reach_target"
+    collision_risk_threshold: float = Field(default=0.45, ge=0.0, le=1.0)
+    target_confidence_minimum: float = Field(default=0.7, ge=0.0, le=1.0)
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class WorkspaceActionPlanAbortRequest(BaseModel):
+    actor: str = "operator"
+    reason: str = ""
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class WorkspaceExecutionProposalCreateRequest(BaseModel):
+    actor: str = "workspace"
+    reason: str = ""
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class WorkspaceExecutionProposalActionRequest(BaseModel):
+    actor: str = "operator"
+    reason: str = ""
+    requested_executor: str = "tod"
+    capability_name: WorkspaceExecutionCapability = "reach_target"
+    collision_risk_threshold: float = Field(default=0.45, ge=0.0, le=1.0)
+    target_confidence_minimum: float = Field(default=0.7, ge=0.0, le=1.0)
+    metadata_json: dict = Field(default_factory=dict)
+
+
+WorkspaceMonitoringTriggerMode = Literal[
+    "interval",
+    "freshness",
+]
+
+
+class WorkspaceMonitoringStartRequest(BaseModel):
+    actor: str = "workspace"
+    reason: str = ""
+    trigger_mode: WorkspaceMonitoringTriggerMode = "interval"
+    interval_seconds: int = Field(default=30, ge=1, le=3600)
+    freshness_threshold_seconds: int = Field(default=900, ge=30, le=86400)
+    cooldown_seconds: int = Field(default=10, ge=0, le=3600)
+    max_scan_rate: int = Field(default=6, ge=1, le=120)
+    priority_zones: list[str] = Field(default_factory=list)
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class WorkspaceMonitoringStopRequest(BaseModel):
+    actor: str = "workspace"
+    reason: str = ""
+    preserve_desired_running: bool = False
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class WorkspaceAutonomyOverrideRequest(BaseModel):
+    actor: str = "operator"
+    reason: str = ""
+    auto_execution_enabled: bool | None = None
+    force_manual_approval: bool | None = None
+    max_auto_actions_per_minute: int | None = Field(default=None, ge=1, le=120)
+    cooldown_between_actions_seconds: int | None = Field(default=None, ge=0, le=3600)
+    zone_action_limits: dict[str, int] = Field(default_factory=dict)
+    auto_safe_confidence_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+    auto_preferred_confidence_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+    low_risk_score_max: float | None = Field(default=None, ge=0.0, le=1.0)
+    reset_auto_history: bool = False
+    pause_monitoring_loop: bool = False
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class WorkspaceAutonomousChainCreateRequest(BaseModel):
+    actor: str = "workspace"
+    reason: str = ""
+    chain_type: str = "proposal_sequence"
+    proposal_ids: list[int] = Field(default_factory=list)
+    source: str = "objective36"
+    step_policy_json: dict = Field(default_factory=dict)
+    stop_on_failure: bool = True
+    cooldown_seconds: int = Field(default=0, ge=0, le=3600)
+    requires_approval: bool = True
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class WorkspaceAutonomousChainAdvanceRequest(BaseModel):
+    actor: str = "workspace"
+    reason: str = ""
+    force: bool = False
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class WorkspaceAutonomousChainApprovalRequest(BaseModel):
+    actor: str = "operator"
+    reason: str = ""
+    metadata_json: dict = Field(default_factory=dict)
+
+
+WorkspaceInterruptionType = Literal[
+    "human_detected_in_workspace",
+    "operator_pause",
+    "operator_stop",
+    "new_obstacle_detected",
+    "target_confidence_drop",
+    "workspace_state_changed",
+    "safety_policy_interrupt",
+]
+
+
+class WorkspaceExecutionPauseRequest(BaseModel):
+    actor: str = "operator"
+    source: str = "operator"
+    interruption_type: WorkspaceInterruptionType = "operator_pause"
+    reason: str = ""
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class WorkspaceExecutionStopRequest(BaseModel):
+    actor: str = "operator"
+    source: str = "operator"
+    interruption_type: WorkspaceInterruptionType = "operator_stop"
+    reason: str = ""
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class WorkspaceExecutionResumeRequest(BaseModel):
+    actor: str = "operator"
+    source: str = "operator"
+    reason: str = ""
+    safety_ack: bool = False
+    conditions_restored: bool = False
+    metadata_json: dict = Field(default_factory=dict)
+
+
+WorkspacePredictiveSignalType = Literal[
+    "object_moved",
+    "object_missing",
+    "confidence_drop",
+    "zone_state_changed",
+    "new_obstacle_detected",
+    "target_no_longer_valid",
+]
+
+
+WorkspacePredictiveOutcome = Literal[
+    "continue_monitor",
+    "pause_and_resimulate",
+    "require_replan",
+    "abort_chain",
+]
+
+
+class WorkspaceExecutionPredictChangeRequest(BaseModel):
+    actor: str = "workspace"
+    source: str = "predictive_monitor"
+    signal_type: WorkspacePredictiveSignalType = "zone_state_changed"
+    predicted_outcome: WorkspacePredictiveOutcome = "continue_monitor"
+    confidence: float = Field(default=0.6, ge=0.0, le=1.0)
+    reason: str = ""
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class WorkspaceActionPlanReplanRequest(BaseModel):
+    actor: str = "operator"
+    reason: str = ""
+    signal_id: int | None = Field(default=None, ge=1)
+    force: bool = False
+    motion_plan_overrides: dict = Field(default_factory=dict)
+    metadata_json: dict = Field(default_factory=dict)

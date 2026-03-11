@@ -30,6 +30,10 @@ class Settings(BaseSettings):
     allow_openai: bool = False
     allow_web_access: bool = False
     allow_local_devices: bool = True
+    vision_policy_path: str = str(PROJECT_ROOT / "config" / "vision_policy.json")
+    voice_policy_path: str = str(PROJECT_ROOT / "config" / "voice_policy.json")
+    execution_feedback_api_key: str = ""
+    execution_feedback_allowed_actors: str = "tod,executor"
 
 
 settings = Settings()
