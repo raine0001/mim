@@ -146,12 +146,15 @@ class Objective34ContinuousWorkspaceMonitoringLoopTest(unittest.TestCase):
             observations=[{"label": f"other-{run_id}", "zone": moved_zone, "confidence": 0.91}],
         )
 
+        seen_events: set[str] = set()
+
         def has_required_deltas() -> bool:
             st, body = get_json("/workspace/monitoring")
             if st != 200:
                 return False
             events = {item.get("event") for item in body.get("last_deltas", []) if isinstance(item, dict)}
-            return "object_moved" in events and "object_missing" in events and "confidence_changed" in events
+            seen_events.update(str(item) for item in events if str(item).strip())
+            return "object_moved" in seen_events and "object_missing" in seen_events and "confidence_changed" in seen_events
 
         self.assertTrue(self._wait_for(has_required_deltas, timeout_seconds=10), "delta detection requirements not met")
 

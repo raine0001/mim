@@ -770,11 +770,16 @@ class WorkspaceAutonomyOverrideRequest(BaseModel):
     auto_execution_enabled: bool | None = None
     force_manual_approval: bool | None = None
     max_auto_actions_per_minute: int | None = Field(default=None, ge=1, le=120)
+    max_auto_tasks_per_window: int | None = Field(default=None, ge=1, le=240)
+    auto_window_seconds: int | None = Field(default=None, ge=10, le=3600)
     cooldown_between_actions_seconds: int | None = Field(default=None, ge=0, le=3600)
+    capability_cooldown_seconds: dict[str, int] = Field(default_factory=dict)
     zone_action_limits: dict[str, int] = Field(default_factory=dict)
+    restricted_zones: list[str] = Field(default_factory=list)
     auto_safe_confidence_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
     auto_preferred_confidence_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
     low_risk_score_max: float | None = Field(default=None, ge=0.0, le=1.0)
+    max_autonomy_retries: int | None = Field(default=None, ge=0, le=5)
     reset_auto_history: bool = False
     pause_monitoring_loop: bool = False
     metadata_json: dict = Field(default_factory=dict)

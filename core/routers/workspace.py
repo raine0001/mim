@@ -89,8 +89,14 @@ REPLAN_OUTCOME_SEVERITY = {
 AUTONOMY_POLICY_TIERS = {
     "manual_only",
     "operator_required",
+    "auto_execute",
     "auto_safe",
     "auto_preferred",
+}
+AUTONOMY_POLICY_OUTCOMES = {
+    "auto_execute",
+    "operator_required",
+    "manual_only",
 }
 AUTONOMY_PROPOSAL_POLICY_MAP: dict[str, str] = {
     "confirm_target_ready": "auto_safe",
@@ -151,11 +157,16 @@ def _default_autonomy_state() -> dict:
         "auto_execution_enabled": True,
         "force_manual_approval": False,
         "max_auto_actions_per_minute": 6,
+        "max_auto_tasks_per_window": 6,
+        "auto_window_seconds": 60,
         "cooldown_between_actions_seconds": 5,
+        "capability_cooldown_seconds": {},
         "zone_action_limits": {},
+        "restricted_zones": [],
         "auto_safe_confidence_threshold": 0.8,
         "auto_preferred_confidence_threshold": 0.7,
         "low_risk_score_max": 0.3,
+        "max_autonomy_retries": 1,
         "recent_auto_actions": [],
     }
 
@@ -173,6 +184,16 @@ def _autonomy_state_from_monitoring(row: WorkspaceMonitoringState) -> dict:
         for key, value in (merged.get("zone_action_limits", {}) if isinstance(merged.get("zone_action_limits", {}), dict) else {}).items()
         if str(key).strip()
     }
+    merged["capability_cooldown_seconds"] = {
+        str(key).strip(): max(0, int(value))
+        for key, value in (merged.get("capability_cooldown_seconds", {}) if isinstance(merged.get("capability_cooldown_seconds", {}), dict) else {}).items()
+        if str(key).strip()
+    }
+    merged["restricted_zones"] = [
+        _normalize_zone_for_map(str(item))
+        for item in (merged.get("restricted_zones", []) if isinstance(merged.get("restricted_zones", []), list) else [])
+        if _normalize_zone_for_map(str(item))
+    ]
     return merged
 
 
@@ -430,9 +451,10 @@ def _parse_iso_to_utc(raw_value: str) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
-def _autonomy_throttle_check(*, autonomy_state: dict, zone: str, now: datetime) -> tuple[bool, str, list[dict]]:
+def _autonomy_throttle_check(*, autonomy_state: dict, zone: str, capability_name: str, now: datetime) -> tuple[bool, str, list[dict]]:
     recent_raw = autonomy_state.get("recent_auto_actions", [])
     recent_actions: list[dict] = []
+    window_seconds = max(10, int(autonomy_state.get("auto_window_seconds", 60) or 60))
     if isinstance(recent_raw, list):
         for item in recent_raw:
             if not isinstance(item, dict):
@@ -441,12 +463,21 @@ def _autonomy_throttle_check(*, autonomy_state: dict, zone: str, now: datetime) 
             parsed = _parse_iso_to_utc(ts) if ts else None
             if not parsed:
                 continue
-            if (now - parsed).total_seconds() <= 60:
+            if (now - parsed).total_seconds() <= window_seconds:
                 recent_actions.append({**item, "timestamp": parsed.isoformat()})
 
-    max_per_min = max(1, int(autonomy_state.get("max_auto_actions_per_minute", 6)))
+    max_per_min = max(
+        1,
+        int(
+            autonomy_state.get(
+                "max_auto_tasks_per_window",
+                autonomy_state.get("max_auto_actions_per_minute", 6),
+            )
+            or 6
+        ),
+    )
     if len(recent_actions) >= max_per_min:
-        return False, "max_auto_actions_per_minute", recent_actions
+        return False, "max_auto_tasks_per_window", recent_actions
 
     cooldown = max(0, int(autonomy_state.get("cooldown_between_actions_seconds", 0)))
     if recent_actions:
@@ -460,7 +491,267 @@ def _autonomy_throttle_check(*, autonomy_state: dict, zone: str, now: datetime) 
         if zone_count >= max(1, int(zone_limits[zone])):
             return False, "zone_based_limit", recent_actions
 
+    capability_cooldowns = autonomy_state.get("capability_cooldown_seconds", {}) if isinstance(autonomy_state.get("capability_cooldown_seconds", {}), dict) else {}
+    cooldown_for_capability = max(0, int(capability_cooldowns.get(capability_name, 0) or 0))
+    if cooldown_for_capability > 0:
+        last_for_capability: datetime | None = None
+        for item in recent_actions:
+            if str(item.get("capability_name", "")).strip() != capability_name:
+                continue
+            parsed = _parse_iso_to_utc(str(item.get("timestamp", "")))
+            if not parsed:
+                continue
+            if not last_for_capability or parsed > last_for_capability:
+                last_for_capability = parsed
+        if last_for_capability and (now - last_for_capability).total_seconds() < cooldown_for_capability:
+            return False, "capability_cooldown", recent_actions
+
     return True, "allowed", recent_actions
+
+
+def _autonomy_policy_outcome_for_tier(tier: str) -> str:
+    if tier in {"manual_only", "operator_required"}:
+        return tier
+    return "auto_execute"
+
+
+async def _autonomy_has_active_interruption(*, db: AsyncSession) -> tuple[bool, str]:
+    now = datetime.now(timezone.utc)
+    stale_after_seconds = 45
+    active = (
+        await db.execute(
+            select(WorkspaceInterruptionEvent)
+            .where(WorkspaceInterruptionEvent.status == "active")
+            .order_by(WorkspaceInterruptionEvent.id.desc())
+        )
+    ).scalars().all()
+    for item in active:
+        if item.execution_id:
+            execution = await db.get(CapabilityExecution, item.execution_id)
+            if execution and execution.status in {"succeeded", "failed", "blocked"}:
+                continue
+        age_seconds = max((now - item.created_at).total_seconds(), 0.0)
+        if age_seconds > stale_after_seconds:
+            continue
+        interruption_type = str(item.interruption_type or "").strip()
+        if interruption_type in INTERRUPTION_BLOCKING_TYPES:
+            return True, f"interruption:{interruption_type}"
+        if str(item.applied_outcome or "").strip() in {"paused", "stopped", "require_operator_decision", "auto_pause", "auto_stop"}:
+            return True, f"interruption_outcome:{item.applied_outcome}"
+    return False, "clear"
+
+
+def _autonomy_capability_for_proposal(proposal: WorkspaceProposal) -> str:
+    if proposal.proposal_type in {
+        "rescan_zone",
+        "confirm_target_ready",
+        MONITORING_RECHECK_PROPOSAL_TYPE,
+        MONITORING_SEARCH_PROPOSAL_TYPE,
+    }:
+        return "workspace_scan"
+    return ""
+
+
+def _is_safe_capability_registration(row: CapabilityRegistration | None) -> bool:
+    if row is None:
+        return False
+    if not row.enabled:
+        return False
+    if row.requires_confirmation:
+        return False
+    policy = row.safety_policy if isinstance(row.safety_policy, dict) else {}
+    scope = str(policy.get("scope", "")).strip().lower()
+    mode = str(policy.get("mode", "")).strip().lower()
+    return scope in {"non-actuating", "read-only", "observe-only"} or mode in {"scan-only", "observe-only", "non-actuating"}
+
+
+async def _autonomy_dispatch_scan_execution(
+    *,
+    proposal: WorkspaceProposal,
+    trigger_reason: str,
+    policy_rule_used: str,
+    capability_name: str,
+    db: AsyncSession,
+) -> tuple[int, int]:
+    task = Task(
+        title=proposal.title,
+        details=proposal.description,
+        dependencies=[],
+        acceptance_criteria="autonomous proposal dispatched for bounded execution",
+        assigned_to="tod",
+        state="queued",
+        objective_id=None,
+    )
+    db.add(task)
+    await db.flush()
+
+    event = InputEvent(
+        source="api",
+        raw_input=f"autonomy dispatch proposal {proposal.id}",
+        parsed_intent="observe_workspace",
+        confidence=float(proposal.confidence),
+        target_system="tod",
+        requested_goal=f"autonomy:proposal:{proposal.id}",
+        safety_flags=["autonomous", "bounded", "policy_safe"],
+        metadata_json={
+            "proposal_id": proposal.id,
+            "proposal_type": proposal.proposal_type,
+            "trigger_reason": trigger_reason,
+            "policy_rule_used": policy_rule_used,
+            "scan_area": proposal.related_zone or "workspace",
+            "task_id": task.id,
+        },
+        normalized=True,
+    )
+    db.add(event)
+    await db.flush()
+
+    execution = CapabilityExecution(
+        input_event_id=event.id,
+        resolution_id=None,
+        goal_id=None,
+        capability_name=capability_name,
+        arguments_json={
+            "proposal_id": proposal.id,
+            "proposal_type": proposal.proposal_type,
+            "scan_area": proposal.related_zone or "workspace",
+            "target_zone": proposal.related_zone or "workspace",
+            "trigger_json": proposal.trigger_json if isinstance(proposal.trigger_json, dict) else {},
+        },
+        safety_mode="autonomous_bounded",
+        requested_executor="tod",
+        dispatch_decision="auto_dispatch",
+        status="dispatched",
+        reason="objective41_autonomous_dispatch",
+        feedback_json={
+            "proposal_id": proposal.id,
+            "proposal_type": proposal.proposal_type,
+            "autonomy": {
+                "trigger_reason": trigger_reason,
+                "policy_rule_used": policy_rule_used,
+            },
+            "task_id": task.id,
+        },
+    )
+    db.add(execution)
+    await db.flush()
+
+    proposal.source_execution_id = execution.id
+    return task.id, execution.id
+
+
+async def _evaluate_autonomous_execution_result(
+    *,
+    proposal: WorkspaceProposal,
+    db: AsyncSession,
+) -> dict:
+    metadata = proposal.metadata_json if isinstance(proposal.metadata_json, dict) else {}
+    execution_id_raw = metadata.get("active_execution_id")
+    execution_id = int(execution_id_raw) if str(execution_id_raw).isdigit() else int(proposal.source_execution_id or 0)
+    if execution_id <= 0:
+        return {"updated": False, "result": "awaiting_execution", "execution_id": None, "memory_delta": {}}
+
+    execution = await db.get(CapabilityExecution, execution_id)
+    if not execution:
+        return {"updated": False, "result": "execution_missing", "execution_id": execution_id, "memory_delta": {}}
+
+    status = str(execution.status or "").strip()
+    feedback = execution.feedback_json if isinstance(execution.feedback_json, dict) else {}
+    memory_delta = {
+        "workspace_observation_ids": feedback.get("workspace_observation_ids", []) if isinstance(feedback.get("workspace_observation_ids", []), list) else [],
+        "workspace_object_ids": feedback.get("workspace_object_ids", []) if isinstance(feedback.get("workspace_object_ids", []), list) else [],
+        "workspace_proposal_ids": feedback.get("workspace_proposal_ids", []) if isinstance(feedback.get("workspace_proposal_ids", []), list) else [],
+        "observation_count": len(feedback.get("observations", [])) if isinstance(feedback.get("observations", []), list) else 0,
+    }
+    has_memory_delta = (
+        bool(memory_delta["workspace_observation_ids"])
+        or bool(memory_delta["workspace_object_ids"])
+        or int(memory_delta["observation_count"]) > 0
+    )
+
+    if status in {"dispatched", "accepted", "running", "paused"}:
+        return {
+            "updated": False,
+            "result": "in_progress",
+            "execution_id": execution.id,
+            "memory_delta": memory_delta,
+            "execution_status": status,
+        }
+
+    if status == "succeeded" and has_memory_delta:
+        proposal.status = "resolved"
+        proposal.metadata_json = {
+            **metadata,
+            "verification": {
+                "result": "success",
+                "execution_status": status,
+                "verified_at": datetime.now(timezone.utc).isoformat(),
+            },
+            "memory_delta": memory_delta,
+        }
+        return {
+            "updated": True,
+            "result": "success",
+            "execution_id": execution.id,
+            "memory_delta": memory_delta,
+            "execution_status": status,
+        }
+
+    retries = int(metadata.get("autonomy_retry_count", 0) or 0)
+    monitoring = await _get_or_create_monitoring_state(db)
+    autonomy_state = _autonomy_state_from_monitoring(monitoring)
+    max_retries = max(0, int(autonomy_state.get("max_autonomy_retries", 1) or 1))
+
+    if retries < max_retries:
+        capability_name = _autonomy_capability_for_proposal(proposal)
+        if capability_name:
+            task_id, retry_execution_id = await _autonomy_dispatch_scan_execution(
+                proposal=proposal,
+                trigger_reason="objective41_retry",
+                policy_rule_used="auto_execute_retry",
+                capability_name=capability_name,
+                db=db,
+            )
+            proposal.status = "accepted"
+            proposal.metadata_json = {
+                **metadata,
+                "autonomy_retry_count": retries + 1,
+                "active_execution_id": retry_execution_id,
+                "linked_task_id": task_id,
+                "verification": {
+                    "result": "retry",
+                    "execution_status": status,
+                    "retry_execution_id": retry_execution_id,
+                    "verified_at": datetime.now(timezone.utc).isoformat(),
+                },
+                "memory_delta": memory_delta,
+            }
+            return {
+                "updated": True,
+                "result": "retry",
+                "execution_id": retry_execution_id,
+                "memory_delta": memory_delta,
+                "execution_status": status,
+            }
+
+    proposal.status = "pending"
+    proposal.metadata_json = {
+        **metadata,
+        "verification": {
+            "result": "escalate_to_operator",
+            "execution_status": status,
+            "verified_at": datetime.now(timezone.utc).isoformat(),
+        },
+        "escalation_required": True,
+        "memory_delta": memory_delta,
+    }
+    return {
+        "updated": True,
+        "result": "escalate_to_operator",
+        "execution_id": execution.id,
+        "memory_delta": memory_delta,
+        "execution_status": status,
+    }
 
 
 async def _execute_workspace_proposal_to_task(
@@ -509,12 +800,24 @@ async def _maybe_auto_execute_workspace_proposal(
         return False, "auto_execution_disabled"
     if autonomy_state.get("force_manual_approval", False):
         return False, "force_manual_approval"
-    if tier in {"manual_only", "operator_required"}:
-        return False, f"policy_{tier}"
+    policy_outcome = _autonomy_policy_outcome_for_tier(tier)
+    if policy_outcome not in AUTONOMY_POLICY_OUTCOMES:
+        return False, "invalid_policy_outcome"
+    if policy_outcome != "auto_execute":
+        return False, f"policy_{policy_outcome}"
+
+    interruption_blocked, interruption_reason = await _autonomy_has_active_interruption(db=db)
+    if interruption_blocked:
+        return False, interruption_reason
 
     threshold = _autonomy_confidence_threshold(tier=tier, autonomy_state=autonomy_state)
     if float(proposal.confidence) < threshold:
         return False, "confidence_below_threshold"
+
+    normalized_zone = _normalize_zone_for_map(proposal.related_zone)
+    restricted_zones = set(autonomy_state.get("restricted_zones", [])) if isinstance(autonomy_state.get("restricted_zones", []), list) else set()
+    if normalized_zone and normalized_zone in restricted_zones:
+        return False, "restricted_zone"
 
     safe_zone = await _is_safe_zone(related_zone=proposal.related_zone, db=db)
     if not safe_zone:
@@ -529,29 +832,47 @@ async def _maybe_auto_execute_workspace_proposal(
         return False, "simulation_not_safe"
 
     now = datetime.now(timezone.utc)
+    capability_name = _autonomy_capability_for_proposal(proposal)
+    if not capability_name:
+        return False, "no_safe_capability_mapping"
+    capability = (
+        await db.execute(select(CapabilityRegistration).where(CapabilityRegistration.capability_name == capability_name))
+    ).scalars().first()
+    if not _is_safe_capability_registration(capability):
+        return False, "capability_not_safe"
+
     throttle_allowed, throttle_reason, recent_actions = _autonomy_throttle_check(
         autonomy_state=autonomy_state,
         zone=proposal.related_zone,
+        capability_name=capability_name,
         now=now,
     )
     if not throttle_allowed:
         return False, throttle_reason
 
-    task_id = await _execute_workspace_proposal_to_task(
+    task_id, execution_id = await _autonomy_dispatch_scan_execution(
         proposal=proposal,
-        actor="system-auto",
-        reason="objective35_auto_execute",
-        metadata_json={
-            "auto_execution": True,
-            "trigger_reason": trigger_reason,
-            "policy_rule_used": tier,
-            "confidence_score": float(proposal.confidence),
-            "risk_score": risk_score,
-            "simulation_result": simulation_result,
-            "execution_outcome": "queued_task",
-        },
+        trigger_reason=trigger_reason,
+        policy_rule_used=policy_outcome,
+        capability_name=capability_name,
         db=db,
     )
+    proposal.status = "accepted"
+    proposal.metadata_json = {
+        **(proposal.metadata_json if isinstance(proposal.metadata_json, dict) else {}),
+        "accepted_by": "system-auto",
+        "accept_reason": "objective41_auto_execute",
+        "linked_task_id": task_id,
+        "active_execution_id": execution_id,
+        "auto_execution": True,
+        "trigger_reason": trigger_reason,
+        "policy_rule_used": policy_outcome,
+        "confidence_score": float(proposal.confidence),
+        "risk_score": risk_score,
+        "simulation_result": simulation_result,
+        "execution_outcome": "dispatched",
+    }
+    proposal.source_execution_id = execution_id
 
     recent_actions.append(
         {
@@ -560,6 +881,8 @@ async def _maybe_auto_execute_workspace_proposal(
             "proposal_type": proposal.proposal_type,
             "zone": proposal.related_zone,
             "task_id": task_id,
+            "execution_id": execution_id,
+            "capability_name": capability_name,
         }
     )
     autonomy_state["recent_auto_actions"] = recent_actions
@@ -574,15 +897,180 @@ async def _maybe_auto_execute_workspace_proposal(
         summary=f"Auto-executed workspace proposal {proposal.id}",
         metadata_json={
             "trigger_reason": trigger_reason,
-            "policy_rule_used": tier,
+            "policy_rule_used": policy_outcome,
+            "autonomy_decision": "auto_execute",
             "confidence_score": float(proposal.confidence),
             "risk_score": risk_score,
             "simulation_result": simulation_result,
-            "execution_outcome": "queued_task",
+            "execution_outcome": "dispatched",
             "linked_task_id": task_id,
+            "execution_id": execution_id,
+            "proposal_id": proposal.id,
+            "result": "dispatched",
+            "memory_delta": {},
         },
     )
     return True, "auto_executed"
+
+
+async def _run_autonomy_controller_step(*, db: AsyncSession, actor: str, reason: str, zone_filter: str = "") -> dict:
+    verification_updates: list[dict] = []
+    accepted_auto_rows = (
+        await db.execute(
+            select(WorkspaceProposal)
+            .where(WorkspaceProposal.status == "accepted")
+            .order_by(WorkspaceProposal.id.asc())
+        )
+    ).scalars().all()
+    for row in accepted_auto_rows:
+        metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
+        if not bool(metadata.get("auto_execution", False)):
+            continue
+        verification = await _evaluate_autonomous_execution_result(proposal=row, db=db)
+        if verification.get("updated"):
+            verification_updates.append(
+                {
+                    "proposal_id": row.id,
+                    "result": verification.get("result"),
+                    "execution_id": verification.get("execution_id"),
+                    "memory_delta": verification.get("memory_delta", {}),
+                    "execution_status": verification.get("execution_status", ""),
+                }
+            )
+            await write_journal(
+                db,
+                actor="workspace-autonomy-controller",
+                action="workspace_autonomy_result_verification",
+                target_type="workspace_proposal",
+                target_id=str(row.id),
+                summary=f"Verified autonomous proposal {row.id}: {verification.get('result', 'unknown')}",
+                metadata_json={
+                    "trigger_reason": reason,
+                    "policy_rule_used": metadata.get("policy_rule_used", "auto_execute"),
+                    "proposal_id": row.id,
+                    "execution_id": verification.get("execution_id"),
+                    "result": verification.get("result", "unknown"),
+                    "memory_delta": verification.get("memory_delta", {}),
+                },
+            )
+
+    blocked, interruption_reason = await _autonomy_has_active_interruption(db=db)
+    if blocked:
+        await write_journal(
+            db,
+            actor=actor,
+            action="workspace_autonomy_controller_paused",
+            target_type="workspace_monitoring",
+            target_id="1",
+            summary="Autonomy controller paused due to interruption",
+            metadata_json={
+                "trigger_reason": reason,
+                "policy_rule_used": "interruption_guard",
+                "proposal_id": None,
+                "execution_id": None,
+                "result": "paused",
+                "memory_delta": {},
+                "interruption_reason": interruption_reason,
+            },
+        )
+        return {
+            "executed": False,
+            "result": "paused_by_interruption",
+            "reason": interruption_reason,
+            "verification_updates": verification_updates,
+            "proposal": None,
+        }
+
+    pending_rows = (
+        await db.execute(
+            select(WorkspaceProposal)
+            .where(WorkspaceProposal.status == "pending")
+            .order_by(WorkspaceProposal.created_at.asc(), WorkspaceProposal.id.asc())
+        )
+    ).scalars().all()
+    if zone_filter.strip():
+        token = zone_filter.strip().lower()
+        pending_rows = [
+            item
+            for item in pending_rows
+            if token in str(item.related_zone or "").strip().lower()
+        ]
+    if not pending_rows:
+        return {
+            "executed": False,
+            "result": "no_pending_proposals",
+            "verification_updates": verification_updates,
+            "proposal": None,
+        }
+
+    scored: list[WorkspaceProposal] = []
+    for row in pending_rows:
+        await _refresh_workspace_proposal_priority(proposal=row, db=db)
+        scored.append(row)
+
+    scored.sort(
+        key=lambda item: (
+            float(item.priority_score),
+            float(item.confidence),
+            item.created_at,
+            item.id,
+        ),
+        reverse=True,
+    )
+    selected = scored[0]
+    for candidate in scored:
+        tier = _autonomy_policy_tier(candidate.proposal_type)
+        if _autonomy_policy_outcome_for_tier(tier) == "auto_execute":
+            selected = candidate
+            break
+    executed, execute_reason = await _maybe_auto_execute_workspace_proposal(
+        proposal=selected,
+        trigger_reason=reason,
+        db=db,
+    )
+
+    if executed:
+        selected_meta = selected.metadata_json if isinstance(selected.metadata_json, dict) else {}
+        await write_journal(
+            db,
+            actor=actor,
+            action="workspace_autonomy_controller_execute",
+            target_type="workspace_proposal",
+            target_id=str(selected.id),
+            summary=f"Autonomy controller executed proposal {selected.id}",
+            metadata_json={
+                "trigger_reason": reason,
+                "policy_rule_used": selected_meta.get("policy_rule_used", "auto_execute"),
+                "proposal_id": selected.id,
+                "execution_id": selected_meta.get("active_execution_id"),
+                "result": "dispatched",
+                "memory_delta": {},
+            },
+        )
+    else:
+        await write_journal(
+            db,
+            actor=actor,
+            action="workspace_autonomy_controller_skip",
+            target_type="workspace_proposal",
+            target_id=str(selected.id),
+            summary=f"Autonomy controller left proposal {selected.id} pending",
+            metadata_json={
+                "trigger_reason": reason,
+                "policy_rule_used": "policy_or_safety_guard",
+                "proposal_id": selected.id,
+                "execution_id": None,
+                "result": execute_reason,
+                "memory_delta": {},
+            },
+        )
+
+    return {
+        "executed": executed,
+        "result": execute_reason,
+        "verification_updates": verification_updates,
+        "proposal": _workspace_proposal_payload(selected),
+    }
 
 
 class _WorkspaceMonitoringRuntime:
@@ -1123,6 +1611,14 @@ async def _workspace_monitoring_loop() -> None:
                     await _run_monitoring_scan_cycle(db=db, row=row, reason=reason)
                 else:
                     row.runtime_status = "running"
+                try:
+                    await _run_autonomy_controller_step(
+                        db=db,
+                        actor="workspace-autonomy-loop",
+                        reason="objective41_monitoring_loop_tick",
+                    )
+                except Exception:
+                    pass
                 await db.commit()
         except asyncio.CancelledError:
             return
@@ -2012,6 +2508,24 @@ async def get_workspace_autonomy_policy(db: AsyncSession = Depends(get_db)) -> d
             for key, value in autonomy.items()
             if key != "recent_auto_actions"
         },
+        "policy_outcomes": sorted(list(AUTONOMY_POLICY_OUTCOMES)),
+    }
+
+
+@router.post("/autonomy/loop/step")
+async def run_workspace_autonomy_loop_step(
+    actor: str = "workspace-autonomy-controller",
+    reason: str = "objective41_controller_step",
+    zone_filter: str = "",
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    result = await _run_autonomy_controller_step(db=db, actor=actor, reason=reason, zone_filter=zone_filter)
+    await db.commit()
+    return {
+        "actor": actor,
+        "reason": reason,
+        "zone_filter": zone_filter,
+        **result,
     }
 
 
@@ -2031,18 +2545,36 @@ async def set_workspace_autonomy_override(
         autonomy["max_auto_actions_per_minute"] = payload.max_auto_actions_per_minute
     if payload.cooldown_between_actions_seconds is not None:
         autonomy["cooldown_between_actions_seconds"] = payload.cooldown_between_actions_seconds
+    if payload.max_auto_tasks_per_window is not None:
+        autonomy["max_auto_tasks_per_window"] = payload.max_auto_tasks_per_window
+    if payload.auto_window_seconds is not None:
+        autonomy["auto_window_seconds"] = payload.auto_window_seconds
+    if payload.capability_cooldown_seconds:
+        autonomy["capability_cooldown_seconds"] = {
+            str(key).strip(): max(0, int(value))
+            for key, value in payload.capability_cooldown_seconds.items()
+            if str(key).strip()
+        }
     if payload.zone_action_limits:
         autonomy["zone_action_limits"] = {
             str(key).strip(): max(1, int(value))
             for key, value in payload.zone_action_limits.items()
             if str(key).strip()
         }
+    if payload.restricted_zones:
+        autonomy["restricted_zones"] = [
+            _normalize_zone_for_map(str(item))
+            for item in payload.restricted_zones
+            if _normalize_zone_for_map(str(item))
+        ]
     if payload.auto_safe_confidence_threshold is not None:
         autonomy["auto_safe_confidence_threshold"] = payload.auto_safe_confidence_threshold
     if payload.auto_preferred_confidence_threshold is not None:
         autonomy["auto_preferred_confidence_threshold"] = payload.auto_preferred_confidence_threshold
     if payload.low_risk_score_max is not None:
         autonomy["low_risk_score_max"] = payload.low_risk_score_max
+    if payload.max_autonomy_retries is not None:
+        autonomy["max_autonomy_retries"] = payload.max_autonomy_retries
     if payload.reset_auto_history:
         autonomy["recent_auto_actions"] = []
 
@@ -2058,9 +2590,12 @@ async def set_workspace_autonomy_override(
         or payload.force_manual_approval is not None
         or payload.max_auto_actions_per_minute is not None
         or payload.cooldown_between_actions_seconds is not None
+        or payload.max_auto_tasks_per_window is not None
+        or payload.auto_window_seconds is not None
         or payload.auto_safe_confidence_threshold is not None
         or payload.auto_preferred_confidence_threshold is not None
         or payload.low_risk_score_max is not None
+        or payload.max_autonomy_retries is not None
     ):
         await apply_learning_signal(db=db, signal="policy_override", user_id=payload.actor or DEFAULT_USER_ID)
 

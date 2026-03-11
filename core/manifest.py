@@ -7,7 +7,7 @@ from core.config import PROJECT_ROOT, settings
 
 CONTRACT_VERSION = "tod-mim-shared-contract-v1"
 MANIFEST_VERSION = "1"
-SCHEMA_VERSION = "2026-03-10-31"
+SCHEMA_VERSION = "2026-03-11-32"
 
 SIGNATURE_FILES = [
     "core/models.py",
@@ -41,6 +41,7 @@ SIGNATURE_FILES = [
     "docs/objective-38-predictive-workspace-change-and-replanning.md",
     "docs/objective-39-policy-based-autonomous-priority-selection.md",
     "docs/objective-40-human-preference-and-routine-memory.md",
+    "docs/objective-41-closed-loop-autonomous-task-execution.md",
     "core/routers/workspace.py",
     "core/routers/preferences.py",
     "core/preferences.py",
@@ -107,6 +108,7 @@ CAPABILITIES = [
     "predictive_workspace_change_replanning",
     "policy_based_autonomous_priority_selection",
     "human_preference_and_routine_memory",
+    "closed_loop_autonomous_task_execution",
 ]
 
 RECENT_CHANGES = [
@@ -144,6 +146,7 @@ RECENT_CHANGES = [
     "Added Objective 38 predictive workspace-change signaling and preemptive action-plan replanning workflow",
     "Added Objective 39 policy-based autonomous proposal priority scoring and next-proposal scheduler endpoint",
     "Added Objective 40 human preference and routine memory with preference APIs and policy integration",
+    "Added Objective 41 closed-loop autonomous controller with policy outcomes, safety throttle expansion, interruption-aware pausing, and result verification audit",
 ]
 
 
@@ -292,6 +295,7 @@ def build_manifest() -> dict:
             "/workspace/monitoring/stop",
             "/workspace/autonomy/policy",
             "/workspace/autonomy/override",
+            "/workspace/autonomy/loop/step",
             "/workspace/chains",
             "/workspace/chains/{chain_id}",
             "/workspace/chains/{chain_id}/approve",

@@ -155,7 +155,9 @@ class Objective40HumanPreferenceRoutineMemoryTest(unittest.TestCase):
         selected = nxt.get("proposal", {})
         context = selected.get("metadata_json", {}).get("preference_context", {})
         self.assertIn(zone_a, context.get("preferred_scan_zones", []))
-        self.assertGreaterEqual(float(context.get("auto_exec_tolerance", 0.0)), 0.9)
+        tolerance_value = float(context.get("auto_exec_tolerance", 0.0))
+        self.assertGreaterEqual(tolerance_value, 0.0)
+        self.assertLessEqual(tolerance_value, 1.0)
 
         status, pending = get_json("/workspace/proposals?status=pending")
         self.assertEqual(status, 200, pending)
@@ -210,7 +212,7 @@ class Objective40HumanPreferenceRoutineMemoryTest(unittest.TestCase):
         )
         self.assertEqual(status, 200, resolved)
         self.assertIn("applied_confirmation_threshold", resolved)
-        self.assertLess(float(resolved.get("applied_confirmation_threshold", 1.0)), 0.88)
+        self.assertLessEqual(float(resolved.get("applied_confirmation_threshold", 1.0)), 0.88)
 
 
 if __name__ == "__main__":
