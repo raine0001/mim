@@ -678,3 +678,21 @@ class WorkspaceEnvironmentStrategy(Base, TimestampMixin):
     influence_weight: Mapped[float] = mapped_column(default=0.5)
     influenced_plan_ids_json: Mapped[list[int]] = mapped_column(JSON, default=list)
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class WorkspaceDecisionRecord(Base, TimestampMixin):
+    __tablename__ = "workspace_decision_records"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    decision_type: Mapped[str] = mapped_column(String(120), index=True)
+    source_context_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    relevant_state_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    preferences_applied_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    constraints_applied_json: Mapped[list[dict]] = mapped_column(JSON, default=list)
+    strategies_applied_json: Mapped[list[dict]] = mapped_column(JSON, default=list)
+    options_considered_json: Mapped[list[dict]] = mapped_column(JSON, default=list)
+    selected_option_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    decision_reason: Mapped[str] = mapped_column(Text, default="")
+    confidence: Mapped[float] = mapped_column(default=0.0)
+    resulting_goal_or_plan_id: Mapped[str] = mapped_column(String(120), default="")
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)

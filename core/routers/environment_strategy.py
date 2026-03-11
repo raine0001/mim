@@ -2,9 +2,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.db import get_db
+from core.decision_record_service import record_decision
 from core.environment_strategy_service import (
     deactivate_environment_strategy,
     generate_environment_strategies,
+    generate_environment_strategies_from_routines,
     get_environment_strategy,
     list_environment_strategies,
     resolve_environment_strategy,
@@ -14,6 +16,7 @@ from core.journal import write_journal
 from core.schemas import (
     EnvironmentStrategyDeactivateRequest,
     EnvironmentStrategyGenerateRequest,
+    EnvironmentStrategyRoutineGenerateRequest,
     EnvironmentStrategyResolveRequest,
 )
 
@@ -33,7 +36,34 @@ async def generate_environment_strategies_endpoint(
         max_strategies=payload.max_strategies,
         metadata_json=payload.metadata_json,
         db=db,
+        user_id="operator",
     )
+
+    for strategy in created:
+        await record_decision(
+            decision_type="strategy_selection",
+            source_context={
+                "source": payload.source,
+                "endpoint": "/planning/strategies/generate",
+            },
+            relevant_state={
+                "conditions": [item.model_dump() for item in payload.observed_conditions],
+            },
+            preferences_applied=(strategy.metadata_json or {}).get("preference_context", {}),
+            constraints_applied=[],
+            strategies_applied=[],
+            options_considered=[item.model_dump() for item in payload.observed_conditions],
+            selected_option={
+                "strategy_id": strategy.id,
+                "strategy_type": strategy.strategy_type,
+                "target_scope": strategy.target_scope,
+            },
+            decision_reason=str(strategy.status_reason or ""),
+            confidence=float(strategy.influence_weight),
+            resulting_goal_or_plan_id=f"strategy:{strategy.id}",
+            metadata_json={"objective": "48", **payload.metadata_json},
+            db=db,
+        )
 
     await write_journal(
         db,
@@ -49,6 +79,71 @@ async def generate_environment_strategies_endpoint(
             **payload.metadata_json,
         },
     )
+    await db.commit()
+    return {
+        "generated": len(created),
+        "strategies": [to_environment_strategy_out(item) for item in created],
+    }
+
+
+@router.post("/planning/strategies/routines/generate")
+async def generate_environment_strategies_from_routines_endpoint(
+    payload: EnvironmentStrategyRoutineGenerateRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    created = await generate_environment_strategies_from_routines(
+        actor=payload.actor,
+        source=payload.source,
+        lookback_hours=payload.lookback_hours,
+        min_occurrence_count=payload.min_occurrence_count,
+        max_strategies=payload.max_strategies,
+        metadata_json=payload.metadata_json,
+        db=db,
+        user_id="operator",
+    )
+
+    await write_journal(
+        db,
+        actor=payload.actor,
+        action="environment_strategies_generated_from_routines",
+        target_type="workspace_environment_strategy",
+        target_id="routine_batch",
+        summary=f"Generated {len(created)} routine environment strategy(ies)",
+        metadata_json={
+            "source": payload.source,
+            "lookback_hours": payload.lookback_hours,
+            "min_occurrence_count": payload.min_occurrence_count,
+            **payload.metadata_json,
+        },
+    )
+
+    for strategy in created:
+        await record_decision(
+            decision_type="strategy_selection",
+            source_context={
+                "source": payload.source,
+                "endpoint": "/planning/strategies/routines/generate",
+            },
+            relevant_state={
+                "lookback_hours": payload.lookback_hours,
+                "min_occurrence_count": payload.min_occurrence_count,
+            },
+            preferences_applied=(strategy.metadata_json or {}).get("preference_context", {}),
+            constraints_applied=[],
+            strategies_applied=[],
+            options_considered=[{"strategy_type": strategy.strategy_type, "target_scope": strategy.target_scope}],
+            selected_option={
+                "strategy_id": strategy.id,
+                "strategy_type": strategy.strategy_type,
+                "target_scope": strategy.target_scope,
+            },
+            decision_reason=str(strategy.status_reason or "routine_pattern"),
+            confidence=float(strategy.influence_weight),
+            resulting_goal_or_plan_id=f"strategy:{strategy.id}",
+            metadata_json={"objective": "48", "routine_generated": True, **payload.metadata_json},
+            db=db,
+        )
+
     await db.commit()
     return {
         "generated": len(created),
@@ -98,6 +193,22 @@ async def resolve_environment_strategy_endpoint(
         metadata_json=payload.metadata_json,
     )
 
+    await record_decision(
+        decision_type="strategy_selection",
+        source_context={"endpoint": f"/planning/strategies/{strategy_id}/resolve"},
+        relevant_state={"previous_status": row.current_status},
+        preferences_applied=(row.metadata_json or {}).get("preference_context", {}),
+        constraints_applied=[],
+        strategies_applied=[{"strategy_id": row.id, "strategy_type": row.strategy_type}],
+        options_considered=[{"status": payload.status}],
+        selected_option={"status": payload.status},
+        decision_reason=payload.reason,
+        confidence=float(row.influence_weight),
+        resulting_goal_or_plan_id=f"strategy:{row.id}",
+        metadata_json={"objective": "48", **payload.metadata_json},
+        db=db,
+    )
+
     await write_journal(
         db,
         actor=payload.actor,
@@ -131,6 +242,22 @@ async def deactivate_environment_strategy_endpoint(
         row=row,
         reason=payload.reason,
         metadata_json=payload.metadata_json,
+    )
+
+    await record_decision(
+        decision_type="strategy_selection",
+        source_context={"endpoint": f"/planning/strategies/{strategy_id}/deactivate"},
+        relevant_state={"strategy_status": row.current_status},
+        preferences_applied=(row.metadata_json or {}).get("preference_context", {}),
+        constraints_applied=[],
+        strategies_applied=[{"strategy_id": row.id, "strategy_type": row.strategy_type}],
+        options_considered=[{"action": "deactivate"}],
+        selected_option={"status": "superseded"},
+        decision_reason=payload.reason,
+        confidence=float(row.influence_weight),
+        resulting_goal_or_plan_id=f"strategy:{row.id}",
+        metadata_json={"objective": "48", **payload.metadata_json},
+        db=db,
     )
 
     await write_journal(

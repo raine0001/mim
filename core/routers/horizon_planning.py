@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.db import get_db
+from core.decision_record_service import record_decision
 from core.horizon_planning_service import (
     advance_horizon_checkpoint,
     create_horizon_plan,
@@ -50,6 +51,33 @@ async def create_horizon_plan_endpoint(
             "goal_candidates": len(payload.goal_candidates),
             **payload.metadata_json,
         },
+    )
+
+    await record_decision(
+        decision_type="plan_selection",
+        source_context={
+            "endpoint": "/planning/horizon/plans",
+            "source": payload.source,
+        },
+        relevant_state={
+            "planning_horizon_minutes": payload.planning_horizon_minutes,
+            "map_freshness_seconds": payload.map_freshness_seconds,
+            "object_confidence": payload.object_confidence,
+            "human_aware_state": payload.human_aware_state,
+        },
+        preferences_applied=payload.operator_preferences if isinstance(payload.operator_preferences, dict) else {},
+        constraints_applied=plan.expected_future_constraints_json if isinstance(plan.expected_future_constraints_json, list) else [],
+        strategies_applied=(plan.explanation_json or {}).get("strategy_context", []) if isinstance(plan.explanation_json, dict) else [],
+        options_considered=[item.model_dump() for item in payload.goal_candidates],
+        selected_option={
+            "plan_id": plan.id,
+            "top_ranked_goal": (plan.ranked_goals_json[0] if isinstance(plan.ranked_goals_json, list) and plan.ranked_goals_json else {}),
+        },
+        decision_reason=str((plan.explanation_json or {}).get("selected_plan_reason", "")),
+        confidence=float((plan.ranked_goals_json[0] or {}).get("score", 0.0)) if isinstance(plan.ranked_goals_json, list) and plan.ranked_goals_json else 0.0,
+        resulting_goal_or_plan_id=f"plan:{plan.id}",
+        metadata_json={"objective": "48", **payload.metadata_json},
+        db=db,
     )
 
     await db.commit()

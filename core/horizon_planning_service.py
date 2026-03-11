@@ -89,15 +89,22 @@ async def create_horizon_plan(
         bonus = 0.0
         reasons: list[str] = []
         strategy_ids: list[int] = []
+        candidate_influences: list[tuple[float, int, str]] = []
         for strategy in active_strategies:
             influence, reason = strategy_influence_for_goal(goal=goal, strategy=strategy)
             if influence <= 0:
                 continue
-            bonus += float(influence)
-            strategy_ids.append(int(strategy.id))
-            influenced_strategy_ids.add(int(strategy.id))
-            if reason:
-                reasons.append(f"{strategy.id}:{reason}")
+            candidate_influences.append((float(influence), int(strategy.id), str(reason or "")))
+
+        if candidate_influences:
+            candidate_influences.sort(key=lambda item: item[0], reverse=True)
+            decay = [1.0, 0.5, 0.25]
+            for index, (influence, strategy_id, reason) in enumerate(candidate_influences[: len(decay)]):
+                bonus += float(influence) * decay[index]
+                strategy_ids.append(strategy_id)
+                influenced_strategy_ids.add(strategy_id)
+                if reason:
+                    reasons.append(f"{strategy_id}:{reason}")
 
         if bonus > 0:
             goal["score"] = round(max(0.0, min(1.0, float(goal.get("score", 0.0)) + bonus)), 6)

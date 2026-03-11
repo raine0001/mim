@@ -7,7 +7,7 @@ from core.config import PROJECT_ROOT, settings
 
 CONTRACT_VERSION = "tod-mim-shared-contract-v1"
 MANIFEST_VERSION = "1"
-SCHEMA_VERSION = "2026-03-11-38"
+SCHEMA_VERSION = "2026-03-11-39"
 
 SIGNATURE_FILES = [
     "core/models.py",
@@ -23,7 +23,9 @@ SIGNATURE_FILES = [
     "core/horizon_planning_service.py",
     "core/routers/horizon_planning.py",
     "core/environment_strategy_service.py",
+    "core/decision_record_service.py",
     "core/routers/environment_strategy.py",
+    "core/routers/decision_records.py",
     "docs/tod-mim-bridge.md",
     "docs/objective-21-unified-input-gateway.md",
     "docs/objective-22-mim-tod-execution-feedback-integration.md",
@@ -60,6 +62,9 @@ SIGNATURE_FILES = [
     "docs/objective-47-environment-strategy-formation.md",
     "docs/objective-47-promotion-readiness-report.md",
     "docs/objective-47-prod-promotion-report.md",
+    "docs/objective-48-human-preference-strategy-integration.md",
+    "docs/objective-48-promotion-readiness-report.md",
+    "docs/objective-48-prod-promotion-report.md",
     "core/routers/workspace.py",
     "core/routers/constraints.py",
     "core/routers/constraint_learning.py",
@@ -139,6 +144,8 @@ CAPABILITIES = [
     "constraint_weight_learning",
     "long_horizon_planning",
     "environment_strategy_formation",
+    "human_preference_strategy_integration",
+    "decision_record_trace",
 ]
 
 RECENT_CHANGES = [
@@ -183,6 +190,7 @@ RECENT_CHANGES = [
     "Added Objective 45 proposal-only constraint weight learning loop with outcome recording, rolling success stats, and auditable soft adjustment proposals",
     "Added Objective 46 long-horizon multi-goal planning with future-state scoring, checkpointed execution states, and replan-on-drift inspectability",
     "Added Objective 47 environment strategy formation with persistent strategy lifecycle, strategy-driven horizon weighting, and strategy inspectability APIs",
+    "Added Objective 48 preference-aware strategy integration with routine pattern strategy generation and unified decision record reasoning trace",
 ]
 
 
@@ -324,6 +332,9 @@ def build_manifest() -> dict:
             "/planning/strategies/{strategy_id}",
             "/planning/strategies/{strategy_id}/resolve",
             "/planning/strategies/{strategy_id}/deactivate",
+            "/planning/strategies/routines/generate",
+            "/planning/decisions",
+            "/planning/decisions/{decision_id}",
             "/operator/inbox",
             "/operator/executions",
             "/operator/executions/{execution_id}",
@@ -820,6 +831,22 @@ def build_manifest() -> dict:
                 "evidence",
                 "influence_weight",
                 "influenced_plan_ids",
+                "metadata_json",
+                "created_at",
+            ],
+            "DecisionRecord": [
+                "decision_id",
+                "decision_type",
+                "source_context",
+                "relevant_state",
+                "preferences_applied",
+                "constraints_applied",
+                "strategies_applied",
+                "options_considered",
+                "selected_option",
+                "decision_reason",
+                "confidence",
+                "resulting_goal_or_plan_id",
                 "metadata_json",
                 "created_at",
             ],

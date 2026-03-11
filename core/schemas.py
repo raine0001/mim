@@ -939,6 +939,15 @@ class EnvironmentStrategyGenerateRequest(BaseModel):
     metadata_json: dict = Field(default_factory=dict)
 
 
+class EnvironmentStrategyRoutineGenerateRequest(BaseModel):
+    actor: str = "workspace"
+    source: str = "objective48"
+    lookback_hours: int = Field(default=24, ge=1, le=720)
+    min_occurrence_count: int = Field(default=3, ge=2, le=500)
+    max_strategies: int = Field(default=5, ge=1, le=25)
+    metadata_json: dict = Field(default_factory=dict)
+
+
 class EnvironmentStrategyResolveRequest(BaseModel):
     actor: str = "operator"
     reason: str = ""
@@ -956,6 +965,23 @@ class EnvironmentStrategyDeactivateRequest(BaseModel):
     actor: str = "operator"
     reason: str = ""
     metadata_json: dict = Field(default_factory=dict)
+
+
+class DecisionRecordOut(BaseModel):
+    decision_id: int
+    decision_type: str
+    source_context: dict
+    relevant_state: dict
+    preferences_applied: dict
+    constraints_applied: list[dict]
+    strategies_applied: list[dict]
+    options_considered: list[dict]
+    selected_option: dict
+    decision_reason: str
+    confidence: float
+    resulting_goal_or_plan_id: str
+    metadata_json: dict
+    created_at: datetime
 
 
 WorkspaceInterruptionType = Literal[
