@@ -35,7 +35,7 @@ This registry indexes objective evidence and promotion artifacts so objective hi
 | 48 | Human Preference Strategy Integration | promoted_verified | 2026-03-11-39 | objective-48 | core/environment_strategy_service.py; core/horizon_planning_service.py; core/decision_record_service.py | docs/objective-48-promotion-readiness-report.md | docs/objective-48-prod-promotion-report.md | human_preference_strategy_integration; decision_record_trace |
 | 49 | Self-improvement Proposal Engine | promoted_verified | 2026-03-11-40 | objective-49 | core/improvement_service.py; core/routers/improvement.py; core/models.py | docs/objective-49-promotion-readiness-report.md | docs/objective-49-prod-promotion-report.md | self_improvement_proposal_engine |
 | 50 | Environment Maintenance Autonomy | promoted_verified | 2026-03-11-41 | objective-50 | core/maintenance_service.py; core/routers/maintenance.py; core/models.py | docs/objective-50-promotion-readiness-report.md | docs/objective-50-prod-promotion-report.md | environment_maintenance_autonomy |
-| 51 | Policy Experiment Sandbox | regression_passed_pending_promotion | 2026-03-11-42 | objective-51 | core/policy_experiment_service.py; core/routers/policy_experiments.py; core/models.py | docs/objective-51-promotion-readiness-report.md | docs/objective-51-prod-promotion-report.md | policy_experiment_sandbox |
+| 51 | Policy Experiment Sandbox | promoted_verified | 2026-03-11-42 | sha-40b28d2 | core/policy_experiment_service.py; core/routers/policy_experiments.py; core/models.py | docs/objective-51-promotion-readiness-report.md | docs/objective-51-prod-promotion-report.md | policy_experiment_sandbox |
 
 ## Notes
 

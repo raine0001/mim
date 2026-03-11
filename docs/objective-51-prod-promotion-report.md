@@ -2,19 +2,19 @@
 
 Generated at: 2026-03-11 (UTC)
 Environment target: production
-Release tag: objective-51
+Release tag: sha-40b28d2
 
 ## Promotion Result
 
 - Promotion command:
   - `scripts/promote_test_to_prod.sh objective-51`
-- Result: PENDING
+- Result: PASS
 
 ## Contract and Capability Targets
 
-- schema version target: `2026-03-11-42`
-- capability target: `policy_experiment_sandbox`
-- endpoint targets:
+- schema version: `2026-03-11-42`
+- capability includes `policy_experiment_sandbox`: `true`
+- endpoints live:
   - `/improvement/experiments/run`
   - `/improvement/experiments`
   - `/improvement/experiments/{experiment_id}`
@@ -25,6 +25,8 @@ Release tag: objective-51
   - `tests/integration/test_objective51_policy_experiment_sandbox.py`: PASS (`Ran 1 test ... OK`)
 - Full integration regression:
   - `python -m unittest discover tests/integration -v`: PASS (`Ran 43 tests in 20.909s ... OK`)
+- Production probe:
+  - `MIM_TEST_BASE_URL=http://127.0.0.1:8000 /home/testpilot/mim/.venv/bin/python -m unittest tests/integration/test_objective51_policy_experiment_sandbox.py -v`: PASS (`Ran 1 test ... OK`)
 
 ## Experiment Isolation Verification
 
@@ -40,17 +42,17 @@ Release tag: objective-51
 
 ## Post-Promotion Verification Checklist
 
-- [ ] `GET /health`: PASS
-- [ ] `GET /manifest`: PASS
-  - [ ] `release_tag=objective-51`
-  - [ ] `schema_version=2026-03-11-42`
-  - [ ] capability includes `policy_experiment_sandbox=true`
-- [ ] endpoint availability:
-  - [ ] `/improvement/experiments/run`
-  - [ ] `/improvement/experiments`
-  - [ ] `/improvement/experiments/{experiment_id}`
-- [ ] production probe test for Objective 51: PASS
+- [x] `GET /health`: PASS
+- [x] `GET /manifest`: PASS
+  - [x] `release_tag=sha-40b28d2`
+  - [x] `schema_version=2026-03-11-42`
+  - [x] capability includes `policy_experiment_sandbox=true`
+- [x] endpoint availability:
+  - [x] `/improvement/experiments/run`
+  - [x] `/improvement/experiments`
+  - [x] `/improvement/experiments/{experiment_id}`
+- [x] production probe test for Objective 51: PASS
 
 ## Verdict
 
-PENDING PROMOTION
+PROMOTED AND VERIFIED
