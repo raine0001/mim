@@ -11,7 +11,7 @@ from core.db import SessionLocal, get_db
 from core.journal import write_journal
 from core.models import CapabilityExecution, CapabilityRegistration, InputEvent, SpeechOutputAction, Task, WorkspaceActionPlan, WorkspaceAutonomousChain, WorkspaceCapabilityChain, WorkspaceInterruptionEvent, WorkspaceMonitoringState, WorkspaceObjectMemory, WorkspaceObjectRelation, WorkspaceObservation, WorkspaceProposal, WorkspaceReplanSignal, WorkspaceTargetResolution, WorkspaceZone, WorkspaceZoneRelation
 from core.preferences import DEFAULT_USER_ID, apply_learning_signal, get_user_preference_payload, get_user_preference_value
-from core.schemas import WorkspaceActionPlanAbortRequest, WorkspaceActionPlanCreateRequest, WorkspaceActionPlanDecisionRequest, WorkspaceActionPlanExecuteRequest, WorkspaceActionPlanHandoffRequest, WorkspaceActionPlanReplanRequest, WorkspaceActionPlanSimulationRequest, WorkspaceAutonomousChainAdvanceRequest, WorkspaceAutonomousChainApprovalRequest, WorkspaceAutonomousChainCreateRequest, WorkspaceAutonomyOverrideRequest, WorkspaceCapabilityChainAdvanceRequest, WorkspaceCapabilityChainCreateRequest, WorkspaceExecutionPauseRequest, WorkspaceExecutionPredictChangeRequest, WorkspaceExecutionProposalActionRequest, WorkspaceExecutionProposalCreateRequest, WorkspaceExecutionResumeRequest, WorkspaceExecutionStopRequest, WorkspaceMonitoringStartRequest, WorkspaceMonitoringStopRequest, WorkspaceProposalActionRequest, WorkspaceProposalPriorityPolicyUpdateRequest, WorkspaceTargetConfirmRequest, WorkspaceTargetResolveRequest
+from core.schemas import WorkspaceActionPlanAbortRequest, WorkspaceActionPlanCreateRequest, WorkspaceActionPlanDecisionRequest, WorkspaceActionPlanExecuteRequest, WorkspaceActionPlanHandoffRequest, WorkspaceActionPlanReplanRequest, WorkspaceActionPlanSimulationRequest, WorkspaceAutonomousChainAdvanceRequest, WorkspaceAutonomousChainApprovalRequest, WorkspaceAutonomousChainCreateRequest, WorkspaceAutonomyOverrideRequest, WorkspaceCapabilityChainAdvanceRequest, WorkspaceCapabilityChainCreateRequest, WorkspaceExecutionPauseRequest, WorkspaceExecutionPredictChangeRequest, WorkspaceExecutionProposalActionRequest, WorkspaceExecutionProposalCreateRequest, WorkspaceExecutionResumeRequest, WorkspaceExecutionStopRequest, WorkspaceHumanAwareSignalUpdateRequest, WorkspaceMonitoringStartRequest, WorkspaceMonitoringStopRequest, WorkspaceProposalActionRequest, WorkspaceProposalPriorityPolicyUpdateRequest, WorkspaceTargetConfirmRequest, WorkspaceTargetResolveRequest
 
 router = APIRouter()
 
@@ -127,6 +127,21 @@ SAFE_CAPABILITY_CHAIN_COMBINATIONS = {
     ("target_resolution", "speech_output"),
     ("rescan_zone", "proposal_resolution"),
 }
+HUMAN_AWARE_POLICY_VERSION = "human-aware-policy-v1"
+HUMAN_AWARE_POLICY_OUTCOMES = {
+    "continue",
+    "slow_suppress",
+    "pause",
+    "require_operator_confirmation",
+    "stop_replan",
+}
+HUMAN_AWARE_PHYSICAL_PROPOSAL_TYPES = {
+    "execution_candidate",
+}
+HUMAN_AWARE_PHYSICAL_CAPABILITIES = {
+    "target_resolution",
+    "proposal_resolution",
+}
 PROPOSAL_PRIORITY_DEFAULT = {
     "weights": {
         "urgency": 0.28,
@@ -209,6 +224,153 @@ def _store_autonomy_state(row: WorkspaceMonitoringState, autonomy_state: dict) -
     row.metadata_json = {
         **metadata,
         "autonomy": autonomy_state,
+    }
+
+
+def _default_human_aware_state() -> dict:
+    return {
+        "human_in_workspace": False,
+        "human_near_target_zone": False,
+        "human_near_motion_path": False,
+        "shared_workspace_active": False,
+        "operator_present": False,
+        "occupied_zones": [],
+        "high_proximity_zones": [],
+        "last_updated_at": "",
+        "last_updated_by": "",
+        "last_reason": "",
+        "last_policy_decision": {
+            "outcome": "continue",
+            "reason": "default_clear",
+            "at": "",
+        },
+    }
+
+
+def _human_aware_state_from_monitoring(row: WorkspaceMonitoringState) -> dict:
+    metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
+    raw = metadata.get("human_aware", {}) if isinstance(metadata.get("human_aware", {}), dict) else {}
+    defaults = _default_human_aware_state()
+    merged = {
+        **defaults,
+        **raw,
+    }
+    for key in [
+        "human_in_workspace",
+        "human_near_target_zone",
+        "human_near_motion_path",
+        "shared_workspace_active",
+        "operator_present",
+    ]:
+        merged[key] = bool(merged.get(key, False))
+    merged["occupied_zones"] = [
+        normalized
+        for normalized in (
+            _normalize_zone_for_map(str(item))
+            for item in (merged.get("occupied_zones", []) if isinstance(merged.get("occupied_zones", []), list) else [])
+        )
+        if normalized
+    ]
+    merged["high_proximity_zones"] = [
+        normalized
+        for normalized in (
+            _normalize_zone_for_map(str(item))
+            for item in (merged.get("high_proximity_zones", []) if isinstance(merged.get("high_proximity_zones", []), list) else [])
+        )
+        if normalized
+    ]
+    return merged
+
+
+def _store_human_aware_state(row: WorkspaceMonitoringState, human_aware_state: dict) -> None:
+    metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
+    row.metadata_json = {
+        **metadata,
+        "human_aware": human_aware_state,
+    }
+
+
+def _is_physical_capability_step(capability: str) -> bool:
+    return capability in HUMAN_AWARE_PHYSICAL_CAPABILITIES
+
+
+def _human_aware_policy_for_capability_step(*, step: dict, human_aware: dict) -> tuple[str, str]:
+    capability = str(step.get("capability", "")).strip()
+    params = step.get("params", {}) if isinstance(step.get("params", {}), dict) else {}
+    normalized_zone = _normalize_zone_for_map(str(params.get("zone", "")))
+
+    if bool(human_aware.get("shared_workspace_active", False)) and bool(human_aware.get("human_in_workspace", False)):
+        return "pause", "shared_workspace_active"
+
+    if bool(human_aware.get("human_near_motion_path", False)) and _is_physical_capability_step(capability):
+        return "stop_replan", "human_near_motion_path"
+
+    occupied = set(human_aware.get("occupied_zones", []) if isinstance(human_aware.get("occupied_zones", []), list) else [])
+    if normalized_zone and normalized_zone in occupied and _is_physical_capability_step(capability):
+        return "pause", "occupied_zone_no_autonomous_movement"
+
+    high_proximity = set(human_aware.get("high_proximity_zones", []) if isinstance(human_aware.get("high_proximity_zones", []), list) else [])
+    if normalized_zone and normalized_zone in high_proximity and _is_physical_capability_step(capability):
+        return "require_operator_confirmation", "high_proximity_zone"
+
+    if bool(human_aware.get("human_near_target_zone", False)) and _is_physical_capability_step(capability):
+        return "require_operator_confirmation", "human_near_target_zone"
+
+    if bool(human_aware.get("human_in_workspace", False)) and _is_physical_capability_step(capability):
+        return "require_operator_confirmation", "human_in_workspace_physical_action"
+
+    if bool(human_aware.get("operator_present", False)) and capability == "speech_output":
+        return "slow_suppress", "operator_present_speech_suppressed"
+
+    return "continue", "clear"
+
+
+def _human_aware_policy_for_proposal(*, proposal: WorkspaceProposal, human_aware: dict) -> tuple[str, str]:
+    proposal_type = str(proposal.proposal_type or "").strip()
+    normalized_zone = _normalize_zone_for_map(str(proposal.related_zone or ""))
+    is_physical = proposal_type in HUMAN_AWARE_PHYSICAL_PROPOSAL_TYPES
+
+    if bool(human_aware.get("shared_workspace_active", False)) and bool(human_aware.get("human_in_workspace", False)):
+        return "pause", "shared_workspace_active"
+
+    if bool(human_aware.get("human_near_motion_path", False)) and is_physical:
+        return "stop_replan", "human_near_motion_path"
+
+    occupied = set(human_aware.get("occupied_zones", []) if isinstance(human_aware.get("occupied_zones", []), list) else [])
+    if normalized_zone and normalized_zone in occupied and is_physical:
+        return "pause", "occupied_zone_no_autonomous_movement"
+
+    high_proximity = set(human_aware.get("high_proximity_zones", []) if isinstance(human_aware.get("high_proximity_zones", []), list) else [])
+    if normalized_zone and normalized_zone in high_proximity and is_physical:
+        return "require_operator_confirmation", "high_proximity_zone"
+
+    if bool(human_aware.get("human_near_target_zone", False)) and is_physical:
+        return "require_operator_confirmation", "human_near_target_zone"
+
+    if bool(human_aware.get("human_in_workspace", False)) and is_physical:
+        return "require_operator_confirmation", "human_in_workspace_physical_action"
+
+    return "continue", "clear"
+
+
+def _human_aware_inspectability_payload(*, row: WorkspaceMonitoringState) -> dict:
+    state = _human_aware_state_from_monitoring(row)
+    return {
+        "policy_version": HUMAN_AWARE_POLICY_VERSION,
+        "signals": {
+            "human_in_workspace": bool(state.get("human_in_workspace", False)),
+            "human_near_target_zone": bool(state.get("human_near_target_zone", False)),
+            "human_near_motion_path": bool(state.get("human_near_motion_path", False)),
+            "shared_workspace_active": bool(state.get("shared_workspace_active", False)),
+            "operator_present": bool(state.get("operator_present", False)),
+            "occupied_zones": state.get("occupied_zones", []),
+            "high_proximity_zones": state.get("high_proximity_zones", []),
+        },
+        "policy_outcomes": sorted(list(HUMAN_AWARE_POLICY_OUTCOMES)),
+        "last_policy_decision": state.get("last_policy_decision", {}),
+        "last_updated_at": state.get("last_updated_at", ""),
+        "last_updated_by": state.get("last_updated_by", ""),
+        "last_reason": state.get("last_reason", ""),
     }
 
 
@@ -817,6 +979,17 @@ async def _maybe_auto_execute_workspace_proposal(
     if interruption_blocked:
         return False, interruption_reason
 
+    human_aware = _human_aware_state_from_monitoring(monitoring)
+    human_outcome, human_reason = _human_aware_policy_for_proposal(proposal=proposal, human_aware=human_aware)
+    if human_outcome in {"pause", "require_operator_confirmation", "stop_replan"}:
+        human_aware["last_policy_decision"] = {
+            "outcome": human_outcome,
+            "reason": human_reason,
+            "at": datetime.now(timezone.utc).isoformat(),
+        }
+        _store_human_aware_state(monitoring, human_aware)
+        return False, f"human_policy_{human_outcome}:{human_reason}"
+
     threshold = _autonomy_confidence_threshold(tier=tier, autonomy_state=autonomy_state)
     if float(proposal.confidence) < threshold:
         return False, "confidence_below_threshold"
@@ -1120,6 +1293,7 @@ def _monitoring_state_payload(row: WorkspaceMonitoringState) -> dict:
             for key, value in autonomy.items()
             if key != "recent_auto_actions"
         },
+        "human_aware": _human_aware_inspectability_payload(row=row),
         "metadata_json": row.metadata_json if isinstance(row.metadata_json, dict) else {},
     }
 
@@ -1488,18 +1662,23 @@ async def _execute_capability_chain_step(*, chain: WorkspaceCapabilityChain, ste
         message = str(params.get("message", f"Target {context.get('last_target_label', 'ready')} confirmed.")).strip()
         if not message:
             return False, "speech_message_required", verification
+        suppress_speech = bool(params.get("human_policy_suppress", False))
         speech = SpeechOutputAction(
             requested_text=message,
             voice_profile="default",
             channel="system",
-            priority="normal",
-            delivery_status="queued",
-            metadata_json={"chain_id": chain.id, "step_id": step.get("step_id")},
+            priority="low" if suppress_speech else "normal",
+            delivery_status="suppressed" if suppress_speech else "queued",
+            metadata_json={
+                "chain_id": chain.id,
+                "step_id": step.get("step_id"),
+                "human_policy_suppress": suppress_speech,
+            },
         )
         db.add(speech)
         await db.flush()
-        verification.update({"speech_action_id": speech.id, "message": message})
-        return True, "speech_queued", verification
+        verification.update({"speech_action_id": speech.id, "message": message, "suppressed": suppress_speech})
+        return True, "speech_suppressed" if suppress_speech else "speech_queued", verification
 
     if capability == "rescan_zone":
         zone = str(params.get("zone", context.get("last_scan_zone", "workspace"))).strip() or "workspace"
@@ -2752,6 +2931,81 @@ async def stop_workspace_monitoring(
     return _monitoring_state_payload(row)
 
 
+@router.get("/human-aware/state")
+async def get_workspace_human_aware_state(db: AsyncSession = Depends(get_db)) -> dict:
+    row = await _get_or_create_monitoring_state(db)
+    return _human_aware_inspectability_payload(row=row)
+
+
+@router.post("/human-aware/signals")
+async def update_workspace_human_aware_signals(
+    payload: WorkspaceHumanAwareSignalUpdateRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    row = await _get_or_create_monitoring_state(db)
+    state = _human_aware_state_from_monitoring(row)
+
+    for key in [
+        "human_in_workspace",
+        "human_near_target_zone",
+        "human_near_motion_path",
+        "shared_workspace_active",
+        "operator_present",
+    ]:
+        value = getattr(payload, key)
+        if value is not None:
+            state[key] = bool(value)
+
+    if payload.occupied_zones:
+        state["occupied_zones"] = [
+            normalized
+            for normalized in (_normalize_zone_for_map(item) for item in payload.occupied_zones)
+            if normalized
+        ]
+    if payload.high_proximity_zones:
+        state["high_proximity_zones"] = [
+            normalized
+            for normalized in (_normalize_zone_for_map(item) for item in payload.high_proximity_zones)
+            if normalized
+        ]
+
+    state["last_updated_at"] = datetime.now(timezone.utc).isoformat()
+    state["last_updated_by"] = payload.actor
+    state["last_reason"] = payload.reason
+    state["last_policy_decision"] = {
+        "outcome": "continue",
+        "reason": "signals_updated",
+        "at": datetime.now(timezone.utc).isoformat(),
+    }
+    _store_human_aware_state(row, state)
+
+    await write_journal(
+        db,
+        actor=payload.actor,
+        action="workspace_human_aware_signals_update",
+        target_type="workspace_monitoring",
+        target_id=str(row.id),
+        summary="Updated human-aware workspace signals",
+        metadata_json={
+            "reason": payload.reason,
+            "signals": {
+                "human_in_workspace": state.get("human_in_workspace", False),
+                "human_near_target_zone": state.get("human_near_target_zone", False),
+                "human_near_motion_path": state.get("human_near_motion_path", False),
+                "shared_workspace_active": state.get("shared_workspace_active", False),
+                "operator_present": state.get("operator_present", False),
+                "occupied_zones": state.get("occupied_zones", []),
+                "high_proximity_zones": state.get("high_proximity_zones", []),
+            },
+            **payload.metadata_json,
+        },
+    )
+
+    await db.commit()
+    await db.refresh(row)
+    return _human_aware_inspectability_payload(row=row)
+
+
 @router.get("/autonomy/policy")
 async def get_workspace_autonomy_policy(db: AsyncSession = Depends(get_db)) -> dict:
     row = await _get_or_create_monitoring_state(db)
@@ -2774,6 +3028,7 @@ async def get_workspace_autonomy_policy(db: AsyncSession = Depends(get_db)) -> d
             for key, value in autonomy.items()
             if key != "recent_auto_actions"
         },
+        "human_aware": _human_aware_inspectability_payload(row=row),
         "policy_outcomes": sorted(list(AUTONOMY_POLICY_OUTCOMES)),
     }
 
@@ -3032,6 +3287,94 @@ async def advance_workspace_capability_chain(
 
     step = steps[row.current_step_index] if isinstance(steps[row.current_step_index], dict) else {}
     step_id = str(step.get("step_id", f"step-{row.current_step_index + 1}")).strip()
+
+    monitoring = await _get_or_create_monitoring_state(db)
+    human_aware = _human_aware_state_from_monitoring(monitoring)
+    human_outcome, human_reason = _human_aware_policy_for_capability_step(step=step, human_aware=human_aware)
+    if human_outcome in {"pause", "require_operator_confirmation", "stop_replan"} and not payload.force:
+        if human_outcome == "pause":
+            row.status = "paused"
+            result = "paused_by_human_presence"
+        elif human_outcome == "require_operator_confirmation":
+            row.status = "pending_confirmation"
+            result = "operator_confirmation_required"
+        else:
+            row.status = "failed"
+            result = "stopped_for_replan"
+            if row.escalate_on_failure:
+                metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
+                row.metadata_json = {
+                    **metadata,
+                    "escalation": {
+                        "required": True,
+                        "reason": human_reason,
+                        "step_id": step_id,
+                        "at": datetime.now(timezone.utc).isoformat(),
+                    },
+                }
+        _append_capability_chain_audit(
+            row,
+            actor=payload.actor,
+            event="capability_step_blocked_human_policy",
+            reason=human_reason,
+            metadata_json={
+                "step_id": step_id,
+                "outcome": human_outcome,
+                "result": result,
+                **payload.metadata_json,
+            },
+        )
+        human_aware["last_policy_decision"] = {
+            "outcome": human_outcome,
+            "reason": human_reason,
+            "at": datetime.now(timezone.utc).isoformat(),
+        }
+        _store_human_aware_state(monitoring, human_aware)
+
+        await write_journal(
+            db,
+            actor=payload.actor,
+            action="workspace_capability_chain_human_policy",
+            target_type="workspace_capability_chain",
+            target_id=str(row.id),
+            summary=f"Human-aware policy applied for workspace capability chain {row.id}",
+            metadata_json={
+                "step_id": step_id,
+                "outcome": human_outcome,
+                "reason": human_reason,
+                "status": row.status,
+                **payload.metadata_json,
+            },
+        )
+        await db.commit()
+        await db.refresh(row)
+        return {
+            **_to_workspace_capability_chain_out(row),
+            "last_step": {
+                "step_id": step_id,
+                "capability": step.get("capability", ""),
+                "result": result,
+                "success": False,
+                "verification": {
+                    "policy_outcome": human_outcome,
+                    "policy_reason": human_reason,
+                },
+            },
+        }
+
+    if human_outcome == "slow_suppress" and str(step.get("capability", "")).strip() == "speech_output":
+        params = step.get("params", {}) if isinstance(step.get("params", {}), dict) else {}
+        step["params"] = {
+            **params,
+            "human_policy_suppress": True,
+        }
+        human_aware["last_policy_decision"] = {
+            "outcome": human_outcome,
+            "reason": human_reason,
+            "at": datetime.now(timezone.utc).isoformat(),
+        }
+        _store_human_aware_state(monitoring, human_aware)
+
     depends_on = step.get("depends_on", []) if isinstance(step.get("depends_on", []), list) else []
     completed_step_ids = row.completed_step_ids if isinstance(row.completed_step_ids, list) else []
     unmet = [dep for dep in depends_on if dep not in completed_step_ids]

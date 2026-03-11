@@ -831,6 +831,19 @@ class WorkspaceCapabilityChainAdvanceRequest(BaseModel):
     metadata_json: dict = Field(default_factory=dict)
 
 
+class WorkspaceHumanAwareSignalUpdateRequest(BaseModel):
+    actor: str = "workspace"
+    reason: str = ""
+    human_in_workspace: bool | None = None
+    human_near_target_zone: bool | None = None
+    human_near_motion_path: bool | None = None
+    shared_workspace_active: bool | None = None
+    operator_present: bool | None = None
+    occupied_zones: list[str] = Field(default_factory=list)
+    high_proximity_zones: list[str] = Field(default_factory=list)
+    metadata_json: dict = Field(default_factory=dict)
+
+
 WorkspaceInterruptionType = Literal[
     "human_detected_in_workspace",
     "operator_pause",
