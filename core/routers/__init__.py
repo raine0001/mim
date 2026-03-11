@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 
-from core.routers import constraint_learning, constraints, custody, decision_records, environment_strategy, gateway, health, horizon_planning, journal, manifest, memory, objectives, operator, preferences, results, reviews, routing, services, status, tasks, tools, workspace
+from core.routers import constraint_learning, constraints, custody, decision_records, environment_strategy, gateway, health, horizon_planning, improvement, journal, manifest, memory, objectives, operator, preferences, results, reviews, routing, services, status, tasks, tools, workspace
 
 api_router = APIRouter()
 api_router.include_router(health.router, prefix="")
@@ -21,6 +21,7 @@ api_router.include_router(constraint_learning.router, prefix="", tags=["constrai
 api_router.include_router(horizon_planning.router, prefix="", tags=["planning-horizon"])
 api_router.include_router(environment_strategy.router, prefix="", tags=["planning-strategy"])
 api_router.include_router(decision_records.router, prefix="", tags=["planning-decisions"])
+api_router.include_router(improvement.router, prefix="", tags=["improvement"])
 api_router.include_router(preferences.router, prefix="", tags=["preferences"])
 api_router.include_router(workspace.router, prefix="/workspace", tags=["workspace"])
 api_router.include_router(tools.router, prefix="/tools", tags=["tools"])

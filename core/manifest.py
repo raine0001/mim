@@ -7,7 +7,7 @@ from core.config import PROJECT_ROOT, settings
 
 CONTRACT_VERSION = "tod-mim-shared-contract-v1"
 MANIFEST_VERSION = "1"
-SCHEMA_VERSION = "2026-03-11-39"
+SCHEMA_VERSION = "2026-03-11-40"
 
 SIGNATURE_FILES = [
     "core/models.py",
@@ -24,8 +24,10 @@ SIGNATURE_FILES = [
     "core/routers/horizon_planning.py",
     "core/environment_strategy_service.py",
     "core/decision_record_service.py",
+    "core/improvement_service.py",
     "core/routers/environment_strategy.py",
     "core/routers/decision_records.py",
+    "core/routers/improvement.py",
     "docs/tod-mim-bridge.md",
     "docs/objective-21-unified-input-gateway.md",
     "docs/objective-22-mim-tod-execution-feedback-integration.md",
@@ -65,6 +67,9 @@ SIGNATURE_FILES = [
     "docs/objective-48-human-preference-strategy-integration.md",
     "docs/objective-48-promotion-readiness-report.md",
     "docs/objective-48-prod-promotion-report.md",
+    "docs/objective-49-self-improvement-proposal-engine.md",
+    "docs/objective-49-promotion-readiness-report.md",
+    "docs/objective-49-prod-promotion-report.md",
     "core/routers/workspace.py",
     "core/routers/constraints.py",
     "core/routers/constraint_learning.py",
@@ -146,6 +151,7 @@ CAPABILITIES = [
     "environment_strategy_formation",
     "human_preference_strategy_integration",
     "decision_record_trace",
+    "self_improvement_proposal_engine",
 ]
 
 RECENT_CHANGES = [
@@ -191,6 +197,7 @@ RECENT_CHANGES = [
     "Added Objective 46 long-horizon multi-goal planning with future-state scoring, checkpointed execution states, and replan-on-drift inspectability",
     "Added Objective 47 environment strategy formation with persistent strategy lifecycle, strategy-driven horizon weighting, and strategy inspectability APIs",
     "Added Objective 48 preference-aware strategy integration with routine pattern strategy generation and unified decision record reasoning trace",
+    "Added Objective 49 self-improvement proposal engine with rule-based friction pattern detection and review-gated improvement artifacts",
 ]
 
 
@@ -335,6 +342,11 @@ def build_manifest() -> dict:
             "/planning/strategies/routines/generate",
             "/planning/decisions",
             "/planning/decisions/{decision_id}",
+            "/improvement/proposals/generate",
+            "/improvement/proposals",
+            "/improvement/proposals/{proposal_id}",
+            "/improvement/proposals/{proposal_id}/accept",
+            "/improvement/proposals/{proposal_id}/reject",
             "/operator/inbox",
             "/operator/executions",
             "/operator/executions/{execution_id}",
@@ -846,7 +858,36 @@ def build_manifest() -> dict:
                 "selected_option",
                 "decision_reason",
                 "confidence",
+                "result_quality",
                 "resulting_goal_or_plan_id",
+                "metadata_json",
+                "created_at",
+            ],
+            "ImprovementProposal": [
+                "proposal_id",
+                "source",
+                "actor",
+                "proposal_type",
+                "trigger_pattern",
+                "evidence_summary",
+                "evidence",
+                "affected_component",
+                "suggested_change",
+                "confidence",
+                "safety_class",
+                "risk_summary",
+                "test_recommendation",
+                "status",
+                "review_reason",
+                "metadata_json",
+                "created_at",
+            ],
+            "ImprovementArtifact": [
+                "artifact_id",
+                "proposal_id",
+                "artifact_type",
+                "status",
+                "candidate_payload",
                 "metadata_json",
                 "created_at",
             ],

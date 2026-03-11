@@ -18,6 +18,7 @@ async def record_decision(
     selected_option: dict,
     decision_reason: str,
     confidence: float,
+    result_quality: float = 0.0,
     resulting_goal_or_plan_id: str,
     metadata_json: dict,
     db: AsyncSession,
@@ -33,6 +34,7 @@ async def record_decision(
         selected_option_json=selected_option if isinstance(selected_option, dict) else {},
         decision_reason=str(decision_reason or ""),
         confidence=max(0.0, min(1.0, float(confidence or 0.0))),
+        result_quality=max(0.0, min(1.0, float(result_quality or 0.0))),
         resulting_goal_or_plan_id=str(resulting_goal_or_plan_id or ""),
         metadata_json=metadata_json if isinstance(metadata_json, dict) else {},
     )
@@ -77,6 +79,7 @@ def to_decision_record_out(row: WorkspaceDecisionRecord) -> dict:
         "selected_option": row.selected_option_json if isinstance(row.selected_option_json, dict) else {},
         "decision_reason": row.decision_reason,
         "confidence": float(row.confidence),
+        "result_quality": float(row.result_quality),
         "resulting_goal_or_plan_id": row.resulting_goal_or_plan_id,
         "metadata_json": row.metadata_json if isinstance(row.metadata_json, dict) else {},
         "created_at": row.created_at,

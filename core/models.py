@@ -694,5 +694,38 @@ class WorkspaceDecisionRecord(Base, TimestampMixin):
     selected_option_json: Mapped[dict] = mapped_column(JSON, default=dict)
     decision_reason: Mapped[str] = mapped_column(Text, default="")
     confidence: Mapped[float] = mapped_column(default=0.0)
+    result_quality: Mapped[float] = mapped_column(default=0.0)
     resulting_goal_or_plan_id: Mapped[str] = mapped_column(String(120), default="")
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class WorkspaceImprovementProposal(Base, TimestampMixin):
+    __tablename__ = "workspace_improvement_proposals"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    source: Mapped[str] = mapped_column(String(80), default="objective49", index=True)
+    actor: Mapped[str] = mapped_column(String(120), default="workspace")
+    proposal_type: Mapped[str] = mapped_column(String(120), index=True)
+    trigger_pattern: Mapped[str] = mapped_column(String(200), default="", index=True)
+    evidence_summary: Mapped[str] = mapped_column(Text, default="")
+    evidence_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    affected_component: Mapped[str] = mapped_column(String(160), default="", index=True)
+    suggested_change: Mapped[str] = mapped_column(Text, default="")
+    confidence: Mapped[float] = mapped_column(default=0.0)
+    safety_class: Mapped[str] = mapped_column(String(40), default="bounded_review", index=True)
+    risk_summary: Mapped[str] = mapped_column(Text, default="")
+    test_recommendation: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(40), default="proposed", index=True)
+    review_reason: Mapped[str] = mapped_column(Text, default="")
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class WorkspaceImprovementArtifact(Base, TimestampMixin):
+    __tablename__ = "workspace_improvement_artifacts"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    proposal_id: Mapped[int] = mapped_column(ForeignKey("workspace_improvement_proposals.id", ondelete="CASCADE"), index=True)
+    artifact_type: Mapped[str] = mapped_column(String(80), default="policy_change_candidate", index=True)
+    status: Mapped[str] = mapped_column(String(40), default="pending_review", index=True)
+    candidate_payload_json: Mapped[dict] = mapped_column(JSON, default=dict)
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
