@@ -64,6 +64,9 @@ def to_constraint_evaluation_out(row: ConstraintEvaluation) -> dict:
         "workspace_state": row.workspace_state_json if isinstance(row.workspace_state_json, dict) else {},
         "system_state": row.system_state_json if isinstance(row.system_state_json, dict) else {},
         "policy_state": row.policy_state_json if isinstance(row.policy_state_json, dict) else {},
+        "outcome_result": row.outcome_result,
+        "outcome_quality": float(row.outcome_quality),
+        "outcome_recorded_at": row.outcome_recorded_at,
         "explanation": row.explanation_json if isinstance(row.explanation_json, dict) else {},
         "created_at": row.created_at,
     }

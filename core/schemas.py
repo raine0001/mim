@@ -855,6 +855,23 @@ class ConstraintEvaluateRequest(BaseModel):
     metadata_json: dict = Field(default_factory=dict)
 
 
+class ConstraintOutcomeRecordRequest(BaseModel):
+    actor: str = "workspace"
+    evaluation_id: int = Field(ge=1)
+    result: str = "unknown"
+    outcome_quality: float = Field(default=0.0, ge=0.0, le=1.0)
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class ConstraintLearningGenerateProposalsRequest(BaseModel):
+    actor: str = "workspace"
+    source: str = "objective45"
+    min_samples: int = Field(default=5, ge=1, le=1000)
+    success_rate_threshold: float = Field(default=0.75, ge=0.0, le=1.0)
+    max_proposals: int = Field(default=5, ge=1, le=50)
+    metadata_json: dict = Field(default_factory=dict)
+
+
 WorkspaceInterruptionType = Literal[
     "human_detected_in_workspace",
     "operator_pause",

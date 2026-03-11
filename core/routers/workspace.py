@@ -50,6 +50,9 @@ MONITORING_DEFAULT_INTERVAL_SECONDS = 30
 MONITORING_DEFAULT_FRESHNESS_THRESHOLD_SECONDS = 900
 MONITORING_DEFAULT_COOLDOWN_SECONDS = 10
 MONITORING_DEFAULT_MAX_SCAN_RATE = 6
+MONITORING_CONFIDENCE_DELTA_THRESHOLD = 0.02
+MONITORING_DELTA_HISTORY_SECONDS = 30
+MONITORING_DELTA_HISTORY_MAX_ITEMS = 200
 CHAIN_DEFAULT_STEP_POLICY = {
     "terminal_statuses": ["accepted", "rejected"],
     "failure_statuses": ["rejected"],
@@ -1803,10 +1806,28 @@ def _snapshot_from_objects(rows: list[WorkspaceObjectMemory]) -> dict[str, dict]
 def _compute_object_deltas(*, previous_snapshot: dict, current_rows: list[WorkspaceObjectMemory]) -> list[dict]:
     deltas: list[dict] = []
     current_snapshot = _snapshot_from_objects(current_rows)
+    previous_by_name: dict[str, tuple[str, dict]] = {}
+    if isinstance(previous_snapshot, dict):
+        for previous_id, previous_payload in previous_snapshot.items():
+            if not isinstance(previous_payload, dict):
+                continue
+            canonical = str(previous_payload.get("canonical_name", "")).strip().lower()
+            if canonical:
+                previous_by_name[canonical] = (str(previous_id), previous_payload)
+
+    matched_previous_ids: set[str] = set()
 
     for row in current_rows:
         key = str(row.id)
         previous = previous_snapshot.get(key, {}) if isinstance(previous_snapshot, dict) else {}
+        if not previous:
+            canonical_key = str(row.canonical_name or "").strip().lower()
+            previous_alias = previous_by_name.get(canonical_key)
+            if previous_alias:
+                alias_previous_id, alias_previous_payload = previous_alias
+                previous = alias_previous_payload if isinstance(alias_previous_payload, dict) else {}
+                matched_previous_ids.add(alias_previous_id)
+
         if not previous:
             deltas.append(
                 {
@@ -1850,7 +1871,7 @@ def _compute_object_deltas(*, previous_snapshot: dict, current_rows: list[Worksp
             previous_confidence = float(previous.get("confidence", row.confidence))
         except (TypeError, ValueError):
             previous_confidence = float(row.confidence)
-        if abs(float(row.confidence) - previous_confidence) >= 0.1:
+        if abs(float(row.confidence) - previous_confidence) >= MONITORING_CONFIDENCE_DELTA_THRESHOLD:
             deltas.append(
                 {
                     "event": "confidence_changed",
@@ -1864,7 +1885,7 @@ def _compute_object_deltas(*, previous_snapshot: dict, current_rows: list[Worksp
 
     previous_ids = set(previous_snapshot.keys()) if isinstance(previous_snapshot, dict) else set()
     current_ids = set(current_snapshot.keys())
-    for orphan_id in sorted(previous_ids - current_ids):
+    for orphan_id in sorted(previous_ids - current_ids - matched_previous_ids):
         previous = previous_snapshot.get(orphan_id, {}) if isinstance(previous_snapshot, dict) else {}
         deltas.append(
             {
@@ -1955,6 +1976,8 @@ def _monitoring_should_scan(
                 parsed = parsed.replace(tzinfo=timezone.utc)
             else:
                 parsed = parsed.astimezone(timezone.utc)
+            if row.last_started_at and parsed < row.last_started_at:
+                continue
             if (now - parsed).total_seconds() <= 60:
                 recent_scans.append(parsed)
 
@@ -2041,14 +2064,50 @@ async def _run_monitoring_scan_cycle(*, db: AsyncSession, row: WorkspaceMonitori
             parsed = parsed.replace(tzinfo=timezone.utc)
         else:
             parsed = parsed.astimezone(timezone.utc)
+        if row.last_started_at and parsed < row.last_started_at:
+            continue
         if (now - parsed).total_seconds() <= 60:
             filtered_recent.append(item)
     recent_scan_strings = filtered_recent
 
+    delta_with_timestamps: list[dict] = []
+    for item in deltas:
+        if not isinstance(item, dict):
+            continue
+        delta_with_timestamps.append(
+            {
+                **item,
+                "detected_at": str(item.get("detected_at") or now.isoformat()),
+            }
+        )
+
+    existing_delta_history = row.last_deltas_json if isinstance(row.last_deltas_json, list) else []
+    merged_delta_history: list[dict] = []
+    for item in [*existing_delta_history, *delta_with_timestamps]:
+        if not isinstance(item, dict):
+            continue
+        raw_detected_at = str(item.get("detected_at", "")).strip()
+        if not raw_detected_at:
+            raw_detected_at = now.isoformat()
+        candidate = raw_detected_at[:-1] + "+00:00" if raw_detected_at.endswith("Z") else raw_detected_at
+        try:
+            parsed = datetime.fromisoformat(candidate)
+        except ValueError:
+            parsed = now
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        else:
+            parsed = parsed.astimezone(timezone.utc)
+        if (now - parsed).total_seconds() <= MONITORING_DELTA_HISTORY_SECONDS:
+            merged_delta_history.append({**item, "detected_at": parsed.isoformat()})
+
+    if len(merged_delta_history) > MONITORING_DELTA_HISTORY_MAX_ITEMS:
+        merged_delta_history = merged_delta_history[-MONITORING_DELTA_HISTORY_MAX_ITEMS:]
+
     row.last_scan_at = now
     row.scan_count = int(row.scan_count) + 1
     row.last_scan_reason = reason
-    row.last_deltas_json = deltas
+    row.last_deltas_json = merged_delta_history
     row.last_proposal_ids = proposal_ids
     row.last_snapshot_json = _snapshot_from_objects(objects)
     row.runtime_status = "running"
@@ -2894,6 +2953,7 @@ async def start_workspace_monitoring(
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     row = await _get_or_create_monitoring_state(db)
+    existing_metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
     row.desired_running = True
     row.runtime_status = "running"
     row.scan_trigger_mode = payload.trigger_mode
@@ -2902,13 +2962,21 @@ async def start_workspace_monitoring(
     row.cooldown_seconds = payload.cooldown_seconds
     row.max_scan_rate = payload.max_scan_rate
     row.priority_zones = [item.strip() for item in payload.priority_zones if str(item).strip()]
+    row.last_scan_at = None
+    row.last_scan_reason = ""
+    row.scan_count = 0
+    row.last_deltas_json = []
+    row.last_proposal_ids = []
     row.last_started_at = datetime.now(timezone.utc)
     row.metadata_json = {
-        **(row.metadata_json if isinstance(row.metadata_json, dict) else {}),
+        **existing_metadata,
+        "recent_scans": [],
         "started_by": payload.actor,
         "start_reason": payload.reason,
         **payload.metadata_json,
     }
+
+    await _run_monitoring_scan_cycle(db=db, row=row, reason="start_bootstrap")
 
     await write_journal(
         db,

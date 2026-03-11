@@ -114,6 +114,9 @@ async def ensure_schema() -> None:
         await conn.execute(text("ALTER TABLE IF EXISTS user_preferences ADD COLUMN IF NOT EXISTS confidence DOUBLE PRECISION DEFAULT 0.0"))
         await conn.execute(text("ALTER TABLE IF EXISTS user_preferences ADD COLUMN IF NOT EXISTS source VARCHAR(80) DEFAULT 'manual'"))
         await conn.execute(text("ALTER TABLE IF EXISTS user_preferences ADD COLUMN IF NOT EXISTS last_updated TIMESTAMPTZ DEFAULT now()"))
+        await conn.execute(text("ALTER TABLE IF EXISTS constraint_evaluations ADD COLUMN IF NOT EXISTS outcome_result VARCHAR(40) DEFAULT 'unknown'"))
+        await conn.execute(text("ALTER TABLE IF EXISTS constraint_evaluations ADD COLUMN IF NOT EXISTS outcome_quality DOUBLE PRECISION DEFAULT 0.0"))
+        await conn.execute(text("ALTER TABLE IF EXISTS constraint_evaluations ADD COLUMN IF NOT EXISTS outcome_recorded_at TIMESTAMPTZ"))
 
     await initialize_workspace_monitoring_runtime()
 

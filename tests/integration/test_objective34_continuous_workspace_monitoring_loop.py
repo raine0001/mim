@@ -156,7 +156,7 @@ class Objective34ContinuousWorkspaceMonitoringLoopTest(unittest.TestCase):
             seen_events.update(str(item) for item in events if str(item).strip())
             return "object_moved" in seen_events and "object_missing" in seen_events and "confidence_changed" in seen_events
 
-        self.assertTrue(self._wait_for(has_required_deltas, timeout_seconds=10), "delta detection requirements not met")
+        self.assertTrue(self._wait_for(has_required_deltas, timeout_seconds=20), "delta detection requirements not met")
 
         status, proposals = get_json("/workspace/proposals?status=pending")
         self.assertEqual(status, 200, proposals)

@@ -592,4 +592,25 @@ class ConstraintEvaluation(Base, TimestampMixin):
     warnings_json: Mapped[list[dict]] = mapped_column(JSON, default=list)
     recommended_next_step: Mapped[str] = mapped_column(String(120), default="execute")
     confidence: Mapped[float] = mapped_column(default=0.0)
+    outcome_result: Mapped[str] = mapped_column(String(40), default="unknown", index=True)
+    outcome_quality: Mapped[float] = mapped_column(default=0.0)
+    outcome_recorded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     explanation_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class ConstraintAdjustmentProposal(Base, TimestampMixin):
+    __tablename__ = "constraint_adjustment_proposals"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    source: Mapped[str] = mapped_column(String(80), default="objective45", index=True)
+    actor: Mapped[str] = mapped_column(String(120), default="workspace")
+    constraint_key: Mapped[str] = mapped_column(String(120), index=True)
+    proposal_type: Mapped[str] = mapped_column(String(80), default="soft_weight_adjustment")
+    current_value: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    proposed_value: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    sample_size: Mapped[int] = mapped_column(default=0)
+    success_rate: Mapped[float] = mapped_column(default=0.0)
+    hard_constraint: Mapped[bool] = mapped_column(default=False)
+    rationale: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(40), default="proposed", index=True)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)

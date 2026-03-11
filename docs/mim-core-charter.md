@@ -426,3 +426,108 @@ Hard constraints remain non-negotiable.
 ### 14.10 Design Philosophy
 
 The engine enables MIM to understand why actions are blocked, choose safer alternatives, propose improvements, and remain both curious and responsible.
+
+### 14.11 Constraint Adaptation Through Experience
+
+MIM is permitted to refine and adjust soft constraint weights through experience.
+
+This allows the system to improve decision-making over time while preserving hard safety guarantees.
+
+Constraint learning may occur when:
+
+- repeated actions succeed despite soft constraint warnings
+- repeated constraint blocks prove unnecessary
+- environmental patterns indicate better thresholds
+- operator feedback indicates preference for different behavior
+
+Constraint learning must preserve these guarantees:
+
+- hard safety constraints (human safety, legality, system integrity, irreversible damage risk) are never modified autonomously
+- learned adjustments remain auditable
+- policy changes remain reversible
+- significant changes are surfaced to operators
+
+### 14.12 Constraint Learning Workflow
+
+The engine records each evaluation with fields including:
+
+- goal
+- action_plan
+- constraints_evaluated
+- decision
+- result
+- outcome_quality
+
+From accumulated outcomes, MIM may detect patterns and propose soft-constraint adjustments.
+
+Example:
+
+- constraint: `object_confidence_threshold >= 0.85`
+- observation: repeated successful actions near `0.75`
+- proposal: lower soft threshold for validation
+
+This remains proposal-driven and never silent:
+
+`constraint_adjustment_proposal -> validate -> test -> gated promotion`
+
+Constraint policy changes follow the same gate/promote process as code changes.
+
+### 14.13 Hard vs Soft Learnability Boundary
+
+Hard constraints (never learnable):
+
+- human safety
+- unlawful behavior
+- system integrity
+- irreversible damage risk
+
+Soft constraints (learnable through proposal + review):
+
+- confidence thresholds
+- rescan frequency
+- priority weights
+- autonomy limits
+- zone preferences
+- operator behavior patterns
+
+### 14.14 Constraint Learning Model Evolution
+
+Current model:
+
+`rules -> decision`
+
+Learning-aware model:
+
+`rules + experience -> weighted decision`
+
+Context-adaptive model:
+
+`rules + experience + context -> adaptive decision`
+
+This is the intended evolution path for safe adaptive autonomy.
+
+### 14.15 Objective 45 Scope: Constraint Weight Learning
+
+Objective 45 introduces a practical V1 of constraint learning:
+
+- record constraint outcomes
+- calculate success/failure patterns
+- generate constraint adjustment proposals
+- run proposals through the same `gate -> promote` workflow
+
+MIM proposes constraint changes; it does not silently apply them.
+
+To keep V1 focused and safe, initial implementation should prioritize:
+
+- counters
+- rolling success rates
+- threshold proposals
+- operator review
+
+### 14.16 Closed Learning Loop
+
+The autonomy stack evolves to:
+
+`Perception -> Memory -> Identity -> Spatial Map -> Planning -> Constraint Evaluation -> Execution -> Feedback -> Constraint Learning`
+
+Constraint learning closes the improvement loop while preserving hard safety and auditability.

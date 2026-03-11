@@ -7,7 +7,7 @@ from core.config import PROJECT_ROOT, settings
 
 CONTRACT_VERSION = "tod-mim-shared-contract-v1"
 MANIFEST_VERSION = "1"
-SCHEMA_VERSION = "2026-03-11-35"
+SCHEMA_VERSION = "2026-03-11-36"
 
 SIGNATURE_FILES = [
     "core/models.py",
@@ -45,11 +45,17 @@ SIGNATURE_FILES = [
     "docs/objective-42-multi-capability-coordination.md",
     "docs/objective-43-human-aware-workspace-behavior.md",
     "docs/objective-44-constraint-evaluation-engine.md",
+    "docs/objective-45-constraint-weight-learning.md",
+    "docs/objective-45-promotion-readiness-report.md",
+    "docs/objective-45-prod-promotion-report.md",
     "docs/mim-core-charter.md",
     "core/routers/workspace.py",
     "core/routers/constraints.py",
+    "core/routers/constraint_learning.py",
     "core/constraint_engine.py",
     "core/constraint_service.py",
+    "core/constraint_learning.py",
+    "core/constraint_learning_service.py",
     "core/routers/preferences.py",
     "core/preferences.py",
     "config/vision_policy.json",
@@ -119,6 +125,7 @@ CAPABILITIES = [
     "multi_capability_coordination",
     "human_aware_workspace_behavior",
     "constraint_evaluation_engine",
+    "constraint_weight_learning",
 ]
 
 RECENT_CHANGES = [
@@ -160,6 +167,7 @@ RECENT_CHANGES = [
     "Added Objective 42 safe multi-capability chain coordination with dependency policy, step verification, stop-on-failure escalation, and explainable chain audit trail",
     "Added Objective 43 human-aware workspace behavior signals and policy gating for shared-workspace pause/confirm/replan decisions with inspectable state",
     "Added Objective 44 centralized constraint evaluation engine with structured decision outcomes, explanation metadata, and reusable integration hooks",
+    "Added Objective 45 proposal-only constraint weight learning loop with outcome recording, rolling success stats, and auditable soft adjustment proposals",
 ]
 
 
@@ -287,6 +295,10 @@ def build_manifest() -> dict:
             "/constraints/evaluate",
             "/constraints/last-evaluation",
             "/constraints/history",
+            "/constraints/outcomes",
+            "/constraints/learning/stats",
+            "/constraints/learning/proposals/generate",
+            "/constraints/learning/proposals",
             "/operator/inbox",
             "/operator/executions",
             "/operator/executions/{execution_id}",
@@ -714,6 +726,42 @@ def build_manifest() -> dict:
                 "completed_step_ids",
                 "failed_step_ids",
                 "audit_trail_json",
+                "metadata_json",
+                "created_at",
+            ],
+            "ConstraintEvaluation": [
+                "evaluation_id",
+                "source",
+                "actor",
+                "decision",
+                "violations",
+                "warnings",
+                "recommended_next_step",
+                "confidence",
+                "goal",
+                "action_plan",
+                "workspace_state",
+                "system_state",
+                "policy_state",
+                "outcome_result",
+                "outcome_quality",
+                "outcome_recorded_at",
+                "explanation",
+                "created_at",
+            ],
+            "ConstraintAdjustmentProposal": [
+                "proposal_id",
+                "source",
+                "actor",
+                "constraint_key",
+                "proposal_type",
+                "current_value",
+                "proposed_value",
+                "sample_size",
+                "success_rate",
+                "hard_constraint",
+                "rationale",
+                "status",
                 "metadata_json",
                 "created_at",
             ],
