@@ -1041,6 +1041,33 @@ class MaintenanceCycleRequest(BaseModel):
     metadata_json: dict = Field(default_factory=dict)
 
 
+class PolicyExperimentRunRequest(BaseModel):
+    actor: str = "workspace"
+    source: str = "objective51"
+    proposal_id: int | None = Field(default=None, ge=1)
+    experiment_type: str = "policy_adjustment_sandbox"
+    lookback_hours: int = Field(default=24, ge=1, le=720)
+    sandbox_mode: str = "shadow_evaluation"
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class PolicyExperimentOut(BaseModel):
+    experiment_id: int
+    source: str
+    actor: str
+    proposal_id: int | None
+    experiment_type: str
+    sandbox_mode: str
+    status: str
+    baseline_metrics: dict
+    experimental_metrics: dict
+    comparison: dict
+    recommendation: str
+    recommendation_reason: str
+    metadata_json: dict
+    created_at: datetime
+
+
 WorkspaceInterruptionType = Literal[
     "human_detected_in_workspace",
     "operator_pause",

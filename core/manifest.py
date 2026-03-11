@@ -7,7 +7,7 @@ from core.config import PROJECT_ROOT, settings
 
 CONTRACT_VERSION = "tod-mim-shared-contract-v1"
 MANIFEST_VERSION = "1"
-SCHEMA_VERSION = "2026-03-11-41"
+SCHEMA_VERSION = "2026-03-11-42"
 
 SIGNATURE_FILES = [
     "core/models.py",
@@ -25,10 +25,12 @@ SIGNATURE_FILES = [
     "core/environment_strategy_service.py",
     "core/decision_record_service.py",
     "core/improvement_service.py",
+    "core/policy_experiment_service.py",
     "core/maintenance_service.py",
     "core/routers/environment_strategy.py",
     "core/routers/decision_records.py",
     "core/routers/improvement.py",
+    "core/routers/policy_experiments.py",
     "core/routers/maintenance.py",
     "docs/tod-mim-bridge.md",
     "docs/objective-21-unified-input-gateway.md",
@@ -75,6 +77,8 @@ SIGNATURE_FILES = [
     "docs/objective-50-environment-maintenance-autonomy.md",
     "docs/objective-50-promotion-readiness-report.md",
     "docs/objective-50-prod-promotion-report.md",
+    "docs/objective-51-policy-experiment-sandbox.md",
+    "docs/objective-51-promotion-readiness-report.md",
     "core/routers/workspace.py",
     "core/routers/constraints.py",
     "core/routers/constraint_learning.py",
@@ -158,6 +162,7 @@ CAPABILITIES = [
     "decision_record_trace",
     "self_improvement_proposal_engine",
     "environment_maintenance_autonomy",
+    "policy_experiment_sandbox",
 ]
 
 RECENT_CHANGES = [
@@ -205,6 +210,7 @@ RECENT_CHANGES = [
     "Added Objective 48 preference-aware strategy integration with routine pattern strategy generation and unified decision record reasoning trace",
     "Added Objective 49 self-improvement proposal engine with rule-based friction pattern detection and review-gated improvement artifacts",
     "Added Objective 50 proactive environment maintenance autonomy with degraded-state detection, auto maintenance strategies, and bounded corrective execution audit trail",
+    "Added Objective 51 policy experiment sandbox with bounded soft-policy trial runs, baseline-vs-experiment comparison, and promote/reject/revise recommendations",
 ]
 
 
@@ -354,6 +360,9 @@ def build_manifest() -> dict:
             "/improvement/proposals/{proposal_id}",
             "/improvement/proposals/{proposal_id}/accept",
             "/improvement/proposals/{proposal_id}/reject",
+            "/improvement/experiments/run",
+            "/improvement/experiments",
+            "/improvement/experiments/{experiment_id}",
             "/maintenance/cycle",
             "/maintenance/runs",
             "/maintenance/runs/{run_id}",
@@ -924,6 +933,22 @@ def build_manifest() -> dict:
                 "status",
                 "reason",
                 "details_json",
+                "created_at",
+            ],
+            "PolicyExperiment": [
+                "experiment_id",
+                "source",
+                "actor",
+                "proposal_id",
+                "experiment_type",
+                "sandbox_mode",
+                "status",
+                "baseline_metrics",
+                "experimental_metrics",
+                "comparison",
+                "recommendation",
+                "recommendation_reason",
+                "metadata_json",
                 "created_at",
             ],
         },

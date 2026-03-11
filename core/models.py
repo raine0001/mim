@@ -758,3 +758,21 @@ class WorkspaceMaintenanceAction(Base, TimestampMixin):
     status: Mapped[str] = mapped_column(String(40), default="succeeded", index=True)
     reason: Mapped[str] = mapped_column(Text, default="")
     details_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class WorkspacePolicyExperiment(Base, TimestampMixin):
+    __tablename__ = "workspace_policy_experiments"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    source: Mapped[str] = mapped_column(String(80), default="objective51", index=True)
+    actor: Mapped[str] = mapped_column(String(120), default="workspace")
+    proposal_id: Mapped[int | None] = mapped_column(ForeignKey("workspace_improvement_proposals.id", ondelete="SET NULL"), nullable=True, index=True)
+    experiment_type: Mapped[str] = mapped_column(String(120), default="soft_constraint_sandbox", index=True)
+    sandbox_mode: Mapped[str] = mapped_column(String(80), default="shadow_evaluation")
+    status: Mapped[str] = mapped_column(String(40), default="completed", index=True)
+    baseline_metrics_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    experimental_metrics_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    comparison_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    recommendation: Mapped[str] = mapped_column(String(40), default="revise", index=True)
+    recommendation_reason: Mapped[str] = mapped_column(Text, default="")
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
