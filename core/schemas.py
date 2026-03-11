@@ -844,6 +844,17 @@ class WorkspaceHumanAwareSignalUpdateRequest(BaseModel):
     metadata_json: dict = Field(default_factory=dict)
 
 
+class ConstraintEvaluateRequest(BaseModel):
+    actor: str = "workspace"
+    source: str = "api"
+    goal: dict = Field(default_factory=dict)
+    action_plan: dict = Field(default_factory=dict)
+    workspace_state: dict = Field(default_factory=dict)
+    system_state: dict = Field(default_factory=dict)
+    policy_state: dict = Field(default_factory=dict)
+    metadata_json: dict = Field(default_factory=dict)
+
+
 WorkspaceInterruptionType = Literal[
     "human_detected_in_workspace",
     "operator_pause",

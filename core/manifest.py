@@ -7,7 +7,7 @@ from core.config import PROJECT_ROOT, settings
 
 CONTRACT_VERSION = "tod-mim-shared-contract-v1"
 MANIFEST_VERSION = "1"
-SCHEMA_VERSION = "2026-03-11-34"
+SCHEMA_VERSION = "2026-03-11-35"
 
 SIGNATURE_FILES = [
     "core/models.py",
@@ -44,7 +44,12 @@ SIGNATURE_FILES = [
     "docs/objective-41-closed-loop-autonomous-task-execution.md",
     "docs/objective-42-multi-capability-coordination.md",
     "docs/objective-43-human-aware-workspace-behavior.md",
+    "docs/objective-44-constraint-evaluation-engine.md",
+    "docs/mim-core-charter.md",
     "core/routers/workspace.py",
+    "core/routers/constraints.py",
+    "core/constraint_engine.py",
+    "core/constraint_service.py",
     "core/routers/preferences.py",
     "core/preferences.py",
     "config/vision_policy.json",
@@ -113,6 +118,7 @@ CAPABILITIES = [
     "closed_loop_autonomous_task_execution",
     "multi_capability_coordination",
     "human_aware_workspace_behavior",
+    "constraint_evaluation_engine",
 ]
 
 RECENT_CHANGES = [
@@ -153,6 +159,7 @@ RECENT_CHANGES = [
     "Added Objective 41 closed-loop autonomous controller with policy outcomes, safety throttle expansion, interruption-aware pausing, and result verification audit",
     "Added Objective 42 safe multi-capability chain coordination with dependency policy, step verification, stop-on-failure escalation, and explainable chain audit trail",
     "Added Objective 43 human-aware workspace behavior signals and policy gating for shared-workspace pause/confirm/replan decisions with inspectable state",
+    "Added Objective 44 centralized constraint evaluation engine with structured decision outcomes, explanation metadata, and reusable integration hooks",
 ]
 
 
@@ -277,6 +284,9 @@ def build_manifest() -> dict:
             "/gateway/voice/output",
             "/gateway/vision/observations",
             "/gateway/capabilities",
+            "/constraints/evaluate",
+            "/constraints/last-evaluation",
+            "/constraints/history",
             "/operator/inbox",
             "/operator/executions",
             "/operator/executions/{execution_id}",

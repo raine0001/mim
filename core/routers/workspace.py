@@ -9,6 +9,7 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from core.db import SessionLocal, get_db
 from core.journal import write_journal
+from core.constraint_service import evaluate_and_record_constraints
 from core.models import CapabilityExecution, CapabilityRegistration, InputEvent, SpeechOutputAction, Task, WorkspaceActionPlan, WorkspaceAutonomousChain, WorkspaceCapabilityChain, WorkspaceInterruptionEvent, WorkspaceMonitoringState, WorkspaceObjectMemory, WorkspaceObjectRelation, WorkspaceObservation, WorkspaceProposal, WorkspaceReplanSignal, WorkspaceTargetResolution, WorkspaceZone, WorkspaceZoneRelation
 from core.preferences import DEFAULT_USER_ID, apply_learning_signal, get_user_preference_payload, get_user_preference_value
 from core.schemas import WorkspaceActionPlanAbortRequest, WorkspaceActionPlanCreateRequest, WorkspaceActionPlanDecisionRequest, WorkspaceActionPlanExecuteRequest, WorkspaceActionPlanHandoffRequest, WorkspaceActionPlanReplanRequest, WorkspaceActionPlanSimulationRequest, WorkspaceAutonomousChainAdvanceRequest, WorkspaceAutonomousChainApprovalRequest, WorkspaceAutonomousChainCreateRequest, WorkspaceAutonomyOverrideRequest, WorkspaceCapabilityChainAdvanceRequest, WorkspaceCapabilityChainCreateRequest, WorkspaceExecutionPauseRequest, WorkspaceExecutionPredictChangeRequest, WorkspaceExecutionProposalActionRequest, WorkspaceExecutionProposalCreateRequest, WorkspaceExecutionResumeRequest, WorkspaceExecutionStopRequest, WorkspaceHumanAwareSignalUpdateRequest, WorkspaceMonitoringStartRequest, WorkspaceMonitoringStopRequest, WorkspaceProposalActionRequest, WorkspaceProposalPriorityPolicyUpdateRequest, WorkspaceTargetConfirmRequest, WorkspaceTargetResolveRequest
@@ -980,6 +981,39 @@ async def _maybe_auto_execute_workspace_proposal(
         return False, interruption_reason
 
     human_aware = _human_aware_state_from_monitoring(monitoring)
+    _, constraint_result = await evaluate_and_record_constraints(
+        actor="workspace-autonomy-controller",
+        source="objective44_autonomy_auto_execute",
+        goal={
+            "goal_type": "proposal_auto_execute",
+            "proposal_id": proposal.id,
+            "proposal_type": proposal.proposal_type,
+        },
+        action_plan={
+            "action_type": "auto_execute_proposal",
+            "proposal_type": proposal.proposal_type,
+            "is_physical": proposal.proposal_type in HUMAN_AWARE_PHYSICAL_PROPOSAL_TYPES,
+        },
+        workspace_state={
+            "human_in_workspace": human_aware.get("human_in_workspace", False),
+            "human_near_target_zone": human_aware.get("human_near_target_zone", False),
+            "human_near_motion_path": human_aware.get("human_near_motion_path", False),
+            "shared_workspace_active": human_aware.get("shared_workspace_active", False),
+            "target_confidence": float(proposal.confidence),
+            "map_freshness_seconds": 0,
+        },
+        system_state={"throttle_blocked": False, "integrity_risk": False},
+        policy_state={
+            "min_target_confidence": float(autonomy_state.get("auto_safe_confidence_threshold", 0.8)),
+            "map_freshness_limit_seconds": MONITORING_DEFAULT_FRESHNESS_THRESHOLD_SECONDS,
+            "unlawful_action": False,
+        },
+        metadata_json={"trigger_reason": trigger_reason},
+        db=db,
+    )
+    if constraint_result.get("decision") in {"requires_confirmation", "requires_replan", "blocked"}:
+        return False, f"constraint_{constraint_result.get('decision')}:objective44"
+
     human_outcome, human_reason = _human_aware_policy_for_proposal(proposal=proposal, human_aware=human_aware)
     if human_outcome in {"pause", "require_operator_confirmation", "stop_replan"}:
         human_aware["last_policy_decision"] = {
@@ -3290,6 +3324,56 @@ async def advance_workspace_capability_chain(
 
     monitoring = await _get_or_create_monitoring_state(db)
     human_aware = _human_aware_state_from_monitoring(monitoring)
+    _, chain_constraint_result = await evaluate_and_record_constraints(
+        actor=payload.actor,
+        source="objective44_capability_chain_advance",
+        goal={"goal_type": "advance_capability_chain", "chain_id": row.id, "step_id": step_id},
+        action_plan={
+            "action_type": str(step.get("capability", "")).strip(),
+            "chain_id": row.id,
+            "step_id": step_id,
+            "is_physical": _is_physical_capability_step(str(step.get("capability", "")).strip()),
+        },
+        workspace_state={
+            "human_in_workspace": human_aware.get("human_in_workspace", False),
+            "human_near_target_zone": human_aware.get("human_near_target_zone", False),
+            "human_near_motion_path": human_aware.get("human_near_motion_path", False),
+            "shared_workspace_active": human_aware.get("shared_workspace_active", False),
+            "target_confidence": 1.0,
+            "map_freshness_seconds": 0,
+        },
+        system_state={"throttle_blocked": False, "integrity_risk": False},
+        policy_state={
+            "min_target_confidence": 0.7,
+            "map_freshness_limit_seconds": MONITORING_DEFAULT_FRESHNESS_THRESHOLD_SECONDS,
+            "unlawful_action": False,
+        },
+        metadata_json={"reason": payload.reason, **payload.metadata_json},
+        db=db,
+    )
+    chain_decision = str(chain_constraint_result.get("decision", "allowed"))
+    if chain_decision in {"requires_replan", "blocked"} and not payload.force:
+        row.status = "failed" if chain_decision == "blocked" else "pending_replan"
+        _append_capability_chain_audit(
+            row,
+            actor=payload.actor,
+            event="capability_step_blocked_constraint_engine",
+            reason=f"decision={chain_decision}",
+            metadata_json={"step_id": step_id, "constraint_result": chain_constraint_result, **payload.metadata_json},
+        )
+        await db.commit()
+        await db.refresh(row)
+        return {
+            **_to_workspace_capability_chain_out(row),
+            "last_step": {
+                "step_id": step_id,
+                "capability": step.get("capability", ""),
+                "result": f"constraint_{chain_decision}",
+                "success": False,
+                "verification": {"constraint_result": chain_constraint_result},
+            },
+        }
+
     human_outcome, human_reason = _human_aware_policy_for_capability_step(step=step, human_aware=human_aware)
     if human_outcome in {"pause", "require_operator_confirmation", "stop_replan"} and not payload.force:
         if human_outcome == "pause":
@@ -4489,6 +4573,43 @@ async def execute_workspace_action_plan(
     target = await db.get(WorkspaceTargetResolution, row.target_resolution_id)
     if not target:
         raise HTTPException(status_code=404, detail="workspace target resolution not found")
+
+    monitoring = await _get_or_create_monitoring_state(db)
+    human_aware = _human_aware_state_from_monitoring(monitoring)
+    _, constraint_result = await evaluate_and_record_constraints(
+        actor=payload.actor,
+        source="objective44_action_plan_execute",
+        goal={
+            "goal_type": "execute_action_plan",
+            "plan_id": row.id,
+            "desired_state": "execution_dispatched",
+        },
+        action_plan={
+            "action_type": "execute_action_plan",
+            "plan_id": row.id,
+            "capability_name": payload.capability_name,
+            "is_physical": True,
+        },
+        workspace_state={
+            "human_in_workspace": human_aware.get("human_in_workspace", False),
+            "human_near_target_zone": human_aware.get("human_near_target_zone", False),
+            "human_near_motion_path": human_aware.get("human_near_motion_path", False),
+            "shared_workspace_active": human_aware.get("shared_workspace_active", False),
+            "target_confidence": float(target.confidence),
+            "map_freshness_seconds": 0,
+        },
+        system_state={"throttle_blocked": False, "integrity_risk": False},
+        policy_state={
+            "min_target_confidence": payload.target_confidence_minimum,
+            "map_freshness_limit_seconds": MONITORING_DEFAULT_FRESHNESS_THRESHOLD_SECONDS,
+            "unlawful_action": False,
+        },
+        metadata_json={"reason": payload.reason, **payload.metadata_json},
+        db=db,
+    )
+    decision = str(constraint_result.get("decision", "allowed"))
+    if decision in {"requires_confirmation", "requires_replan", "blocked"}:
+        raise HTTPException(status_code=422, detail=f"constraint engine blocked execution: {decision}")
 
     predictive_freshness = await _evaluate_predictive_freshness(action_plan=row, target=target, db=db)
     predictive_outcome = predictive_freshness.get("recommended_outcome", "continue_monitor")
@@ -5877,6 +5998,38 @@ async def resume_workspace_execution(
 
     if highest_replan_outcome in {"pause_and_resimulate", "require_replan", "abort_chain"} and not payload.conditions_restored:
         raise HTTPException(status_code=422, detail=f"resume blocked: predictive drift requires {highest_replan_outcome}")
+
+    monitoring = await _get_or_create_monitoring_state(db)
+    human_aware = _human_aware_state_from_monitoring(monitoring)
+    _, resume_constraint_result = await evaluate_and_record_constraints(
+        actor=payload.actor,
+        source="objective44_resume_execution",
+        goal={"goal_type": "resume_execution", "execution_id": execution.id},
+        action_plan={
+            "action_type": "resume_execution",
+            "execution_id": execution.id,
+            "is_physical": True,
+        },
+        workspace_state={
+            "human_in_workspace": human_aware.get("human_in_workspace", False),
+            "human_near_target_zone": human_aware.get("human_near_target_zone", False),
+            "human_near_motion_path": human_aware.get("human_near_motion_path", False),
+            "shared_workspace_active": human_aware.get("shared_workspace_active", False),
+            "target_confidence": float((target.confidence if target else 1.0) or 1.0),
+            "map_freshness_seconds": 0,
+        },
+        system_state={"throttle_blocked": False, "integrity_risk": False},
+        policy_state={
+            "min_target_confidence": EXECUTION_TARGET_CONFIDENCE_MINIMUM_DEFAULT,
+            "map_freshness_limit_seconds": MONITORING_DEFAULT_FRESHNESS_THRESHOLD_SECONDS,
+            "unlawful_action": False,
+        },
+        metadata_json={"reason": payload.reason, **payload.metadata_json},
+        db=db,
+    )
+    resume_decision = str(resume_constraint_result.get("decision", "allowed"))
+    if resume_decision in {"requires_confirmation", "requires_replan", "blocked"} and not payload.conditions_restored:
+        raise HTTPException(status_code=422, detail=f"resume blocked by constraint engine: {resume_decision}")
 
     resolved_ids: list[int] = []
     if payload.conditions_restored:

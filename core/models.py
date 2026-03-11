@@ -574,3 +574,22 @@ class WorkspaceReplanSignal(Base, TimestampMixin):
     resolved_by: Mapped[str] = mapped_column(String(120), default="")
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class ConstraintEvaluation(Base, TimestampMixin):
+    __tablename__ = "constraint_evaluations"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    source: Mapped[str] = mapped_column(String(80), default="api", index=True)
+    actor: Mapped[str] = mapped_column(String(120), default="workspace")
+    goal_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    action_plan_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    workspace_state_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    system_state_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    policy_state_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    decision: Mapped[str] = mapped_column(String(60), default="allowed", index=True)
+    violations_json: Mapped[list[dict]] = mapped_column(JSON, default=list)
+    warnings_json: Mapped[list[dict]] = mapped_column(JSON, default=list)
+    recommended_next_step: Mapped[str] = mapped_column(String(120), default="execute")
+    confidence: Mapped[float] = mapped_column(default=0.0)
+    explanation_json: Mapped[dict] = mapped_column(JSON, default=dict)
