@@ -106,6 +106,14 @@ async def ensure_schema() -> None:
         await conn.execute(text("ALTER TABLE IF EXISTS workspace_replan_signals ADD COLUMN IF NOT EXISTS resolved_by VARCHAR(120) DEFAULT ''"))
         await conn.execute(text("ALTER TABLE IF EXISTS workspace_replan_signals ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMPTZ"))
         await conn.execute(text("ALTER TABLE IF EXISTS workspace_replan_signals ADD COLUMN IF NOT EXISTS metadata_json JSONB DEFAULT '{}'::jsonb"))
+        await conn.execute(text("ALTER TABLE IF EXISTS workspace_proposals ADD COLUMN IF NOT EXISTS priority_score DOUBLE PRECISION DEFAULT 0.0"))
+        await conn.execute(text("ALTER TABLE IF EXISTS workspace_proposals ADD COLUMN IF NOT EXISTS priority_reason TEXT DEFAULT ''"))
+        await conn.execute(text("ALTER TABLE IF EXISTS user_preferences ADD COLUMN IF NOT EXISTS user_id VARCHAR(120) DEFAULT 'operator'"))
+        await conn.execute(text("ALTER TABLE IF EXISTS user_preferences ADD COLUMN IF NOT EXISTS preference_type VARCHAR(120) DEFAULT ''"))
+        await conn.execute(text("ALTER TABLE IF EXISTS user_preferences ADD COLUMN IF NOT EXISTS value JSONB DEFAULT '{}'::jsonb"))
+        await conn.execute(text("ALTER TABLE IF EXISTS user_preferences ADD COLUMN IF NOT EXISTS confidence DOUBLE PRECISION DEFAULT 0.0"))
+        await conn.execute(text("ALTER TABLE IF EXISTS user_preferences ADD COLUMN IF NOT EXISTS source VARCHAR(80) DEFAULT 'manual'"))
+        await conn.execute(text("ALTER TABLE IF EXISTS user_preferences ADD COLUMN IF NOT EXISTS last_updated TIMESTAMPTZ DEFAULT now()"))
 
     await initialize_workspace_monitoring_runtime()
 

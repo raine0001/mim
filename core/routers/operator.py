@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from core.db import get_db
 from core.journal import write_journal
 from core.models import CapabilityExecution, Goal, InputEvent, InputEventResolution
+from core.preferences import apply_learning_signal
 from core.schemas import OperatorExecutionActionRequest
 
 router = APIRouter(tags=["operator"])
@@ -247,6 +248,7 @@ async def approve_execution(
         reason=execution.reason,
         metadata_json=payload.metadata_json,
     )
+    await apply_learning_signal(db=db, signal="operator_approve", user_id=payload.actor)
     await db.commit()
     await db.refresh(execution)
     return _to_operator_execution(execution, resolution, event)
@@ -277,6 +279,7 @@ async def reject_execution(
         reason=execution.reason,
         metadata_json=payload.metadata_json,
     )
+    await apply_learning_signal(db=db, signal="operator_reject", user_id=payload.actor)
     await db.commit()
     await db.refresh(execution)
     return _to_operator_execution(execution, resolution, event)

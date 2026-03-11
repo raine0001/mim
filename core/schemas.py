@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -617,6 +617,35 @@ class WorkspaceObjectMemoryListOut(BaseModel):
 class WorkspaceProposalActionRequest(BaseModel):
     actor: str = "operator"
     reason: str = ""
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class UserPreferenceUpsertRequest(BaseModel):
+    user_id: str = "operator"
+    preference_type: str = Field(min_length=1)
+    value: Any = None
+    confidence: float = Field(default=0.8, ge=0.0, le=1.0)
+    source: str = "manual"
+
+
+class UserPreferenceOut(BaseModel):
+    user_id: str
+    preference_type: str
+    value: Any = None
+    confidence: float
+    source: str
+    last_updated: datetime | None = None
+    is_default: bool = False
+
+
+class WorkspaceProposalPriorityPolicyUpdateRequest(BaseModel):
+    actor: str = "operator"
+    reason: str = ""
+    urgency_map: dict[str, float] = Field(default_factory=dict)
+    zone_importance: dict[str, float] = Field(default_factory=dict)
+    operator_preference: dict[str, float] = Field(default_factory=dict)
+    age_saturation_minutes: int | None = Field(default=None, ge=1, le=1440)
+    weights: dict[str, float] = Field(default_factory=dict)
     metadata_json: dict = Field(default_factory=dict)
 
 

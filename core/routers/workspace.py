@@ -10,7 +10,8 @@ from sqlalchemy.orm.attributes import flag_modified
 from core.db import SessionLocal, get_db
 from core.journal import write_journal
 from core.models import CapabilityExecution, CapabilityRegistration, InputEvent, Task, WorkspaceActionPlan, WorkspaceAutonomousChain, WorkspaceInterruptionEvent, WorkspaceMonitoringState, WorkspaceObjectMemory, WorkspaceObjectRelation, WorkspaceObservation, WorkspaceProposal, WorkspaceReplanSignal, WorkspaceTargetResolution, WorkspaceZone, WorkspaceZoneRelation
-from core.schemas import WorkspaceActionPlanAbortRequest, WorkspaceActionPlanCreateRequest, WorkspaceActionPlanDecisionRequest, WorkspaceActionPlanExecuteRequest, WorkspaceActionPlanHandoffRequest, WorkspaceActionPlanReplanRequest, WorkspaceActionPlanSimulationRequest, WorkspaceAutonomousChainAdvanceRequest, WorkspaceAutonomousChainApprovalRequest, WorkspaceAutonomousChainCreateRequest, WorkspaceAutonomyOverrideRequest, WorkspaceExecutionPauseRequest, WorkspaceExecutionPredictChangeRequest, WorkspaceExecutionProposalActionRequest, WorkspaceExecutionProposalCreateRequest, WorkspaceExecutionResumeRequest, WorkspaceExecutionStopRequest, WorkspaceMonitoringStartRequest, WorkspaceMonitoringStopRequest, WorkspaceProposalActionRequest, WorkspaceTargetConfirmRequest, WorkspaceTargetResolveRequest
+from core.preferences import DEFAULT_USER_ID, apply_learning_signal, get_user_preference_payload, get_user_preference_value
+from core.schemas import WorkspaceActionPlanAbortRequest, WorkspaceActionPlanCreateRequest, WorkspaceActionPlanDecisionRequest, WorkspaceActionPlanExecuteRequest, WorkspaceActionPlanHandoffRequest, WorkspaceActionPlanReplanRequest, WorkspaceActionPlanSimulationRequest, WorkspaceAutonomousChainAdvanceRequest, WorkspaceAutonomousChainApprovalRequest, WorkspaceAutonomousChainCreateRequest, WorkspaceAutonomyOverrideRequest, WorkspaceExecutionPauseRequest, WorkspaceExecutionPredictChangeRequest, WorkspaceExecutionProposalActionRequest, WorkspaceExecutionProposalCreateRequest, WorkspaceExecutionResumeRequest, WorkspaceExecutionStopRequest, WorkspaceMonitoringStartRequest, WorkspaceMonitoringStopRequest, WorkspaceProposalActionRequest, WorkspaceProposalPriorityPolicyUpdateRequest, WorkspaceTargetConfirmRequest, WorkspaceTargetResolveRequest
 
 router = APIRouter()
 
@@ -112,6 +113,38 @@ AUTONOMY_PROPOSAL_RISK_SCORE: dict[str, float] = {
     "execution_candidate": 0.82,
 }
 
+PROPOSAL_PRIORITY_POLICY_VERSION = "proposal-priority-v1"
+PROPOSAL_PRIORITY_DEFAULT = {
+    "weights": {
+        "urgency": 0.28,
+        "confidence": 0.22,
+        "safety": 0.2,
+        "operator_preference": 0.15,
+        "zone_importance": 0.1,
+        "age": 0.05,
+    },
+    "urgency_map": {
+        "execution_candidate": 0.95,
+        "verify_moved_object": 0.9,
+        "monitor_search_adjacent_zone": 0.8,
+        "monitor_recheck_workspace": 0.72,
+        "rescan_zone": 0.62,
+        "confirm_target_ready": 0.52,
+        "target_reobserve": 0.45,
+        "target_confirmation": 0.4,
+    },
+    "zone_importance": {
+        "front-center": 1.0,
+        "front-left": 0.85,
+        "front-right": 0.85,
+        "rear-center": 0.7,
+        "rear-left": 0.55,
+        "rear-right": 0.55,
+    },
+    "operator_preference": {},
+    "age_saturation_minutes": 120,
+}
+
 
 def _default_autonomy_state() -> dict:
     return {
@@ -148,6 +181,200 @@ def _store_autonomy_state(row: WorkspaceMonitoringState, autonomy_state: dict) -
     row.metadata_json = {
         **metadata,
         "autonomy": autonomy_state,
+    }
+
+
+def _normalize_score(value: float) -> float:
+    return max(0.0, min(1.0, float(value)))
+
+
+def _proposal_priority_policy_from_monitoring(row: WorkspaceMonitoringState) -> dict:
+    metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
+    raw = metadata.get("proposal_priority_policy", {}) if isinstance(metadata.get("proposal_priority_policy", {}), dict) else {}
+    defaults = PROPOSAL_PRIORITY_DEFAULT
+
+    policy = {
+        "weights": {
+            key: _normalize_score(value)
+            for key, value in {
+                **defaults.get("weights", {}),
+                **(raw.get("weights", {}) if isinstance(raw.get("weights", {}), dict) else {}),
+            }.items()
+        },
+        "urgency_map": {
+            str(key): _normalize_score(value)
+            for key, value in {
+                **defaults.get("urgency_map", {}),
+                **(raw.get("urgency_map", {}) if isinstance(raw.get("urgency_map", {}), dict) else {}),
+            }.items()
+            if str(key).strip()
+        },
+        "zone_importance": {
+            str(key): _normalize_score(value)
+            for key, value in {
+                **defaults.get("zone_importance", {}),
+                **(raw.get("zone_importance", {}) if isinstance(raw.get("zone_importance", {}), dict) else {}),
+            }.items()
+            if str(key).strip()
+        },
+        "operator_preference": {
+            str(key): _normalize_score(value)
+            for key, value in {
+                **(defaults.get("operator_preference", {}) if isinstance(defaults.get("operator_preference", {}), dict) else {}),
+                **(raw.get("operator_preference", {}) if isinstance(raw.get("operator_preference", {}), dict) else {}),
+            }.items()
+            if str(key).strip()
+        },
+        "age_saturation_minutes": max(1, int(raw.get("age_saturation_minutes", defaults.get("age_saturation_minutes", 120)))),
+        "version": PROPOSAL_PRIORITY_POLICY_VERSION,
+    }
+    return policy
+
+
+def _compute_workspace_proposal_priority(*, proposal: WorkspaceProposal, policy: dict, now: datetime) -> tuple[float, str, dict]:
+    urgency_map = policy.get("urgency_map", {}) if isinstance(policy.get("urgency_map", {}), dict) else {}
+    zone_importance_map = policy.get("zone_importance", {}) if isinstance(policy.get("zone_importance", {}), dict) else {}
+    operator_preference_map = policy.get("operator_preference", {}) if isinstance(policy.get("operator_preference", {}), dict) else {}
+    weights = policy.get("weights", {}) if isinstance(policy.get("weights", {}), dict) else {}
+
+    normalized_zone = _normalize_zone_for_map(proposal.related_zone)
+    urgency = _normalize_score(float(urgency_map.get(proposal.proposal_type, 0.5)))
+    confidence = _normalize_score(float(proposal.confidence))
+    safety = _normalize_score(1.0 - _autonomy_risk_score(proposal.proposal_type))
+    operator_preference = _normalize_score(float(operator_preference_map.get(proposal.proposal_type, 0.5)))
+    zone_importance = _normalize_score(float(zone_importance_map.get(normalized_zone, 0.5)))
+
+    age_minutes = max(0.0, (now - proposal.created_at).total_seconds() / 60.0)
+    age_saturation = max(1.0, float(policy.get("age_saturation_minutes", 120)))
+    age = _normalize_score(age_minutes / age_saturation)
+
+    components = {
+        "urgency": urgency,
+        "confidence": confidence,
+        "safety": safety,
+        "operator_preference": operator_preference,
+        "zone_importance": zone_importance,
+        "age": age,
+    }
+    score = 0.0
+    contribution: dict[str, float] = {}
+    for name, value in components.items():
+        weighted = _normalize_score(float(weights.get(name, 0.0))) * value
+        contribution[name] = round(weighted, 6)
+        score += weighted
+
+    top = sorted(contribution.items(), key=lambda item: item[1], reverse=True)[:3]
+    reason = ", ".join(f"{name}={components[name]:.2f}" for name, _ in top)
+    return round(_normalize_score(score), 4), reason, {
+        "components": components,
+        "weighted": contribution,
+        "top_signals": [name for name, _ in top],
+    }
+
+
+async def _refresh_workspace_proposal_priority(*, proposal: WorkspaceProposal, db: AsyncSession) -> dict:
+    monitoring = await _get_or_create_monitoring_state(db)
+    policy = _proposal_priority_policy_from_monitoring(monitoring)
+
+    preferred_scan_zones_payload = await get_user_preference_payload(
+        db=db,
+        preference_type="preferred_scan_zones",
+        user_id=DEFAULT_USER_ID,
+    )
+    preferred_scan_zones = preferred_scan_zones_payload.get("value", [])
+    if isinstance(preferred_scan_zones, list):
+        zone_importance = dict(policy.get("zone_importance", {}))
+        for zone_name in preferred_scan_zones:
+            normalized = _normalize_zone_for_map(str(zone_name))
+            if normalized:
+                zone_importance[normalized] = max(0.95, float(zone_importance.get(normalized, 0.5)))
+        policy["zone_importance"] = zone_importance
+
+    auto_exec_tolerance_payload = await get_user_preference_payload(
+        db=db,
+        preference_type="auto_exec_tolerance",
+        user_id=DEFAULT_USER_ID,
+    )
+    auto_exec_tolerance = float(auto_exec_tolerance_payload.get("value", 0.5) or 0.5)
+    operator_preference = dict(policy.get("operator_preference", {}))
+    operator_preference["confirm_target_ready"] = max(
+        float(operator_preference.get("confirm_target_ready", 0.5)),
+        max(0.0, min(1.0, auto_exec_tolerance)),
+    )
+    operator_preference["rescan_zone"] = max(
+        float(operator_preference.get("rescan_zone", 0.5)),
+        max(0.0, min(1.0, auto_exec_tolerance)),
+    )
+    policy["operator_preference"] = operator_preference
+
+    now = datetime.now(timezone.utc)
+    score, reason, breakdown = _compute_workspace_proposal_priority(proposal=proposal, policy=policy, now=now)
+    proposal.priority_score = score
+    proposal.priority_reason = reason
+    proposal.metadata_json = {
+        **(proposal.metadata_json if isinstance(proposal.metadata_json, dict) else {}),
+        "priority_policy_version": policy.get("version", PROPOSAL_PRIORITY_POLICY_VERSION),
+        "priority_breakdown": breakdown,
+        "preference_context": {
+            "preferred_scan_zones": preferred_scan_zones if isinstance(preferred_scan_zones, list) else [],
+            "auto_exec_tolerance": auto_exec_tolerance,
+        },
+    }
+    return {
+        "policy": policy,
+        "score": score,
+        "reason": reason,
+        "breakdown": breakdown,
+    }
+
+
+def _workspace_proposal_payload(row: WorkspaceProposal) -> dict:
+    return {
+        "proposal_id": row.id,
+        "proposal_type": row.proposal_type,
+        "title": row.title,
+        "description": row.description,
+        "status": row.status,
+        "confidence": row.confidence,
+        "priority_score": float(row.priority_score),
+        "priority_reason": row.priority_reason,
+        "source": row.source,
+        "related_zone": row.related_zone,
+        "related_object_id": row.related_object_id,
+        "source_execution_id": row.source_execution_id,
+        "trigger_json": row.trigger_json,
+        "metadata_json": row.metadata_json,
+        "created_at": row.created_at,
+    }
+
+
+async def _notification_payload_for_proposal(*, db: AsyncSession, proposal: WorkspaceProposal, action: str) -> dict:
+    verbosity = await get_user_preference_value(
+        db=db,
+        preference_type="notification_verbosity",
+        user_id=DEFAULT_USER_ID,
+    )
+    level = str(verbosity or "normal").strip().lower()
+    if level not in {"low", "normal", "high"}:
+        level = "normal"
+
+    if level == "low":
+        message = f"Proposal {proposal.id} {action}."
+    elif level == "high":
+        message = (
+            f"Proposal {proposal.id} {action}: type={proposal.proposal_type}, "
+            f"priority_score={float(proposal.priority_score):.2f}, confidence={float(proposal.confidence):.2f}, "
+            f"reason={proposal.priority_reason}."
+        )
+    else:
+        message = (
+            f"Proposal {proposal.id} {action} with priority_score={float(proposal.priority_score):.2f} "
+            f"and confidence={float(proposal.confidence):.2f}."
+        )
+
+    return {
+        "verbosity": level,
+        "message": message,
     }
 
 
@@ -730,6 +957,7 @@ async def _create_monitoring_delta_proposal(
     )
     db.add(proposal)
     await db.flush()
+    await _refresh_workspace_proposal_priority(proposal=proposal, db=db)
     await _maybe_auto_execute_workspace_proposal(
         proposal=proposal,
         trigger_reason="objective34_delta",
@@ -1101,6 +1329,7 @@ async def _create_workspace_proposal_for_target(
     )
     db.add(proposal)
     await db.flush()
+    await _refresh_workspace_proposal_priority(proposal=proposal, db=db)
     await _maybe_auto_execute_workspace_proposal(
         proposal=proposal,
         trigger_reason="objective29_target_resolution",
@@ -1765,10 +1994,19 @@ async def stop_workspace_monitoring(
 async def get_workspace_autonomy_policy(db: AsyncSession = Depends(get_db)) -> dict:
     row = await _get_or_create_monitoring_state(db)
     autonomy = _autonomy_state_from_monitoring(row)
+    proposal_priority_policy = _proposal_priority_policy_from_monitoring(row)
     return {
         "tiers": sorted(list(AUTONOMY_POLICY_TIERS)),
         "proposal_policy_map": AUTONOMY_PROPOSAL_POLICY_MAP,
         "proposal_risk_scores": AUTONOMY_PROPOSAL_RISK_SCORE,
+        "proposal_priority_policy": {
+            "policy_version": proposal_priority_policy.get("version", PROPOSAL_PRIORITY_POLICY_VERSION),
+            "weights": proposal_priority_policy.get("weights", {}),
+            "urgency_map": proposal_priority_policy.get("urgency_map", {}),
+            "zone_importance": proposal_priority_policy.get("zone_importance", {}),
+            "operator_preference": proposal_priority_policy.get("operator_preference", {}),
+            "age_saturation_minutes": proposal_priority_policy.get("age_saturation_minutes", 120),
+        },
         "autonomy": {
             key: value
             for key, value in autonomy.items()
@@ -1814,6 +2052,17 @@ async def set_workspace_autonomy_override(
         row.desired_running = False
         row.runtime_status = "paused"
         row.last_stopped_at = datetime.now(timezone.utc)
+
+    if (
+        payload.auto_execution_enabled is not None
+        or payload.force_manual_approval is not None
+        or payload.max_auto_actions_per_minute is not None
+        or payload.cooldown_between_actions_seconds is not None
+        or payload.auto_safe_confidence_threshold is not None
+        or payload.auto_preferred_confidence_threshold is not None
+        or payload.low_risk_score_max is not None
+    ):
+        await apply_learning_signal(db=db, signal="policy_override", user_id=payload.actor or DEFAULT_USER_ID)
 
     await write_journal(
         db,
@@ -2144,25 +2393,159 @@ async def list_workspace_proposals(
         stmt = stmt.where(WorkspaceProposal.status == status.strip())
 
     rows = (await db.execute(stmt)).scalars().all()[:limit]
+    refresh_needed = False
+    for row in rows:
+        if status.strip() == "pending" or (not status.strip() and row.status == "pending"):
+            await _refresh_workspace_proposal_priority(proposal=row, db=db)
+            refresh_needed = True
+    if refresh_needed:
+        await db.commit()
+    return {"proposals": [_workspace_proposal_payload(row) for row in rows]}
+
+
+@router.get("/proposals/priority-policy")
+async def get_workspace_proposal_priority_policy(db: AsyncSession = Depends(get_db)) -> dict:
+    row = await _get_or_create_monitoring_state(db)
+    policy = _proposal_priority_policy_from_monitoring(row)
     return {
-        "proposals": [
-            {
-                "proposal_id": row.id,
-                "proposal_type": row.proposal_type,
-                "title": row.title,
-                "description": row.description,
-                "status": row.status,
-                "confidence": row.confidence,
-                "source": row.source,
-                "related_zone": row.related_zone,
-                "related_object_id": row.related_object_id,
-                "source_execution_id": row.source_execution_id,
-                "trigger_json": row.trigger_json,
-                "metadata_json": row.metadata_json,
-                "created_at": row.created_at,
-            }
-            for row in rows
-        ]
+        "policy_version": policy.get("version", PROPOSAL_PRIORITY_POLICY_VERSION),
+        "weights": policy.get("weights", {}),
+        "urgency_map": policy.get("urgency_map", {}),
+        "zone_importance": policy.get("zone_importance", {}),
+        "operator_preference": policy.get("operator_preference", {}),
+        "age_saturation_minutes": policy.get("age_saturation_minutes", 120),
+    }
+
+
+@router.post("/proposals/priority-policy")
+async def update_workspace_proposal_priority_policy(
+    payload: WorkspaceProposalPriorityPolicyUpdateRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    row = await _get_or_create_monitoring_state(db)
+    metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
+    existing = metadata.get("proposal_priority_policy", {}) if isinstance(metadata.get("proposal_priority_policy", {}), dict) else {}
+
+    updated = {
+        **existing,
+        "weights": {
+            **(existing.get("weights", {}) if isinstance(existing.get("weights", {}), dict) else {}),
+            **{key: _normalize_score(value) for key, value in payload.weights.items() if str(key).strip()},
+        },
+        "urgency_map": {
+            **(existing.get("urgency_map", {}) if isinstance(existing.get("urgency_map", {}), dict) else {}),
+            **{str(key).strip(): _normalize_score(value) for key, value in payload.urgency_map.items() if str(key).strip()},
+        },
+        "zone_importance": {
+            **(existing.get("zone_importance", {}) if isinstance(existing.get("zone_importance", {}), dict) else {}),
+            **{str(key).strip(): _normalize_score(value) for key, value in payload.zone_importance.items() if str(key).strip()},
+        },
+        "operator_preference": {
+            **(existing.get("operator_preference", {}) if isinstance(existing.get("operator_preference", {}), dict) else {}),
+            **{str(key).strip(): _normalize_score(value) for key, value in payload.operator_preference.items() if str(key).strip()},
+        },
+        "version": PROPOSAL_PRIORITY_POLICY_VERSION,
+    }
+    if payload.age_saturation_minutes is not None:
+        updated["age_saturation_minutes"] = payload.age_saturation_minutes
+
+    row.metadata_json = {
+        **metadata,
+        "proposal_priority_policy": updated,
+        "proposal_priority_policy_last_updated": {
+            "actor": payload.actor,
+            "reason": payload.reason,
+            "at": datetime.now(timezone.utc).isoformat(),
+            **payload.metadata_json,
+        },
+    }
+    await write_journal(
+        db,
+        actor=payload.actor,
+        action="workspace_proposal_priority_policy_update",
+        target_type="workspace_monitoring",
+        target_id=str(row.id),
+        summary="Updated workspace proposal priority policy",
+        metadata_json={
+            "reason": payload.reason,
+            "version": PROPOSAL_PRIORITY_POLICY_VERSION,
+        },
+    )
+    await db.commit()
+    policy = _proposal_priority_policy_from_monitoring(row)
+    return {
+        "updated": True,
+        "policy_version": policy.get("version", PROPOSAL_PRIORITY_POLICY_VERSION),
+        "weights": policy.get("weights", {}),
+        "urgency_map": policy.get("urgency_map", {}),
+        "zone_importance": policy.get("zone_importance", {}),
+        "operator_preference": policy.get("operator_preference", {}),
+        "age_saturation_minutes": policy.get("age_saturation_minutes", 120),
+    }
+
+
+@router.get("/proposals/next")
+async def get_next_workspace_proposal(
+    actor: str = "scheduler",
+    reason: str = "priority_selection",
+    status: str = "pending",
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    status_filter = status.strip() or "pending"
+    rows = (
+        await db.execute(
+            select(WorkspaceProposal)
+            .where(WorkspaceProposal.status == status_filter)
+            .order_by(WorkspaceProposal.created_at.asc(), WorkspaceProposal.id.asc())
+        )
+    ).scalars().all()
+    if not rows:
+        return {"proposal": None, "selected": False, "status": status_filter}
+
+    scored: list[tuple[WorkspaceProposal, dict]] = []
+    for row in rows:
+        priority = await _refresh_workspace_proposal_priority(proposal=row, db=db)
+        scored.append((row, priority))
+
+    scored.sort(
+        key=lambda item: (
+            float(item[0].priority_score),
+            float(item[0].confidence),
+            item[0].created_at,
+            item[0].id,
+        ),
+        reverse=True,
+    )
+    selected_row, selected_priority = scored[0]
+    await write_journal(
+        db,
+        actor=actor,
+        action="workspace_proposal_priority_next",
+        target_type="workspace_proposal",
+        target_id=str(selected_row.id),
+        summary=f"Selected next workspace proposal {selected_row.id} by policy score",
+        metadata_json={
+            "reason": reason,
+            "status_filter": status_filter,
+            "priority_score": selected_row.priority_score,
+            "priority_reason": selected_row.priority_reason,
+            "policy_version": selected_priority.get("policy", {}).get("version", PROPOSAL_PRIORITY_POLICY_VERSION),
+            "priority_breakdown": selected_priority.get("breakdown", {}),
+        },
+    )
+    notification = await _notification_payload_for_proposal(
+        db=db,
+        proposal=selected_row,
+        action="selected_for_next",
+    )
+    await db.commit()
+    return {
+        "selected": True,
+        "status": status_filter,
+        "proposal": _workspace_proposal_payload(selected_row),
+        "policy_version": selected_priority.get("policy", {}).get("version", PROPOSAL_PRIORITY_POLICY_VERSION),
+        "priority_breakdown": selected_priority.get("breakdown", {}),
+        "notification": notification,
     }
 
 
@@ -2171,21 +2554,10 @@ async def get_workspace_proposal(proposal_id: int, db: AsyncSession = Depends(ge
     row = await db.get(WorkspaceProposal, proposal_id)
     if not row:
         raise HTTPException(status_code=404, detail="workspace proposal not found")
-    return {
-        "proposal_id": row.id,
-        "proposal_type": row.proposal_type,
-        "title": row.title,
-        "description": row.description,
-        "status": row.status,
-        "confidence": row.confidence,
-        "source": row.source,
-        "related_zone": row.related_zone,
-        "related_object_id": row.related_object_id,
-        "source_execution_id": row.source_execution_id,
-        "trigger_json": row.trigger_json,
-        "metadata_json": row.metadata_json,
-        "created_at": row.created_at,
-    }
+    if row.status == "pending":
+        await _refresh_workspace_proposal_priority(proposal=row, db=db)
+        await db.commit()
+    return _workspace_proposal_payload(row)
 
 
 @router.post("/proposals/{proposal_id}/accept")
@@ -2220,6 +2592,8 @@ async def accept_workspace_proposal(
         "linked_task_id": task.id,
         **payload.metadata_json,
     }
+    await apply_learning_signal(db=db, signal="proposal_accept", user_id=payload.actor or DEFAULT_USER_ID)
+    notification = await _notification_payload_for_proposal(db=db, proposal=proposal, action="accepted")
 
     await write_journal(
         db,
@@ -2236,6 +2610,7 @@ async def accept_workspace_proposal(
         "proposal_id": proposal.id,
         "status": proposal.status,
         "linked_task_id": task.id,
+        "notification": notification,
     }
 
 
@@ -2258,6 +2633,8 @@ async def reject_workspace_proposal(
         "reject_reason": payload.reason,
         **payload.metadata_json,
     }
+    await apply_learning_signal(db=db, signal="proposal_reject", user_id=payload.actor or DEFAULT_USER_ID)
+    notification = await _notification_payload_for_proposal(db=db, proposal=proposal, action="rejected")
 
     await write_journal(
         db,
@@ -2273,6 +2650,7 @@ async def reject_workspace_proposal(
     return {
         "proposal_id": proposal.id,
         "status": proposal.status,
+        "notification": notification,
     }
 
 
@@ -2283,6 +2661,21 @@ async def resolve_workspace_target(payload: WorkspaceTargetResolveRequest, db: A
     rows = (await db.execute(select(WorkspaceObjectMemory).order_by(WorkspaceObjectMemory.last_seen_at.desc()))).scalars().all()
     requested_zone = payload.preferred_zone.strip()
     unsafe_set = {item.strip() for item in payload.unsafe_zones if item.strip()}
+    preferred_threshold_raw = await get_user_preference_value(
+        db=db,
+        preference_type="preferred_confirmation_threshold",
+        user_id=DEFAULT_USER_ID,
+    )
+    preferred_confirmation_threshold = max(0.5, min(0.99, float(preferred_threshold_raw or 0.9)))
+    auto_exec_safe_tasks = bool(
+        await get_user_preference_value(
+            db=db,
+            preference_type="auto_exec_safe_tasks",
+            user_id=DEFAULT_USER_ID,
+        )
+    )
+    if auto_exec_safe_tasks:
+        preferred_confirmation_threshold = max(0.5, preferred_confirmation_threshold - 0.05)
 
     scored: list[tuple[WorkspaceObjectMemory, float]] = []
     for row in rows:
@@ -2343,7 +2736,7 @@ async def resolve_workspace_target(payload: WorkspaceTargetResolveRequest, db: A
                 policy_outcome = "target_blocked_unsafe_zone"
                 status = "blocked"
                 suggested_actions = ["request operator confirmation"]
-            elif match_outcome == "exact_match" and top_row.status == "active" and top_score >= 0.9:
+            elif match_outcome == "exact_match" and top_row.status == "active" and top_score >= preferred_confirmation_threshold:
                 policy_outcome = "target_confirmed"
                 status = "confirmed"
                 suggested_actions = ["create proposal", "queue safely"]
@@ -2358,6 +2751,8 @@ async def resolve_workspace_target(payload: WorkspaceTargetResolveRequest, db: A
             "top_score": top_score,
             "top_zone": top_row.zone,
             "top_status": top_row.status,
+            "preferred_confirmation_threshold": preferred_confirmation_threshold,
+            "auto_exec_safe_tasks": auto_exec_safe_tasks,
         }
 
     target = WorkspaceTargetResolution(
@@ -2430,6 +2825,7 @@ async def resolve_workspace_target(payload: WorkspaceTargetResolveRequest, db: A
         "candidate_object_ids": target.candidate_object_ids,
         "suggested_actions": target.suggested_actions,
         "metadata_json": target.metadata_json,
+        "applied_confirmation_threshold": preferred_confirmation_threshold,
     }
 
 
@@ -3019,6 +3415,7 @@ async def propose_workspace_action_plan_execution(
     )
     db.add(proposal)
     await db.flush()
+    await _refresh_workspace_proposal_priority(proposal=proposal, db=db)
 
     await write_journal(
         db,

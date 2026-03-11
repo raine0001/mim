@@ -7,7 +7,7 @@ from core.config import PROJECT_ROOT, settings
 
 CONTRACT_VERSION = "tod-mim-shared-contract-v1"
 MANIFEST_VERSION = "1"
-SCHEMA_VERSION = "2026-03-10-29"
+SCHEMA_VERSION = "2026-03-10-31"
 
 SIGNATURE_FILES = [
     "core/models.py",
@@ -39,7 +39,11 @@ SIGNATURE_FILES = [
     "docs/objective-36-multi-step-autonomous-task-chaining.md",
     "docs/objective-37-human-aware-interruption-and-safe-pause-handling.md",
     "docs/objective-38-predictive-workspace-change-and-replanning.md",
+    "docs/objective-39-policy-based-autonomous-priority-selection.md",
+    "docs/objective-40-human-preference-and-routine-memory.md",
     "core/routers/workspace.py",
+    "core/routers/preferences.py",
+    "core/preferences.py",
     "config/vision_policy.json",
     "config/voice_policy.json",
 ]
@@ -101,6 +105,8 @@ CAPABILITIES = [
     "multi_step_autonomous_task_chaining",
     "human_aware_interruption_pause_handling",
     "predictive_workspace_change_replanning",
+    "policy_based_autonomous_priority_selection",
+    "human_preference_and_routine_memory",
 ]
 
 RECENT_CHANGES = [
@@ -136,6 +142,8 @@ RECENT_CHANGES = [
     "Added Objective 36 policy-controlled multi-step autonomous task chaining with approval/cooldown/failure controls and chain audit trail",
     "Added Objective 37 human-aware interruption events with policy-driven pause/stop/resume controls and safety-validated resume gating",
     "Added Objective 38 predictive workspace-change signaling and preemptive action-plan replanning workflow",
+    "Added Objective 39 policy-based autonomous proposal priority scoring and next-proposal scheduler endpoint",
+    "Added Objective 40 human preference and routine memory with preference APIs and policy integration",
 ]
 
 
@@ -236,6 +244,8 @@ def build_manifest() -> dict:
             "/goals/{goal_id}/custody",
             "/tasks/{task_id}/custody",
             "/journal",
+            "/preferences",
+            "/preferences/{preference_type}",
             "/memory",
             "/tools",
             "/services",
@@ -299,6 +309,8 @@ def build_manifest() -> dict:
             "/workspace/proposals/{proposal_id}",
             "/workspace/proposals/{proposal_id}/accept",
             "/workspace/proposals/{proposal_id}/reject",
+            "/workspace/proposals/priority-policy",
+            "/workspace/proposals/next",
             "/workspace/targets/resolve",
             "/workspace/targets/{target_resolution_id}",
             "/workspace/targets/{target_resolution_id}/confirm",
@@ -552,6 +564,8 @@ def build_manifest() -> dict:
                 "description",
                 "status",
                 "confidence",
+                "priority_score",
+                "priority_reason",
                 "source",
                 "related_zone",
                 "related_object_id",
@@ -559,6 +573,14 @@ def build_manifest() -> dict:
                 "trigger_json",
                 "metadata_json",
                 "created_at",
+            ],
+            "UserPreference": [
+                "user_id",
+                "preference_type",
+                "value",
+                "confidence",
+                "source",
+                "last_updated",
             ],
             "WorkspaceInterruptionEvent": [
                 "interruption_id",

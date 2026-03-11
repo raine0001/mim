@@ -92,6 +92,18 @@ class MemoryLink(Base, TimestampMixin):
     relation: Mapped[str] = mapped_column(String(80), default="related")
 
 
+class UserPreference(Base, TimestampMixin):
+    __tablename__ = "user_preferences"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(120), default="operator", index=True)
+    preference_type: Mapped[str] = mapped_column(String(120), index=True)
+    value: Mapped[object] = mapped_column(JSON, default=dict)
+    confidence: Mapped[float] = mapped_column(default=0.0)
+    source: Mapped[str] = mapped_column(String(80), default="manual")
+    last_updated: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+
 class Tool(Base, TimestampMixin):
     __tablename__ = "tools"
 
@@ -405,6 +417,8 @@ class WorkspaceProposal(Base, TimestampMixin):
     description: Mapped[str] = mapped_column(Text, default="")
     status: Mapped[str] = mapped_column(String(40), default="pending", index=True)
     confidence: Mapped[float] = mapped_column(default=0.0)
+    priority_score: Mapped[float] = mapped_column(default=0.0, index=True)
+    priority_reason: Mapped[str] = mapped_column(Text, default="")
     source: Mapped[str] = mapped_column(String(80), default="workspace_state")
     related_zone: Mapped[str] = mapped_column(String(120), default="", index=True)
     related_object_id: Mapped[int | None] = mapped_column(ForeignKey("workspace_object_memories.id", ondelete="SET NULL"), nullable=True, index=True)
