@@ -1099,6 +1099,32 @@ class ImprovementBacklogOut(BaseModel):
     created_at: datetime
 
 
+class CrossDomainReasoningBuildRequest(BaseModel):
+    actor: str = "workspace"
+    source: str = "objective56"
+    lookback_hours: int = Field(default=24, ge=1, le=720)
+    max_items_per_domain: int = Field(default=50, ge=1, le=200)
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class CrossDomainReasoningOut(BaseModel):
+    context_id: int
+    source: str
+    actor: str
+    lookback_hours: int
+    workspace_state: dict
+    communication_state: dict
+    external_information: dict
+    development_state: dict
+    self_improvement_state: dict
+    reasoning_summary: str
+    reasoning: dict
+    confidence: float
+    status: str
+    metadata_json: dict
+    created_at: datetime
+
+
 class ImprovementRecommendationOut(BaseModel):
     recommendation_id: int
     source: str

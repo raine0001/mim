@@ -7,7 +7,7 @@ from core.config import PROJECT_ROOT, settings
 
 CONTRACT_VERSION = "tod-mim-shared-contract-v1"
 MANIFEST_VERSION = "1"
-SCHEMA_VERSION = "2026-03-11-46"
+SCHEMA_VERSION = "2026-03-11-47"
 
 SIGNATURE_FILES = [
     "core/models.py",
@@ -30,10 +30,12 @@ SIGNATURE_FILES = [
     "core/routers/environment_strategy.py",
     "core/routers/decision_records.py",
     "core/routers/improvement.py",
+    "core/routers/reasoning.py",
     "core/routers/policy_experiments.py",
     "core/routers/maintenance.py",
     "core/improvement_recommendation_service.py",
     "core/improvement_governance_service.py",
+    "core/cross_domain_reasoning_service.py",
     "docs/tod-mim-bridge.md",
     "docs/objective-21-unified-input-gateway.md",
     "docs/objective-22-mim-tod-execution-feedback-integration.md",
@@ -103,6 +105,8 @@ SIGNATURE_FILES = [
     "docs/objective-54-promotion-readiness-report.md",
     "docs/objective-55-improvement-prioritization-and-governance.md",
     "docs/objective-55-promotion-readiness-report.md",
+    "docs/objective-56-cross-domain-reasoning.md",
+    "docs/objective-56-promotion-readiness-report.md",
     "config/vision_policy.json",
     "config/voice_policy.json",
 ]
@@ -182,6 +186,7 @@ CAPABILITIES = [
     "multi_session_developmental_memory",
     "self_guided_improvement_loop",
     "improvement_prioritization_governance",
+    "cross_domain_reasoning",
 ]
 
 RECENT_CHANGES = [
@@ -234,6 +239,7 @@ RECENT_CHANGES = [
     "Added Objective 53 multi-session developmental memory with cross-session pattern aggregation, inspectable development patterns, and self-improvement feedback influence",
     "Added Objective 54 self-guided improvement loop with pattern-triggered proposals, sandbox orchestration, standardized experiment metrics, and review-gated recommendations",
     "Added Objective 55 improvement prioritization and governance with weighted backlog scoring, lifecycle state orchestration, and operator-visible ranking/risk reasoning",
+    "Added Objective 56 cross-domain reasoning with unified workspace, communication, external-information, and developmental-memory context aggregation",
 ]
 
 
@@ -400,6 +406,9 @@ def build_manifest() -> dict:
             "/improvement/backlog/refresh",
             "/improvement/backlog",
             "/improvement/backlog/{improvement_id}",
+            "/reasoning/context/build",
+            "/reasoning/context",
+            "/reasoning/context/{context_id}",
             "/maintenance/cycle",
             "/maintenance/runs",
             "/maintenance/runs/{run_id}",
@@ -1059,6 +1068,23 @@ def build_manifest() -> dict:
                 "evidence_summary",
                 "risk_summary",
                 "reasoning",
+                "metadata_json",
+                "created_at",
+            ],
+            "CrossDomainReasoningContext": [
+                "context_id",
+                "source",
+                "actor",
+                "lookback_hours",
+                "workspace_state",
+                "communication_state",
+                "external_information",
+                "development_state",
+                "self_improvement_state",
+                "reasoning_summary",
+                "reasoning",
+                "confidence",
+                "status",
                 "metadata_json",
                 "created_at",
             ],

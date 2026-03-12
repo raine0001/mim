@@ -860,3 +860,22 @@ class WorkspaceImprovementBacklog(Base, TimestampMixin):
     status: Mapped[str] = mapped_column(String(40), default="proposed", index=True)
     reasoning_json: Mapped[dict] = mapped_column(JSON, default=dict)
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class WorkspaceCrossDomainReasoningContext(Base, TimestampMixin):
+    __tablename__ = "workspace_cross_domain_reasoning_contexts"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    source: Mapped[str] = mapped_column(String(80), default="objective56", index=True)
+    actor: Mapped[str] = mapped_column(String(120), default="workspace")
+    lookback_hours: Mapped[int] = mapped_column(default=24)
+    workspace_state_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    communication_state_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    external_information_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    development_state_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    self_improvement_state_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    reasoning_summary: Mapped[str] = mapped_column(Text, default="")
+    reasoning_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    confidence: Mapped[float] = mapped_column(default=0.0)
+    status: Mapped[str] = mapped_column(String(40), default="active", index=True)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
