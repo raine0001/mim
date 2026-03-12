@@ -7,7 +7,7 @@ from core.config import PROJECT_ROOT, settings
 
 CONTRACT_VERSION = "tod-mim-shared-contract-v1"
 MANIFEST_VERSION = "1"
-SCHEMA_VERSION = "2026-03-11-53"
+SCHEMA_VERSION = "2026-03-11-54"
 
 SIGNATURE_FILES = [
     "core/models.py",
@@ -125,6 +125,9 @@ SIGNATURE_FILES = [
     "docs/objective-60-promotion-readiness-report.md",
     "docs/objective-61-live-perception-adapters.md",
     "docs/objective-61-promotion-readiness-report.md",
+    "docs/objective-61_1-regression-recovery-baseline-stabilization.md",
+    "docs/objective-61_1-promotion-readiness-report.md",
+    "docs/objective-61_1-prod-promotion-report.md",
     "config/vision_policy.json",
     "config/voice_policy.json",
 ]
@@ -268,6 +271,7 @@ RECENT_CHANGES = [
     "Added Objective 59 strategic goal persistence and review with cross-session carry-forward scoring and operator review audit",
     "Added Objective 60 environment stewardship loop with desired-state maintenance, integrated strategy-memory-autonomy inputs, and inspectable cycle history",
     "Added Objective 61 live perception adapters with camera/mic source ingestion, throttling, source health tracking, and inspectable adapter status",
+    "Added Objective 61.1 regression recovery stabilization by restoring Objective 49/51 idempotent proposal generation behavior and re-establishing full green integration baseline",
 ]
 
 

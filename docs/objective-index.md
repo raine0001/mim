@@ -46,6 +46,7 @@ This registry indexes objective evidence and promotion artifacts so objective hi
 | 59 | Strategic Goal Persistence and Review | promoted_verified | 2026-03-11-51 | objective-59 | core/goal_strategy_service.py; core/routers/strategy.py; core/models.py | docs/objective-59-promotion-readiness-report.md | docs/objective-59-prod-promotion-report.md | strategic_goal_persistence_review |
 | 60 | Environment Stewardship Loop | promoted_verified | 2026-03-11-52 | objective-60 | core/stewardship_service.py; core/routers/stewardship.py; core/models.py | docs/objective-60-promotion-readiness-report.md | docs/objective-60-prod-promotion-report.md | environment_stewardship_loop |
 | 61 | Live Perception Adapters | promoted_with_regression_exceptions | 2026-03-11-53 | objective-61 | core/routers/gateway.py; core/models.py; core/schemas.py | docs/objective-61-promotion-readiness-report.md | docs/objective-61-prod-promotion-report.md | live_perception_adapters |
+| 61.1 | Regression Recovery and Baseline Stabilization | promoted_verified | 2026-03-11-54 | objective-61-1 | core/improvement_service.py; core/constraint_learning.py; core/horizon_planning.py; core/manifest.py | docs/objective-61_1-promotion-readiness-report.md | docs/objective-61_1-prod-promotion-report.md | regression_baseline_stabilization |
 
 ## Notes
 

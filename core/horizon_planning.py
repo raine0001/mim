@@ -84,6 +84,7 @@ def score_goal_candidate(goal: dict, context: PlanningContext, weights: dict) ->
         "is_physical": bool(goal.get("is_physical", False)),
         "deferred": deferred,
         "defer_reason": defer_reason,
+        "metadata_json": goal.get("metadata_json", {}) if isinstance(goal.get("metadata_json", {}), dict) else {},
         "score": round(_bounded(base), 6),
         "score_breakdown": {
             "priority": priority_score,

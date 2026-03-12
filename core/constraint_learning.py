@@ -49,6 +49,8 @@ def aggregate_constraint_outcomes(evaluations: list[dict], *, max_constraints: i
 
         is_success = outcome_result in {"success", "pass", "passed", "completed", "ok"}
         is_failure = outcome_result in {"failure", "failed", "error", "blocked"}
+        if not is_success and not is_failure:
+            continue
 
         for key in all_keys:
             entry = stats[key]

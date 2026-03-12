@@ -391,6 +391,7 @@ async def generate_improvement_proposals(
     candidates.extend(await _development_trigger_candidates(min_occurrence_count=min_count, db=db))
 
     created: list[WorkspaceImprovementProposal] = []
+    seen_ids: set[int] = set()
     for item in sorted(candidates, key=lambda entry: float(entry.get("confidence", 0.0)), reverse=True):
         if len(created) >= max(1, min(50, int(max_proposals))):
             break
@@ -406,6 +407,10 @@ async def generate_improvement_proposals(
             db=db,
         )
         if duplicate:
+            duplicate_id = int(duplicate.id or 0)
+            if duplicate_id > 0 and duplicate_id not in seen_ids:
+                created.append(duplicate)
+                seen_ids.add(duplicate_id)
             continue
 
         related_concept_ids = await concept_ids_for_component(
@@ -446,6 +451,8 @@ async def generate_improvement_proposals(
         )
         db.add(row)
         created.append(row)
+        if int(row.id or 0) > 0:
+            seen_ids.add(int(row.id))
 
     await db.flush()
     return created
