@@ -519,6 +519,35 @@ class WorkspacePerceptionSource(Base, TimestampMixin):
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
+class WorkspaceInquiryQuestion(Base, TimestampMixin):
+    __tablename__ = "workspace_inquiry_questions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    source: Mapped[str] = mapped_column(String(80), default="objective62", index=True)
+    actor: Mapped[str] = mapped_column(String(120), default="workspace")
+    status: Mapped[str] = mapped_column(String(40), default="open", index=True)
+    dedupe_key: Mapped[str] = mapped_column(String(220), default="", index=True)
+    trigger_type: Mapped[str] = mapped_column(String(120), default="unknown_trigger", index=True)
+    uncertainty_type: Mapped[str] = mapped_column(String(120), default="unknown_uncertainty", index=True)
+    origin_strategy_goal_id: Mapped[int | None] = mapped_column(ForeignKey("workspace_strategy_goals.id", ondelete="SET NULL"), nullable=True, index=True)
+    origin_strategy_id: Mapped[int | None] = mapped_column(ForeignKey("workspace_environment_strategies.id", ondelete="SET NULL"), nullable=True, index=True)
+    origin_plan_id: Mapped[int | None] = mapped_column(ForeignKey("workspace_horizon_plans.id", ondelete="SET NULL"), nullable=True, index=True)
+    why_answer_matters: Mapped[str] = mapped_column(Text, default="")
+    waiting_decision: Mapped[str] = mapped_column(Text, default="")
+    no_answer_behavior: Mapped[str] = mapped_column(Text, default="")
+    candidate_answer_paths_json: Mapped[list[dict]] = mapped_column(JSON, default=list)
+    urgency: Mapped[str] = mapped_column(String(40), default="normal", index=True)
+    priority: Mapped[str] = mapped_column(String(40), default="normal", index=True)
+    safe_default_if_unanswered: Mapped[str] = mapped_column(Text, default="")
+    trigger_evidence_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    selected_path_id: Mapped[str] = mapped_column(String(120), default="")
+    answer_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    applied_effect_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    answered_by: Mapped[str] = mapped_column(String(120), default="")
+    answered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
 class WorkspaceAutonomousChain(Base, TimestampMixin):
     __tablename__ = "workspace_autonomous_chains"
 

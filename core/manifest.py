@@ -7,7 +7,7 @@ from core.config import PROJECT_ROOT, settings
 
 CONTRACT_VERSION = "tod-mim-shared-contract-v1"
 MANIFEST_VERSION = "1"
-SCHEMA_VERSION = "2026-03-11-54"
+SCHEMA_VERSION = "2026-03-11-55"
 
 SIGNATURE_FILES = [
     "core/models.py",
@@ -37,10 +37,12 @@ SIGNATURE_FILES = [
     "core/improvement_governance_service.py",
     "core/cross_domain_reasoning_service.py",
     "core/goal_strategy_service.py",
+    "core/inquiry_service.py",
     "core/autonomy_boundary_service.py",
     "core/stewardship_service.py",
     "core/routers/autonomy_boundaries.py",
     "core/routers/strategy.py",
+    "core/routers/inquiry.py",
     "core/routers/stewardship.py",
     "docs/tod-mim-bridge.md",
     "docs/objective-21-unified-input-gateway.md",
@@ -128,6 +130,9 @@ SIGNATURE_FILES = [
     "docs/objective-61_1-regression-recovery-baseline-stabilization.md",
     "docs/objective-61_1-promotion-readiness-report.md",
     "docs/objective-61_1-prod-promotion-report.md",
+    "docs/objective-62-inquisitive-question-loop.md",
+    "docs/objective-62-promotion-readiness-report.md",
+    "docs/objective-62-prod-promotion-report.md",
     "config/vision_policy.json",
     "config/voice_policy.json",
 ]
@@ -213,6 +218,7 @@ CAPABILITIES = [
     "strategic_goal_persistence_review",
     "environment_stewardship_loop",
     "live_perception_adapters",
+    "inquisitive_question_loop",
 ]
 
 RECENT_CHANGES = [
@@ -272,6 +278,7 @@ RECENT_CHANGES = [
     "Added Objective 60 environment stewardship loop with desired-state maintenance, integrated strategy-memory-autonomy inputs, and inspectable cycle history",
     "Added Objective 61 live perception adapters with camera/mic source ingestion, throttling, source health tracking, and inspectable adapter status",
     "Added Objective 61.1 regression recovery stabilization by restoring Objective 49/51 idempotent proposal generation behavior and re-establishing full green integration baseline",
+    "Added Objective 62 inquisitive question loop with uncertainty-triggered inquiry generation, explainable question state, and answer-driven downstream planning effects",
 ]
 
 
@@ -456,6 +463,10 @@ def build_manifest() -> dict:
             "/stewardship",
             "/stewardship/{stewardship_id}",
             "/stewardship/history",
+            "/inquiry/questions",
+            "/inquiry/questions/{question_id}",
+            "/inquiry/questions/{question_id}/answer",
+            "/inquiry/questions/generate",
             "/maintenance/cycle",
             "/maintenance/runs",
             "/maintenance/runs/{run_id}",
@@ -1264,6 +1275,32 @@ def build_manifest() -> dict:
                 "min_interval_seconds",
                 "duplicate_window_seconds",
                 "confidence_floor",
+                "metadata_json",
+                "created_at",
+            ],
+            "InquiryQuestion": [
+                "question_id",
+                "source",
+                "actor",
+                "status",
+                "trigger_type",
+                "uncertainty_type",
+                "originating_goal_id",
+                "originating_strategy_id",
+                "originating_plan_id",
+                "why_answer_matters",
+                "waiting_decision",
+                "no_answer_behavior",
+                "candidate_answer_paths",
+                "urgency",
+                "priority",
+                "safe_default_if_unanswered",
+                "trigger_evidence",
+                "selected_path_id",
+                "answer_json",
+                "applied_effect_json",
+                "answered_by",
+                "answered_at",
                 "metadata_json",
                 "created_at",
             ],

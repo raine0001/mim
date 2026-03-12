@@ -1410,6 +1410,49 @@ class StewardshipCycleOut(BaseModel):
     created_at: datetime
 
 
+class InquiryQuestionGenerateRequest(BaseModel):
+    actor: str = "workspace"
+    source: str = "objective62"
+    lookback_hours: int = Field(default=24, ge=1, le=720)
+    max_questions: int = Field(default=10, ge=1, le=100)
+    min_soft_friction_count: int = Field(default=3, ge=2, le=50)
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class InquiryQuestionAnswerRequest(BaseModel):
+    actor: str = "operator"
+    selected_path_id: str = Field(min_length=1)
+    answer_json: dict = Field(default_factory=dict)
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class InquiryQuestionOut(BaseModel):
+    question_id: int
+    source: str
+    actor: str
+    status: str
+    trigger_type: str
+    uncertainty_type: str
+    originating_goal_id: int | None
+    originating_strategy_id: int | None
+    originating_plan_id: int | None
+    why_answer_matters: str
+    waiting_decision: str
+    no_answer_behavior: str
+    candidate_answer_paths: list[dict]
+    urgency: str
+    priority: str
+    safe_default_if_unanswered: str
+    trigger_evidence: dict
+    selected_path_id: str
+    answer_json: dict
+    applied_effect_json: dict
+    answered_by: str
+    answered_at: datetime | None
+    metadata_json: dict
+    created_at: datetime
+
+
 class PolicyExperimentRunRequest(BaseModel):
     actor: str = "workspace"
     source: str = "objective51"
