@@ -1,28 +1,47 @@
 # Objective 66 Production Promotion Report
 
-Date: 2026-03-11
+Date: 2026-03-12
 Objective: 66 — Negotiated Task Resolution and Follow-Through
 Release Tag: objective-66
 
 ## Promotion Outcome
 
-- Promotion: BLOCKED
-- Reason: `scripts/promote_test_to_prod.sh objective-66` requires interactive `sudo` password entry in this execution environment.
+- Promotion: SUCCESS
+- Health Probe: PASS
+- Manifest Probe: PASS
+- Focused Objective 66 Probe: PASS
 
 ### Promotion Command
 
 - `bash scripts/promote_test_to_prod.sh objective-66`
 
-## Readiness Snapshot
+## Runtime Verification
 
-- Focused Objective 65 gate: PASS (`1/1`)
-- Focused Objective 66 gate: PASS (`1/1`)
-- Validation Base URL: `http://127.0.0.1:18001`
+### Smoke
 
-## Next Action
+- Command: `bash scripts/smoke_test.sh prod`
+- Result: PASS (`http://127.0.0.1:8000`)
 
-Execute promotion on a terminal with interactive sudo access, then append:
+### Manifest
 
-- `scripts/smoke_test.sh prod` result
-- production `/manifest` verification (schema/version/capability)
-- focused Objective 66 probe on production base URL
+- Endpoint: `/manifest`
+- Schema Version: `2026-03-12-59`
+- Release Tag: `objective-66`
+- Capability Present: `negotiated_task_resolution_follow_through`
+- Endpoints Present:
+	- `/collaboration/negotiations`
+	- `/collaboration/negotiations/{negotiation_id}/respond`
+
+### Focused Objective 66 Probe on Production
+
+- `MIM_TEST_BASE_URL=http://127.0.0.1:8000 /home/testpilot/Desktop/MIM/.venv/bin/python -m unittest discover -s /home/testpilot/mim/tests/integration -p 'test_objective66_negotiated_task_resolution_follow_through.py'`
+
+Result: PASS (`1/1`)
+
+## Status
+
+Objective 66 is promoted and production-verified.
+
+## Decision
+
+Objective 66 promotion is complete. Negotiated task resolution follow-through and pattern-reuse behavior are active in production.

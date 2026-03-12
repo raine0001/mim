@@ -29,5 +29,6 @@ Result: PASS (`1/1`)
 
 ## Promotion Follow-up
 
-- Promotion Command Attempted: `bash scripts/promote_test_to_prod.sh objective-66`
-- Status: BLOCKED (requires interactive `sudo` password in this environment)
+- Promotion Executed: `bash scripts/promote_test_to_prod.sh objective-66`
+- Production Smoke: PASS
+- Production Objective 66 Probe: PASS (`1/1`)
