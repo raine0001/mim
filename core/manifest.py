@@ -7,7 +7,7 @@ from core.config import PROJECT_ROOT, settings
 
 CONTRACT_VERSION = "tod-mim-shared-contract-v1"
 MANIFEST_VERSION = "1"
-SCHEMA_VERSION = "2026-03-11-44"
+SCHEMA_VERSION = "2026-03-11-45"
 
 SIGNATURE_FILES = [
     "core/models.py",
@@ -32,6 +32,7 @@ SIGNATURE_FILES = [
     "core/routers/improvement.py",
     "core/routers/policy_experiments.py",
     "core/routers/maintenance.py",
+    "core/improvement_recommendation_service.py",
     "docs/tod-mim-bridge.md",
     "docs/objective-21-unified-input-gateway.md",
     "docs/objective-22-mim-tod-execution-feedback-integration.md",
@@ -97,6 +98,8 @@ SIGNATURE_FILES = [
     "docs/objective-53-multi-session-developmental-memory.md",
     "docs/objective-53-promotion-readiness-report.md",
     "docs/objective-53-prod-promotion-report.md",
+    "docs/objective-54-self-guided-improvement-loop.md",
+    "docs/objective-54-promotion-readiness-report.md",
     "config/vision_policy.json",
     "config/voice_policy.json",
 ]
@@ -174,6 +177,7 @@ CAPABILITIES = [
     "policy_experiment_sandbox",
     "concept_pattern_memory",
     "multi_session_developmental_memory",
+    "self_guided_improvement_loop",
 ]
 
 RECENT_CHANGES = [
@@ -224,6 +228,7 @@ RECENT_CHANGES = [
     "Added Objective 51 policy experiment sandbox with bounded soft-policy trial runs, baseline-vs-experiment comparison, and promote/reject/revise recommendations",
     "Added Objective 52 concept and pattern memory with rule-based concept extraction, inspectable concept records, and concept-influenced strategy weighting",
     "Added Objective 53 multi-session developmental memory with cross-session pattern aggregation, inspectable development patterns, and self-improvement feedback influence",
+    "Added Objective 54 self-guided improvement loop with pattern-triggered proposals, sandbox orchestration, standardized experiment metrics, and review-gated recommendations",
 ]
 
 
@@ -382,6 +387,11 @@ def build_manifest() -> dict:
             "/improvement/experiments/run",
             "/improvement/experiments",
             "/improvement/experiments/{experiment_id}",
+            "/improvement/recommendations/generate",
+            "/improvement/recommendations",
+            "/improvement/recommendations/{recommendation_id}",
+            "/improvement/recommendations/{recommendation_id}/approve",
+            "/improvement/recommendations/{recommendation_id}/reject",
             "/maintenance/cycle",
             "/maintenance/runs",
             "/maintenance/runs/{run_id}",
@@ -1003,6 +1013,25 @@ def build_manifest() -> dict:
                 "status",
                 "metadata_json",
                 "created_at",
+            ],
+            "ImprovementRecommendation": [
+                "recommendation_id",
+                "source",
+                "actor",
+                "proposal_id",
+                "experiment_id",
+                "recommendation_type",
+                "recommendation_summary",
+                "baseline_metrics",
+                "experimental_metrics",
+                "comparison",
+                "status",
+                "review_reason",
+                "reviewed_by",
+                "reviewed_at",
+                "metadata_json",
+                "created_at",
+                "latest_artifact",
             ],
         },
     }

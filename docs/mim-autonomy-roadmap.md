@@ -58,11 +58,12 @@ This roadmap is the master sequencing document for MIM objective development. It
 - Objective 51 — Policy experiment sandbox
 - Objective 52 — Concept and pattern memory
 - Objective 53 — Multi-session developmental memory
+- Objective 54 — Self-guided improvement loop
 
 ## Future Objectives
 
-- Objective 54+ — Cross-domain integration and cognition bridge
-- Objective 55+ — Experience graph operationalization at scale
+- Objective 55+ — Cross-domain integration and cognition bridge
+- Objective 56+ — Experience graph operationalization at scale
 
 ## Layered Objective Grouping (Canonical Sequence)
 
@@ -72,7 +73,7 @@ This roadmap is the master sequencing document for MIM objective development. It
 - 32–38: Execution, monitoring, interruption, replanning
 - 39–44: Priority, preferences, constraint reasoning
 - 45–49: Constraint learning, horizon planning, strategy, self-improvement
-- 50+: Environment maintenance, policy experimentation, concept formation, developmental memory
+- 50+: Environment maintenance, policy experimentation, concept formation, developmental memory, self-guided improvement
 
 ## Governance Notes
 

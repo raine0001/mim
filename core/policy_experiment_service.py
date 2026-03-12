@@ -6,7 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.development_memory_service import development_influence_for_experiment
-from core.models import ConstraintEvaluation, WorkspaceDecisionRecord, WorkspaceImprovementProposal, WorkspacePolicyExperiment
+from core.models import Action, ConstraintEvaluation, WorkspaceDecisionRecord, WorkspaceHorizonReplanEvent, WorkspaceImprovementProposal, WorkspacePolicyExperiment
 
 
 async def _warning_rows(*, since: datetime, db: AsyncSession) -> list[ConstraintEvaluation]:
@@ -64,6 +64,60 @@ def _quality_avg(rows: list[WorkspaceDecisionRecord], *, decision_type: str = ""
     return round(sum(float(item.result_quality or 0.0) for item in relevant) / float(len(relevant)), 6)
 
 
+def _operator_override_rate(rows: list[WorkspaceDecisionRecord]) -> float:
+    if not rows:
+        return 0.0
+    override_count = 0
+    for row in rows:
+        source_context = row.source_context_json if isinstance(row.source_context_json, dict) else {}
+        endpoint = str(source_context.get("endpoint", "")).strip()
+        if endpoint.endswith("/resolve") or endpoint.endswith("/deactivate"):
+            override_count += 1
+    return round(float(override_count) / float(max(1, len(rows))), 6)
+
+
+async def _execution_time_ms(*, since: datetime, db: AsyncSession) -> float:
+    rows = (
+        await db.execute(
+            select(Action)
+            .where(Action.started_at >= since)
+            .order_by(Action.id.desc())
+            .limit(4000)
+        )
+    ).scalars().all()
+    durations: list[float] = []
+    for row in rows:
+        if row.completed_at is None or row.started_at is None:
+            continue
+        elapsed = (row.completed_at - row.started_at).total_seconds() * 1000.0
+        if elapsed >= 0:
+            durations.append(elapsed)
+    if not durations:
+        return 0.0
+    return round(sum(durations) / float(len(durations)), 6)
+
+
+async def _replan_frequency(*, since: datetime, db: AsyncSession) -> float:
+    replan_count = (
+        await db.execute(
+            select(WorkspaceHorizonReplanEvent)
+            .where(WorkspaceHorizonReplanEvent.created_at >= since)
+            .order_by(WorkspaceHorizonReplanEvent.id.desc())
+            .limit(4000)
+        )
+    ).scalars().all()
+    action_count = (
+        await db.execute(
+            select(Action)
+            .where(Action.started_at >= since)
+            .order_by(Action.id.desc())
+            .limit(4000)
+        )
+    ).scalars().all()
+    total_actions = max(1, len(action_count))
+    return round(float(len(replan_count)) / float(total_actions), 6)
+
+
 def _proposal_constraint_key(proposal: WorkspaceImprovementProposal | None) -> str:
     if not proposal:
         return "execution_throttle"
@@ -119,6 +173,9 @@ async def run_policy_experiment(
     warning_count = _count_warning(warning_rows, constraint_key=constraint_key)
     success_rate = _success_rate(warning_rows, constraint_key=constraint_key)
     decision_quality = _quality_avg(decision_rows)
+    execution_time_ms = await _execution_time_ms(since=since, db=db)
+    replan_frequency = await _replan_frequency(since=since, db=db)
+    operator_override_rate = _operator_override_rate(decision_rows)
 
     baseline = {
         "lookback_hours": max(1, int(lookback_hours)),
@@ -126,6 +183,9 @@ async def run_policy_experiment(
         "friction_events": int(warning_count),
         "success_rate": float(success_rate),
         "decision_quality": float(decision_quality),
+        "execution_time_ms": float(execution_time_ms),
+        "replan_frequency": float(replan_frequency),
+        "operator_override_rate": float(operator_override_rate),
     }
 
     improvement_factor = 0.2
@@ -135,6 +195,9 @@ async def run_policy_experiment(
     experimental_friction = max(0, int(round(warning_count * (1.0 - improvement_factor))))
     experimental_success = max(0.0, min(1.0, round(success_rate + 0.04, 6)))
     experimental_quality = max(0.0, min(1.0, round(decision_quality + 0.05, 6)))
+    experimental_execution_time_ms = max(0.0, round(execution_time_ms * 0.92, 6))
+    experimental_replan_frequency = max(0.0, round(replan_frequency * (1.0 - (improvement_factor * 0.6)), 6))
+    experimental_operator_override_rate = max(0.0, round(operator_override_rate * 0.9, 6))
 
     experimental = {
         "sandbox_applied": True,
@@ -146,12 +209,26 @@ async def run_policy_experiment(
         "friction_events": experimental_friction,
         "success_rate": experimental_success,
         "decision_quality": experimental_quality,
+        "execution_time_ms": experimental_execution_time_ms,
+        "replan_frequency": experimental_replan_frequency,
+        "operator_override_rate": experimental_operator_override_rate,
     }
 
     friction_reduction = max(0.0, float(warning_count - experimental_friction) / float(max(warning_count, 1)))
     success_gain = max(0.0, experimental_success - success_rate)
     quality_gain = max(0.0, experimental_quality - decision_quality)
-    improvement_score = round((0.45 * friction_reduction) + (0.3 * success_gain) + (0.25 * quality_gain), 6)
+    execution_time_gain = max(0.0, (execution_time_ms - experimental_execution_time_ms) / float(max(execution_time_ms, 1.0)))
+    replan_gain = max(0.0, replan_frequency - experimental_replan_frequency)
+    override_gain = max(0.0, operator_override_rate - experimental_operator_override_rate)
+    improvement_score = round(
+        (0.3 * friction_reduction)
+        + (0.2 * success_gain)
+        + (0.2 * quality_gain)
+        + (0.12 * execution_time_gain)
+        + (0.1 * replan_gain)
+        + (0.08 * override_gain),
+        6,
+    )
 
     derived_experiment_type = _derive_experiment_type(proposal, experiment_type)
 
@@ -183,6 +260,9 @@ async def run_policy_experiment(
         "friction_reduction_ratio": round(friction_reduction, 6),
         "success_rate_delta": round(success_gain, 6),
         "decision_quality_delta": round(quality_gain, 6),
+        "execution_time_ms_delta": round(execution_time_ms - experimental_execution_time_ms, 6),
+        "replan_frequency_delta": round(replan_frequency - experimental_replan_frequency, 6),
+        "operator_override_rate_delta": round(operator_override_rate - experimental_operator_override_rate, 6),
         "improvement_score": improvement_score,
         "recommendation_confidence": round(min(0.95, 0.5 + improvement_score), 6),
         "development_influence": development_influence,

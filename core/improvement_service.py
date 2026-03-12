@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.concept_memory_service import concept_ids_for_component
 from core.development_memory_service import development_pattern_ids_for_component
+from core.development_memory_service import list_development_patterns
 from core.models import (
     ConstraintEvaluation,
     Task,
@@ -306,6 +307,48 @@ async def _throttle_friction_candidates(*, since: datetime, min_occurrence_count
     ]
 
 
+async def _development_trigger_candidates(*, min_occurrence_count: int, db: AsyncSession) -> list[dict]:
+    patterns = await list_development_patterns(db=db, status="active", pattern_type="", limit=300)
+    candidates: list[dict] = []
+    for pattern in patterns:
+        evidence_count = int(pattern.evidence_count or 0)
+        if evidence_count < min_occurrence_count:
+            continue
+
+        pattern_type = str(pattern.pattern_type or "").strip()
+        affected_component = str(pattern.affected_component or "").strip() or "system"
+        if pattern_type in {"strategy_underperforming", "zone_recurring_friction"}:
+            proposal_type = "priority_rule_refinement"
+        elif pattern_type in {"proposal_type_low_value", "constraint_threshold_too_high"}:
+            proposal_type = "policy_adjustment"
+        elif pattern_type in {"experiment_consistently_successful", "strategy_repeatedly_successful"}:
+            proposal_type = "routine_strategy_refinement"
+        else:
+            proposal_type = "policy_adjustment"
+
+        confidence = max(0.5, min(0.95, float(pattern.confidence or 0.0) + 0.05))
+        candidates.append(
+            {
+                "proposal_type": proposal_type,
+                "trigger_pattern": "development_pattern_trigger",
+                "affected_component": affected_component,
+                "suggested_change": (
+                    f"Apply bounded adjustment for component '{affected_component}' driven by development pattern '{pattern_type}'"
+                ),
+                "evidence_summary": (
+                    f"Development pattern '{pattern_type}' accumulated evidence_count={evidence_count}"
+                ),
+                "evidence_json": {
+                    "development_pattern_id": int(pattern.id),
+                    "pattern_type": pattern_type,
+                    "evidence_count": evidence_count,
+                },
+                "confidence": confidence,
+            }
+        )
+    return candidates
+
+
 async def _existing_duplicate(
     *,
     proposal_type: str,
@@ -345,6 +388,7 @@ async def generate_improvement_proposals(
     candidates.extend(await _retry_friction_candidates(since=since, min_occurrence_count=min_count, db=db))
     candidates.extend(await _strategy_starvation_candidates(since=since, min_occurrence_count=min_count, db=db))
     candidates.extend(await _throttle_friction_candidates(since=since, min_occurrence_count=min_count, db=db))
+    candidates.extend(await _development_trigger_candidates(min_occurrence_count=min_count, db=db))
 
     created: list[WorkspaceImprovementProposal] = []
     for item in sorted(candidates, key=lambda entry: float(entry.get("confidence", 0.0)), reverse=True):

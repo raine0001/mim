@@ -814,3 +814,23 @@ class WorkspaceDevelopmentPattern(Base, TimestampMixin):
     evidence_summary: Mapped[str] = mapped_column(Text, default="")
     status: Mapped[str] = mapped_column(String(40), default="active", index=True)
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class WorkspaceImprovementRecommendation(Base, TimestampMixin):
+    __tablename__ = "workspace_improvement_recommendations"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    source: Mapped[str] = mapped_column(String(80), default="objective54", index=True)
+    actor: Mapped[str] = mapped_column(String(120), default="workspace")
+    proposal_id: Mapped[int] = mapped_column(ForeignKey("workspace_improvement_proposals.id", ondelete="CASCADE"), index=True)
+    experiment_id: Mapped[int] = mapped_column(ForeignKey("workspace_policy_experiments.id", ondelete="CASCADE"), index=True)
+    recommendation_type: Mapped[str] = mapped_column(String(40), default="revise", index=True)
+    recommendation_summary: Mapped[str] = mapped_column(Text, default="")
+    baseline_metrics_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    experimental_metrics_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    comparison_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    status: Mapped[str] = mapped_column(String(40), default="proposed", index=True)
+    review_reason: Mapped[str] = mapped_column(Text, default="")
+    reviewed_by: Mapped[str] = mapped_column(String(120), default="")
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)

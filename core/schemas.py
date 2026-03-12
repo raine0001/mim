@@ -1051,6 +1051,42 @@ class ImprovementProposalReviewRequest(BaseModel):
     metadata_json: dict = Field(default_factory=dict)
 
 
+class ImprovementRecommendationGenerateRequest(BaseModel):
+    actor: str = "workspace"
+    source: str = "objective54"
+    lookback_hours: int = Field(default=24, ge=1, le=720)
+    min_occurrence_count: int = Field(default=2, ge=2, le=500)
+    max_recommendations: int = Field(default=5, ge=1, le=50)
+    include_existing_open_proposals: bool = True
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class ImprovementRecommendationReviewRequest(BaseModel):
+    actor: str = "operator"
+    reason: str = ""
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class ImprovementRecommendationOut(BaseModel):
+    recommendation_id: int
+    source: str
+    actor: str
+    proposal_id: int
+    experiment_id: int
+    recommendation_type: str
+    recommendation_summary: str
+    baseline_metrics: dict
+    experimental_metrics: dict
+    comparison: dict
+    status: str
+    review_reason: str
+    reviewed_by: str
+    reviewed_at: datetime | None
+    metadata_json: dict
+    created_at: datetime
+    latest_artifact: "ImprovementArtifactOut | None" = None
+
+
 class ImprovementArtifactOut(BaseModel):
     artifact_id: int
     proposal_id: int
