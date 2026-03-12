@@ -92,12 +92,13 @@
     "collaboration_strategy_profiles",
     "unified_state_bus",
     "state_bus_consumers_cross_system_subscription",
-    "bus_driven_cross_system_reactions"
+    "bus_driven_cross_system_reactions",
+    "operator_interface_channel_bridge"
   ],
-  "capability_count": 92,
-  "current_next_objective": "73",
+  "capability_count": 93,
+  "current_next_objective": "74",
   "export_version": "mim-context-v2",
-  "exported_at": "2026-03-12T17:43:55.304610Z",
+  "exported_at": "2026-03-12T18:06:24.469356Z",
   "health": {
     "prod": {
       "base_url": "http://127.0.0.1:8000",
@@ -110,19 +111,19 @@
       "status": "unreachable"
     }
   },
-  "latest_completed_objective": "72",
+  "latest_completed_objective": "73",
   "next_actions": [
     "finalize verification gate",
-    "begin objective 73 planning"
+    "begin objective 74 planning"
   ],
   "notes": [
     "Export regenerated from live manifest and objective index",
     "Replaces stale bootstrap snapshots (e.g., objective 17 warming phase)"
   ],
-  "objective_active": "72",
+  "objective_active": "73",
   "phase": "execution",
-  "release_tag": "objective-73",
-  "schema_version": "2026-03-12-66",
+  "release_tag": "objective-74",
+  "schema_version": "2026-03-12-67",
   "source_of_truth": {
     "manifest_endpoint_priority": [
       "http://127.0.0.1:8000/manifest",
