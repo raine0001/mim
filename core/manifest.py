@@ -7,7 +7,7 @@ from core.config import PROJECT_ROOT, settings
 
 CONTRACT_VERSION = "tod-mim-shared-contract-v1"
 MANIFEST_VERSION = "1"
-SCHEMA_VERSION = "2026-03-12-59"
+SCHEMA_VERSION = "2026-03-12-60"
 
 SIGNATURE_FILES = [
     "core/models.py",
@@ -145,6 +145,7 @@ SIGNATURE_FILES = [
     "docs/objective-65-promotion-readiness-report.md",
     "docs/objective-65-prod-promotion-report.md",
     "docs/objective-66-negotiated-task-resolution-follow-through.md",
+    "docs/objective-67-negotiation-memory-and-human-preference-consolidation.md",
     "config/vision_policy.json",
     "config/voice_policy.json",
 ]
@@ -235,6 +236,7 @@ CAPABILITIES = [
     "human_aware_cross_domain_collaboration",
     "human_aware_collaboration_negotiation",
     "negotiated_task_resolution_follow_through",
+    "negotiation_memory_human_preference_consolidation",
 ]
 
 RECENT_CHANGES = [
@@ -299,6 +301,7 @@ RECENT_CHANGES = [
     "Added Objective 64 human-aware cross-domain collaboration with collaboration-mode policy, communication-aware task shaping, and explainable human-context modifiers",
     "Added Objective 65 human-aware collaboration negotiation with persistent negotiation state, structured option shaping, response endpoints, and safe unanswered fallbacks",
     "Added Objective 66 negotiated task resolution follow-through with negotiation outcome memory, pattern-based reuse, and downstream follow-through propagation",
+    "Added Objective 67 negotiation memory and human-preference consolidation with durable preference conversion, inspectable evidence, and safe revision behavior",
 ]
 
 
@@ -480,6 +483,7 @@ def build_manifest() -> dict:
             "/collaboration/negotiations",
             "/collaboration/negotiations/{negotiation_id}",
             "/collaboration/negotiations/{negotiation_id}/respond",
+            "/collaboration/preferences",
             "/strategy/goals/build",
             "/strategy/goals",
             "/strategy/persistence/goals/recompute",

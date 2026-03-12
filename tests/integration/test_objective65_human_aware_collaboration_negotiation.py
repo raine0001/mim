@@ -41,17 +41,21 @@ def get_json(path: str) -> tuple[int, dict | list]:
 
 class Objective65HumanAwareCollaborationNegotiationTest(unittest.TestCase):
     def _reset_negotiation_patterns(self) -> None:
-        status, payload = post_json(
-            "/preferences",
-            {
-                "user_id": "operator",
-                "preference_type": "collaboration_negotiation_patterns",
-                "value": {"version": "objective66-v1", "patterns": {}},
-                "confidence": 0.0,
-                "source": "test_reset",
-            },
-        )
-        self.assertEqual(status, 200, payload)
+        for preference_type, value in [
+            ("collaboration_negotiation_patterns", {"version": "objective66-v1", "patterns": {}}),
+            ("collaboration_negotiation_memory", {"version": "objective67-v1", "patterns": {}}),
+        ]:
+            status, payload = post_json(
+                "/preferences",
+                {
+                    "user_id": "operator",
+                    "preference_type": preference_type,
+                    "value": value,
+                    "confidence": 0.0,
+                    "source": "test_reset",
+                },
+            )
+            self.assertEqual(status, 200, payload)
 
     def _seed_cross_domain_inputs(self, run_id: str, zone: str, urgent: bool) -> None:
         text = f"Objective65 routine update {run_id}"

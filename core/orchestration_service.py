@@ -30,6 +30,11 @@ NEGOTIATION_POLICY_VERSION = "human-aware-negotiation-v1"
 NEGOTIATION_PATTERN_PREFERENCE_TYPE = "collaboration_negotiation_patterns"
 NEGOTIATION_PATTERN_MIN_REUSE_COUNT = 2
 NEGOTIATION_PATTERN_MIN_CONFIDENCE = 0.8
+NEGOTIATION_MEMORY_PREFERENCE_TYPE = "collaboration_negotiation_memory"
+NEGOTIATION_MEMORY_MIN_EVIDENCE = 4
+NEGOTIATION_MEMORY_MIN_CONFIDENCE = 0.74
+NEGOTIATION_MEMORY_REVISION_FLOOR = 0.55
+NEGOTIATION_MEMORY_MAX_INTERACTIONS = 40
 NEGOTIATION_OPTION_IDS = {
     "continue_now",
     "defer_action",
@@ -327,6 +332,7 @@ def _resolve_collaboration_mode(
     human_aware: dict,
     communication_urgency: float,
     interruption_likelihood: float,
+    memory_preference: dict | None = None,
 ) -> tuple[str, str]:
     requested = str(requested_mode or "auto").strip().lower()
     if requested in COLLABORATION_MODES:
@@ -340,6 +346,11 @@ def _resolve_collaboration_mode(
         return "confirmation-first", "operator_or_motion_proximity"
     if communication_urgency >= 0.65:
         return "assistive", "urgent_communication_context"
+    if isinstance(memory_preference, dict):
+        preferred_option = str(memory_preference.get("preferred_option_id", "")).strip()
+        confidence = float(memory_preference.get("confidence", 0.0) or 0.0)
+        if confidence >= 0.8 and preferred_option in {"defer_action", "rescan_first", "speak_summary_only"}:
+            return "deferential", "negotiation_memory_preference"
     return preferred_mode, "operator_preference_default"
 
 
@@ -351,6 +362,7 @@ def _apply_collaboration_policy(
     interruption_likelihood: float,
     task_kind: str,
     action_risk_level: str,
+    memory_preference: dict | None = None,
 ) -> dict:
     normalized_kind = str(task_kind or "mixed").strip().lower()
     normalized_risk = str(action_risk_level or "medium").strip().lower()
@@ -389,6 +401,21 @@ def _apply_collaboration_policy(
     if interruption_likelihood >= 0.7 and physical and not low_risk:
         defer_physical_action = True
         modifiers.append("elevated_interruption_likelihood_defer")
+
+    if isinstance(memory_preference, dict):
+        preferred_option = str(memory_preference.get("preferred_option_id", "")).strip()
+        confidence = float(memory_preference.get("confidence", 0.0) or 0.0)
+        if confidence >= 0.8 and preferred_option in {"defer_action", "rescan_first"} and physical:
+            defer_physical_action = True
+            ask_question = False
+            modifiers.append("objective67_memory_prefers_deferral")
+        if confidence >= 0.78 and preferred_option == "speak_summary_only":
+            surface_concise_update = True
+            defer_physical_action = True if physical else defer_physical_action
+            ask_question = False
+            modifiers.append("objective67_memory_prefers_concise_update")
+        if confidence >= 0.9 and preferred_option == "continue_now" and informational and low_risk:
+            modifiers.append("objective67_memory_prefers_continue")
 
     continue_allowed = informational and low_risk
     if continue_allowed:
@@ -687,10 +714,22 @@ def _negotiation_options(
     return deduped
 
 
-def _default_safe_path(*, options: list[dict], task_kind: str, action_risk_level: str, human_aware: dict, communication_urgency: float) -> str:
+def _default_safe_path(
+    *,
+    options: list[dict],
+    task_kind: str,
+    action_risk_level: str,
+    human_aware: dict,
+    communication_urgency: float,
+    preferred_default_option: str = "",
+) -> str:
     option_ids = {str(item.get("option_id", "")).strip() for item in options if isinstance(item, dict)}
     physical = str(task_kind or "mixed").strip().lower() == "physical"
     risk = str(action_risk_level or "medium").strip().lower()
+
+    preferred = str(preferred_default_option or "").strip()
+    if preferred and preferred in option_ids:
+        return preferred
 
     if physical and bool(human_aware.get("shared_workspace_active", False)) and "defer_action" in option_ids:
         return "defer_action"
@@ -773,6 +812,57 @@ async def _load_negotiation_patterns(*, db: AsyncSession) -> dict:
     return {"version": "objective66-v1", "patterns": {}}
 
 
+async def _load_negotiation_memory(*, db: AsyncSession) -> dict:
+    payload = await get_user_preference_value(
+        db=db,
+        preference_type=NEGOTIATION_MEMORY_PREFERENCE_TYPE,
+        user_id=DEFAULT_USER_ID,
+    )
+    if isinstance(payload, dict):
+        return payload
+    return {
+        "version": "objective67-v1",
+        "patterns": {},
+    }
+
+
+def _memory_preference_for_pattern(*, memory_payload: dict, pattern_key: str, option_ids: set[str] | None = None) -> dict:
+    patterns = memory_payload.get("patterns", {}) if isinstance(memory_payload.get("patterns", {}), dict) else {}
+    item = patterns.get(pattern_key, {}) if isinstance(patterns.get(pattern_key, {}), dict) else {}
+    state = str(item.get("state", "learning")).strip()
+    evidence_count = int(item.get("evidence_count", 0) or 0)
+    confidence = float(item.get("confidence", 0.0) or 0.0)
+    preferred_option_id = str(item.get("dominant_option_id", "")).strip()
+    if option_ids is not None and preferred_option_id and preferred_option_id not in option_ids:
+        preferred_option_id = ""
+
+    return {
+        "pattern_key": pattern_key,
+        "state": state,
+        "evidence_count": evidence_count,
+        "confidence": confidence,
+        "preferred_option_id": preferred_option_id,
+        "option_counts": item.get("option_counts", {}) if isinstance(item.get("option_counts", {}), dict) else {},
+        "source_interactions": item.get("source_interactions", []) if isinstance(item.get("source_interactions", []), list) else [],
+    }
+
+
+def _consolidated_option_from_memory(*, memory_preference: dict, option_ids: set[str]) -> tuple[str | None, float, int]:
+    preferred_option_id = str(memory_preference.get("preferred_option_id", "")).strip()
+    confidence = float(memory_preference.get("confidence", 0.0) or 0.0)
+    evidence_count = int(memory_preference.get("evidence_count", 0) or 0)
+    state = str(memory_preference.get("state", "learning")).strip()
+    if state != "consolidated":
+        return None, confidence, evidence_count
+    if evidence_count < NEGOTIATION_MEMORY_MIN_EVIDENCE:
+        return None, confidence, evidence_count
+    if confidence < NEGOTIATION_MEMORY_MIN_CONFIDENCE:
+        return None, confidence, evidence_count
+    if preferred_option_id not in option_ids:
+        return None, confidence, evidence_count
+    return preferred_option_id, confidence, evidence_count
+
+
 def _recommended_option_from_patterns(*, pattern_payload: dict, pattern_key: str, option_ids: set[str]) -> tuple[str | None, float, int]:
     patterns = pattern_payload.get("patterns", {}) if isinstance(pattern_payload.get("patterns", {}), dict) else {}
     item = patterns.get(pattern_key, {}) if isinstance(patterns.get(pattern_key, {}), dict) else {}
@@ -804,6 +894,8 @@ async def _record_negotiation_pattern_signal(
     human_context_state: dict,
     selected_option_id: str,
     actor: str,
+    resolution_status: str = "",
+    negotiation_id: int | None = None,
     db: AsyncSession,
 ) -> None:
     pattern_key = _negotiation_pattern_key(trigger_type=trigger_type, human_context_state=human_context_state)
@@ -838,6 +930,124 @@ async def _record_negotiation_pattern_signal(
         source="learning",
         user_id=DEFAULT_USER_ID,
     )
+
+    memory_payload = await _load_negotiation_memory(db=db)
+    memory_patterns = memory_payload.get("patterns", {}) if isinstance(memory_payload.get("patterns", {}), dict) else {}
+    memory_item = memory_patterns.get(pattern_key, {}) if isinstance(memory_patterns.get(pattern_key, {}), dict) else {}
+    memory_counts = memory_item.get("option_counts", {}) if isinstance(memory_item.get("option_counts", {}), dict) else {}
+    memory_counts[option_id] = int(memory_counts.get(option_id, 0) or 0) + 1
+    evidence_count = int(memory_item.get("evidence_count", 0) or 0) + 1
+    dominant_option = ""
+    dominant_count = 0
+    for candidate, candidate_count in memory_counts.items():
+        normalized = str(candidate or "").strip()
+        count = int(candidate_count or 0)
+        if count > dominant_count:
+            dominant_option = normalized
+            dominant_count = count
+    ratio = float(dominant_count / max(1, evidence_count))
+    scaled_confidence = _bounded(ratio)
+
+    prior_state = str(memory_item.get("state", "learning")).strip()
+    new_state = "learning"
+    if evidence_count >= NEGOTIATION_MEMORY_MIN_EVIDENCE and ratio >= NEGOTIATION_MEMORY_MIN_CONFIDENCE:
+        new_state = "consolidated"
+    elif prior_state == "consolidated" and ratio < NEGOTIATION_MEMORY_REVISION_FLOOR:
+        new_state = "learning"
+
+    source_interactions = memory_item.get("source_interactions", []) if isinstance(memory_item.get("source_interactions", []), list) else []
+    source_interactions = [
+        item
+        for item in source_interactions
+        if isinstance(item, dict)
+    ]
+    source_interactions.append(
+        {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "selected_option_id": option_id,
+            "actor": actor,
+            "resolution_status": str(resolution_status or ""),
+            "negotiation_id": int(negotiation_id) if negotiation_id is not None else None,
+        }
+    )
+    source_interactions = source_interactions[-NEGOTIATION_MEMORY_MAX_INTERACTIONS:]
+
+    memory_patterns[pattern_key] = {
+        "pattern_key": pattern_key,
+        "state": new_state,
+        "evidence_count": evidence_count,
+        "option_counts": memory_counts,
+        "dominant_option_id": dominant_option,
+        "confidence": round(scaled_confidence, 6),
+        "source_interactions": source_interactions,
+        "last_updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    memory_payload = {
+        "version": "objective67-v1",
+        "patterns": memory_patterns,
+    }
+    await upsert_user_preference(
+        db=db,
+        preference_type=NEGOTIATION_MEMORY_PREFERENCE_TYPE,
+        value=memory_payload,
+        confidence=min(1.0, 0.2 + (evidence_count / 20.0)),
+        source="learning",
+        user_id=DEFAULT_USER_ID,
+    )
+
+
+async def inspect_negotiation_preferences(
+    *,
+    pattern_key: str,
+    limit: int,
+    db: AsyncSession,
+) -> dict:
+    memory_payload = await _load_negotiation_memory(db=db)
+    patterns = memory_payload.get("patterns", {}) if isinstance(memory_payload.get("patterns", {}), dict) else {}
+    selected: dict[str, dict]
+    if pattern_key.strip():
+        key = pattern_key.strip()
+        selected = {key: patterns.get(key, {}) if isinstance(patterns.get(key, {}), dict) else {}}
+    else:
+        selected = {
+            key: value
+            for key, value in patterns.items()
+            if isinstance(key, str) and isinstance(value, dict)
+        }
+
+    ordered = sorted(
+        selected.values(),
+        key=lambda item: (
+            float(item.get("confidence", 0.0) or 0.0),
+            int(item.get("evidence_count", 0) or 0),
+            str(item.get("last_updated_at", "")),
+        ),
+        reverse=True,
+    )
+    trimmed = ordered[: max(1, min(500, int(limit)))]
+    consolidated = [
+        {
+            "pattern_key": str(item.get("pattern_key", "")),
+            "state": str(item.get("state", "learning")),
+            "preferred_option_id": str(item.get("dominant_option_id", "")),
+            "confidence": float(item.get("confidence", 0.0) or 0.0),
+            "evidence_count": int(item.get("evidence_count", 0) or 0),
+            "option_counts": item.get("option_counts", {}) if isinstance(item.get("option_counts", {}), dict) else {},
+            "source_interactions": item.get("source_interactions", []) if isinstance(item.get("source_interactions", []), list) else [],
+            "last_updated_at": item.get("last_updated_at", ""),
+        }
+        for item in trimmed
+    ]
+    return {
+        "policy_version": "objective67-negotiation-memory-v1",
+        "thresholds": {
+            "min_evidence_for_consolidation": NEGOTIATION_MEMORY_MIN_EVIDENCE,
+            "min_confidence_for_consolidation": NEGOTIATION_MEMORY_MIN_CONFIDENCE,
+            "revision_floor": NEGOTIATION_MEMORY_REVISION_FLOOR,
+        },
+        "preferences": consolidated,
+    }
 
 
 async def _apply_negotiation_follow_through(
@@ -939,12 +1149,28 @@ async def build_cross_domain_task_orchestration(
     interruption_likelihood, interruption_details = await _interruption_likelihood(human_aware=human_aware, db=db)
     operator_presence_score = _operator_presence_score(human_aware=human_aware)
     preferred_mode = await _preferred_collaboration_mode(db=db)
+    memory_pattern_key = _negotiation_pattern_key(
+        trigger_type="",
+        human_context_state={
+            "task_kind": task_kind,
+            "action_risk_level": action_risk_level,
+            "communication_urgency": communication_urgency,
+            "signals": human_aware,
+        },
+    )
+    memory_payload = await _load_negotiation_memory(db=db)
+    memory_preference = _memory_preference_for_pattern(
+        memory_payload=memory_payload,
+        pattern_key=memory_pattern_key,
+        option_ids=None,
+    )
     collaboration_mode, collaboration_mode_reason = _resolve_collaboration_mode(
         requested_mode=collaboration_mode_preference,
         preferred_mode=preferred_mode,
         human_aware=human_aware,
         communication_urgency=communication_urgency,
         interruption_likelihood=interruption_likelihood,
+        memory_preference=memory_preference,
     )
     collaboration_policy = _apply_collaboration_policy(
         mode=collaboration_mode,
@@ -953,6 +1179,7 @@ async def build_cross_domain_task_orchestration(
         interruption_likelihood=interruption_likelihood,
         task_kind=task_kind,
         action_risk_level=action_risk_level,
+        memory_preference=memory_preference,
     )
     priority_score = _bounded(priority_score + float(collaboration_policy.get("reprioritize_delta", 0.0)))
     priority_label = _priority_label(priority_score)
@@ -1061,12 +1288,26 @@ async def build_cross_domain_task_orchestration(
 
     negotiation_payload: dict | None = None
     if negotiation_triggers:
+        memory_option_ids = {
+            str(item.get("option_id", "")).strip()
+            for item in options_presented
+            if isinstance(item, dict)
+        }
+        memory_default_option, memory_default_confidence, memory_default_evidence = _consolidated_option_from_memory(
+            memory_preference=_memory_preference_for_pattern(
+                memory_payload=memory_payload,
+                pattern_key=memory_pattern_key,
+                option_ids=memory_option_ids,
+            ),
+            option_ids=memory_option_ids,
+        )
         default_path = _default_safe_path(
             options=options_presented,
             task_kind=task_kind,
             action_risk_level=action_risk_level,
             human_aware=human_aware,
             communication_urgency=communication_urgency,
+            preferred_default_option=(memory_default_option or ""),
         )
         negotiation_payload = {
             "trigger": negotiation_triggers[0],
@@ -1090,6 +1331,15 @@ async def build_cross_domain_task_orchestration(
                 "safe_fallback_if_unanswered": default_path,
             },
         }
+        if memory_default_option:
+            negotiation_payload["explainability"] = {
+                **(negotiation_payload.get("explainability", {}) if isinstance(negotiation_payload.get("explainability", {}), dict) else {}),
+                "objective67_memory_influence": {
+                    "preferred_option_id": memory_default_option,
+                    "confidence": memory_default_confidence,
+                    "evidence_count": memory_default_evidence,
+                },
+            }
         if not bool(collaboration_policy.get("continue_allowed", False)):
             if bool(collaboration_policy.get("defer_physical_action", False)):
                 status = "deferred"
@@ -1279,6 +1529,19 @@ async def build_cross_domain_task_orchestration(
             pattern_key=pattern_key,
             option_ids=option_ids,
         )
+        consolidated_memory_option, consolidated_memory_confidence, consolidated_memory_total = _consolidated_option_from_memory(
+            memory_preference=_memory_preference_for_pattern(
+                memory_payload=memory_payload,
+                pattern_key=pattern_key,
+                option_ids=option_ids,
+            ),
+            option_ids=option_ids,
+        )
+        if not recommended_option_id:
+            if consolidated_memory_option:
+                recommended_option_id = consolidated_memory_option
+                recommended_confidence = consolidated_memory_confidence
+                recommended_total = consolidated_memory_total
 
         negotiation = await _create_collaboration_negotiation(
             actor=actor,
@@ -1311,7 +1574,7 @@ async def build_cross_domain_task_orchestration(
             "linked_collaboration_negotiation_ids": linked_negotiation_ids,
         }
 
-        if recommended_option_id:
+        if recommended_option_id and not consolidated_memory_option:
             selected_option = _option_by_id(
                 options=negotiation.options_presented_json if isinstance(negotiation.options_presented_json, list) else [],
                 option_id=recommended_option_id,
@@ -1373,6 +1636,8 @@ async def build_cross_domain_task_orchestration(
                     human_context_state=negotiation.human_context_state_json if isinstance(negotiation.human_context_state_json, dict) else {},
                     selected_option_id=recommended_option_id,
                     actor="system_pattern",
+                    resolution_status="reused_prior_pattern",
+                    negotiation_id=int(negotiation.id),
                     db=db,
                 )
     return row, context
@@ -1606,6 +1871,8 @@ async def respond_collaboration_negotiation(
         human_context_state=negotiation.human_context_state_json if isinstance(negotiation.human_context_state_json, dict) else {},
         selected_option_id=selected_option_id,
         actor=actor,
+        resolution_status="operator_selected",
+        negotiation_id=int(negotiation.id),
         db=db,
     )
     await db.flush()
@@ -1666,6 +1933,8 @@ async def apply_due_collaboration_negotiation_fallbacks(
             human_context_state=row.human_context_state_json if isinstance(row.human_context_state_json, dict) else {},
             selected_option_id=selected_option_id,
             actor="system",
+            resolution_status="fallback_safe_default",
+            negotiation_id=int(row.id),
             db=db,
         )
         applied.append(row)

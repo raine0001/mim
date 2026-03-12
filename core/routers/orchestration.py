@@ -8,6 +8,7 @@ from core.orchestration_service import (
     apply_due_collaboration_negotiation_fallbacks,
     build_cross_domain_task_orchestration,
     get_collaboration_negotiation,
+    inspect_negotiation_preferences,
     get_task_orchestration,
     inspect_collaboration_state,
     list_collaboration_negotiations,
@@ -249,3 +250,17 @@ async def respond_collaboration_negotiation_endpoint(
         "negotiation": to_collaboration_negotiation_out(negotiation),
         "orchestration": to_task_orchestration_out(orchestration) if orchestration else None,
     }
+
+
+@router.get("/collaboration/preferences")
+async def inspect_collaboration_preferences_endpoint(
+    pattern_key: str = Query(default=""),
+    limit: int = Query(default=50, ge=1, le=500),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    payload = await inspect_negotiation_preferences(
+        pattern_key=pattern_key,
+        limit=limit,
+        db=db,
+    )
+    return payload

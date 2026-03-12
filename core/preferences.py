@@ -38,6 +38,16 @@ DEFAULT_PREFERENCES: dict[str, dict] = {
         "confidence": 0.2,
         "source": "learning",
     },
+    "collaboration_negotiation_patterns": {
+        "value": {"version": "objective66-v1", "patterns": {}},
+        "confidence": 0.0,
+        "source": "learning",
+    },
+    "collaboration_negotiation_memory": {
+        "value": {"version": "objective67-v1", "patterns": {}},
+        "confidence": 0.0,
+        "source": "learning",
+    },
 }
 
 
