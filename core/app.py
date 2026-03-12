@@ -124,6 +124,13 @@ async def ensure_schema() -> None:
         await conn.execute(text("ALTER TABLE IF EXISTS workspace_autonomy_boundary_profiles ADD COLUMN IF NOT EXISTS evidence_inputs_json JSONB DEFAULT '{}'::jsonb"))
         await conn.execute(text("ALTER TABLE IF EXISTS workspace_autonomy_boundary_profiles ADD COLUMN IF NOT EXISTS last_adjusted TIMESTAMPTZ"))
         await conn.execute(text("ALTER TABLE IF EXISTS workspace_autonomy_boundary_profiles ADD COLUMN IF NOT EXISTS adjustment_reason TEXT DEFAULT ''"))
+        await conn.execute(text("ALTER TABLE IF EXISTS workspace_strategy_goals ADD COLUMN IF NOT EXISTS persistence_state VARCHAR(40) DEFAULT 'session'"))
+        await conn.execute(text("ALTER TABLE IF EXISTS workspace_strategy_goals ADD COLUMN IF NOT EXISTS review_status VARCHAR(40) DEFAULT 'unreviewed'"))
+        await conn.execute(text("ALTER TABLE IF EXISTS workspace_strategy_goals ADD COLUMN IF NOT EXISTS persistence_confidence DOUBLE PRECISION DEFAULT 0.0"))
+        await conn.execute(text("ALTER TABLE IF EXISTS workspace_strategy_goals ADD COLUMN IF NOT EXISTS surviving_sessions INTEGER DEFAULT 0"))
+        await conn.execute(text("ALTER TABLE IF EXISTS workspace_strategy_goals ADD COLUMN IF NOT EXISTS carry_forward_count INTEGER DEFAULT 0"))
+        await conn.execute(text("ALTER TABLE IF EXISTS workspace_strategy_goals ADD COLUMN IF NOT EXISTS last_reviewed_at TIMESTAMPTZ"))
+        await conn.execute(text("ALTER TABLE IF EXISTS workspace_strategy_goals ADD COLUMN IF NOT EXISTS review_notes TEXT DEFAULT ''"))
 
     await initialize_workspace_monitoring_runtime()
 

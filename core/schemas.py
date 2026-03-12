@@ -1160,6 +1160,44 @@ class StrategyGoalOut(BaseModel):
     linked_improvement_proposal_ids: list[int]
     linked_maintenance_run_ids: list[int]
     operator_recommendations: list[str]
+    persistence_state: str
+    review_status: str
+    persistence_confidence: float
+    surviving_sessions: int
+    carry_forward_count: int
+    last_reviewed_at: datetime | None
+    review_notes: str
+    metadata_json: dict
+    created_at: datetime
+
+
+class StrategyGoalPersistenceRecomputeRequest(BaseModel):
+    actor: str = "workspace"
+    source: str = "objective59"
+    lookback_hours: int = Field(default=168, ge=1, le=2160)
+    min_support_count: int = Field(default=2, ge=1, le=100)
+    min_persistence_confidence: float = Field(default=0.55, ge=0.0, le=1.0)
+    limit: int = Field(default=500, ge=1, le=2000)
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class StrategyGoalReviewRequest(BaseModel):
+    actor: str = "operator"
+    decision: Literal["carry_forward", "activate", "defer", "archive"] = "carry_forward"
+    reason: str = ""
+    evidence_json: dict = Field(default_factory=dict)
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class StrategyGoalReviewOut(BaseModel):
+    review_id: int
+    strategy_goal_id: int
+    actor: str
+    decision: str
+    reason: str
+    resulting_persistence_state: str
+    resulting_review_status: str
+    evidence_json: dict
     metadata_json: dict
     created_at: datetime
 

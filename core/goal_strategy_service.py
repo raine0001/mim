@@ -7,7 +7,9 @@ from core.cross_domain_reasoning_service import build_cross_domain_reasoning_con
 from core.horizon_planning_service import create_horizon_plan
 from core.improvement_service import generate_improvement_proposals as generate_improvement_proposals_for_strategy
 from core.maintenance_service import run_environment_maintenance_cycle
-from core.models import UserPreference, WorkspaceStrategyGoal
+from datetime import datetime, timedelta, timezone
+
+from core.models import UserPreference, WorkspaceStrategyGoal, WorkspaceStrategyGoalReview
 
 
 STRATEGY_GOAL_STATUSES = {
@@ -17,6 +19,25 @@ STRATEGY_GOAL_STATUSES = {
     "superseded",
     "completed",
     "rejected",
+}
+STRATEGY_PERSISTENCE_STATES = {
+    "session",
+    "candidate",
+    "persistent",
+    "archived",
+}
+STRATEGY_REVIEW_STATUSES = {
+    "unreviewed",
+    "needs_review",
+    "approved",
+    "deferred",
+    "archived",
+}
+STRATEGY_REVIEW_DECISIONS = {
+    "carry_forward",
+    "activate",
+    "defer",
+    "archive",
 }
 
 
@@ -507,6 +528,174 @@ async def get_strategy_goal(*, strategy_goal_id: int, db: AsyncSession) -> Works
     ).scalars().first()
 
 
+async def recompute_strategy_goal_persistence(
+    *,
+    actor: str,
+    source: str,
+    lookback_hours: int,
+    min_support_count: int,
+    min_persistence_confidence: float,
+    limit: int,
+    metadata_json: dict,
+    db: AsyncSession,
+) -> tuple[list[WorkspaceStrategyGoal], dict]:
+    since = datetime.now(timezone.utc) - timedelta(hours=max(1, int(lookback_hours)))
+    rows = (
+        await db.execute(
+            select(WorkspaceStrategyGoal)
+            .where(WorkspaceStrategyGoal.created_at >= since)
+            .order_by(WorkspaceStrategyGoal.created_at.desc(), WorkspaceStrategyGoal.id.desc())
+            .limit(max(1, min(1000, int(limit))))
+        )
+    ).scalars().all()
+
+    by_type: dict[str, list[WorkspaceStrategyGoal]] = {}
+    for row in rows:
+        key = str(row.strategy_type or "").strip() or "unknown"
+        by_type.setdefault(key, []).append(row)
+
+    updated: list[WorkspaceStrategyGoal] = []
+    threshold_count = max(1, int(min_support_count))
+    threshold_confidence = _bounded(float(min_persistence_confidence))
+
+    for strategy_type, items in by_type.items():
+        support_count = len(items)
+        avg_priority = _bounded(sum(float(item.priority_score or 0.0) for item in items) / float(max(1, support_count)))
+        persistence_confidence = _bounded((avg_priority * 0.6) + (_bounded(float(support_count) / 5.0) * 0.4))
+        is_persistent = support_count >= threshold_count and persistence_confidence >= threshold_confidence
+
+        for item in items:
+            prev_state = str(item.persistence_state or "session")
+            next_state = "persistent" if is_persistent else "session"
+            next_review = "needs_review" if is_persistent else "unreviewed"
+            if str(item.review_status or "") in {"approved", "deferred", "archived"}:
+                next_review = str(item.review_status)
+
+            item.persistence_state = next_state
+            item.review_status = next_review
+            item.persistence_confidence = persistence_confidence
+            item.surviving_sessions = support_count
+            if prev_state == "persistent" and next_state == "persistent":
+                item.carry_forward_count = int(item.carry_forward_count or 0) + 1
+
+            item.reasoning_json = {
+                **(item.reasoning_json if isinstance(item.reasoning_json, dict) else {}),
+                "objective59_persistence": {
+                    "support_count": support_count,
+                    "threshold_count": threshold_count,
+                    "avg_priority": avg_priority,
+                    "persistence_confidence": persistence_confidence,
+                    "threshold_confidence": threshold_confidence,
+                    "persistent": is_persistent,
+                    "evaluated_by": actor,
+                    "source": source,
+                },
+            }
+            item.metadata_json = {
+                **(item.metadata_json if isinstance(item.metadata_json, dict) else {}),
+                **(metadata_json if isinstance(metadata_json, dict) else {}),
+                "objective59_goal_persistence": True,
+            }
+            updated.append(item)
+
+    return updated, {
+        "evaluated": len(rows),
+        "updated": len(updated),
+        "types": len(by_type),
+        "threshold_count": threshold_count,
+        "threshold_confidence": threshold_confidence,
+    }
+
+
+async def review_strategy_goal(
+    *,
+    strategy_goal_id: int,
+    actor: str,
+    decision: str,
+    reason: str,
+    evidence_json: dict,
+    metadata_json: dict,
+    db: AsyncSession,
+) -> tuple[WorkspaceStrategyGoal | None, WorkspaceStrategyGoalReview | None]:
+    goal = await get_strategy_goal(strategy_goal_id=strategy_goal_id, db=db)
+    if not goal:
+        return None, None
+
+    normalized_decision = str(decision or "carry_forward").strip().lower()
+    if normalized_decision not in STRATEGY_REVIEW_DECISIONS:
+        normalized_decision = "carry_forward"
+
+    if normalized_decision == "archive":
+        goal.persistence_state = "archived"
+        goal.review_status = "archived"
+        goal.status = "superseded"
+    elif normalized_decision == "defer":
+        goal.persistence_state = "persistent"
+        goal.review_status = "deferred"
+        goal.status = "deferred"
+    elif normalized_decision == "activate":
+        goal.persistence_state = "persistent"
+        goal.review_status = "approved"
+        goal.status = "active"
+    else:
+        goal.persistence_state = "persistent"
+        goal.review_status = "approved"
+
+    goal.last_reviewed_at = datetime.now(timezone.utc)
+    goal.review_notes = str(reason or "")
+    if goal.persistence_state == "persistent":
+        goal.carry_forward_count = int(goal.carry_forward_count or 0) + 1
+
+    review = WorkspaceStrategyGoalReview(
+        strategy_goal_id=int(goal.id),
+        actor=actor,
+        decision=normalized_decision,
+        reason=str(reason or ""),
+        resulting_persistence_state=goal.persistence_state,
+        resulting_review_status=goal.review_status,
+        evidence_json=evidence_json if isinstance(evidence_json, dict) else {},
+        metadata_json={
+            **(metadata_json if isinstance(metadata_json, dict) else {}),
+            "objective59_goal_review": True,
+        },
+    )
+    db.add(review)
+    await db.flush()
+    return goal, review
+
+
+async def list_strategy_goal_reviews(
+    *,
+    strategy_goal_id: int,
+    limit: int,
+    db: AsyncSession,
+) -> list[WorkspaceStrategyGoalReview]:
+    rows = (
+        await db.execute(
+            select(WorkspaceStrategyGoalReview)
+            .where(WorkspaceStrategyGoalReview.strategy_goal_id == strategy_goal_id)
+            .order_by(WorkspaceStrategyGoalReview.id.desc())
+            .limit(max(1, min(500, int(limit))))
+        )
+    ).scalars().all()
+    return rows
+
+
+def to_strategy_goal_review_out(row: WorkspaceStrategyGoalReview) -> dict:
+    return {
+        "review_id": int(row.id),
+        "strategy_goal_id": int(row.strategy_goal_id),
+        "actor": row.actor,
+        "decision": row.decision,
+        "reason": row.reason,
+        "resulting_persistence_state": row.resulting_persistence_state,
+        "resulting_review_status": row.resulting_review_status,
+        "evidence_json": row.evidence_json if isinstance(row.evidence_json, dict) else {},
+        "metadata_json": row.metadata_json if isinstance(row.metadata_json, dict) else {},
+        "created_at": row.created_at,
+    }
+
+
 def to_strategy_goal_out(row: WorkspaceStrategyGoal) -> dict:
     return {
         "strategy_goal_id": int(row.id),
@@ -528,6 +717,13 @@ def to_strategy_goal_out(row: WorkspaceStrategyGoal) -> dict:
         "linked_improvement_proposal_ids": row.linked_improvement_proposal_ids_json if isinstance(row.linked_improvement_proposal_ids_json, list) else [],
         "linked_maintenance_run_ids": row.linked_maintenance_run_ids_json if isinstance(row.linked_maintenance_run_ids_json, list) else [],
         "operator_recommendations": row.operator_recommendations_json if isinstance(row.operator_recommendations_json, list) else [],
+        "persistence_state": row.persistence_state,
+        "review_status": row.review_status,
+        "persistence_confidence": float(row.persistence_confidence or 0.0),
+        "surviving_sessions": int(row.surviving_sessions or 0),
+        "carry_forward_count": int(row.carry_forward_count or 0),
+        "last_reviewed_at": row.last_reviewed_at,
+        "review_notes": row.review_notes,
         "metadata_json": row.metadata_json if isinstance(row.metadata_json, dict) else {},
         "created_at": row.created_at,
     }

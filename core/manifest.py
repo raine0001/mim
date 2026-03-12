@@ -7,7 +7,7 @@ from core.config import PROJECT_ROOT, settings
 
 CONTRACT_VERSION = "tod-mim-shared-contract-v1"
 MANIFEST_VERSION = "1"
-SCHEMA_VERSION = "2026-03-11-50"
+SCHEMA_VERSION = "2026-03-11-51"
 
 SIGNATURE_FILES = [
     "core/models.py",
@@ -117,6 +117,8 @@ SIGNATURE_FILES = [
     "docs/objective-58-adaptive-autonomy-boundaries.md",
     "docs/objective-58-promotion-readiness-report.md",
     "docs/objective-58-prod-promotion-report.md",
+    "docs/objective-59-strategic-goal-persistence-review.md",
+    "docs/objective-59-promotion-readiness-report.md",
     "config/vision_policy.json",
     "config/voice_policy.json",
 ]
@@ -199,6 +201,7 @@ CAPABILITIES = [
     "cross_domain_reasoning",
     "goal_strategy_engine",
     "adaptive_autonomy_boundaries",
+    "strategic_goal_persistence_review",
 ]
 
 RECENT_CHANGES = [
@@ -254,6 +257,7 @@ RECENT_CHANGES = [
     "Added Objective 56 cross-domain reasoning with unified workspace, communication, external-information, and developmental-memory context aggregation",
     "Added Objective 57 goal strategy engine with strategic goal synthesis, deterministic ranking, and strategy-to-plan bridge generation",
     "Added Objective 58 adaptive autonomy boundaries with experience-conditioned policy recommendations and applyable autonomy limits",
+    "Added Objective 59 strategic goal persistence and review with cross-session carry-forward scoring and operator review audit",
 ]
 
 
@@ -425,7 +429,11 @@ def build_manifest() -> dict:
             "/reasoning/context/{context_id}",
             "/strategy/goals/build",
             "/strategy/goals",
+            "/strategy/persistence/goals/recompute",
+            "/strategy/persistence/goals",
             "/strategy/goals/{strategy_goal_id}",
+            "/strategy/goals/{strategy_goal_id}/review",
+            "/strategy/goals/{strategy_goal_id}/reviews",
             "/maintenance/cycle",
             "/maintenance/runs",
             "/maintenance/runs/{run_id}",
@@ -1131,6 +1139,25 @@ def build_manifest() -> dict:
                 "linked_improvement_proposal_ids",
                 "linked_maintenance_run_ids",
                 "operator_recommendations",
+                "persistence_state",
+                "review_status",
+                "persistence_confidence",
+                "surviving_sessions",
+                "carry_forward_count",
+                "last_reviewed_at",
+                "review_notes",
+                "metadata_json",
+                "created_at",
+            ],
+            "StrategyGoalReview": [
+                "review_id",
+                "strategy_goal_id",
+                "actor",
+                "decision",
+                "reason",
+                "resulting_persistence_state",
+                "resulting_review_status",
+                "evidence_json",
                 "metadata_json",
                 "created_at",
             ],

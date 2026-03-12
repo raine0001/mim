@@ -903,6 +903,27 @@ class WorkspaceStrategyGoal(Base, TimestampMixin):
     linked_improvement_proposal_ids_json: Mapped[list[int]] = mapped_column(JSON, default=list)
     linked_maintenance_run_ids_json: Mapped[list[int]] = mapped_column(JSON, default=list)
     operator_recommendations_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    persistence_state: Mapped[str] = mapped_column(String(40), default="session", index=True)
+    review_status: Mapped[str] = mapped_column(String(40), default="unreviewed", index=True)
+    persistence_confidence: Mapped[float] = mapped_column(default=0.0)
+    surviving_sessions: Mapped[int] = mapped_column(default=0)
+    carry_forward_count: Mapped[int] = mapped_column(default=0)
+    last_reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    review_notes: Mapped[str] = mapped_column(Text, default="")
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class WorkspaceStrategyGoalReview(Base, TimestampMixin):
+    __tablename__ = "workspace_strategy_goal_reviews"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    strategy_goal_id: Mapped[int] = mapped_column(ForeignKey("workspace_strategy_goals.id", ondelete="CASCADE"), index=True)
+    actor: Mapped[str] = mapped_column(String(120), default="operator")
+    decision: Mapped[str] = mapped_column(String(40), default="carry_forward", index=True)
+    reason: Mapped[str] = mapped_column(Text, default="")
+    resulting_persistence_state: Mapped[str] = mapped_column(String(40), default="session", index=True)
+    resulting_review_status: Mapped[str] = mapped_column(String(40), default="unreviewed", index=True)
+    evidence_json: Mapped[dict] = mapped_column(JSON, default=dict)
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
