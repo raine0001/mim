@@ -7,7 +7,7 @@ from core.config import PROJECT_ROOT, settings
 
 CONTRACT_VERSION = "tod-mim-shared-contract-v1"
 MANIFEST_VERSION = "1"
-SCHEMA_VERSION = "2026-03-11-51"
+SCHEMA_VERSION = "2026-03-11-52"
 
 SIGNATURE_FILES = [
     "core/models.py",
@@ -38,8 +38,10 @@ SIGNATURE_FILES = [
     "core/cross_domain_reasoning_service.py",
     "core/goal_strategy_service.py",
     "core/autonomy_boundary_service.py",
+    "core/stewardship_service.py",
     "core/routers/autonomy_boundaries.py",
     "core/routers/strategy.py",
+    "core/routers/stewardship.py",
     "docs/tod-mim-bridge.md",
     "docs/objective-21-unified-input-gateway.md",
     "docs/objective-22-mim-tod-execution-feedback-integration.md",
@@ -119,6 +121,8 @@ SIGNATURE_FILES = [
     "docs/objective-58-prod-promotion-report.md",
     "docs/objective-59-strategic-goal-persistence-review.md",
     "docs/objective-59-promotion-readiness-report.md",
+    "docs/objective-60-environment-stewardship-loop.md",
+    "docs/objective-60-promotion-readiness-report.md",
     "config/vision_policy.json",
     "config/voice_policy.json",
 ]
@@ -202,6 +206,7 @@ CAPABILITIES = [
     "goal_strategy_engine",
     "adaptive_autonomy_boundaries",
     "strategic_goal_persistence_review",
+    "environment_stewardship_loop",
 ]
 
 RECENT_CHANGES = [
@@ -258,6 +263,7 @@ RECENT_CHANGES = [
     "Added Objective 57 goal strategy engine with strategic goal synthesis, deterministic ranking, and strategy-to-plan bridge generation",
     "Added Objective 58 adaptive autonomy boundaries with experience-conditioned policy recommendations and applyable autonomy limits",
     "Added Objective 59 strategic goal persistence and review with cross-session carry-forward scoring and operator review audit",
+    "Added Objective 60 environment stewardship loop with desired-state maintenance, integrated strategy-memory-autonomy inputs, and inspectable cycle history",
 ]
 
 
@@ -434,6 +440,10 @@ def build_manifest() -> dict:
             "/strategy/goals/{strategy_goal_id}",
             "/strategy/goals/{strategy_goal_id}/review",
             "/strategy/goals/{strategy_goal_id}/reviews",
+            "/stewardship/cycle",
+            "/stewardship",
+            "/stewardship/{stewardship_id}",
+            "/stewardship/history",
             "/maintenance/cycle",
             "/maintenance/runs",
             "/maintenance/runs/{run_id}",
@@ -1185,6 +1195,43 @@ def build_manifest() -> dict:
                 "applied_boundaries",
                 "adaptation_summary",
                 "adaptation_reasoning",
+                "metadata_json",
+                "created_at",
+            ],
+            "Stewardship": [
+                "stewardship_id",
+                "source",
+                "actor",
+                "status",
+                "target_environment_state",
+                "managed_scope",
+                "maintenance_priority",
+                "current_health",
+                "last_cycle",
+                "next_cycle",
+                "cycle_count",
+                "linked_strategy_goal_ids",
+                "linked_maintenance_run_ids",
+                "linked_strategy_types",
+                "linked_autonomy_boundary_id",
+                "last_decision_summary",
+                "metadata_json",
+                "created_at",
+            ],
+            "StewardshipCycle": [
+                "cycle_id",
+                "stewardship_id",
+                "source",
+                "actor",
+                "pre_health",
+                "post_health",
+                "improvement_delta",
+                "degraded_signals",
+                "selected_actions",
+                "decision",
+                "integration_evidence",
+                "maintenance_run_id",
+                "improved",
                 "metadata_json",
                 "created_at",
             ],

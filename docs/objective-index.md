@@ -44,6 +44,7 @@ This registry indexes objective evidence and promotion artifacts so objective hi
 | 57 | Goal Strategy Engine | promoted_verified | 2026-03-11-48 | objective-57 | core/goal_strategy_service.py; core/routers/strategy.py; core/models.py | docs/objective-57-promotion-readiness-report.md | docs/objective-57-prod-promotion-report.md | goal_strategy_engine |
 | 58 | Adaptive Autonomy Boundaries | promoted_verified | 2026-03-11-50 | objective-58 | core/autonomy_boundary_service.py; core/routers/autonomy_boundaries.py; core/models.py | docs/objective-58-promotion-readiness-report.md | docs/objective-58-prod-promotion-report.md | adaptive_autonomy_boundaries |
 | 59 | Strategic Goal Persistence and Review | promoted_verified | 2026-03-11-51 | objective-59 | core/goal_strategy_service.py; core/routers/strategy.py; core/models.py | docs/objective-59-promotion-readiness-report.md | docs/objective-59-prod-promotion-report.md | strategic_goal_persistence_review |
+| 60 | Environment Stewardship Loop | promoted_verified | 2026-03-11-52 | objective-60 | core/stewardship_service.py; core/routers/stewardship.py; core/models.py | docs/objective-60-promotion-readiness-report.md | docs/objective-60-prod-promotion-report.md | environment_stewardship_loop |
 
 ## Notes
 

@@ -1303,6 +1303,58 @@ class MaintenanceCycleRequest(BaseModel):
     metadata_json: dict = Field(default_factory=dict)
 
 
+class StewardshipCycleRequest(BaseModel):
+    actor: str = "workspace"
+    source: str = "objective60"
+    managed_scope: str = "global"
+    stale_after_seconds: int = Field(default=900, ge=60, le=172800)
+    lookback_hours: int = Field(default=168, ge=1, le=2160)
+    max_strategies: int = Field(default=5, ge=1, le=50)
+    max_actions: int = Field(default=5, ge=1, le=50)
+    auto_execute: bool = True
+    force_degraded: bool = False
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class StewardshipOut(BaseModel):
+    stewardship_id: int
+    source: str
+    actor: str
+    status: str
+    target_environment_state: dict
+    managed_scope: str
+    maintenance_priority: str
+    current_health: float
+    last_cycle: datetime | None
+    next_cycle: datetime | None
+    cycle_count: int
+    linked_strategy_goal_ids: list[int]
+    linked_maintenance_run_ids: list[int]
+    linked_strategy_types: list[str]
+    linked_autonomy_boundary_id: int | None
+    last_decision_summary: str
+    metadata_json: dict
+    created_at: datetime
+
+
+class StewardshipCycleOut(BaseModel):
+    cycle_id: int
+    stewardship_id: int
+    source: str
+    actor: str
+    pre_health: float
+    post_health: float
+    improvement_delta: float
+    degraded_signals: list[dict]
+    selected_actions: list[dict]
+    decision: dict
+    integration_evidence: dict
+    maintenance_run_id: int | None
+    improved: bool
+    metadata_json: dict
+    created_at: datetime
+
+
 class PolicyExperimentRunRequest(BaseModel):
     actor: str = "workspace"
     source: str = "objective51"

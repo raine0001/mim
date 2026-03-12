@@ -953,3 +953,44 @@ class WorkspaceAutonomyBoundaryProfile(Base, TimestampMixin):
     adaptation_summary: Mapped[str] = mapped_column(Text, default="")
     adaptation_reasoning_json: Mapped[dict] = mapped_column(JSON, default=dict)
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class WorkspaceStewardshipState(Base, TimestampMixin):
+    __tablename__ = "workspace_stewardship_states"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    source: Mapped[str] = mapped_column(String(80), default="objective60", index=True)
+    actor: Mapped[str] = mapped_column(String(120), default="workspace")
+    status: Mapped[str] = mapped_column(String(40), default="active", index=True)
+    target_environment_state_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    managed_scope: Mapped[str] = mapped_column(String(120), default="global", index=True)
+    maintenance_priority: Mapped[str] = mapped_column(String(40), default="normal", index=True)
+    current_health: Mapped[float] = mapped_column(default=0.0)
+    last_cycle_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    next_cycle_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    cycle_count: Mapped[int] = mapped_column(default=0)
+    linked_strategy_goal_ids_json: Mapped[list[int]] = mapped_column(JSON, default=list)
+    linked_maintenance_run_ids_json: Mapped[list[int]] = mapped_column(JSON, default=list)
+    linked_strategy_types_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    linked_autonomy_boundary_id: Mapped[int | None] = mapped_column(ForeignKey("workspace_autonomy_boundary_profiles.id", ondelete="SET NULL"), nullable=True, index=True)
+    last_decision_summary: Mapped[str] = mapped_column(Text, default="")
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class WorkspaceStewardshipCycle(Base, TimestampMixin):
+    __tablename__ = "workspace_stewardship_cycles"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    stewardship_id: Mapped[int] = mapped_column(ForeignKey("workspace_stewardship_states.id", ondelete="CASCADE"), index=True)
+    source: Mapped[str] = mapped_column(String(80), default="objective60", index=True)
+    actor: Mapped[str] = mapped_column(String(120), default="workspace")
+    pre_health: Mapped[float] = mapped_column(default=0.0)
+    post_health: Mapped[float] = mapped_column(default=0.0)
+    improvement_delta: Mapped[float] = mapped_column(default=0.0)
+    degraded_signals_json: Mapped[list[dict]] = mapped_column(JSON, default=list)
+    selected_actions_json: Mapped[list[dict]] = mapped_column(JSON, default=list)
+    decision_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    integration_evidence_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    maintenance_run_id: Mapped[int | None] = mapped_column(ForeignKey("workspace_maintenance_runs.id", ondelete="SET NULL"), nullable=True, index=True)
+    improved: Mapped[bool] = mapped_column(default=False)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
