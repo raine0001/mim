@@ -27,6 +27,7 @@ from core.orchestration_service import (
     to_task_orchestration_out,
 )
 from core.schemas import CollaborationModePreferenceRequest, CollaborationNegotiationRespondRequest, CollaborationPatternAcknowledgeRequest, CollaborationProfileRecomputeRequest, CrossDomainTaskOrchestrationBuildRequest
+from core.state_bus_service import append_state_bus_event
 
 router = APIRouter()
 
@@ -74,6 +75,30 @@ async def build_cross_domain_task_orchestration_endpoint(
             "action_risk_level": payload.action_risk_level,
             **payload.metadata_json,
         },
+    )
+
+    await append_state_bus_event(
+        actor=payload.actor,
+        source="objective71",
+        event_domain="mim.strategy",
+        event_type="orchestration.built",
+        stream_key=f"orchestration:{row.id}",
+        payload_json={
+            "orchestration_id": row.id,
+            "source": payload.source,
+            "status": row.status,
+            "collaboration_mode": row.collaboration_mode,
+            "priority_label": row.priority_label,
+            "linked_goal_ids": row.linked_goal_ids_json if isinstance(row.linked_goal_ids_json, list) else [],
+            "linked_horizon_plan_ids": row.linked_horizon_plan_ids_json if isinstance(row.linked_horizon_plan_ids_json, list) else [],
+            "downstream_artifacts": row.downstream_artifacts_json if isinstance(row.downstream_artifacts_json, list) else [],
+        },
+        metadata_json={
+            "objective": "objective71",
+            "origin_context_id": row.origin_context_id,
+            **payload.metadata_json,
+        },
+        db=db,
     )
 
     await db.commit()

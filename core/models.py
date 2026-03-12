@@ -1031,6 +1031,38 @@ class WorkspaceCollaborationProfile(Base, TimestampMixin):
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
+class WorkspaceStateBusEvent(Base, TimestampMixin):
+    __tablename__ = "workspace_state_bus_events"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    source: Mapped[str] = mapped_column(String(80), default="objective71", index=True)
+    actor: Mapped[str] = mapped_column(String(120), default="workspace")
+    event_domain: Mapped[str] = mapped_column(String(120), index=True)
+    event_type: Mapped[str] = mapped_column(String(160), index=True)
+    stream_key: Mapped[str] = mapped_column(String(240), index=True)
+    sequence_id: Mapped[int] = mapped_column(default=1)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+    payload_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class WorkspaceStateBusSnapshot(Base, TimestampMixin):
+    __tablename__ = "workspace_state_bus_snapshots"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    source: Mapped[str] = mapped_column(String(80), default="objective71", index=True)
+    actor: Mapped[str] = mapped_column(String(120), default="workspace")
+    snapshot_scope: Mapped[str] = mapped_column(String(240), unique=True, index=True)
+    state_version: Mapped[int] = mapped_column(default=1)
+    state_payload_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    last_event_id: Mapped[int | None] = mapped_column(ForeignKey("workspace_state_bus_events.id", ondelete="SET NULL"), nullable=True, index=True)
+    last_event_sequence: Mapped[int] = mapped_column(default=0)
+    last_event_domain: Mapped[str] = mapped_column(String(120), default="")
+    last_event_type: Mapped[str] = mapped_column(String(160), default="")
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), index=True)
+
+
 class WorkspaceStrategyGoal(Base, TimestampMixin):
     __tablename__ = "workspace_strategy_goals"
 

@@ -7,7 +7,7 @@ from core.config import PROJECT_ROOT, settings
 
 CONTRACT_VERSION = "tod-mim-shared-contract-v1"
 MANIFEST_VERSION = "1"
-SCHEMA_VERSION = "2026-03-12-63"
+SCHEMA_VERSION = "2026-03-12-64"
 
 SIGNATURE_FILES = [
     "core/models.py",
@@ -39,12 +39,14 @@ SIGNATURE_FILES = [
     "core/goal_strategy_service.py",
     "core/inquiry_service.py",
     "core/orchestration_service.py",
+    "core/state_bus_service.py",
     "core/autonomy_boundary_service.py",
     "core/stewardship_service.py",
     "core/routers/autonomy_boundaries.py",
     "core/routers/strategy.py",
     "core/routers/inquiry.py",
     "core/routers/orchestration.py",
+    "core/routers/state_bus.py",
     "core/routers/stewardship.py",
     "docs/tod-mim-bridge.md",
     "docs/objective-21-unified-input-gateway.md",
@@ -149,6 +151,7 @@ SIGNATURE_FILES = [
     "docs/objective-68-negotiation-memory-decay-and-contextualization.md",
     "docs/objective-69-negotiation-pattern-abstraction.md",
     "docs/objective-70-collaboration-strategy-profiles.md",
+    "docs/objective-71-unified-state-bus.md",
     "config/vision_policy.json",
     "config/voice_policy.json",
 ]
@@ -243,6 +246,7 @@ CAPABILITIES = [
     "negotiation_memory_decay_contextualization",
     "negotiation_pattern_abstraction",
     "collaboration_strategy_profiles",
+    "unified_state_bus",
 ]
 
 RECENT_CHANGES = [
@@ -311,6 +315,7 @@ RECENT_CHANGES = [
     "Added Objective 68 negotiation-memory decay and contextualization with freshness-aware confidence decay, context-scoped preference keys, and stale-pattern suppression",
     "Added Objective 69 negotiation pattern abstraction with persistent collaboration concepts, rule-based extraction, bounded influence defaults, and inspectable pattern APIs",
     "Added Objective 70 collaboration strategy profiles with synthesized collaboration modes, bounded profile influence, and inspectable profile recompute APIs",
+    "Added Objective 71 unified state bus with durable snapshot/event-stream separation, multi-domain event ingestion, and inspectable state-bus APIs",
 ]
 
 
@@ -592,6 +597,10 @@ def build_manifest() -> dict:
             "/workspace/execution-proposals",
             "/workspace/execution-proposals/{proposal_id}/accept",
             "/workspace/execution-proposals/{proposal_id}/reject",
+            "/state-bus/events",
+            "/state-bus/events/{event_id}",
+            "/state-bus/snapshots",
+            "/state-bus/snapshots/{snapshot_scope}",
         ],
         "objects": {
             "Objective": [
@@ -1388,6 +1397,34 @@ def build_manifest() -> dict:
                 "influence_profile",
                 "last_observed_at",
                 "metadata_json",
+                "created_at",
+            ],
+            "StateBusEvent": [
+                "event_id",
+                "source",
+                "actor",
+                "event_domain",
+                "event_type",
+                "stream_key",
+                "sequence_id",
+                "occurred_at",
+                "payload_json",
+                "metadata_json",
+                "created_at",
+            ],
+            "StateBusSnapshot": [
+                "snapshot_id",
+                "source",
+                "actor",
+                "snapshot_scope",
+                "state_version",
+                "state_payload_json",
+                "last_event_id",
+                "last_event_sequence",
+                "last_event_domain",
+                "last_event_type",
+                "metadata_json",
+                "updated_at",
                 "created_at",
             ],
         },

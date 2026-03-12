@@ -1405,6 +1405,55 @@ class CollaborationProfileRecomputeRequest(BaseModel):
     metadata_json: dict = Field(default_factory=dict)
 
 
+class StateBusEventCreateRequest(BaseModel):
+    actor: str = "workspace"
+    source: str = "objective71"
+    event_domain: Literal["tod.runtime", "mim.perception", "mim.strategy", "mim.improvement", "mim.assist"] = "mim.strategy"
+    event_type: str = "state.updated"
+    stream_key: str = "global"
+    occurred_at: str = ""
+    payload_json: dict = Field(default_factory=dict)
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class StateBusEventOut(BaseModel):
+    event_id: int
+    source: str
+    actor: str
+    event_domain: str
+    event_type: str
+    stream_key: str
+    sequence_id: int
+    occurred_at: datetime
+    payload_json: dict
+    metadata_json: dict
+    created_at: datetime
+
+
+class StateBusSnapshotUpsertRequest(BaseModel):
+    actor: str = "workspace"
+    source: str = "objective71"
+    state_payload_json: dict = Field(default_factory=dict)
+    last_event_id: int | None = Field(default=None, ge=1)
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class StateBusSnapshotOut(BaseModel):
+    snapshot_id: int
+    source: str
+    actor: str
+    snapshot_scope: str
+    state_version: int
+    state_payload_json: dict
+    last_event_id: int | None
+    last_event_sequence: int
+    last_event_domain: str
+    last_event_type: str
+    metadata_json: dict
+    updated_at: datetime
+    created_at: datetime
+
+
 class StrategyGoalPersistenceRecomputeRequest(BaseModel):
     actor: str = "workspace"
     source: str = "objective59"
