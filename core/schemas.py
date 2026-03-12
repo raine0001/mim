@@ -1516,6 +1516,79 @@ class StateBusReactionStepRequest(BaseModel):
     metadata_json: dict = Field(default_factory=dict)
 
 
+class InterfaceSessionUpsertRequest(BaseModel):
+    actor: str = "operator"
+    source: str = "objective74"
+    channel: Literal["text", "voice", "camera", "api"] = "text"
+    status: Literal["active", "paused", "closed"] = "active"
+    context_json: dict = Field(default_factory=dict)
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class InterfaceSessionOut(BaseModel):
+    session_id: int
+    source: str
+    actor: str
+    session_key: str
+    channel: str
+    status: str
+    last_input_at: datetime | None
+    last_output_at: datetime | None
+    context_json: dict
+    metadata_json: dict
+    updated_at: datetime
+    created_at: datetime
+
+
+class InterfaceMessageCreateRequest(BaseModel):
+    actor: str = "operator"
+    source: str = "objective74"
+    direction: Literal["inbound", "outbound", "system"] = "inbound"
+    role: Literal["operator", "mim", "tod", "system"] = "operator"
+    content: str = ""
+    parsed_intent: str = ""
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    requires_approval: bool = False
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class InterfaceMessageOut(BaseModel):
+    message_id: int
+    session_id: int
+    source: str
+    actor: str
+    direction: str
+    role: str
+    content: str
+    parsed_intent: str
+    confidence: float
+    requires_approval: bool
+    delivery_status: str
+    metadata_json: dict
+    created_at: datetime
+
+
+class InterfaceApprovalRequest(BaseModel):
+    actor: str = "operator"
+    source: str = "objective74"
+    message_id: int | None = Field(default=None, ge=1)
+    decision: Literal["approved", "rejected", "deferred"] = "approved"
+    reason: str = ""
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class InterfaceApprovalOut(BaseModel):
+    approval_id: int
+    session_id: int
+    message_id: int | None
+    source: str
+    actor: str
+    decision: str
+    reason: str
+    metadata_json: dict
+    created_at: datetime
+
+
 class StrategyGoalPersistenceRecomputeRequest(BaseModel):
     actor: str = "workspace"
     source: str = "objective59"

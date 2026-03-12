@@ -7,7 +7,7 @@ from core.config import PROJECT_ROOT, settings
 
 CONTRACT_VERSION = "tod-mim-shared-contract-v1"
 MANIFEST_VERSION = "1"
-SCHEMA_VERSION = "2026-03-12-66"
+SCHEMA_VERSION = "2026-03-12-67"
 
 SIGNATURE_FILES = [
     "core/models.py",
@@ -39,6 +39,7 @@ SIGNATURE_FILES = [
     "core/goal_strategy_service.py",
     "core/inquiry_service.py",
     "core/orchestration_service.py",
+    "core/interface_service.py",
     "core/state_bus_service.py",
     "core/state_bus_consumer_service.py",
     "core/autonomy_boundary_service.py",
@@ -47,6 +48,7 @@ SIGNATURE_FILES = [
     "core/routers/strategy.py",
     "core/routers/inquiry.py",
     "core/routers/orchestration.py",
+    "core/routers/interface.py",
     "core/routers/state_bus.py",
     "core/routers/stewardship.py",
     "docs/tod-mim-bridge.md",
@@ -155,6 +157,7 @@ SIGNATURE_FILES = [
     "docs/objective-71-unified-state-bus.md",
     "docs/objective-72-state-bus-consumers-and-cross-system-subscription.md",
     "docs/objective-73-bus-driven-cross-system-reactions.md",
+    "docs/objective-74-operator-interface-and-channel-bridge.md",
     "config/vision_policy.json",
     "config/voice_policy.json",
 ]
@@ -252,6 +255,7 @@ CAPABILITIES = [
     "unified_state_bus",
     "state_bus_consumers_cross_system_subscription",
     "bus_driven_cross_system_reactions",
+    "operator_interface_channel_bridge",
 ]
 
 RECENT_CHANGES = [
@@ -323,6 +327,7 @@ RECENT_CHANGES = [
     "Added Objective 71 unified state bus with durable snapshot/event-stream separation, multi-domain event ingestion, and inspectable state-bus APIs",
     "Added Objective 72 state bus consumers with filtered subscriptions, idempotent acknowledgment, replay controls, and mim-core cross-system consumption",
     "Added Objective 73 bus-driven cross-system reactions with reaction consumer step, derived reaction events, and replay-safe idempotent handling",
+    "Added Objective 74 operator interface channel bridge with session/message/approval APIs and auditable state-bus-linked approvals",
 ]
 
 
@@ -615,6 +620,10 @@ def build_manifest() -> dict:
             "/state-bus/consumers/{consumer_key}/replay",
             "/state-bus/consumers/mim-core/step",
             "/state-bus/reactions/mim-tod/step",
+            "/interface/sessions/{session_key}",
+            "/interface/sessions",
+            "/interface/sessions/{session_key}/messages",
+            "/interface/sessions/{session_key}/approvals",
         ],
         "objects": {
             "Objective": [
@@ -1460,6 +1469,46 @@ def build_manifest() -> dict:
                 "last_replayed_at",
                 "metadata_json",
                 "updated_at",
+                "created_at",
+            ],
+            "InterfaceSession": [
+                "session_id",
+                "source",
+                "actor",
+                "session_key",
+                "channel",
+                "status",
+                "last_input_at",
+                "last_output_at",
+                "context_json",
+                "metadata_json",
+                "updated_at",
+                "created_at",
+            ],
+            "InterfaceMessage": [
+                "message_id",
+                "session_id",
+                "source",
+                "actor",
+                "direction",
+                "role",
+                "content",
+                "parsed_intent",
+                "confidence",
+                "requires_approval",
+                "delivery_status",
+                "metadata_json",
+                "created_at",
+            ],
+            "InterfaceApproval": [
+                "approval_id",
+                "session_id",
+                "message_id",
+                "source",
+                "actor",
+                "decision",
+                "reason",
+                "metadata_json",
                 "created_at",
             ],
         },

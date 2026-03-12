@@ -1199,3 +1199,49 @@ class WorkspaceStewardshipCycle(Base, TimestampMixin):
     maintenance_run_id: Mapped[int | None] = mapped_column(ForeignKey("workspace_maintenance_runs.id", ondelete="SET NULL"), nullable=True, index=True)
     improved: Mapped[bool] = mapped_column(default=False)
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class WorkspaceInterfaceSession(Base, TimestampMixin):
+    __tablename__ = "workspace_interface_sessions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    source: Mapped[str] = mapped_column(String(80), default="objective74", index=True)
+    actor: Mapped[str] = mapped_column(String(120), default="workspace")
+    session_key: Mapped[str] = mapped_column(String(180), unique=True, index=True)
+    channel: Mapped[str] = mapped_column(String(40), default="text", index=True)
+    status: Mapped[str] = mapped_column(String(40), default="active", index=True)
+    last_input_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_output_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    context_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), index=True)
+
+
+class WorkspaceInterfaceMessage(Base, TimestampMixin):
+    __tablename__ = "workspace_interface_messages"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    session_id: Mapped[int] = mapped_column(ForeignKey("workspace_interface_sessions.id", ondelete="CASCADE"), index=True)
+    source: Mapped[str] = mapped_column(String(80), default="objective74", index=True)
+    actor: Mapped[str] = mapped_column(String(120), default="workspace")
+    direction: Mapped[str] = mapped_column(String(20), default="inbound", index=True)
+    role: Mapped[str] = mapped_column(String(40), default="operator", index=True)
+    content: Mapped[str] = mapped_column(Text, default="")
+    parsed_intent: Mapped[str] = mapped_column(String(120), default="")
+    confidence: Mapped[float] = mapped_column(default=0.0)
+    requires_approval: Mapped[bool] = mapped_column(default=False)
+    delivery_status: Mapped[str] = mapped_column(String(40), default="accepted", index=True)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class WorkspaceInterfaceApproval(Base, TimestampMixin):
+    __tablename__ = "workspace_interface_approvals"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    session_id: Mapped[int] = mapped_column(ForeignKey("workspace_interface_sessions.id", ondelete="CASCADE"), index=True)
+    message_id: Mapped[int | None] = mapped_column(ForeignKey("workspace_interface_messages.id", ondelete="SET NULL"), nullable=True, index=True)
+    source: Mapped[str] = mapped_column(String(80), default="objective74", index=True)
+    actor: Mapped[str] = mapped_column(String(120), default="operator")
+    decision: Mapped[str] = mapped_column(String(40), default="approved", index=True)
+    reason: Mapped[str] = mapped_column(Text, default="")
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
