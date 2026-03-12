@@ -37,6 +37,9 @@ sudo docker compose \
   --env-file "$ENV_FILE" \
   up -d --build
 
+echo "[5/5] Refresh shared MIM context export"
+"$ROOT_DIR/.venv/bin/python" "$ROOT_DIR/scripts/export_mim_context.py"
+
 mkdir -p "$(dirname "$DEPLOY_LOG")"
 echo "${BUILD_TS} release=${RELEASE_TAG} git_sha=${GIT_SHA}" >> "$DEPLOY_LOG"
 
