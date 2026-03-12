@@ -98,7 +98,7 @@
   "capability_count": 93,
   "current_next_objective": "75",
   "export_version": "mim-context-v2",
-  "exported_at": "2026-03-12T18:57:08.985752Z",
+  "exported_at": "2026-03-12T20:41:13.001432Z",
   "health": {
     "prod": {
       "base_url": "http://127.0.0.1:8000",
