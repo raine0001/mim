@@ -14,6 +14,7 @@ from core.models import (
     InputEvent,
     UserPreference,
     WorkspaceCollaborationPattern,
+    WorkspaceCollaborationProfile,
     WorkspaceCollaborationNegotiation,
     WorkspaceCrossDomainReasoningContext,
     WorkspaceHorizonPlan,
@@ -41,6 +42,9 @@ NEGOTIATION_MEMORY_STALE_AFTER_DAYS = 45.0
 NEGOTIATION_ABSTRACTION_POLICY_VERSION = "objective69-negotiation-pattern-abstraction-v1"
 NEGOTIATION_ABSTRACTION_MIN_EVIDENCE = 4
 NEGOTIATION_ABSTRACTION_MIN_CONFIDENCE = 0.74
+COLLABORATION_PROFILE_POLICY_VERSION = "objective70-collaboration-strategy-profiles-v1"
+COLLABORATION_PROFILE_MIN_EVIDENCE = 4
+COLLABORATION_PROFILE_MIN_CONFIDENCE = 0.72
 NEGOTIATION_OPTION_IDS = {
     "continue_now",
     "defer_action",
@@ -370,6 +374,7 @@ def _resolve_collaboration_mode(
     interruption_likelihood: float,
     memory_preference: dict | None = None,
     pattern_preference: dict | None = None,
+    profile_preference: dict | None = None,
 ) -> tuple[str, str]:
     requested = str(requested_mode or "auto").strip().lower()
     if requested in COLLABORATION_MODES:
@@ -379,6 +384,12 @@ def _resolve_collaboration_mode(
         return "deferential", "shared_workspace_active"
     if interruption_likelihood >= 0.7:
         return "deferential", "high_interruption_likelihood"
+    if isinstance(profile_preference, dict):
+        if bool(profile_preference.get("influence_applied", False)):
+            suggested_mode = str(profile_preference.get("dominant_collaboration_mode", "")).strip().lower()
+            confidence = float(profile_preference.get("effective_confidence", 0.0) or 0.0)
+            if suggested_mode in COLLABORATION_MODES and confidence >= 0.76:
+                return suggested_mode, "objective70_profile_influence"
     if bool(human_aware.get("human_near_motion_path", False)) or bool(human_aware.get("operator_present", False)):
         return "confirmation-first", "operator_or_motion_proximity"
     if communication_urgency >= 0.65:
@@ -408,6 +419,7 @@ def _apply_collaboration_policy(
     action_risk_level: str,
     memory_preference: dict | None = None,
     pattern_preference: dict | None = None,
+    profile_preference: dict | None = None,
 ) -> dict:
     normalized_kind = str(task_kind or "mixed").strip().lower()
     normalized_risk = str(action_risk_level or "medium").strip().lower()
@@ -475,6 +487,20 @@ def _apply_collaboration_policy(
                 require_confirmation = True
                 ask_question = True
                 modifiers.append("objective69_pattern_prefers_confirmation")
+
+    if isinstance(profile_preference, dict):
+        if bool(profile_preference.get("influence_applied", False)):
+            influence_profile = profile_preference.get("influence_profile", {}) if isinstance(profile_preference.get("influence_profile", {}), dict) else {}
+            if bool(influence_profile.get("defer_physical_action", False)) and physical:
+                defer_physical_action = True
+                modifiers.append("objective70_profile_prefers_defer_physical")
+            if bool(influence_profile.get("surface_concise_update", False)):
+                surface_concise_update = True
+                modifiers.append("objective70_profile_prefers_concise_update")
+            if bool(influence_profile.get("require_confirmation", False)) and physical:
+                require_confirmation = True
+                ask_question = True
+                modifiers.append("objective70_profile_prefers_confirmation")
 
     continue_allowed = informational and low_risk
     if continue_allowed:
@@ -1250,6 +1276,494 @@ async def _pattern_influence_for_signature(
     }
 
 
+def _collaboration_profile_type(
+    *,
+    pattern_type: str,
+    shared_workspace_ratio: float,
+    urgency_score: float,
+) -> str:
+    if shared_workspace_ratio >= 0.5:
+        return "shared_workspace_deferential_strategy"
+    if urgency_score >= 0.7:
+        return "urgent_communication_priority_strategy"
+    if pattern_type.strip():
+        return f"pattern_derived:{pattern_type.strip()}"
+    return "contextual_collaboration_strategy"
+
+
+def _collaboration_profile_influence_profile(
+    *,
+    dominant_mode: str,
+    dominant_outcome: str,
+    shared_workspace_ratio: float,
+    urgency_score: float,
+) -> dict:
+    profile = {
+        "preferred_default_option": dominant_outcome,
+        "collaboration_mode": dominant_mode,
+        "defer_physical_action": False,
+        "surface_concise_update": False,
+        "require_confirmation": False,
+        "autonomy_suppression": False,
+        "question_priority": "normal",
+    }
+    if dominant_mode in {"deferential", "confirmation-first"}:
+        profile["defer_physical_action"] = True
+    if dominant_mode == "confirmation-first":
+        profile["require_confirmation"] = True
+        profile["question_priority"] = "high"
+    if urgency_score >= 0.7:
+        profile["surface_concise_update"] = True
+        profile["question_priority"] = "high"
+    if shared_workspace_ratio >= 0.5:
+        profile["autonomy_suppression"] = True
+        profile["defer_physical_action"] = True
+    return profile
+
+
+def _collaboration_profile_mode_from_signals(
+    *,
+    pattern_mode: str,
+    operator_override_mode: str,
+    urgency_score: float,
+    shared_workspace_ratio: float,
+    deferral_ratio: float,
+    confirmation_ratio: float,
+) -> str:
+    if shared_workspace_ratio >= 0.5 and deferral_ratio >= 0.45:
+        return "deferential"
+    if confirmation_ratio >= 0.45:
+        return "confirmation-first"
+    if urgency_score >= 0.7:
+        return "assistive"
+    if pattern_mode in COLLABORATION_MODES and deferral_ratio >= 0.3:
+        return pattern_mode
+    if operator_override_mode in COLLABORATION_MODES:
+        return operator_override_mode
+    return "autonomous"
+
+
+async def _recent_negotiation_stats_for_context(
+    *,
+    context_signature: str,
+    db: AsyncSession,
+) -> dict:
+    signature = str(context_signature or "").strip()
+    if not signature:
+        return {
+            "sample_count": 0,
+            "shared_workspace_ratio": 0.0,
+            "urgency_score": 0.0,
+            "deferral_ratio": 0.0,
+            "confirmation_ratio": 0.0,
+            "follow_through_quality": 0.0,
+            "resolution_counts": {},
+        }
+
+    rows = (
+        await db.execute(
+            select(WorkspaceCollaborationNegotiation)
+            .order_by(WorkspaceCollaborationNegotiation.id.desc())
+            .limit(300)
+        )
+    ).scalars().all()
+
+    matched: list[WorkspaceCollaborationNegotiation] = []
+    for row in rows:
+        state = row.human_context_state_json if isinstance(row.human_context_state_json, dict) else {}
+        row_signature = _negotiation_pattern_key(trigger_type="", human_context_state=state)
+        if row_signature == signature:
+            matched.append(row)
+
+    if not matched:
+        return {
+            "sample_count": 0,
+            "shared_workspace_ratio": 0.0,
+            "urgency_score": 0.0,
+            "deferral_ratio": 0.0,
+            "confirmation_ratio": 0.0,
+            "follow_through_quality": 0.0,
+            "resolution_counts": {},
+        }
+
+    shared_hits = 0
+    urgency_values: list[float] = []
+    deferral_hits = 0
+    confirmation_hits = 0
+    follow_success = 0
+    resolution_counts: dict[str, int] = {}
+
+    for row in matched:
+        state = row.human_context_state_json if isinstance(row.human_context_state_json, dict) else {}
+        signals = state.get("signals", {}) if isinstance(state.get("signals", {}), dict) else {}
+        if bool(signals.get("shared_workspace_active", False)):
+            shared_hits += 1
+
+        urgency_values.append(float(state.get("communication_urgency", 0.0) or 0.0))
+        selected_option = str(row.selected_option_id or "").strip()
+        if selected_option in {"defer_action", "rescan_first", "speak_summary_only"}:
+            deferral_hits += 1
+        if selected_option in {"request_confirmation_later", "rescan_first"}:
+            confirmation_hits += 1
+
+        resolution = str(row.resolution_status or "").strip()
+        if resolution:
+            resolution_counts[resolution] = int(resolution_counts.get(resolution, 0) or 0) + 1
+        if resolution in {"operator_selected", "reused_prior_pattern", "fallback_safe_default"}:
+            follow_success += 1
+
+    sample_count = len(matched)
+    return {
+        "sample_count": sample_count,
+        "shared_workspace_ratio": _bounded(shared_hits / max(1, sample_count)),
+        "urgency_score": _bounded(sum(urgency_values) / max(1, len(urgency_values))),
+        "deferral_ratio": _bounded(deferral_hits / max(1, sample_count)),
+        "confirmation_ratio": _bounded(confirmation_hits / max(1, sample_count)),
+        "follow_through_quality": _bounded(follow_success / max(1, sample_count)),
+        "resolution_counts": resolution_counts,
+    }
+
+
+async def _upsert_collaboration_strategy_profile(
+    *,
+    context_scope: str,
+    actor: str,
+    db: AsyncSession,
+) -> WorkspaceCollaborationProfile | None:
+    scope = str(context_scope or "").strip()
+    if not scope:
+        return None
+
+    pattern = (
+        await db.execute(
+            select(WorkspaceCollaborationPattern)
+            .where(WorkspaceCollaborationPattern.context_signature == scope)
+            .order_by(WorkspaceCollaborationPattern.id.desc())
+            .limit(1)
+        )
+    ).scalars().first()
+    if not pattern:
+        return None
+
+    stats = await _recent_negotiation_stats_for_context(context_signature=scope, db=db)
+    pattern_freshness, pattern_decay_factor, pattern_age_days = _collaboration_pattern_freshness(row=pattern)
+    effective_pattern_confidence = _bounded(float(pattern.confidence or 0.0) * pattern_decay_factor)
+    operator_override_mode = await _preferred_collaboration_mode(db=db)
+    pattern_mode = ""
+    pattern_profile = pattern.influence_profile_json if isinstance(pattern.influence_profile_json, dict) else {}
+    if pattern_profile:
+        pattern_mode = str(pattern_profile.get("collaboration_mode", "")).strip().lower()
+
+    dominant_mode = _collaboration_profile_mode_from_signals(
+        pattern_mode=pattern_mode,
+        operator_override_mode=operator_override_mode,
+        urgency_score=float(stats.get("urgency_score", 0.0) or 0.0),
+        shared_workspace_ratio=float(stats.get("shared_workspace_ratio", 0.0) or 0.0),
+        deferral_ratio=float(stats.get("deferral_ratio", 0.0) or 0.0),
+        confirmation_ratio=float(stats.get("confirmation_ratio", 0.0) or 0.0),
+    )
+
+    evidence_count = max(
+        int(pattern.evidence_count or 0),
+        int(stats.get("sample_count", 0) or 0),
+    )
+    follow_quality = float(stats.get("follow_through_quality", 0.0) or 0.0)
+    confidence = _bounded((effective_pattern_confidence * 0.7) + (follow_quality * 0.2) + (float(stats.get("deferral_ratio", 0.0) or 0.0) * 0.1))
+    if operator_override_mode in COLLABORATION_MODES and operator_override_mode != dominant_mode:
+        confidence = _bounded(confidence - 0.06)
+
+    freshness = "stale" if pattern_freshness == "stale" else "fresh"
+    status = "stale" if freshness == "stale" else ("consolidated" if evidence_count >= COLLABORATION_PROFILE_MIN_EVIDENCE and confidence >= COLLABORATION_PROFILE_MIN_CONFIDENCE else "learning")
+
+    dominant_outcome = str(pattern.dominant_outcome or "").strip()
+    profile_type = _collaboration_profile_type(
+        pattern_type=str(pattern.pattern_type or "").strip(),
+        shared_workspace_ratio=float(stats.get("shared_workspace_ratio", 0.0) or 0.0),
+        urgency_score=float(stats.get("urgency_score", 0.0) or 0.0),
+    )
+    influence_profile = _collaboration_profile_influence_profile(
+        dominant_mode=dominant_mode,
+        dominant_outcome=dominant_outcome,
+        shared_workspace_ratio=float(stats.get("shared_workspace_ratio", 0.0) or 0.0),
+        urgency_score=float(stats.get("urgency_score", 0.0) or 0.0),
+    )
+    evidence_summary = (
+        f"Profile synthesized from pattern {int(pattern.id)} with evidence={evidence_count}, "
+        f"confidence={confidence:.2f}, shared_workspace_ratio={float(stats.get('shared_workspace_ratio', 0.0) or 0.0):.2f}, "
+        f"follow_through_quality={follow_quality:.2f}."
+    )
+
+    row = (
+        await db.execute(
+            select(WorkspaceCollaborationProfile)
+            .where(WorkspaceCollaborationProfile.context_scope == scope)
+            .order_by(WorkspaceCollaborationProfile.id.desc())
+            .limit(1)
+        )
+    ).scalars().first()
+
+    now = datetime.now(timezone.utc)
+    if not row:
+        row = WorkspaceCollaborationProfile(
+            source="objective70",
+            actor=actor,
+            profile_type=profile_type,
+            context_scope=scope,
+            dominant_collaboration_mode=dominant_mode,
+            supporting_pattern_ids_json=[int(pattern.id)],
+            evidence_count=evidence_count,
+            confidence=round(confidence, 6),
+            freshness=freshness,
+            status=status,
+            evidence_summary=evidence_summary,
+            explainability_json={},
+            influence_profile_json=influence_profile,
+            last_observed_at=now,
+            metadata_json={},
+        )
+        db.add(row)
+        await db.flush()
+
+    row.profile_type = profile_type
+    row.dominant_collaboration_mode = dominant_mode
+    row.supporting_pattern_ids_json = [int(pattern.id)]
+    row.evidence_count = int(evidence_count)
+    row.confidence = round(confidence, 6)
+    row.freshness = freshness
+    row.status = status
+    row.evidence_summary = evidence_summary
+    row.influence_profile_json = influence_profile
+    row.last_observed_at = now
+    row.explainability_json = {
+        "policy_version": COLLABORATION_PROFILE_POLICY_VERSION,
+        "context_scope": scope,
+        "supporting_pattern_id": int(pattern.id),
+        "pattern_type": str(pattern.pattern_type or ""),
+        "pattern_dominant_outcome": dominant_outcome,
+        "pattern_effective_confidence": round(effective_pattern_confidence, 6),
+        "pattern_age_days": round(pattern_age_days, 6),
+        "operator_override_mode": operator_override_mode,
+        "shared_workspace_ratio": float(stats.get("shared_workspace_ratio", 0.0) or 0.0),
+        "urgency_score": float(stats.get("urgency_score", 0.0) or 0.0),
+        "deferral_ratio": float(stats.get("deferral_ratio", 0.0) or 0.0),
+        "confirmation_ratio": float(stats.get("confirmation_ratio", 0.0) or 0.0),
+        "follow_through_quality": follow_quality,
+        "resolution_counts": stats.get("resolution_counts", {}) if isinstance(stats.get("resolution_counts", {}), dict) else {},
+    }
+    row.metadata_json = {
+        **(row.metadata_json if isinstance(row.metadata_json, dict) else {}),
+        "last_updated_at": now.isoformat(),
+        "strategy_profile_source": "objective70",
+    }
+    return row
+
+
+def _collaboration_profile_freshness(*, row: WorkspaceCollaborationProfile) -> tuple[str, float, float]:
+    decay_factor, age_days, is_stale = _negotiation_memory_decay(last_updated_at=row.last_observed_at)
+    freshness = "stale" if is_stale or str(row.freshness or "").strip().lower() == "stale" else "fresh"
+    return freshness, round(decay_factor, 6), round(age_days, 6)
+
+
+async def _profile_influence_for_scope(*, context_scope: str, db: AsyncSession) -> dict:
+    scope = str(context_scope or "").strip()
+    if not scope:
+        return {}
+    row = (
+        await db.execute(
+            select(WorkspaceCollaborationProfile)
+            .where(WorkspaceCollaborationProfile.context_scope == scope)
+            .order_by(WorkspaceCollaborationProfile.id.desc())
+            .limit(1)
+        )
+    ).scalars().first()
+    if not row:
+        return {}
+
+    freshness, decay_factor, age_days = _collaboration_profile_freshness(row=row)
+    effective_confidence = _bounded(float(row.confidence or 0.0) * decay_factor)
+    if freshness == "stale":
+        return {
+            "profile_id": int(row.id),
+            "context_scope": scope,
+            "influence_applied": False,
+            "reason": "stale_profile",
+            "freshness": freshness,
+            "decay_factor": decay_factor,
+            "age_days": age_days,
+        }
+    if str(row.status or "").strip().lower() != "consolidated":
+        return {
+            "profile_id": int(row.id),
+            "context_scope": scope,
+            "influence_applied": False,
+            "reason": "profile_not_consolidated",
+            "freshness": freshness,
+            "decay_factor": decay_factor,
+            "age_days": age_days,
+        }
+    if effective_confidence < COLLABORATION_PROFILE_MIN_CONFIDENCE:
+        return {
+            "profile_id": int(row.id),
+            "context_scope": scope,
+            "influence_applied": False,
+            "reason": "profile_confidence_below_threshold",
+            "freshness": freshness,
+            "decay_factor": decay_factor,
+            "age_days": age_days,
+        }
+
+    return {
+        "profile_id": int(row.id),
+        "context_scope": scope,
+        "profile_type": str(row.profile_type or ""),
+        "dominant_collaboration_mode": str(row.dominant_collaboration_mode or ""),
+        "effective_confidence": round(effective_confidence, 6),
+        "evidence_count": int(row.evidence_count or 0),
+        "influence_profile": row.influence_profile_json if isinstance(row.influence_profile_json, dict) else {},
+        "influence_applied": True,
+        "reason": "matched_context_scope",
+        "freshness": freshness,
+        "decay_factor": decay_factor,
+        "age_days": age_days,
+    }
+
+
+def to_collaboration_profile_out(row: WorkspaceCollaborationProfile, *, context_scope: str = "") -> dict:
+    freshness, decay_factor, age_days = _collaboration_profile_freshness(row=row)
+    expected_scope = str(context_scope or "").strip()
+    row_scope = str(row.context_scope or "").strip()
+    effective_confidence = _bounded(float(row.confidence or 0.0) * decay_factor)
+    return {
+        "profile_id": int(row.id),
+        "source": row.source,
+        "actor": row.actor,
+        "profile_type": row.profile_type,
+        "context_scope": row_scope,
+        "dominant_collaboration_mode": row.dominant_collaboration_mode,
+        "supporting_pattern_ids": row.supporting_pattern_ids_json if isinstance(row.supporting_pattern_ids_json, list) else [],
+        "evidence_count": int(row.evidence_count or 0),
+        "confidence": round(effective_confidence, 6),
+        "raw_confidence": float(row.confidence or 0.0),
+        "freshness": freshness,
+        "status": row.status,
+        "evidence_summary": row.evidence_summary,
+        "decay_factor": decay_factor,
+        "age_days": age_days,
+        "context_match_score": 1.0 if expected_scope and expected_scope == row_scope else 0.0,
+        "explainability": row.explainability_json if isinstance(row.explainability_json, dict) else {},
+        "influence_profile": row.influence_profile_json if isinstance(row.influence_profile_json, dict) else {},
+        "last_observed_at": row.last_observed_at,
+        "metadata_json": row.metadata_json if isinstance(row.metadata_json, dict) else {},
+        "created_at": row.created_at,
+    }
+
+
+async def list_collaboration_profiles(
+    *,
+    status: str,
+    profile_type: str,
+    context_scope: str,
+    limit: int,
+    db: AsyncSession,
+) -> list[WorkspaceCollaborationProfile]:
+    rows = (
+        await db.execute(
+            select(WorkspaceCollaborationProfile)
+            .order_by(WorkspaceCollaborationProfile.id.desc())
+        )
+    ).scalars().all()
+
+    filtered = rows
+    if status.strip():
+        requested = status.strip().lower()
+        filtered = [item for item in filtered if str(item.status or "").strip().lower() == requested]
+    if profile_type.strip():
+        requested = profile_type.strip().lower()
+        filtered = [item for item in filtered if str(item.profile_type or "").strip().lower() == requested]
+    if context_scope.strip():
+        requested = context_scope.strip()
+        filtered = [item for item in filtered if str(item.context_scope or "").strip() == requested]
+
+    return filtered[: max(1, min(500, int(limit)))]
+
+
+async def get_collaboration_profile(*, profile_id: int, db: AsyncSession) -> WorkspaceCollaborationProfile | None:
+    return (
+        await db.execute(
+            select(WorkspaceCollaborationProfile).where(WorkspaceCollaborationProfile.id == profile_id)
+        )
+    ).scalars().first()
+
+
+async def recompute_collaboration_profiles(
+    *,
+    actor: str,
+    context_scope: str,
+    limit: int,
+    db: AsyncSession,
+) -> list[WorkspaceCollaborationProfile]:
+    scopes: list[str] = []
+    requested_scope = str(context_scope or "").strip()
+    if requested_scope:
+        scopes = [requested_scope]
+    else:
+        pattern_rows = (
+            await db.execute(
+                select(WorkspaceCollaborationPattern)
+                .order_by(WorkspaceCollaborationPattern.id.desc())
+                .limit(max(1, min(500, int(limit))))
+            )
+        ).scalars().all()
+        seen: set[str] = set()
+        for item in pattern_rows:
+            signature = str(item.context_signature or "").strip()
+            if not signature or signature in seen:
+                continue
+            scopes.append(signature)
+            seen.add(signature)
+
+    updated: list[WorkspaceCollaborationProfile] = []
+    for scope in scopes[: max(1, min(500, int(limit)))]:
+        row = await _upsert_collaboration_strategy_profile(
+            context_scope=scope,
+            actor=actor,
+            db=db,
+        )
+        if row:
+            updated.append(row)
+    return updated
+
+
+async def inspect_collaboration_profiles(
+    *,
+    status: str,
+    profile_type: str,
+    context_scope: str,
+    limit: int,
+    db: AsyncSession,
+) -> dict:
+    rows = await list_collaboration_profiles(
+        status=status,
+        profile_type=profile_type,
+        context_scope=context_scope,
+        limit=limit,
+        db=db,
+    )
+    return {
+        "policy_version": COLLABORATION_PROFILE_POLICY_VERSION,
+        "thresholds": {
+            "min_evidence_for_profile": COLLABORATION_PROFILE_MIN_EVIDENCE,
+            "min_confidence_for_profile": COLLABORATION_PROFILE_MIN_CONFIDENCE,
+            "decay_half_life_days": NEGOTIATION_MEMORY_DECAY_HALF_LIFE_DAYS,
+            "stale_after_days": NEGOTIATION_MEMORY_STALE_AFTER_DAYS,
+        },
+        "profiles": [
+            to_collaboration_profile_out(item, context_scope=context_scope)
+            for item in rows
+        ],
+    }
+
+
 async def _record_negotiation_pattern_signal(
     *,
     trigger_type: str,
@@ -1362,6 +1876,12 @@ async def _record_negotiation_pattern_signal(
         context_signature=pattern_key,
         human_context_state=human_context_state,
         memory_item=memory_patterns.get(pattern_key, {}) if isinstance(memory_patterns.get(pattern_key, {}), dict) else {},
+        actor=actor,
+        db=db,
+    )
+
+    await _upsert_collaboration_strategy_profile(
+        context_scope=pattern_key,
         actor=actor,
         db=db,
     )
@@ -1684,6 +2204,10 @@ async def build_cross_domain_task_orchestration(
         option_ids=set(),
         db=db,
     )
+    profile_influence = await _profile_influence_for_scope(
+        context_scope=memory_pattern_key,
+        db=db,
+    )
     memory_payload = await _load_negotiation_memory(db=db)
     memory_preference = _memory_preference_for_pattern(
         memory_payload=memory_payload,
@@ -1696,6 +2220,12 @@ async def build_cross_domain_task_orchestration(
             "influence_applied": False,
             "reason": "objective68_memory_gate",
         }
+        profile_influence = {
+            **(profile_influence if isinstance(profile_influence, dict) else {}),
+            "influence_applied": False,
+            "reason": "objective68_memory_gate",
+            "influence_profile": {},
+        }
     collaboration_mode, collaboration_mode_reason = _resolve_collaboration_mode(
         requested_mode=collaboration_mode_preference,
         preferred_mode=preferred_mode,
@@ -1704,6 +2234,7 @@ async def build_cross_domain_task_orchestration(
         interruption_likelihood=interruption_likelihood,
         memory_preference=memory_preference,
         pattern_preference=pattern_influence,
+        profile_preference=profile_influence,
     )
     collaboration_policy = _apply_collaboration_policy(
         mode=collaboration_mode,
@@ -1714,6 +2245,7 @@ async def build_cross_domain_task_orchestration(
         action_risk_level=action_risk_level,
         memory_preference=memory_preference,
         pattern_preference=pattern_influence,
+        profile_preference=profile_influence,
     )
     priority_score = _bounded(priority_score + float(collaboration_policy.get("reprioritize_delta", 0.0)))
     priority_label = _priority_label(priority_score)
@@ -1777,7 +2309,11 @@ async def build_cross_domain_task_orchestration(
             }
         )
     if bool(collaboration_policy.get("ask_question", False)) and not bool(dependency_gaps):
-        profile = pattern_influence.get("influence_profile", {}) if isinstance(pattern_influence.get("influence_profile", {}), dict) else {}
+        profile = {}
+        if isinstance(profile_influence, dict) and bool(profile_influence):
+            profile = profile_influence.get("influence_profile", {}) if isinstance(profile_influence.get("influence_profile", {}), dict) else {}
+        if not profile and isinstance(pattern_influence, dict) and bool(pattern_influence):
+            profile = pattern_influence.get("influence_profile", {}) if isinstance(pattern_influence.get("influence_profile", {}), dict) else {}
         question_priority = str(profile.get("question_priority", "high")).strip().lower()
         if question_priority not in {"normal", "high"}:
             question_priority = "high"
@@ -1850,22 +2386,45 @@ async def build_cross_domain_task_orchestration(
             option_ids=memory_option_ids,
             db=db,
         )
+        profile_influence = await _profile_influence_for_scope(
+            context_scope=memory_pattern_key,
+            db=db,
+        )
+        memory_gate_applied = False
         if str(memory_preference_with_options.get("freshness", "fresh")).strip() == "stale" or str(memory_preference_with_options.get("state", "learning")).strip() != "consolidated":
+            memory_gate_applied = True
             pattern_influence = {
                 **(pattern_influence if isinstance(pattern_influence, dict) else {}),
                 "influence_applied": False,
                 "reason": "objective68_memory_gate",
                 "preferred_default_option": "",
             }
+            profile_influence = {
+                **(profile_influence if isinstance(profile_influence, dict) else {}),
+                "influence_applied": False,
+                "reason": "objective68_memory_gate",
+                "influence_profile": {},
+            }
         pattern_default_option = str(pattern_influence.get("preferred_default_option", "")).strip() if isinstance(pattern_influence, dict) else ""
+        profile_default_option = ""
+        if isinstance(profile_influence, dict) and bool(profile_influence.get("influence_applied", False)):
+            influence_profile = profile_influence.get("influence_profile", {}) if isinstance(profile_influence.get("influence_profile", {}), dict) else {}
+            profile_default_option = str(influence_profile.get("preferred_default_option", "")).strip()
+        if profile_default_option and profile_default_option not in memory_option_ids:
+            profile_default_option = ""
         default_path = _default_safe_path(
             options=options_presented,
             task_kind=task_kind,
             action_risk_level=action_risk_level,
             human_aware=human_aware,
             communication_urgency=communication_urgency,
-            preferred_default_option=(pattern_default_option or memory_default_option or ""),
+            preferred_default_option=(profile_default_option or pattern_default_option or memory_default_option or ""),
         )
+        if memory_gate_applied and default_path == "rescan_first":
+            if "defer_action" in memory_option_ids:
+                default_path = "defer_action"
+            elif "speak_summary_only" in memory_option_ids:
+                default_path = "speak_summary_only"
         negotiation_payload = {
             "trigger": negotiation_triggers[0],
             "requested_decision": "Select preferred safe collaboration path for current orchestration conflict.",
@@ -1915,6 +2474,22 @@ async def build_cross_domain_task_orchestration(
                     "freshness": str(pattern_influence.get("freshness", "fresh")),
                     "decay_factor": float(pattern_influence.get("decay_factor", 1.0) or 1.0),
                     "reason": str(pattern_influence.get("reason", "")),
+                },
+            }
+        if isinstance(profile_influence, dict) and bool(profile_influence):
+            negotiation_payload["explainability"] = {
+                **(negotiation_payload.get("explainability", {}) if isinstance(negotiation_payload.get("explainability", {}), dict) else {}),
+                "objective70_profile_influence": {
+                    "profile_id": int(profile_influence.get("profile_id", 0) or 0),
+                    "profile_type": str(profile_influence.get("profile_type", "")),
+                    "context_scope": str(profile_influence.get("context_scope", "")),
+                    "influence_applied": bool(profile_influence.get("influence_applied", False)),
+                    "dominant_collaboration_mode": str(profile_influence.get("dominant_collaboration_mode", "")),
+                    "effective_confidence": float(profile_influence.get("effective_confidence", 0.0) or 0.0),
+                    "evidence_count": int(profile_influence.get("evidence_count", 0) or 0),
+                    "freshness": str(profile_influence.get("freshness", "fresh")),
+                    "decay_factor": float(profile_influence.get("decay_factor", 1.0) or 1.0),
+                    "reason": str(profile_influence.get("reason", "")),
                 },
             }
         if not bool(collaboration_policy.get("continue_allowed", False)):
@@ -2054,6 +2629,7 @@ async def build_cross_domain_task_orchestration(
         "interruption_details": interruption_details,
         "operator_presence_score": operator_presence_score,
         "human_aware_signals": human_aware,
+        "objective70_profile": profile_influence if isinstance(profile_influence, dict) else {},
     }
 
     row = WorkspaceTaskOrchestration(
@@ -2082,6 +2658,7 @@ async def build_cross_domain_task_orchestration(
             "objective63_cross_domain_task_orchestration": True,
             "objective64_human_aware_cross_domain_collaboration": True,
             "objective65_human_aware_collaboration_negotiation": bool(negotiation_payload),
+            "objective70_collaboration_strategy_profiles": True,
             "created_at_utc": datetime.now(timezone.utc).isoformat(),
         },
     )

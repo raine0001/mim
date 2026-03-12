@@ -8,21 +8,25 @@ from core.orchestration_service import (
     acknowledge_collaboration_pattern,
     apply_due_collaboration_negotiation_fallbacks,
     build_cross_domain_task_orchestration,
+    get_collaboration_profile,
     get_collaboration_negotiation,
     get_collaboration_pattern,
+    inspect_collaboration_profiles,
     inspect_negotiation_preferences,
     inspect_collaboration_patterns,
     get_task_orchestration,
     inspect_collaboration_state,
     list_collaboration_negotiations,
     respond_collaboration_negotiation,
+    recompute_collaboration_profiles,
     list_task_orchestrations,
     set_collaboration_mode_preference,
     to_collaboration_negotiation_out,
     to_collaboration_pattern_out,
+    to_collaboration_profile_out,
     to_task_orchestration_out,
 )
-from core.schemas import CollaborationModePreferenceRequest, CollaborationNegotiationRespondRequest, CollaborationPatternAcknowledgeRequest, CrossDomainTaskOrchestrationBuildRequest
+from core.schemas import CollaborationModePreferenceRequest, CollaborationNegotiationRespondRequest, CollaborationPatternAcknowledgeRequest, CollaborationProfileRecomputeRequest, CrossDomainTaskOrchestrationBuildRequest
 
 router = APIRouter()
 
@@ -336,4 +340,70 @@ async def acknowledge_collaboration_pattern_endpoint(
     await db.commit()
     return {
         "pattern": to_collaboration_pattern_out(row),
+    }
+
+
+@router.get("/collaboration/profiles")
+async def inspect_collaboration_profiles_endpoint(
+    status: str = Query(default=""),
+    profile_type: str = Query(default=""),
+    context_scope: str = Query(default=""),
+    limit: int = Query(default=50, ge=1, le=500),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    payload = await inspect_collaboration_profiles(
+        status=status,
+        profile_type=profile_type,
+        context_scope=context_scope,
+        limit=limit,
+        db=db,
+    )
+    return payload
+
+
+@router.get("/collaboration/profiles/{profile_id}")
+async def get_collaboration_profile_endpoint(
+    profile_id: int,
+    context_scope: str = Query(default=""),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    row = await get_collaboration_profile(profile_id=profile_id, db=db)
+    if not row:
+        raise HTTPException(status_code=404, detail="collaboration_profile_not_found")
+    return {
+        "profile": to_collaboration_profile_out(row, context_scope=context_scope),
+    }
+
+
+@router.post("/collaboration/profiles/recompute")
+async def recompute_collaboration_profiles_endpoint(
+    payload: CollaborationProfileRecomputeRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    rows = await recompute_collaboration_profiles(
+        actor=payload.actor,
+        context_scope=payload.context_scope,
+        limit=payload.limit,
+        db=db,
+    )
+    await write_journal(
+        db,
+        actor=payload.actor,
+        action="collaboration_profiles_recomputed",
+        target_type="workspace_collaboration_profile",
+        target_id=payload.context_scope or "all",
+        summary=f"Recomputed {len(rows)} collaboration profiles",
+        metadata_json={
+            "context_scope": payload.context_scope,
+            "limit": payload.limit,
+            **payload.metadata_json,
+        },
+    )
+    await db.commit()
+    return {
+        "recomputed": len(rows),
+        "profiles": [
+            to_collaboration_profile_out(item, context_scope=payload.context_scope)
+            for item in rows
+        ],
     }

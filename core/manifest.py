@@ -7,7 +7,7 @@ from core.config import PROJECT_ROOT, settings
 
 CONTRACT_VERSION = "tod-mim-shared-contract-v1"
 MANIFEST_VERSION = "1"
-SCHEMA_VERSION = "2026-03-12-62"
+SCHEMA_VERSION = "2026-03-12-63"
 
 SIGNATURE_FILES = [
     "core/models.py",
@@ -148,6 +148,7 @@ SIGNATURE_FILES = [
     "docs/objective-67-negotiation-memory-and-human-preference-consolidation.md",
     "docs/objective-68-negotiation-memory-decay-and-contextualization.md",
     "docs/objective-69-negotiation-pattern-abstraction.md",
+    "docs/objective-70-collaboration-strategy-profiles.md",
     "config/vision_policy.json",
     "config/voice_policy.json",
 ]
@@ -241,6 +242,7 @@ CAPABILITIES = [
     "negotiation_memory_human_preference_consolidation",
     "negotiation_memory_decay_contextualization",
     "negotiation_pattern_abstraction",
+    "collaboration_strategy_profiles",
 ]
 
 RECENT_CHANGES = [
@@ -308,6 +310,7 @@ RECENT_CHANGES = [
     "Added Objective 67 negotiation memory and human-preference consolidation with durable preference conversion, inspectable evidence, and safe revision behavior",
     "Added Objective 68 negotiation-memory decay and contextualization with freshness-aware confidence decay, context-scoped preference keys, and stale-pattern suppression",
     "Added Objective 69 negotiation pattern abstraction with persistent collaboration concepts, rule-based extraction, bounded influence defaults, and inspectable pattern APIs",
+    "Added Objective 70 collaboration strategy profiles with synthesized collaboration modes, bounded profile influence, and inspectable profile recompute APIs",
 ]
 
 
@@ -493,6 +496,9 @@ def build_manifest() -> dict:
             "/collaboration/patterns",
             "/collaboration/patterns/{pattern_id}",
             "/collaboration/patterns/{pattern_id}/acknowledge",
+            "/collaboration/profiles",
+            "/collaboration/profiles/{profile_id}",
+            "/collaboration/profiles/recompute",
             "/strategy/goals/build",
             "/strategy/goals",
             "/strategy/persistence/goals/recompute",
@@ -1361,6 +1367,25 @@ def build_manifest() -> dict:
                 "influence_profile",
                 "acknowledged_by",
                 "acknowledged_at",
+                "last_observed_at",
+                "metadata_json",
+                "created_at",
+            ],
+            "CollaborationProfile": [
+                "profile_id",
+                "source",
+                "actor",
+                "profile_type",
+                "context_scope",
+                "dominant_collaboration_mode",
+                "supporting_pattern_ids",
+                "evidence_count",
+                "confidence",
+                "freshness",
+                "status",
+                "evidence_summary",
+                "explainability",
+                "influence_profile",
                 "last_observed_at",
                 "metadata_json",
                 "created_at",
