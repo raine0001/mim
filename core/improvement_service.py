@@ -6,6 +6,8 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from core.concept_memory_service import concept_ids_for_component
+from core.development_memory_service import development_pattern_ids_for_component
 from core.models import (
     ConstraintEvaluation,
     Task,
@@ -362,6 +364,19 @@ async def generate_improvement_proposals(
         if duplicate:
             continue
 
+        related_concept_ids = await concept_ids_for_component(
+            affected_component=affected_component,
+            db=db,
+        )
+        related_development_pattern_ids = await development_pattern_ids_for_component(
+            affected_component=affected_component,
+            db=db,
+        )
+
+        confidence = max(0.0, min(1.0, float(item.get("confidence", 0.0) or 0.0)))
+        if related_development_pattern_ids:
+            confidence = max(0.0, min(1.0, confidence + 0.06))
+
         row = WorkspaceImprovementProposal(
             source=source,
             actor=actor,
@@ -371,7 +386,7 @@ async def generate_improvement_proposals(
             evidence_json=item.get("evidence_json", {}) if isinstance(item.get("evidence_json", {}), dict) else {},
             affected_component=affected_component,
             suggested_change=str(item.get("suggested_change", "")),
-            confidence=max(0.0, min(1.0, float(item.get("confidence", 0.0) or 0.0))),
+            confidence=confidence,
             safety_class="bounded_review",
             risk_summary=_risk_for_type(proposal_type),
             test_recommendation=_test_for_type(proposal_type, affected_component),
@@ -380,6 +395,8 @@ async def generate_improvement_proposals(
                 "generator": "objective49",
                 "lookback_hours": lookback_hours,
                 "min_occurrence_count": min_count,
+                "related_concept_ids": related_concept_ids,
+                "related_development_pattern_ids": related_development_pattern_ids,
                 **(metadata_json if isinstance(metadata_json, dict) else {}),
             },
         )

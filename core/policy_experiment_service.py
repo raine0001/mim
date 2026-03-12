@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from core.development_memory_service import development_influence_for_experiment
 from core.models import ConstraintEvaluation, WorkspaceDecisionRecord, WorkspaceImprovementProposal, WorkspacePolicyExperiment
 
 
@@ -152,9 +153,21 @@ async def run_policy_experiment(
     quality_gain = max(0.0, experimental_quality - decision_quality)
     improvement_score = round((0.45 * friction_reduction) + (0.3 * success_gain) + (0.25 * quality_gain), 6)
 
+    derived_experiment_type = _derive_experiment_type(proposal, experiment_type)
+
     promote_threshold = 0.08
     if proposal is not None and "medium_risk" in str(proposal.risk_summary or ""):
         promote_threshold = 0.12
+
+    development_influence = await development_influence_for_experiment(
+        experiment_type=derived_experiment_type,
+        db=db,
+    )
+    if bool(development_influence.get("applied", False)):
+        promote_threshold = max(
+            0.03,
+            float(promote_threshold) - float(development_influence.get("promote_threshold_delta", 0.0) or 0.0),
+        )
 
     if improvement_score >= promote_threshold:
         recommendation = "promote"
@@ -172,13 +185,14 @@ async def run_policy_experiment(
         "decision_quality_delta": round(quality_gain, 6),
         "improvement_score": improvement_score,
         "recommendation_confidence": round(min(0.95, 0.5 + improvement_score), 6),
+        "development_influence": development_influence,
     }
 
     row = WorkspacePolicyExperiment(
         source=source,
         actor=actor,
         proposal_id=proposal.id if proposal is not None else None,
-        experiment_type=_derive_experiment_type(proposal, experiment_type),
+        experiment_type=derived_experiment_type,
         sandbox_mode=sandbox_mode,
         status="completed",
         baseline_metrics_json=baseline,
@@ -188,6 +202,7 @@ async def run_policy_experiment(
         recommendation_reason=recommendation_reason,
         metadata_json={
             "proposal_type": str(proposal.proposal_type) if proposal is not None else "",
+            "development_influence": development_influence,
             **(metadata_json if isinstance(metadata_json, dict) else {}),
         },
     )

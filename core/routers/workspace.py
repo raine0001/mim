@@ -10,6 +10,7 @@ from sqlalchemy.orm.attributes import flag_modified
 from core.db import SessionLocal, get_db
 from core.journal import write_journal
 from core.constraint_service import evaluate_and_record_constraints
+from core.concept_memory_service import concept_influence_for_proposal
 from core.models import CapabilityExecution, CapabilityRegistration, InputEvent, SpeechOutputAction, Task, WorkspaceActionPlan, WorkspaceAutonomousChain, WorkspaceCapabilityChain, WorkspaceInterruptionEvent, WorkspaceMonitoringState, WorkspaceObjectMemory, WorkspaceObjectRelation, WorkspaceObservation, WorkspaceProposal, WorkspaceReplanSignal, WorkspaceTargetResolution, WorkspaceZone, WorkspaceZoneRelation
 from core.preferences import DEFAULT_USER_ID, apply_learning_signal, get_user_preference_payload, get_user_preference_value
 from core.schemas import WorkspaceActionPlanAbortRequest, WorkspaceActionPlanCreateRequest, WorkspaceActionPlanDecisionRequest, WorkspaceActionPlanExecuteRequest, WorkspaceActionPlanHandoffRequest, WorkspaceActionPlanReplanRequest, WorkspaceActionPlanSimulationRequest, WorkspaceAutonomousChainAdvanceRequest, WorkspaceAutonomousChainApprovalRequest, WorkspaceAutonomousChainCreateRequest, WorkspaceAutonomyOverrideRequest, WorkspaceCapabilityChainAdvanceRequest, WorkspaceCapabilityChainCreateRequest, WorkspaceExecutionPauseRequest, WorkspaceExecutionPredictChangeRequest, WorkspaceExecutionProposalActionRequest, WorkspaceExecutionProposalCreateRequest, WorkspaceExecutionResumeRequest, WorkspaceExecutionStopRequest, WorkspaceHumanAwareSignalUpdateRequest, WorkspaceMonitoringStartRequest, WorkspaceMonitoringStopRequest, WorkspaceProposalActionRequest, WorkspaceProposalPriorityPolicyUpdateRequest, WorkspaceTargetConfirmRequest, WorkspaceTargetResolveRequest
@@ -503,6 +504,18 @@ async def _refresh_workspace_proposal_priority(*, proposal: WorkspaceProposal, d
 
     now = datetime.now(timezone.utc)
     score, reason, breakdown = _compute_workspace_proposal_priority(proposal=proposal, policy=policy, now=now)
+    concept_influence = await concept_influence_for_proposal(
+        related_zone=proposal.related_zone,
+        proposal_type=proposal.proposal_type,
+        db=db,
+    )
+    if bool(concept_influence.get("applied", False)):
+        breakdown = {
+            **(breakdown if isinstance(breakdown, dict) else {}),
+            "concept_influence": concept_influence,
+        }
+        reason = f"{reason}, concept_context" if reason else "concept_context"
+
     proposal.priority_score = score
     proposal.priority_reason = reason
     proposal.metadata_json = {
@@ -3985,6 +3998,7 @@ async def get_next_workspace_proposal(
     actor: str = "scheduler",
     reason: str = "priority_selection",
     status: str = "pending",
+    limit: int = Query(default=100, ge=1, le=500),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     status_filter = status.strip() or "pending"
@@ -3992,7 +4006,8 @@ async def get_next_workspace_proposal(
         await db.execute(
             select(WorkspaceProposal)
             .where(WorkspaceProposal.status == status_filter)
-            .order_by(WorkspaceProposal.created_at.asc(), WorkspaceProposal.id.asc())
+            .order_by(WorkspaceProposal.id.desc())
+            .limit(limit)
         )
     ).scalars().all()
     if not rows:

@@ -5,6 +5,8 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from core.concept_memory_service import concept_influence_for_candidate
+from core.development_memory_service import development_influence_for_strategy
 from core.models import CapabilityExecution, WorkspaceEnvironmentStrategy, WorkspaceObservation, WorkspaceTargetResolution
 from core.preferences import DEFAULT_USER_ID, get_user_preference_value
 
@@ -184,6 +186,34 @@ async def generate_environment_strategies(
             continue
         mapped = _strategy_from_condition(condition, preference_context)
         if mapped:
+            concept_influence = await concept_influence_for_candidate(
+                target_scope=str(mapped.get("target_scope", "workspace")),
+                strategy_type=str(mapped.get("strategy_type", "")),
+                db=db,
+            )
+            if bool(concept_influence.get("applied", False)):
+                mapped["influence_weight"] = min(
+                    1.0,
+                    float(mapped.get("influence_weight", 0.5) or 0.5) + float(concept_influence.get("boost", 0.0) or 0.0),
+                )
+                mapped_metadata = mapped.get("metadata_json", {}) if isinstance(mapped.get("metadata_json", {}), dict) else {}
+                mapped_metadata["concept_influence"] = concept_influence
+                mapped["metadata_json"] = mapped_metadata
+                mapped_evidence = mapped.get("evidence_json", {}) if isinstance(mapped.get("evidence_json", {}), dict) else {}
+                mapped_evidence["concept_ids"] = concept_influence.get("concept_ids", [])
+                mapped["evidence_json"] = mapped_evidence
+
+            development_influence = await development_influence_for_strategy(
+                strategy_type=str(mapped.get("strategy_type", "")),
+                db=db,
+            )
+            if bool(development_influence.get("applied", False)):
+                mapped_metadata = mapped.get("metadata_json", {}) if isinstance(mapped.get("metadata_json", {}), dict) else {}
+                mapped_metadata["development_influence"] = development_influence
+                mapped["metadata_json"] = mapped_metadata
+                mapped_evidence = mapped.get("evidence_json", {}) if isinstance(mapped.get("evidence_json", {}), dict) else {}
+                mapped_evidence["development_pattern_ids"] = development_influence.get("pattern_ids", [])
+                mapped["evidence_json"] = mapped_evidence
             candidates.append(mapped)
 
     created: list[WorkspaceEnvironmentStrategy] = []

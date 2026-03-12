@@ -22,6 +22,8 @@ This roadmap is the master sequencing document for MIM objective development. It
 - Objective 26 — Object identity persistence
 - Objective 27 — Workspace map and relational context
 - Objective 40 — Human preference and routine memory
+- Objective 52 — Concept and pattern memory
+- Objective 53 — Multi-session developmental memory
 
 ## Planning and Execution Objectives
 
@@ -53,12 +55,14 @@ This roadmap is the master sequencing document for MIM objective development. It
 
 - Objective 49 — Self-improvement proposal engine
 - Objective 50 — Environment maintenance autonomy
+- Objective 51 — Policy experiment sandbox
+- Objective 52 — Concept and pattern memory
+- Objective 53 — Multi-session developmental memory
 
 ## Future Objectives
 
-- Objective 51+ — Policy experimentation sandbox and safe policy trials
-- Objective 52+ — Concept formation and abstraction layer
-- Objective 53+ — Experience graph operationalization
+- Objective 54+ — Cross-domain integration and cognition bridge
+- Objective 55+ — Experience graph operationalization at scale
 
 ## Layered Objective Grouping (Canonical Sequence)
 
@@ -68,7 +72,7 @@ This roadmap is the master sequencing document for MIM objective development. It
 - 32–38: Execution, monitoring, interruption, replanning
 - 39–44: Priority, preferences, constraint reasoning
 - 45–49: Constraint learning, horizon planning, strategy, self-improvement
-- 50+: Environment maintenance, policy experimentation, concept formation
+- 50+: Environment maintenance, policy experimentation, concept formation, developmental memory
 
 ## Governance Notes
 

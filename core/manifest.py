@@ -7,7 +7,7 @@ from core.config import PROJECT_ROOT, settings
 
 CONTRACT_VERSION = "tod-mim-shared-contract-v1"
 MANIFEST_VERSION = "1"
-SCHEMA_VERSION = "2026-03-11-42"
+SCHEMA_VERSION = "2026-03-11-44"
 
 SIGNATURE_FILES = [
     "core/models.py",
@@ -79,6 +79,10 @@ SIGNATURE_FILES = [
     "docs/objective-50-prod-promotion-report.md",
     "docs/objective-51-policy-experiment-sandbox.md",
     "docs/objective-51-promotion-readiness-report.md",
+    "docs/objective-51-prod-promotion-report.md",
+    "docs/objective-52-concept-and-pattern-memory.md",
+    "docs/objective-52-promotion-readiness-report.md",
+    "docs/objective-52-prod-promotion-report.md",
     "core/routers/workspace.py",
     "core/routers/constraints.py",
     "core/routers/constraint_learning.py",
@@ -86,8 +90,13 @@ SIGNATURE_FILES = [
     "core/constraint_service.py",
     "core/constraint_learning.py",
     "core/constraint_learning_service.py",
+    "core/concept_memory_service.py",
+    "core/development_memory_service.py",
     "core/routers/preferences.py",
     "core/preferences.py",
+    "docs/objective-53-multi-session-developmental-memory.md",
+    "docs/objective-53-promotion-readiness-report.md",
+    "docs/objective-53-prod-promotion-report.md",
     "config/vision_policy.json",
     "config/voice_policy.json",
 ]
@@ -163,6 +172,8 @@ CAPABILITIES = [
     "self_improvement_proposal_engine",
     "environment_maintenance_autonomy",
     "policy_experiment_sandbox",
+    "concept_pattern_memory",
+    "multi_session_developmental_memory",
 ]
 
 RECENT_CHANGES = [
@@ -211,6 +222,8 @@ RECENT_CHANGES = [
     "Added Objective 49 self-improvement proposal engine with rule-based friction pattern detection and review-gated improvement artifacts",
     "Added Objective 50 proactive environment maintenance autonomy with degraded-state detection, auto maintenance strategies, and bounded corrective execution audit trail",
     "Added Objective 51 policy experiment sandbox with bounded soft-policy trial runs, baseline-vs-experiment comparison, and promote/reject/revise recommendations",
+    "Added Objective 52 concept and pattern memory with rule-based concept extraction, inspectable concept records, and concept-influenced strategy weighting",
+    "Added Objective 53 multi-session developmental memory with cross-session pattern aggregation, inspectable development patterns, and self-improvement feedback influence",
 ]
 
 
@@ -314,6 +327,12 @@ def build_manifest() -> dict:
             "/preferences",
             "/preferences/{preference_type}",
             "/memory",
+            "/memory/concepts/extract",
+            "/memory/concepts",
+            "/memory/concepts/{concept_id}",
+            "/memory/concepts/{concept_id}/acknowledge",
+            "/memory/development-patterns",
+            "/memory/development-patterns/{pattern_id}",
             "/tools",
             "/services",
             "/gateway/intake",
@@ -948,6 +967,40 @@ def build_manifest() -> dict:
                 "comparison",
                 "recommendation",
                 "recommendation_reason",
+                "metadata_json",
+                "created_at",
+            ],
+            "ConceptMemory": [
+                "concept_id",
+                "source",
+                "actor",
+                "concept_type",
+                "trigger_pattern",
+                "evidence_count",
+                "confidence",
+                "affected_zones",
+                "affected_objects",
+                "affected_strategies",
+                "suggested_implications",
+                "evidence_summary",
+                "status",
+                "acknowledged_by",
+                "acknowledged_at",
+                "metadata_json",
+                "created_at",
+            ],
+            "DevelopmentPattern": [
+                "pattern_id",
+                "source",
+                "actor",
+                "pattern_type",
+                "evidence_count",
+                "confidence",
+                "affected_component",
+                "first_seen",
+                "last_seen",
+                "evidence_summary",
+                "status",
                 "metadata_json",
                 "created_at",
             ],

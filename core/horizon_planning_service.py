@@ -11,6 +11,7 @@ from core.environment_strategy_service import (
     mark_strategy_influenced_plan,
     strategy_influence_for_goal,
 )
+from core.concept_memory_service import concept_influence_for_goal
 from core.models import ConstraintAdjustmentProposal, WorkspaceHorizonCheckpoint, WorkspaceHorizonPlan, WorkspaceHorizonReplanEvent
 
 
@@ -82,10 +83,31 @@ async def create_horizon_plan(
 
     scored = [score_goal_candidate(item, context, weights) for item in goal_candidates]
     active_strategies = await get_active_environment_strategies(db=db, limit=50)
+    run_id = ""
+    if isinstance(metadata_json, dict):
+        run_id = str(metadata_json.get("run_id", "")).strip()
+    if run_id and active_strategies:
+        run_scoped = [
+            item
+            for item in active_strategies
+            if isinstance(item.metadata_json, dict) and str(item.metadata_json.get("run_id", "")).strip() == run_id
+        ]
+        if run_scoped:
+            active_strategies = run_scoped
+
     influenced_strategy_ids: set[int] = set()
     strategy_context_rows: list[dict] = []
 
     for goal in scored:
+        concept_influence = await concept_influence_for_goal(goal=goal, db=db)
+        if bool(concept_influence.get("applied", False)):
+            concept_boost = float(concept_influence.get("boost", 0.0) or 0.0)
+            goal["score"] = round(max(0.0, min(1.0, float(goal.get("score", 0.0)) + concept_boost)), 6)
+            score_breakdown = goal.get("score_breakdown", {}) if isinstance(goal.get("score_breakdown", {}), dict) else {}
+            score_breakdown["concept"] = round(concept_boost, 6)
+            goal["score_breakdown"] = score_breakdown
+            goal["concept_influence"] = concept_influence
+
         bonus = 0.0
         reasons: list[str] = []
         strategy_ids: list[int] = []

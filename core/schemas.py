@@ -136,6 +136,57 @@ class MemoryOut(BaseModel):
     created_at: datetime
 
 
+class ConceptExtractRequest(BaseModel):
+    actor: str = "workspace"
+    source: str = "objective52"
+    lookback_hours: int = Field(default=24, ge=1, le=720)
+    min_evidence_count: int = Field(default=3, ge=2, le=500)
+    max_concepts: int = Field(default=10, ge=1, le=100)
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class ConceptAcknowledgeRequest(BaseModel):
+    actor: str = "operator"
+    reason: str = ""
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class ConceptMemoryOut(BaseModel):
+    concept_id: int
+    source: str
+    actor: str
+    concept_type: str
+    trigger_pattern: str
+    evidence_count: int
+    confidence: float
+    affected_zones: list[str]
+    affected_objects: list[str]
+    affected_strategies: list[str]
+    suggested_implications: list[str]
+    evidence_summary: str
+    status: str
+    acknowledged_by: str
+    acknowledged_at: datetime | None
+    metadata_json: dict
+    created_at: datetime
+
+
+class DevelopmentPatternOut(BaseModel):
+    pattern_id: int
+    source: str
+    actor: str
+    pattern_type: str
+    evidence_count: int
+    confidence: float
+    affected_component: str
+    first_seen: datetime
+    last_seen: datetime
+    evidence_summary: str
+    status: str
+    metadata_json: dict
+    created_at: datetime
+
+
 class ManifestResponse(BaseModel):
     system_name: str
     system_version: str

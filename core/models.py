@@ -776,3 +776,41 @@ class WorkspacePolicyExperiment(Base, TimestampMixin):
     recommendation: Mapped[str] = mapped_column(String(40), default="revise", index=True)
     recommendation_reason: Mapped[str] = mapped_column(Text, default="")
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class WorkspaceConceptMemory(Base, TimestampMixin):
+    __tablename__ = "workspace_concept_memories"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    source: Mapped[str] = mapped_column(String(80), default="objective52", index=True)
+    actor: Mapped[str] = mapped_column(String(120), default="workspace")
+    concept_type: Mapped[str] = mapped_column(String(120), index=True)
+    trigger_pattern: Mapped[str] = mapped_column(String(200), default="", index=True)
+    evidence_count: Mapped[int] = mapped_column(default=0)
+    confidence: Mapped[float] = mapped_column(default=0.0)
+    affected_zones_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    affected_objects_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    affected_strategies_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    suggested_implications_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    evidence_summary: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(40), default="active", index=True)
+    acknowledged_by: Mapped[str] = mapped_column(String(120), default="")
+    acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class WorkspaceDevelopmentPattern(Base, TimestampMixin):
+    __tablename__ = "workspace_development_patterns"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    source: Mapped[str] = mapped_column(String(80), default="objective53", index=True)
+    actor: Mapped[str] = mapped_column(String(120), default="workspace")
+    pattern_type: Mapped[str] = mapped_column(String(120), index=True)
+    evidence_count: Mapped[int] = mapped_column(default=0)
+    confidence: Mapped[float] = mapped_column(default=0.0)
+    affected_component: Mapped[str] = mapped_column(String(200), default="", index=True)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+    evidence_summary: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(40), default="active", index=True)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
