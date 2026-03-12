@@ -7,7 +7,7 @@ from core.config import PROJECT_ROOT, settings
 
 CONTRACT_VERSION = "tod-mim-shared-contract-v1"
 MANIFEST_VERSION = "1"
-SCHEMA_VERSION = "2026-03-11-52"
+SCHEMA_VERSION = "2026-03-11-53"
 
 SIGNATURE_FILES = [
     "core/models.py",
@@ -123,6 +123,8 @@ SIGNATURE_FILES = [
     "docs/objective-59-promotion-readiness-report.md",
     "docs/objective-60-environment-stewardship-loop.md",
     "docs/objective-60-promotion-readiness-report.md",
+    "docs/objective-61-live-perception-adapters.md",
+    "docs/objective-61-promotion-readiness-report.md",
     "config/vision_policy.json",
     "config/voice_policy.json",
 ]
@@ -207,6 +209,7 @@ CAPABILITIES = [
     "adaptive_autonomy_boundaries",
     "strategic_goal_persistence_review",
     "environment_stewardship_loop",
+    "live_perception_adapters",
 ]
 
 RECENT_CHANGES = [
@@ -264,6 +267,7 @@ RECENT_CHANGES = [
     "Added Objective 58 adaptive autonomy boundaries with experience-conditioned policy recommendations and applyable autonomy limits",
     "Added Objective 59 strategic goal persistence and review with cross-session carry-forward scoring and operator review audit",
     "Added Objective 60 environment stewardship loop with desired-state maintenance, integrated strategy-memory-autonomy inputs, and inspectable cycle history",
+    "Added Objective 61 live perception adapters with camera/mic source ingestion, throttling, source health tracking, and inspectable adapter status",
 ]
 
 
@@ -393,6 +397,10 @@ def build_manifest() -> dict:
             "/gateway/voice/input",
             "/gateway/voice/output",
             "/gateway/vision/observations",
+            "/gateway/perception/camera/events",
+            "/gateway/perception/mic/events",
+            "/gateway/perception/sources",
+            "/gateway/perception/status",
             "/gateway/capabilities",
             "/constraints/evaluate",
             "/constraints/last-evaluation",
@@ -1232,6 +1240,26 @@ def build_manifest() -> dict:
                 "integration_evidence",
                 "maintenance_run_id",
                 "improved",
+                "metadata_json",
+                "created_at",
+            ],
+            "PerceptionSourceStatus": [
+                "source_id",
+                "source_type",
+                "device_id",
+                "session_id",
+                "is_remote",
+                "status",
+                "health_status",
+                "last_seen_at",
+                "last_accepted_at",
+                "accepted_count",
+                "dropped_count",
+                "duplicate_count",
+                "low_confidence_count",
+                "min_interval_seconds",
+                "duplicate_window_seconds",
+                "confidence_floor",
                 "metadata_json",
                 "created_at",
             ],

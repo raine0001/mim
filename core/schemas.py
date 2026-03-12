@@ -522,6 +522,61 @@ class VisionObservationRequest(BaseModel):
     metadata_json: dict = Field(default_factory=dict)
 
 
+class LiveCameraObservationItem(BaseModel):
+    object_label: str = Field(min_length=1)
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    zone: str = "workspace"
+    timestamp: datetime | None = None
+
+
+class LiveCameraAdapterRequest(BaseModel):
+    device_id: str = Field(min_length=1)
+    source_type: str = "camera"
+    session_id: str = ""
+    is_remote: bool = False
+    observations: list[LiveCameraObservationItem] = Field(default_factory=list)
+    min_interval_seconds: int = Field(default=2, ge=0, le=60)
+    duplicate_window_seconds: int = Field(default=20, ge=1, le=600)
+    observation_confidence_floor: float = Field(default=0.5, ge=0.0, le=1.0)
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class LiveMicAdapterRequest(BaseModel):
+    device_id: str = Field(min_length=1)
+    source_type: str = "microphone"
+    session_id: str = ""
+    is_remote: bool = False
+    transcript: str = Field(min_length=1)
+    confidence: float = Field(default=0.7, ge=0.0, le=1.0)
+    timestamp: datetime | None = None
+    min_interval_seconds: int = Field(default=1, ge=0, le=30)
+    duplicate_window_seconds: int = Field(default=20, ge=1, le=600)
+    transcript_confidence_floor: float = Field(default=0.45, ge=0.0, le=1.0)
+    discard_low_confidence: bool = True
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class PerceptionSourceOut(BaseModel):
+    source_id: int
+    source_type: str
+    device_id: str
+    session_id: str
+    is_remote: bool
+    status: str
+    health_status: str
+    last_seen_at: datetime | None
+    last_accepted_at: datetime | None
+    accepted_count: int
+    dropped_count: int
+    duplicate_count: int
+    low_confidence_count: int
+    min_interval_seconds: int
+    duplicate_window_seconds: int
+    confidence_floor: float
+    metadata_json: dict
+    created_at: datetime
+
+
 class CapabilityRegistrationCreate(BaseModel):
     capability_name: str = Field(min_length=1, max_length=120)
     category: str = "action"

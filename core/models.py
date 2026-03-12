@@ -495,6 +495,30 @@ class WorkspaceMonitoringState(Base, TimestampMixin):
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
+class WorkspacePerceptionSource(Base, TimestampMixin):
+    __tablename__ = "workspace_perception_sources"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    source_type: Mapped[str] = mapped_column(String(40), default="camera", index=True)
+    device_id: Mapped[str] = mapped_column(String(120), default="unknown", index=True)
+    session_id: Mapped[str] = mapped_column(String(120), default="", index=True)
+    is_remote: Mapped[bool] = mapped_column(default=False)
+    status: Mapped[str] = mapped_column(String(40), default="active", index=True)
+    health_status: Mapped[str] = mapped_column(String(40), default="healthy", index=True)
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    last_accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_event_fingerprint: Mapped[str] = mapped_column(String(120), default="")
+    last_event_payload_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    accepted_count: Mapped[int] = mapped_column(default=0)
+    dropped_count: Mapped[int] = mapped_column(default=0)
+    duplicate_count: Mapped[int] = mapped_column(default=0)
+    low_confidence_count: Mapped[int] = mapped_column(default=0)
+    min_interval_seconds: Mapped[int] = mapped_column(default=2)
+    duplicate_window_seconds: Mapped[int] = mapped_column(default=20)
+    confidence_floor: Mapped[float] = mapped_column(default=0.5)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
 class WorkspaceAutonomousChain(Base, TimestampMixin):
     __tablename__ = "workspace_autonomous_chains"
 

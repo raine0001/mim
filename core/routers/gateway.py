@@ -1,4 +1,5 @@
 import json
+from hashlib import sha256
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Header, HTTPException
@@ -8,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from core.db import get_db
 from core.config import settings
 from core.journal import write_journal
-from core.models import CapabilityExecution, CapabilityRegistration, Goal, InputEvent, InputEventResolution, SpeechOutputAction, Task, WorkspaceMonitoringState, WorkspaceObservation, WorkspaceObjectMemory, WorkspaceObjectRelation, WorkspaceProposal, WorkspaceZone, WorkspaceZoneRelation
+from core.models import CapabilityExecution, CapabilityRegistration, Goal, InputEvent, InputEventResolution, SpeechOutputAction, Task, WorkspaceMonitoringState, WorkspaceObservation, WorkspaceObjectMemory, WorkspaceObjectRelation, WorkspacePerceptionSource, WorkspaceProposal, WorkspaceZone, WorkspaceZoneRelation
 from core.voice_policy import evaluate_voice_policy, load_voice_policy, validate_voice_output
 from core.vision_policy import evaluate_vision_policy
 from core.vision_policy import load_vision_policy
@@ -18,7 +19,10 @@ from core.schemas import (
     CapabilityExecutionHandoffOut,
     ExecutionFeedbackUpdateRequest,
     ExecutionDispatchRequest,
+    LiveCameraAdapterRequest,
+    LiveMicAdapterRequest,
     NormalizedInputCreate,
+    PerceptionSourceOut,
     PromoteEventToGoalRequest,
     SpeechOutputRequest,
     TextInputAdapterRequest,
@@ -36,6 +40,8 @@ OBJECT_IDENTITY_WINDOW_SECONDS = 1800
 OBJECT_STALE_WINDOW_SECONDS = 7200
 OBJECT_MATCH_THRESHOLD = 0.65
 PROPOSAL_DEDUPE_WINDOW_SECONDS = 900
+
+PERCEPTION_STALE_SECONDS = 60
 
 AUTONOMY_PROPOSAL_POLICY_MAP: dict[str, str] = {
     "confirm_target_ready": "auto_safe",
@@ -1490,6 +1496,92 @@ async def _store_normalized(payload: NormalizedInputCreate, db: AsyncSession) ->
     return event_out
 
 
+def _hash_payload(parts: list[str]) -> str:
+    joined = "|".join(str(item) for item in parts)
+    return sha256(joined.encode("utf-8")).hexdigest()
+
+
+async def _get_or_create_perception_source(
+    *,
+    source_type: str,
+    device_id: str,
+    session_id: str,
+    is_remote: bool,
+    db: AsyncSession,
+) -> WorkspacePerceptionSource:
+    row = (
+        await db.execute(
+            select(WorkspacePerceptionSource)
+            .where(WorkspacePerceptionSource.source_type == source_type)
+            .where(WorkspacePerceptionSource.device_id == device_id)
+            .order_by(WorkspacePerceptionSource.id.desc())
+            .limit(1)
+        )
+    ).scalars().first()
+    if row:
+        if session_id.strip():
+            row.session_id = session_id.strip()
+        row.is_remote = bool(is_remote)
+        return row
+
+    row = WorkspacePerceptionSource(
+        source_type=source_type,
+        device_id=device_id,
+        session_id=session_id,
+        is_remote=bool(is_remote),
+        status="active",
+        health_status="healthy",
+        min_interval_seconds=2,
+        duplicate_window_seconds=20,
+        confidence_floor=0.5,
+        metadata_json={},
+    )
+    db.add(row)
+    await db.flush()
+    return row
+
+
+def _is_duplicate_event(*, row: WorkspacePerceptionSource, fingerprint: str, now: datetime) -> bool:
+    if not fingerprint or not row.last_event_fingerprint:
+        return False
+    if row.last_event_fingerprint != fingerprint:
+        return False
+    if not row.last_seen_at:
+        return False
+    age_seconds = max(0.0, (now - row.last_seen_at).total_seconds())
+    return age_seconds <= float(max(1, int(row.duplicate_window_seconds or 20)))
+
+
+def _is_interval_blocked(*, row: WorkspacePerceptionSource, now: datetime) -> bool:
+    if not row.last_accepted_at:
+        return False
+    age_seconds = max(0.0, (now - row.last_accepted_at).total_seconds())
+    return age_seconds < float(max(0, int(row.min_interval_seconds or 0)))
+
+
+def _to_perception_source_out(row: WorkspacePerceptionSource) -> dict:
+    return {
+        "source_id": int(row.id),
+        "source_type": row.source_type,
+        "device_id": row.device_id,
+        "session_id": row.session_id,
+        "is_remote": bool(row.is_remote),
+        "status": row.status,
+        "health_status": row.health_status,
+        "last_seen_at": row.last_seen_at,
+        "last_accepted_at": row.last_accepted_at,
+        "accepted_count": int(row.accepted_count or 0),
+        "dropped_count": int(row.dropped_count or 0),
+        "duplicate_count": int(row.duplicate_count or 0),
+        "low_confidence_count": int(row.low_confidence_count or 0),
+        "min_interval_seconds": int(row.min_interval_seconds or 0),
+        "duplicate_window_seconds": int(row.duplicate_window_seconds or 0),
+        "confidence_floor": float(row.confidence_floor or 0.0),
+        "metadata_json": row.metadata_json if isinstance(row.metadata_json, dict) else {},
+        "created_at": row.created_at,
+    }
+
+
 @router.post("/intake")
 async def intake_normalized(payload: NormalizedInputCreate, db: AsyncSession = Depends(get_db)) -> dict:
     return await _store_normalized(payload, db)
@@ -1625,6 +1717,329 @@ async def vision_observation(payload: VisionObservationRequest, db: AsyncSession
         },
     )
     return await _store_normalized(normalized, db)
+
+
+@router.post("/perception/camera/events")
+async def live_camera_adapter(payload: LiveCameraAdapterRequest, db: AsyncSession = Depends(get_db)) -> dict:
+    now = datetime.now(timezone.utc)
+    source = await _get_or_create_perception_source(
+        source_type=str(payload.source_type or "camera").strip() or "camera",
+        device_id=str(payload.device_id).strip(),
+        session_id=str(payload.session_id or "").strip(),
+        is_remote=bool(payload.is_remote),
+        db=db,
+    )
+    source.min_interval_seconds = int(payload.min_interval_seconds)
+    source.duplicate_window_seconds = int(payload.duplicate_window_seconds)
+    source.confidence_floor = float(payload.observation_confidence_floor)
+
+    observations = payload.observations if isinstance(payload.observations, list) else []
+    accepted_items = [item for item in observations if float(item.confidence) >= float(source.confidence_floor)]
+    if not accepted_items:
+        source.last_seen_at = now
+        source.health_status = "degraded"
+        source.dropped_count = int(source.dropped_count or 0) + 1
+        source.low_confidence_count = int(source.low_confidence_count or 0) + 1
+        await db.commit()
+        return {
+            "status": "discarded_low_confidence",
+            "reason": "observation_confidence_below_floor",
+            "source": _to_perception_source_out(source),
+            "accepted_count": 0,
+        }
+
+    fingerprint = _hash_payload(
+        [
+            source.source_type,
+            source.device_id,
+            source.session_id,
+            *[
+                f"{item.object_label}:{item.zone}:{round(float(item.confidence), 3)}"
+                for item in sorted(accepted_items, key=lambda entry: (entry.zone, entry.object_label, entry.confidence))
+            ],
+        ]
+    )
+    if _is_duplicate_event(row=source, fingerprint=fingerprint, now=now):
+        source.last_seen_at = now
+        source.health_status = "healthy"
+        source.dropped_count = int(source.dropped_count or 0) + 1
+        source.duplicate_count = int(source.duplicate_count or 0) + 1
+        await db.commit()
+        return {
+            "status": "suppressed_duplicate",
+            "reason": "duplicate_observation_batch",
+            "source": _to_perception_source_out(source),
+            "accepted_count": 0,
+        }
+
+    if _is_interval_blocked(row=source, now=now):
+        source.last_seen_at = now
+        source.health_status = "healthy"
+        source.dropped_count = int(source.dropped_count or 0) + 1
+        await db.commit()
+        return {
+            "status": "throttled_interval",
+            "reason": "min_interval_not_elapsed",
+            "source": _to_perception_source_out(source),
+            "accepted_count": 0,
+        }
+
+    top = max(accepted_items, key=lambda item: float(item.confidence))
+    normalized = NormalizedInputCreate(
+        source="vision",
+        raw_input=f"live_camera:{top.object_label}:{top.zone}",
+        parsed_intent="vision_observation",
+        confidence=float(top.confidence),
+        target_system="mim",
+        requested_goal="update workspace observation memory",
+        safety_flags=["requires_confirmation"],
+        metadata_json={
+            **(payload.metadata_json if isinstance(payload.metadata_json, dict) else {}),
+            "adapter": "vision_live_camera",
+            "device_id": source.device_id,
+            "source_type": source.source_type,
+            "session_id": source.session_id,
+            "is_remote": source.is_remote,
+            "detected_labels": [item.object_label for item in accepted_items],
+        },
+    )
+
+    event_out = await _store_normalized(normalized, db)
+    for item in accepted_items:
+        observed_at = item.timestamp or now
+        db.add(
+            WorkspaceObservation(
+                observed_at=observed_at,
+                zone=str(item.zone or "workspace"),
+                label=str(item.object_label),
+                confidence=float(item.confidence),
+                source="live_camera",
+                execution_id=None,
+                lifecycle_status="active",
+                first_seen_at=observed_at,
+                last_seen_at=observed_at,
+                observation_count=1,
+                metadata_json={
+                    "device_id": source.device_id,
+                    "source_type": source.source_type,
+                    "session_id": source.session_id,
+                    "is_remote": source.is_remote,
+                    "objective61_live_adapter": True,
+                },
+            )
+        )
+
+    source.last_seen_at = now
+    source.last_accepted_at = now
+    source.last_event_fingerprint = fingerprint
+    source.last_event_payload_json = {
+        "type": "camera",
+        "object_label": top.object_label,
+        "zone": top.zone,
+        "confidence": float(top.confidence),
+        "timestamp": now.isoformat(),
+    }
+    source.accepted_count = int(source.accepted_count or 0) + 1
+    source.health_status = "healthy"
+    source.metadata_json = {
+        **(source.metadata_json if isinstance(source.metadata_json, dict) else {}),
+        "objective61_live_adapter": True,
+    }
+    await db.commit()
+
+    return {
+        "status": "accepted",
+        "source": _to_perception_source_out(source),
+        "accepted_count": len(accepted_items),
+        "event": event_out,
+    }
+
+
+@router.post("/perception/mic/events")
+async def live_mic_adapter(payload: LiveMicAdapterRequest, db: AsyncSession = Depends(get_db)) -> dict:
+    now = datetime.now(timezone.utc)
+    source = await _get_or_create_perception_source(
+        source_type=str(payload.source_type or "microphone").strip() or "microphone",
+        device_id=str(payload.device_id).strip(),
+        session_id=str(payload.session_id or "").strip(),
+        is_remote=bool(payload.is_remote),
+        db=db,
+    )
+    source.min_interval_seconds = int(payload.min_interval_seconds)
+    source.duplicate_window_seconds = int(payload.duplicate_window_seconds)
+    source.confidence_floor = float(payload.transcript_confidence_floor)
+
+    transcript = str(payload.transcript or "").strip()
+    confidence = float(payload.confidence)
+    fingerprint = _hash_payload([source.source_type, source.device_id, source.session_id, transcript.lower(), round(confidence, 3)])
+
+    if confidence < float(source.confidence_floor) and bool(payload.discard_low_confidence):
+        source.last_seen_at = now
+        source.health_status = "degraded"
+        source.dropped_count = int(source.dropped_count or 0) + 1
+        source.low_confidence_count = int(source.low_confidence_count or 0) + 1
+        await db.commit()
+        return {
+            "status": "discarded_low_confidence",
+            "reason": "clarification_required",
+            "source": _to_perception_source_out(source),
+            "accepted": False,
+        }
+
+    if _is_duplicate_event(row=source, fingerprint=fingerprint, now=now):
+        source.last_seen_at = now
+        source.health_status = "healthy"
+        source.dropped_count = int(source.dropped_count or 0) + 1
+        source.duplicate_count = int(source.duplicate_count or 0) + 1
+        await db.commit()
+        return {
+            "status": "suppressed_duplicate",
+            "reason": "duplicate_transcript",
+            "source": _to_perception_source_out(source),
+            "accepted": False,
+        }
+
+    if _is_interval_blocked(row=source, now=now):
+        source.last_seen_at = now
+        source.health_status = "healthy"
+        source.dropped_count = int(source.dropped_count or 0) + 1
+        await db.commit()
+        return {
+            "status": "throttled_interval",
+            "reason": "min_interval_not_elapsed",
+            "source": _to_perception_source_out(source),
+            "accepted": False,
+        }
+
+    normalized = NormalizedInputCreate(
+        source="voice",
+        raw_input=transcript,
+        parsed_intent="unknown",
+        confidence=confidence,
+        target_system="mim",
+        requested_goal="voice_live_input",
+        safety_flags=[],
+        metadata_json={
+            **(payload.metadata_json if isinstance(payload.metadata_json, dict) else {}),
+            "adapter": "voice_live_mic",
+            "device_id": source.device_id,
+            "source_type": source.source_type,
+            "session_id": source.session_id,
+            "is_remote": source.is_remote,
+            "timestamp": (payload.timestamp or now).isoformat(),
+        },
+    )
+    event_out = await _store_normalized(normalized, db)
+
+    source.last_seen_at = now
+    source.last_accepted_at = now
+    source.last_event_fingerprint = fingerprint
+    source.last_event_payload_json = {
+        "type": "microphone",
+        "transcript": transcript,
+        "confidence": confidence,
+        "timestamp": now.isoformat(),
+    }
+    source.accepted_count = int(source.accepted_count or 0) + 1
+    source.health_status = "healthy"
+    source.metadata_json = {
+        **(source.metadata_json if isinstance(source.metadata_json, dict) else {}),
+        "objective61_live_adapter": True,
+    }
+    await db.commit()
+
+    return {
+        "status": "accepted",
+        "source": _to_perception_source_out(source),
+        "accepted": True,
+        "event": event_out,
+    }
+
+
+@router.get("/perception/sources")
+async def list_perception_sources(
+    source_type: str = "",
+    active_only: bool = False,
+    limit: int = 50,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    stmt = select(WorkspacePerceptionSource).order_by(WorkspacePerceptionSource.id.desc())
+    if source_type.strip():
+        stmt = stmt.where(WorkspacePerceptionSource.source_type == source_type.strip())
+    rows = (await db.execute(stmt.limit(max(1, min(500, int(limit)))))).scalars().all()
+
+    now = datetime.now(timezone.utc)
+    source_items = []
+    for row in rows:
+        if active_only:
+            if not row.last_seen_at:
+                continue
+            if (now - row.last_seen_at).total_seconds() > PERCEPTION_STALE_SECONDS:
+                continue
+        source_items.append(_to_perception_source_out(row))
+
+    return {
+        "sources": source_items,
+    }
+
+
+@router.get("/perception/status")
+async def get_perception_status(db: AsyncSession = Depends(get_db)) -> dict:
+    rows = (
+        await db.execute(
+            select(WorkspacePerceptionSource)
+            .order_by(WorkspacePerceptionSource.id.desc())
+            .limit(200)
+        )
+    ).scalars().all()
+
+    now = datetime.now(timezone.utc)
+    active = []
+    last_camera_event = None
+    last_mic_transcript = None
+
+    for row in rows:
+        age_seconds = None
+        if row.last_seen_at:
+            age_seconds = max(0.0, (now - row.last_seen_at).total_seconds())
+        if age_seconds is not None and age_seconds <= PERCEPTION_STALE_SECONDS:
+            active.append({
+                "source_id": int(row.id),
+                "source_type": row.source_type,
+                "device_id": row.device_id,
+                "session_id": row.session_id,
+                "is_remote": bool(row.is_remote),
+                "last_seen_at": row.last_seen_at,
+                "health_status": row.health_status,
+            })
+
+        payload = row.last_event_payload_json if isinstance(row.last_event_payload_json, dict) else {}
+        if row.source_type == "camera" and payload and last_camera_event is None:
+            last_camera_event = payload
+            last_camera_event["device_id"] = row.device_id
+        if row.source_type == "microphone" and payload and last_mic_transcript is None:
+            last_mic_transcript = payload
+            last_mic_transcript["device_id"] = row.device_id
+
+    return {
+        "active_perception_adapters": active,
+        "camera_source_status": {
+            "active": any(item.get("source_type") == "camera" for item in active),
+            "last_event": last_camera_event,
+        },
+        "mic_source_status": {
+            "active": any(item.get("source_type") == "microphone" for item in active),
+            "last_transcript": last_mic_transcript,
+        },
+        "adapter_health": {
+            "healthy_count": sum(1 for row in rows if str(row.health_status or "") == "healthy"),
+            "degraded_count": sum(1 for row in rows if str(row.health_status or "") != "healthy"),
+        },
+        "last_event_timestamp": max(
+            [row.last_seen_at for row in rows if row.last_seen_at is not None],
+            default=None,
+        ),
+    }
 
 
 @router.get("/intake")
