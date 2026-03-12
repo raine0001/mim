@@ -43,7 +43,7 @@ class Objective65HumanAwareCollaborationNegotiationTest(unittest.TestCase):
     def _reset_negotiation_patterns(self) -> None:
         for preference_type, value in [
             ("collaboration_negotiation_patterns", {"version": "objective66-v1", "patterns": {}}),
-            ("collaboration_negotiation_memory", {"version": "objective67-v1", "patterns": {}}),
+            ("collaboration_negotiation_memory", {"version": "objective68-v1", "patterns": {}}),
         ]:
             status, payload = post_json(
                 "/preferences",

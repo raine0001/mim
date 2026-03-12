@@ -3,6 +3,7 @@ import os
 import unittest
 import urllib.error
 import urllib.request
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 
@@ -39,7 +40,7 @@ def get_json(path: str) -> tuple[int, dict | list]:
         return exc.code, parsed
 
 
-class Objective67NegotiationMemoryPreferenceConsolidationTest(unittest.TestCase):
+class Objective68NegotiationMemoryDecayAndContextualizationTest(unittest.TestCase):
     def _reset_negotiation_preferences(self) -> None:
         for preference_type, value in [
             ("collaboration_negotiation_patterns", {"version": "objective66-v1", "patterns": {}}),
@@ -61,7 +62,7 @@ class Objective67NegotiationMemoryPreferenceConsolidationTest(unittest.TestCase)
         status, event = post_json(
             "/gateway/intake/text",
             {
-                "text": f"URGENT: objective67 negotiation memory flow {run_id}",
+                "text": f"URGENT: objective68 negotiation memory flow {run_id}",
                 "parsed_intent": "operator_urgent_request",
                 "confidence": 0.97,
                 "metadata_json": {"run_id": run_id, "urgency": "high"},
@@ -82,7 +83,7 @@ class Objective67NegotiationMemoryPreferenceConsolidationTest(unittest.TestCase)
                 "metadata_json": {"run_id": run_id},
                 "observations": [
                     {
-                        "object_label": "objective67-target",
+                        "object_label": "objective68-target",
                         "confidence": 0.88,
                         "zone": zone,
                     }
@@ -95,8 +96,8 @@ class Objective67NegotiationMemoryPreferenceConsolidationTest(unittest.TestCase)
             "/memory",
             {
                 "memory_class": "external_signal",
-                "content": f"Objective67 external context {run_id}",
-                "summary": "External context for objective67 negotiation memory",
+                "content": f"Objective68 external context {run_id}",
+                "summary": "External context for objective68 negotiation memory",
                 "metadata_json": {"run_id": run_id},
             },
         )
@@ -106,8 +107,8 @@ class Objective67NegotiationMemoryPreferenceConsolidationTest(unittest.TestCase)
         status, payload = post_json(
             "/workspace/human-aware/signals",
             {
-                "actor": "objective67-test",
-                "reason": "objective67 focused setup",
+                "actor": "objective68-test",
+                "reason": "objective68 focused setup",
                 "operator_present": True,
                 "human_in_workspace": True,
                 "shared_workspace_active": True,
@@ -116,11 +117,11 @@ class Objective67NegotiationMemoryPreferenceConsolidationTest(unittest.TestCase)
         )
         self.assertEqual(status, 200, payload)
 
-    def _build_orchestration(self, run_id: str, source: str) -> dict:
+    def _build_orchestration(self, run_id: str, source: str, environment_profile: str) -> dict:
         status, payload = post_json(
             "/orchestration/build",
             {
-                "actor": "objective67-test",
+                "actor": "objective68-test",
                 "source": source,
                 "lookback_hours": 24,
                 "max_items_per_domain": 50,
@@ -134,7 +135,10 @@ class Objective67NegotiationMemoryPreferenceConsolidationTest(unittest.TestCase)
                 "generate_goal": True,
                 "generate_horizon_plan": True,
                 "generate_improvement_proposals": False,
-                "metadata_json": {"run_id": run_id},
+                "metadata_json": {
+                    "run_id": run_id,
+                    "environment_profile": environment_profile,
+                },
             },
         )
         self.assertEqual(status, 200, payload)
@@ -149,47 +153,45 @@ class Objective67NegotiationMemoryPreferenceConsolidationTest(unittest.TestCase)
                 return int(item.get("artifact_id", 0) or 0)
         return 0
 
-    def _respond(self, negotiation_id: int, option_id: str, run_id: str) -> dict:
+    def _respond(self, negotiation_id: int, option_id: str, run_id: str) -> None:
         status, payload = post_json(
             f"/collaboration/negotiations/{negotiation_id}/respond",
             {
-                "actor": "objective67-test",
+                "actor": "objective68-test",
                 "option_id": option_id,
-                "reason": f"objective67 choose {option_id}",
+                "reason": f"objective68 choose {option_id}",
                 "metadata_json": {"run_id": run_id},
             },
         )
         self.assertEqual(status, 200, payload)
-        return payload
 
-    def _preferences(self) -> list[dict]:
-        status, payload = get_json("/collaboration/preferences?limit=100")
+    def _preferences(self, pattern_key: str = "") -> list[dict]:
+        query = f"?limit=100&pattern_key={pattern_key}" if pattern_key else "?limit=100"
+        status, payload = get_json(f"/collaboration/preferences{query}")
         self.assertEqual(status, 200, payload)
         preferences = payload.get("preferences", []) if isinstance(payload, dict) else []
         self.assertTrue(isinstance(preferences, list))
         return preferences
 
-    def test_objective67_negotiation_memory_preference_consolidation(self) -> None:
+    def _negotiation_default(self, orchestration: dict) -> str:
+        negotiation_id = self._negotiation_id(orchestration)
+        self.assertGreater(negotiation_id, 0)
+        status, payload = get_json(f"/collaboration/negotiations/{negotiation_id}")
+        self.assertEqual(status, 200, payload)
+        negotiation = payload.get("negotiation", {}) if isinstance(payload, dict) else {}
+        return str(negotiation.get("default_safe_path", ""))
+
+    def test_objective68_negotiation_memory_decay_and_contextualization(self) -> None:
         run_id = uuid4().hex[:8]
-        source = f"objective67-focused-{run_id}"
-        zone = f"obj67-zone-{run_id}"
+        source = f"objective68-focused-{run_id}"
+        zone = f"obj68-zone-{run_id}"
 
         self._reset_negotiation_preferences()
         self._seed_cross_domain_inputs(run_id=run_id, zone=zone)
         self._set_human_signals(run_id=run_id)
 
-        first = self._build_orchestration(run_id=run_id, source=source)
-        first_negotiation_id = self._negotiation_id(first)
-        self.assertGreater(first_negotiation_id, 0)
-        self._respond(first_negotiation_id, "rescan_first", run_id)
-
-        low_evidence = self._preferences()
-        self.assertTrue(bool(low_evidence))
-        first_pref = low_evidence[0] if low_evidence else {}
-        self.assertNotEqual(str(first_pref.get("state", "")), "consolidated")
-
-        for _ in range(3):
-            orchestration = self._build_orchestration(run_id=run_id, source=source)
+        for _ in range(4):
+            orchestration = self._build_orchestration(run_id=run_id, source=source, environment_profile="warehouse_a")
             negotiation_id = self._negotiation_id(orchestration)
             self.assertGreater(negotiation_id, 0)
             status, negotiation_payload = get_json(f"/collaboration/negotiations/{negotiation_id}")
@@ -198,46 +200,57 @@ class Objective67NegotiationMemoryPreferenceConsolidationTest(unittest.TestCase)
             if str(negotiation.get("status", "")) == "open":
                 self._respond(negotiation_id, "rescan_first", run_id)
 
-        consolidated = self._preferences()
-        self.assertTrue(bool(consolidated))
-        pref = consolidated[0]
-        self.assertEqual(str(pref.get("state", "")), "consolidated")
-        self.assertEqual(str(pref.get("preferred_option_id", "")), "rescan_first")
-        self.assertGreaterEqual(int(pref.get("evidence_count", 0) or 0), 4)
-        previous_confidence = float(pref.get("confidence", 0.0) or 0.0)
+        prefs = self._preferences()
+        self.assertTrue(bool(prefs))
+        warehouse_a_pref = next((item for item in prefs if "env:warehouse_a" in str(item.get("pattern_key", ""))), {})
+        self.assertTrue(bool(warehouse_a_pref))
+        self.assertEqual(str(warehouse_a_pref.get("state", "")), "consolidated")
+        self.assertEqual(str(warehouse_a_pref.get("preferred_option_id", "")), "rescan_first")
 
-        influenced = self._build_orchestration(run_id=run_id, source=source)
-        influenced_negotiation_id = self._negotiation_id(influenced)
-        self.assertGreater(influenced_negotiation_id, 0)
-        status, influenced_payload = get_json(f"/collaboration/negotiations/{influenced_negotiation_id}")
-        self.assertEqual(status, 200, influenced_payload)
-        influenced_negotiation = influenced_payload.get("negotiation", {}) if isinstance(influenced_payload, dict) else {}
-        self.assertEqual(str(influenced_negotiation.get("default_safe_path", "")), "rescan_first")
+        same_context = self._build_orchestration(run_id=run_id, source=source, environment_profile="warehouse_a")
+        self.assertEqual(self._negotiation_default(same_context), "rescan_first")
 
-        for _ in range(5):
-            orchestration = self._build_orchestration(run_id=run_id, source=source)
-            negotiation_id = self._negotiation_id(orchestration)
-            self.assertGreater(negotiation_id, 0)
-            status, negotiation_payload = get_json(f"/collaboration/negotiations/{negotiation_id}")
-            self.assertEqual(status, 200, negotiation_payload)
-            negotiation = negotiation_payload.get("negotiation", {}) if isinstance(negotiation_payload, dict) else {}
-            if str(negotiation.get("status", "")) == "open":
-                self._respond(negotiation_id, "defer_action", run_id)
+        different_context = self._build_orchestration(run_id=run_id, source=source, environment_profile="warehouse_b")
+        self.assertNotEqual(self._negotiation_default(different_context), "rescan_first")
 
-        revised = self._preferences()
-        self.assertTrue(bool(revised))
-        revised_pref = revised[0]
-        revised_option = str(revised_pref.get("preferred_option_id", ""))
-        revised_confidence = float(revised_pref.get("confidence", 0.0) or 0.0)
-        revised_state = str(revised_pref.get("state", ""))
-
-        self.assertTrue(
-            revised_option == "defer_action"
-            or revised_state == "learning"
-            or revised_confidence < previous_confidence
+        stale_pattern_key = str(warehouse_a_pref.get("pattern_key", ""))
+        stale_timestamp = (datetime.now(timezone.utc) - timedelta(days=120)).isoformat()
+        status, payload = post_json(
+            "/preferences",
+            {
+                "user_id": "operator",
+                "preference_type": "collaboration_negotiation_memory",
+                "value": {
+                    "version": "objective68-v1",
+                    "patterns": {
+                        stale_pattern_key: {
+                            "pattern_key": stale_pattern_key,
+                            "state": "consolidated",
+                            "evidence_count": 20,
+                            "option_counts": {"rescan_first": 20},
+                            "dominant_option_id": "rescan_first",
+                            "confidence": 1.0,
+                            "source_interactions": [],
+                            "last_updated_at": stale_timestamp,
+                        }
+                    },
+                },
+                "confidence": 1.0,
+                "source": "objective68-test-stale-seed",
+            },
         )
+        self.assertEqual(status, 200, payload)
 
-        self.assertTrue(bool(revised_pref.get("source_interactions", [])))
+        stale_inspect = self._preferences(pattern_key=stale_pattern_key)
+        self.assertTrue(bool(stale_inspect))
+        stale_pref = stale_inspect[0]
+        self.assertEqual(str(stale_pref.get("freshness", "")), "stale")
+        self.assertTrue(bool(stale_pref.get("decay_applied", False)))
+        self.assertGreater(float(stale_pref.get("raw_confidence", 0.0) or 0.0), float(stale_pref.get("confidence", 0.0) or 0.0))
+        self.assertEqual(float(stale_pref.get("context_match_score", 0.0) or 0.0), 1.0)
+
+        stale_context = self._build_orchestration(run_id=run_id, source=source, environment_profile="warehouse_a")
+        self.assertNotEqual(self._negotiation_default(stale_context), "rescan_first")
 
 
 if __name__ == "__main__":

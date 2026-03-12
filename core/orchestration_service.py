@@ -35,6 +35,8 @@ NEGOTIATION_MEMORY_MIN_EVIDENCE = 4
 NEGOTIATION_MEMORY_MIN_CONFIDENCE = 0.74
 NEGOTIATION_MEMORY_REVISION_FLOOR = 0.55
 NEGOTIATION_MEMORY_MAX_INTERACTIONS = 40
+NEGOTIATION_MEMORY_DECAY_HALF_LIFE_DAYS = 14.0
+NEGOTIATION_MEMORY_STALE_AFTER_DAYS = 45.0
 NEGOTIATION_OPTION_IDS = {
     "continue_now",
     "defer_action",
@@ -53,6 +55,36 @@ def _safe_int(value: object) -> int:
         return int(value or 0)
     except Exception:
         return 0
+
+
+def _parse_iso8601(value: object) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    normalized = raw
+    if normalized.endswith("Z"):
+        normalized = f"{normalized[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except Exception:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _negotiation_memory_decay(*, last_updated_at: object) -> tuple[float, float, bool]:
+    parsed = _parse_iso8601(last_updated_at)
+    if not parsed:
+        return 1.0, 0.0, False
+    now = datetime.now(timezone.utc)
+    age_days = max((now - parsed).total_seconds() / 86400.0, 0.0)
+    if NEGOTIATION_MEMORY_DECAY_HALF_LIFE_DAYS <= 0:
+        decay_factor = 1.0
+    else:
+        decay_factor = _bounded(0.5 ** (age_days / NEGOTIATION_MEMORY_DECAY_HALF_LIFE_DAYS), lo=0.0, hi=1.0)
+    is_stale = age_days >= NEGOTIATION_MEMORY_STALE_AFTER_DAYS
+    return decay_factor, age_days, is_stale
 
 
 def _priority_label(score: float) -> str:
@@ -790,6 +822,7 @@ def _negotiation_pattern_key(*, trigger_type: str, human_context_state: dict) ->
     signals = state.get("signals", {}) if isinstance(state.get("signals", {}), dict) else {}
     urgency = float(state.get("communication_urgency", 0.0) or 0.0)
     urgency_bucket = "high" if urgency >= 0.65 else ("medium" if urgency >= 0.35 else "low")
+    environment_profile = str(state.get("environment_profile", "default")).strip().lower() or "default"
     parts = [
         "collaboration_negotiation",
         str(state.get("task_kind", "mixed")).strip().lower(),
@@ -797,6 +830,7 @@ def _negotiation_pattern_key(*, trigger_type: str, human_context_state: dict) ->
         f"shared:{bool(signals.get('shared_workspace_active', False))}",
         f"operator:{bool(signals.get('operator_present', False))}",
         f"urgency:{urgency_bucket}",
+        f"env:{environment_profile}",
     ]
     return "|".join(parts)
 
@@ -821,7 +855,7 @@ async def _load_negotiation_memory(*, db: AsyncSession) -> dict:
     if isinstance(payload, dict):
         return payload
     return {
-        "version": "objective67-v1",
+        "version": "objective68-v1",
         "patterns": {},
     }
 
@@ -833,17 +867,32 @@ def _memory_preference_for_pattern(*, memory_payload: dict, pattern_key: str, op
     evidence_count = int(item.get("evidence_count", 0) or 0)
     confidence = float(item.get("confidence", 0.0) or 0.0)
     preferred_option_id = str(item.get("dominant_option_id", "")).strip()
+    last_updated_at = str(item.get("last_updated_at", "")).strip()
+    decay_factor, age_days, is_stale = _negotiation_memory_decay(last_updated_at=last_updated_at)
+    effective_confidence = round(_bounded(confidence * decay_factor), 6)
+    effective_evidence = int(max(0, round(evidence_count * decay_factor)))
+    effective_state = "learning" if is_stale else state
     if option_ids is not None and preferred_option_id and preferred_option_id not in option_ids:
         preferred_option_id = ""
 
     return {
         "pattern_key": pattern_key,
-        "state": state,
-        "evidence_count": evidence_count,
-        "confidence": confidence,
+        "state": effective_state,
+        "raw_state": state,
+        "evidence_count": effective_evidence,
+        "raw_evidence_count": evidence_count,
+        "confidence": effective_confidence,
+        "raw_confidence": confidence,
         "preferred_option_id": preferred_option_id,
         "option_counts": item.get("option_counts", {}) if isinstance(item.get("option_counts", {}), dict) else {},
         "source_interactions": item.get("source_interactions", []) if isinstance(item.get("source_interactions", []), list) else [],
+        "freshness": "stale" if is_stale else "fresh",
+        "is_stale": is_stale,
+        "age_days": round(age_days, 6),
+        "decay_factor": round(decay_factor, 6),
+        "decay_applied": bool(decay_factor < 0.999999),
+        "context_match_score": 1.0,
+        "last_updated_at": last_updated_at,
     }
 
 
@@ -984,7 +1033,7 @@ async def _record_negotiation_pattern_signal(
     }
 
     memory_payload = {
-        "version": "objective67-v1",
+        "version": "objective68-v1",
         "patterns": memory_patterns,
     }
     await upsert_user_preference(
@@ -1016,8 +1065,20 @@ async def inspect_negotiation_preferences(
             if isinstance(key, str) and isinstance(value, dict)
         }
 
+    enriched: list[dict] = []
+    for key, item in selected.items():
+        if not isinstance(item, dict):
+            continue
+        memory_item = _memory_preference_for_pattern(
+            memory_payload=memory_payload,
+            pattern_key=key,
+            option_ids=None,
+        )
+        memory_item["context_match_score"] = 1.0 if pattern_key.strip() and key == pattern_key.strip() else 0.0
+        enriched.append(memory_item)
+
     ordered = sorted(
-        selected.values(),
+        enriched,
         key=lambda item: (
             float(item.get("confidence", 0.0) or 0.0),
             int(item.get("evidence_count", 0) or 0),
@@ -1030,21 +1091,31 @@ async def inspect_negotiation_preferences(
         {
             "pattern_key": str(item.get("pattern_key", "")),
             "state": str(item.get("state", "learning")),
-            "preferred_option_id": str(item.get("dominant_option_id", "")),
+            "raw_state": str(item.get("raw_state", "learning")),
+            "preferred_option_id": str(item.get("preferred_option_id", "")),
             "confidence": float(item.get("confidence", 0.0) or 0.0),
+            "raw_confidence": float(item.get("raw_confidence", 0.0) or 0.0),
             "evidence_count": int(item.get("evidence_count", 0) or 0),
+            "raw_evidence_count": int(item.get("raw_evidence_count", 0) or 0),
             "option_counts": item.get("option_counts", {}) if isinstance(item.get("option_counts", {}), dict) else {},
             "source_interactions": item.get("source_interactions", []) if isinstance(item.get("source_interactions", []), list) else [],
             "last_updated_at": item.get("last_updated_at", ""),
+            "freshness": str(item.get("freshness", "fresh")),
+            "decay_applied": bool(item.get("decay_applied", False)),
+            "decay_factor": float(item.get("decay_factor", 1.0) or 1.0),
+            "age_days": float(item.get("age_days", 0.0) or 0.0),
+            "context_match_score": float(item.get("context_match_score", 0.0) or 0.0),
         }
         for item in trimmed
     ]
     return {
-        "policy_version": "objective67-negotiation-memory-v1",
+        "policy_version": "objective68-negotiation-memory-v1",
         "thresholds": {
             "min_evidence_for_consolidation": NEGOTIATION_MEMORY_MIN_EVIDENCE,
             "min_confidence_for_consolidation": NEGOTIATION_MEMORY_MIN_CONFIDENCE,
             "revision_floor": NEGOTIATION_MEMORY_REVISION_FLOOR,
+            "decay_half_life_days": NEGOTIATION_MEMORY_DECAY_HALF_LIFE_DAYS,
+            "stale_after_days": NEGOTIATION_MEMORY_STALE_AFTER_DAYS,
         },
         "preferences": consolidated,
     }
@@ -1149,11 +1220,13 @@ async def build_cross_domain_task_orchestration(
     interruption_likelihood, interruption_details = await _interruption_likelihood(human_aware=human_aware, db=db)
     operator_presence_score = _operator_presence_score(human_aware=human_aware)
     preferred_mode = await _preferred_collaboration_mode(db=db)
+    environment_profile = str((metadata_json if isinstance(metadata_json, dict) else {}).get("environment_profile", "default")).strip().lower() or "default"
     memory_pattern_key = _negotiation_pattern_key(
         trigger_type="",
         human_context_state={
             "task_kind": task_kind,
             "action_risk_level": action_risk_level,
+            "environment_profile": environment_profile,
             "communication_urgency": communication_urgency,
             "signals": human_aware,
         },
@@ -1319,6 +1392,7 @@ async def build_cross_domain_task_orchestration(
                 "preferred_mode": preferred_mode,
                 "task_kind": task_kind,
                 "action_risk_level": action_risk_level,
+                "environment_profile": environment_profile,
                 "communication_urgency": communication_urgency,
                 "interruption_likelihood": interruption_likelihood,
                 "operator_presence_score": operator_presence_score,
@@ -1338,6 +1412,9 @@ async def build_cross_domain_task_orchestration(
                     "preferred_option_id": memory_default_option,
                     "confidence": memory_default_confidence,
                     "evidence_count": memory_default_evidence,
+                    "freshness": str(memory_preference.get("freshness", "fresh")),
+                    "decay_factor": float(memory_preference.get("decay_factor", 1.0) or 1.0),
+                    "context_match_score": float(memory_preference.get("context_match_score", 1.0) or 0.0),
                 },
             }
         if not bool(collaboration_policy.get("continue_allowed", False)):

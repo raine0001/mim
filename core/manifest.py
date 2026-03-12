@@ -7,7 +7,7 @@ from core.config import PROJECT_ROOT, settings
 
 CONTRACT_VERSION = "tod-mim-shared-contract-v1"
 MANIFEST_VERSION = "1"
-SCHEMA_VERSION = "2026-03-12-60"
+SCHEMA_VERSION = "2026-03-12-61"
 
 SIGNATURE_FILES = [
     "core/models.py",
@@ -146,6 +146,7 @@ SIGNATURE_FILES = [
     "docs/objective-65-prod-promotion-report.md",
     "docs/objective-66-negotiated-task-resolution-follow-through.md",
     "docs/objective-67-negotiation-memory-and-human-preference-consolidation.md",
+    "docs/objective-68-negotiation-memory-decay-and-contextualization.md",
     "config/vision_policy.json",
     "config/voice_policy.json",
 ]
@@ -237,6 +238,7 @@ CAPABILITIES = [
     "human_aware_collaboration_negotiation",
     "negotiated_task_resolution_follow_through",
     "negotiation_memory_human_preference_consolidation",
+    "negotiation_memory_decay_contextualization",
 ]
 
 RECENT_CHANGES = [
@@ -302,6 +304,7 @@ RECENT_CHANGES = [
     "Added Objective 65 human-aware collaboration negotiation with persistent negotiation state, structured option shaping, response endpoints, and safe unanswered fallbacks",
     "Added Objective 66 negotiated task resolution follow-through with negotiation outcome memory, pattern-based reuse, and downstream follow-through propagation",
     "Added Objective 67 negotiation memory and human-preference consolidation with durable preference conversion, inspectable evidence, and safe revision behavior",
+    "Added Objective 68 negotiation-memory decay and contextualization with freshness-aware confidence decay, context-scoped preference keys, and stale-pattern suppression",
 ]
 
 
