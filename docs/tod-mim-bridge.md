@@ -91,6 +91,37 @@ Example TOD config:
 - `GET /reviews`
 - `POST/GET /journal`
 
+### Execution integration (Objective 22)
+
+- `GET /gateway/capabilities/executions/{execution_id}/handoff`
+- `POST /gateway/capabilities/executions/{execution_id}/feedback`
+- `GET /gateway/capabilities/executions/{execution_id}/feedback`
+
+Execution handoff payload includes:
+
+- `execution_id`
+- `goal_ref` and `action_ref`
+- `capability_name`
+- `arguments_json`
+- `safety_mode`
+- `correlation_metadata`
+
+Execution feedback posting supports:
+
+- direct status updates (`accepted`, `running`, `succeeded`, `failed`, `blocked`)
+- runtime outcome mapping:
+  - `executor_unavailable` → `failed`
+  - `guardrail_blocked` → `blocked`
+  - `retry_in_progress` → `running`
+  - `fallback_used` → `running`
+  - `recovered` → `succeeded`
+  - `unrecovered_failure` → `failed`
+
+Feedback auth/safety boundary:
+
+- actor allow-list enforced by MIM (`execution_feedback_allowed_actors`)
+- optional shared key header `X-MIM-Feedback-Key` when MIM `execution_feedback_api_key` is set
+
 ## TOD command mapping
 
 - `ping-mim` → `GET /health`, `GET /status`

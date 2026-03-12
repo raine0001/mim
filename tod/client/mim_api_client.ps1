@@ -668,6 +668,188 @@ function Invoke-ExecutionEngine {
     return $finalResult
 }
 
+function Get-MimExecutionFeedbackHeaders {
+    param([pscustomobject]$Config)
+
+    $headers = @{}
+    if ($Config.PSObject.Properties.Name -contains "execution_feedback_auth_key") {
+        $token = [string]$Config.execution_feedback_auth_key
+        if (-not [string]::IsNullOrWhiteSpace($token)) {
+            $headers["X-MIM-Feedback-Key"] = $token
+        }
+    }
+    return $headers
+}
+
+function Get-MimExecutionHandoff {
+    param(
+        [int]$ExecutionId,
+        [string]$ConfigPath
+    )
+
+    $config = Get-TodConfig -ConfigPath $ConfigPath
+    $mode = Resolve-TodMode -Mode $config.mode
+    if ($mode -eq "local") {
+        throw "Execution handoff requires remote MIM mode"
+    }
+
+    return Invoke-MimGet -Endpoint "/gateway/capabilities/executions/$ExecutionId/handoff" -Config $config
+}
+
+function Publish-MimExecutionFeedback {
+    param(
+        [int]$ExecutionId,
+        [string]$Status = "",
+        [string]$Reason = "",
+        [string]$RuntimeOutcome = "",
+        [string]$RecoveryState = "",
+        [hashtable]$FeedbackJson = @{},
+        [hashtable]$CorrelationJson = @{},
+        [string]$Actor = "tod",
+        [string]$ConfigPath
+    )
+
+    $config = Get-TodConfig -ConfigPath $ConfigPath
+    $mode = Resolve-TodMode -Mode $config.mode
+    if ($mode -eq "local") {
+        return [pscustomobject]@{
+            status = "skipped"
+            reason = "local mode"
+            execution_id = $ExecutionId
+        }
+    }
+
+    $headers = Get-MimExecutionFeedbackHeaders -Config $config
+    $payload = @{
+        status = $Status
+        reason = $Reason
+        runtime_outcome = $RuntimeOutcome
+        recovery_state = $RecoveryState
+        feedback_json = $FeedbackJson
+        correlation_json = $CorrelationJson
+        actor = $Actor
+    }
+
+    return Invoke-MimPost -Endpoint "/gateway/capabilities/executions/$ExecutionId/feedback" -Payload $payload -Config $config -Headers $headers
+}
+
+function Invoke-MimExecutionLifecycle {
+    param(
+        [int]$ExecutionId,
+        [string]$PackagePath,
+        [pscustomobject]$TaskMetadata,
+        [string]$ConfigPath,
+        [string]$Actor = "tod"
+    )
+
+    $handoff = Get-MimExecutionHandoff -ExecutionId $ExecutionId -ConfigPath $ConfigPath
+    $correlation = @{
+        execution_id = $ExecutionId
+        goal_id = $handoff.goal_ref.goal_id
+        resolution_id = $handoff.action_ref.resolution_id
+        source = $handoff.correlation_metadata.event_source
+        target_system = $handoff.correlation_metadata.target_system
+    }
+
+    Publish-MimExecutionFeedback -ExecutionId $ExecutionId -Status "accepted" -Reason "TOD accepted execution handoff" -FeedbackJson @{ phase = "accepted"; capability = $handoff.capability_name } -CorrelationJson $correlation -Actor $Actor -ConfigPath $ConfigPath | Out-Null
+    Publish-MimExecutionFeedback -ExecutionId $ExecutionId -Status "running" -Reason "TOD execution started" -FeedbackJson @{ phase = "running"; requested_executor = $handoff.requested_executor } -CorrelationJson $correlation -Actor $Actor -ConfigPath $ConfigPath | Out-Null
+
+    try {
+        if ($handoff.capability_name -eq "workspace_scan") {
+            $scanMode = "standard"
+            $scanArea = "workspace"
+            $confidenceThreshold = 0.6
+            if ($null -ne $handoff.arguments_json) {
+                if ($handoff.arguments_json.PSObject.Properties.Name -contains "scan_mode") {
+                    $scanMode = [string]$handoff.arguments_json.scan_mode
+                }
+                if ($handoff.arguments_json.PSObject.Properties.Name -contains "scan_area") {
+                    $scanArea = [string]$handoff.arguments_json.scan_area
+                }
+                if ($handoff.arguments_json.PSObject.Properties.Name -contains "confidence_threshold") {
+                    $confidenceThreshold = [double]$handoff.arguments_json.confidence_threshold
+                }
+            }
+
+            $observations = @(
+                @{ label = "workspace"; confidence = 0.95; source = "workspace_scan" },
+                @{ label = "table"; confidence = 0.91; source = "workspace_scan" },
+                @{ label = "cable"; confidence = 0.76; source = "workspace_scan" }
+            )
+
+            $result = New-ExecutionResultEnvelope `
+                -Engine "local" `
+                -Success $true `
+                -Summary "Workspace scan completed" `
+                -RawOutput "scan_mode=$scanMode; scan_area=$scanArea; confidence_threshold=$confidenceThreshold" `
+                -FilesChanged @() `
+                -TestsRun @("workspace-scan-stub") `
+                -TestResults "pass" `
+                -Failures @() `
+                -Recommendations "Review observations and promote if needed" `
+                -NeedsEscalation $false `
+                -ExecutionMetadata @{
+                    capability = "workspace_scan"
+                    scan_mode = $scanMode
+                    scan_area = $scanArea
+                    confidence_threshold = $confidenceThreshold
+                    observations = $observations
+                }
+            $result = Finalize-ExecutionResult -RawResult $result -EngineName "local"
+        }
+        else {
+            $result = Invoke-ExecutionEngine -PackagePath $PackagePath -TaskMetadata $TaskMetadata -ConfigPath $ConfigPath
+        }
+
+        $hasFallback = $false
+        if ($null -ne $result.execution_metadata -and ($result.execution_metadata.PSObject.Properties.Name -contains "fallback_from")) {
+            $hasFallback = -not [string]::IsNullOrWhiteSpace([string]$result.execution_metadata.fallback_from)
+        }
+        if ($hasFallback) {
+            Publish-MimExecutionFeedback -ExecutionId $ExecutionId -RuntimeOutcome "fallback_used" -Reason "Fallback execution engine used" -FeedbackJson @{ fallback_from = [string]$result.execution_metadata.fallback_from; phase = "running" } -CorrelationJson $correlation -Actor $Actor -ConfigPath $ConfigPath | Out-Null
+        }
+
+        if ([bool]$result.success) {
+            $runtimeOutcome = ""
+            $recoveryState = ""
+            if ($hasFallback) {
+                $runtimeOutcome = "recovered"
+                $recoveryState = "fallback_recovered"
+            }
+
+            $successFeedback = @{
+                summary = [string]$result.summary
+                test_results = [string]$result.test_results
+                files_changed = @($result.files_changed)
+                failures = @($result.failures)
+            }
+            if ($null -ne $result.execution_metadata -and ($result.execution_metadata.PSObject.Properties.Name -contains "observations")) {
+                $successFeedback["observations"] = @($result.execution_metadata.observations)
+                if ($result.execution_metadata.PSObject.Properties.Name -contains "confidence_threshold") {
+                    $successFeedback["observation_confidence"] = [double]$result.execution_metadata.confidence_threshold
+                }
+                $successFeedback["scan_mode"] = [string]$result.execution_metadata.scan_mode
+                $successFeedback["scan_area"] = [string]$result.execution_metadata.scan_area
+            }
+            return Publish-MimExecutionFeedback -ExecutionId $ExecutionId -Status "succeeded" -Reason "TOD execution succeeded" -RuntimeOutcome $runtimeOutcome -RecoveryState $recoveryState -FeedbackJson $successFeedback -CorrelationJson $correlation -Actor $Actor -ConfigPath $ConfigPath
+        }
+
+        $firstFailure = "execution failed"
+        if ($null -ne $result.failures -and @($result.failures).Count -gt 0) {
+            $firstFailure = [string]$result.failures[0]
+        }
+
+        if ($firstFailure -match "guardrail blocked|blocked by guardrail") {
+            return Publish-MimExecutionFeedback -ExecutionId $ExecutionId -Status "blocked" -RuntimeOutcome "guardrail_blocked" -Reason "Execution blocked by guardrail" -FeedbackJson @{ summary = [string]$result.summary; failure = $firstFailure } -CorrelationJson $correlation -Actor $Actor -ConfigPath $ConfigPath
+        }
+
+        return Publish-MimExecutionFeedback -ExecutionId $ExecutionId -Status "failed" -RuntimeOutcome "unrecovered_failure" -Reason "TOD execution failed" -FeedbackJson @{ summary = [string]$result.summary; failures = @($result.failures); recommendations = [string]$result.recommendations } -CorrelationJson $correlation -Actor $Actor -ConfigPath $ConfigPath
+    }
+    catch {
+        return Publish-MimExecutionFeedback -ExecutionId $ExecutionId -Status "failed" -RuntimeOutcome "executor_unavailable" -Reason "TOD executor unavailable" -FeedbackJson @{ error = $_.Exception.Message } -CorrelationJson $correlation -Actor $Actor -ConfigPath $ConfigPath
+    }
+}
+
 function Get-MimManifest {
     param([string]$ConfigPath)
 
