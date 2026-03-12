@@ -1125,6 +1125,45 @@ class CrossDomainReasoningOut(BaseModel):
     created_at: datetime
 
 
+class StrategyGoalBuildRequest(BaseModel):
+    actor: str = "workspace"
+    source: str = "objective57"
+    lookback_hours: int = Field(default=24, ge=1, le=720)
+    max_items_per_domain: int = Field(default=50, ge=1, le=200)
+    max_goals: int = Field(default=5, ge=1, le=20)
+    min_context_confidence: float = Field(default=0.4, ge=0.0, le=1.0)
+    min_domains_required: int = Field(default=2, ge=1, le=10)
+    min_cross_domain_links: int = Field(default=1, ge=0, le=20)
+    generate_horizon_plans: bool = True
+    generate_improvement_proposals: bool = True
+    generate_maintenance_cycles: bool = False
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class StrategyGoalOut(BaseModel):
+    strategy_goal_id: int
+    source: str
+    actor: str
+    strategy_type: str
+    origin_context_id: int | None
+    priority: str
+    priority_score: float
+    success_criteria: str
+    status: str
+    evidence_summary: str
+    supporting_evidence: dict
+    contributing_domains: list[str]
+    ranking_factors: dict
+    reasoning_summary: str
+    reasoning: dict
+    linked_horizon_plan_ids: list[int]
+    linked_improvement_proposal_ids: list[int]
+    linked_maintenance_run_ids: list[int]
+    operator_recommendations: list[str]
+    metadata_json: dict
+    created_at: datetime
+
+
 class ImprovementRecommendationOut(BaseModel):
     recommendation_id: int
     source: str

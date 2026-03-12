@@ -7,7 +7,7 @@ from core.config import PROJECT_ROOT, settings
 
 CONTRACT_VERSION = "tod-mim-shared-contract-v1"
 MANIFEST_VERSION = "1"
-SCHEMA_VERSION = "2026-03-11-47"
+SCHEMA_VERSION = "2026-03-11-48"
 
 SIGNATURE_FILES = [
     "core/models.py",
@@ -36,6 +36,8 @@ SIGNATURE_FILES = [
     "core/improvement_recommendation_service.py",
     "core/improvement_governance_service.py",
     "core/cross_domain_reasoning_service.py",
+    "core/goal_strategy_service.py",
+    "core/routers/strategy.py",
     "docs/tod-mim-bridge.md",
     "docs/objective-21-unified-input-gateway.md",
     "docs/objective-22-mim-tod-execution-feedback-integration.md",
@@ -107,6 +109,9 @@ SIGNATURE_FILES = [
     "docs/objective-55-promotion-readiness-report.md",
     "docs/objective-56-cross-domain-reasoning.md",
     "docs/objective-56-promotion-readiness-report.md",
+    "docs/objective-57-goal-strategy-engine.md",
+    "docs/objective-57-promotion-readiness-report.md",
+    "docs/objective-57-prod-promotion-report.md",
     "config/vision_policy.json",
     "config/voice_policy.json",
 ]
@@ -187,6 +192,7 @@ CAPABILITIES = [
     "self_guided_improvement_loop",
     "improvement_prioritization_governance",
     "cross_domain_reasoning",
+    "goal_strategy_engine",
 ]
 
 RECENT_CHANGES = [
@@ -240,6 +246,7 @@ RECENT_CHANGES = [
     "Added Objective 54 self-guided improvement loop with pattern-triggered proposals, sandbox orchestration, standardized experiment metrics, and review-gated recommendations",
     "Added Objective 55 improvement prioritization and governance with weighted backlog scoring, lifecycle state orchestration, and operator-visible ranking/risk reasoning",
     "Added Objective 56 cross-domain reasoning with unified workspace, communication, external-information, and developmental-memory context aggregation",
+    "Added Objective 57 goal strategy engine with strategic goal synthesis, deterministic ranking, and strategy-to-plan bridge generation",
 ]
 
 
@@ -409,6 +416,9 @@ def build_manifest() -> dict:
             "/reasoning/context/build",
             "/reasoning/context",
             "/reasoning/context/{context_id}",
+            "/strategy/goals/build",
+            "/strategy/goals",
+            "/strategy/goals/{strategy_goal_id}",
             "/maintenance/cycle",
             "/maintenance/runs",
             "/maintenance/runs/{run_id}",
@@ -1085,6 +1095,29 @@ def build_manifest() -> dict:
                 "reasoning",
                 "confidence",
                 "status",
+                "metadata_json",
+                "created_at",
+            ],
+            "StrategyGoal": [
+                "strategy_goal_id",
+                "source",
+                "actor",
+                "strategy_type",
+                "origin_context_id",
+                "priority",
+                "priority_score",
+                "success_criteria",
+                "status",
+                "evidence_summary",
+                "supporting_evidence",
+                "contributing_domains",
+                "ranking_factors",
+                "reasoning_summary",
+                "reasoning",
+                "linked_horizon_plan_ids",
+                "linked_improvement_proposal_ids",
+                "linked_maintenance_run_ids",
+                "operator_recommendations",
                 "metadata_json",
                 "created_at",
             ],

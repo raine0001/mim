@@ -63,8 +63,6 @@ This roadmap is the master sequencing document for MIM objective development. It
 
 ## Future Objectives
 
-- Objective 56 — Cross-domain reasoning (workspace state + communication inputs + external information)
-- Objective 57 — Goal strategy engine (longer-term environment goals)
 - Objective 58 — Adaptive autonomy boundaries (experience-conditioned autonomy limits)
 
 ## Layered Objective Grouping (Canonical Sequence)
