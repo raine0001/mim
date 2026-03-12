@@ -238,6 +238,7 @@ async def reject_improvement_recommendation(
     actor: str,
     reason: str,
     metadata_json: dict,
+    db: AsyncSession,
 ) -> WorkspaceImprovementRecommendation:
     if row.status != "proposed":
         raise ValueError("recommendation_not_open")

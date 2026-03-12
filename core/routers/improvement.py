@@ -321,6 +321,7 @@ async def reject_improvement_recommendation_endpoint(
             actor=payload.actor,
             reason=payload.reason,
             metadata_json=payload.metadata_json,
+            db=db,
         )
     except ValueError as exc:
         if str(exc) == "recommendation_not_open":
