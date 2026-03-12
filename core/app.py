@@ -118,6 +118,12 @@ async def ensure_schema() -> None:
         await conn.execute(text("ALTER TABLE IF EXISTS constraint_evaluations ADD COLUMN IF NOT EXISTS outcome_quality DOUBLE PRECISION DEFAULT 0.0"))
         await conn.execute(text("ALTER TABLE IF EXISTS constraint_evaluations ADD COLUMN IF NOT EXISTS outcome_recorded_at TIMESTAMPTZ"))
         await conn.execute(text("ALTER TABLE IF EXISTS workspace_decision_records ADD COLUMN IF NOT EXISTS result_quality DOUBLE PRECISION DEFAULT 0.0"))
+        await conn.execute(text("ALTER TABLE IF EXISTS workspace_autonomy_boundary_profiles ADD COLUMN IF NOT EXISTS scope VARCHAR(120) DEFAULT 'global'"))
+        await conn.execute(text("ALTER TABLE IF EXISTS workspace_autonomy_boundary_profiles ADD COLUMN IF NOT EXISTS current_level VARCHAR(40) DEFAULT 'operator_required'"))
+        await conn.execute(text("ALTER TABLE IF EXISTS workspace_autonomy_boundary_profiles ADD COLUMN IF NOT EXISTS confidence DOUBLE PRECISION DEFAULT 0.0"))
+        await conn.execute(text("ALTER TABLE IF EXISTS workspace_autonomy_boundary_profiles ADD COLUMN IF NOT EXISTS evidence_inputs_json JSONB DEFAULT '{}'::jsonb"))
+        await conn.execute(text("ALTER TABLE IF EXISTS workspace_autonomy_boundary_profiles ADD COLUMN IF NOT EXISTS last_adjusted TIMESTAMPTZ"))
+        await conn.execute(text("ALTER TABLE IF EXISTS workspace_autonomy_boundary_profiles ADD COLUMN IF NOT EXISTS adjustment_reason TEXT DEFAULT ''"))
 
     await initialize_workspace_monitoring_runtime()
 

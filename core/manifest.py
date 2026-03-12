@@ -7,7 +7,7 @@ from core.config import PROJECT_ROOT, settings
 
 CONTRACT_VERSION = "tod-mim-shared-contract-v1"
 MANIFEST_VERSION = "1"
-SCHEMA_VERSION = "2026-03-11-48"
+SCHEMA_VERSION = "2026-03-11-50"
 
 SIGNATURE_FILES = [
     "core/models.py",
@@ -37,6 +37,8 @@ SIGNATURE_FILES = [
     "core/improvement_governance_service.py",
     "core/cross_domain_reasoning_service.py",
     "core/goal_strategy_service.py",
+    "core/autonomy_boundary_service.py",
+    "core/routers/autonomy_boundaries.py",
     "core/routers/strategy.py",
     "docs/tod-mim-bridge.md",
     "docs/objective-21-unified-input-gateway.md",
@@ -112,6 +114,9 @@ SIGNATURE_FILES = [
     "docs/objective-57-goal-strategy-engine.md",
     "docs/objective-57-promotion-readiness-report.md",
     "docs/objective-57-prod-promotion-report.md",
+    "docs/objective-58-adaptive-autonomy-boundaries.md",
+    "docs/objective-58-promotion-readiness-report.md",
+    "docs/objective-58-prod-promotion-report.md",
     "config/vision_policy.json",
     "config/voice_policy.json",
 ]
@@ -193,6 +198,7 @@ CAPABILITIES = [
     "improvement_prioritization_governance",
     "cross_domain_reasoning",
     "goal_strategy_engine",
+    "adaptive_autonomy_boundaries",
 ]
 
 RECENT_CHANGES = [
@@ -247,6 +253,7 @@ RECENT_CHANGES = [
     "Added Objective 55 improvement prioritization and governance with weighted backlog scoring, lifecycle state orchestration, and operator-visible ranking/risk reasoning",
     "Added Objective 56 cross-domain reasoning with unified workspace, communication, external-information, and developmental-memory context aggregation",
     "Added Objective 57 goal strategy engine with strategic goal synthesis, deterministic ranking, and strategy-to-plan bridge generation",
+    "Added Objective 58 adaptive autonomy boundaries with experience-conditioned policy recommendations and applyable autonomy limits",
 ]
 
 
@@ -449,6 +456,12 @@ def build_manifest() -> dict:
             "/workspace/autonomy/policy",
             "/workspace/autonomy/override",
             "/workspace/autonomy/loop/step",
+            "/autonomy/boundaries/recompute",
+            "/autonomy/boundaries",
+            "/autonomy/boundaries/{boundary_id}",
+            "/workspace/autonomy/boundaries/evaluate",
+            "/workspace/autonomy/boundaries",
+            "/workspace/autonomy/boundaries/{profile_id}",
             "/workspace/chains",
             "/workspace/chains/{chain_id}",
             "/workspace/chains/{chain_id}/approve",
@@ -1118,6 +1131,33 @@ def build_manifest() -> dict:
                 "linked_improvement_proposal_ids",
                 "linked_maintenance_run_ids",
                 "operator_recommendations",
+                "metadata_json",
+                "created_at",
+            ],
+            "AdaptiveAutonomyBoundaryProfile": [
+                "boundary_id",
+                "profile_id",
+                "scope",
+                "source",
+                "actor",
+                "profile_status",
+                "current_level",
+                "confidence",
+                "evidence_inputs",
+                "last_adjusted",
+                "adjustment_reason",
+                "lookback_hours",
+                "sample_count",
+                "success_rate",
+                "escalation_rate",
+                "retry_rate",
+                "interruption_rate",
+                "memory_delta_rate",
+                "current_boundaries",
+                "recommended_boundaries",
+                "applied_boundaries",
+                "adaptation_summary",
+                "adaptation_reasoning",
                 "metadata_json",
                 "created_at",
             ],

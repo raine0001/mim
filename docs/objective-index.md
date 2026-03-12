@@ -42,6 +42,7 @@ This registry indexes objective evidence and promotion artifacts so objective hi
 | 55 | Improvement Prioritization and Governance | promoted_verified | 2026-03-11-46 | objective-55 | core/improvement_governance_service.py; core/routers/improvement.py; core/models.py | docs/objective-55-promotion-readiness-report.md | docs/objective-55-prod-promotion-report.md | improvement_prioritization_governance |
 | 56 | Cross-Domain Reasoning | promoted_verified | 2026-03-11-47 | objective-56 | core/cross_domain_reasoning_service.py; core/routers/reasoning.py; core/models.py | docs/objective-56-promotion-readiness-report.md | docs/objective-56-prod-promotion-report.md | cross_domain_reasoning |
 | 57 | Goal Strategy Engine | promoted_verified | 2026-03-11-48 | objective-57 | core/goal_strategy_service.py; core/routers/strategy.py; core/models.py | docs/objective-57-promotion-readiness-report.md | docs/objective-57-prod-promotion-report.md | goal_strategy_engine |
+| 58 | Adaptive Autonomy Boundaries | promoted_verified | 2026-03-11-50 | objective-58 | core/autonomy_boundary_service.py; core/routers/autonomy_boundaries.py; core/models.py | docs/objective-58-promotion-readiness-report.md | docs/objective-58-prod-promotion-report.md | adaptive_autonomy_boundaries |
 
 ## Notes
 

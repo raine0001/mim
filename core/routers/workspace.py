@@ -9,11 +9,17 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from core.db import SessionLocal, get_db
 from core.journal import write_journal
+from core.autonomy_boundary_service import (
+    evaluate_adaptive_autonomy_boundaries,
+    get_autonomy_boundary_profile,
+    list_autonomy_boundary_profiles,
+    to_autonomy_boundary_profile_out,
+)
 from core.constraint_service import evaluate_and_record_constraints
 from core.concept_memory_service import concept_influence_for_proposal
 from core.models import CapabilityExecution, CapabilityRegistration, InputEvent, SpeechOutputAction, Task, WorkspaceActionPlan, WorkspaceAutonomousChain, WorkspaceCapabilityChain, WorkspaceInterruptionEvent, WorkspaceMonitoringState, WorkspaceObjectMemory, WorkspaceObjectRelation, WorkspaceObservation, WorkspaceProposal, WorkspaceReplanSignal, WorkspaceTargetResolution, WorkspaceZone, WorkspaceZoneRelation
 from core.preferences import DEFAULT_USER_ID, apply_learning_signal, get_user_preference_payload, get_user_preference_value
-from core.schemas import WorkspaceActionPlanAbortRequest, WorkspaceActionPlanCreateRequest, WorkspaceActionPlanDecisionRequest, WorkspaceActionPlanExecuteRequest, WorkspaceActionPlanHandoffRequest, WorkspaceActionPlanReplanRequest, WorkspaceActionPlanSimulationRequest, WorkspaceAutonomousChainAdvanceRequest, WorkspaceAutonomousChainApprovalRequest, WorkspaceAutonomousChainCreateRequest, WorkspaceAutonomyOverrideRequest, WorkspaceCapabilityChainAdvanceRequest, WorkspaceCapabilityChainCreateRequest, WorkspaceExecutionPauseRequest, WorkspaceExecutionPredictChangeRequest, WorkspaceExecutionProposalActionRequest, WorkspaceExecutionProposalCreateRequest, WorkspaceExecutionResumeRequest, WorkspaceExecutionStopRequest, WorkspaceHumanAwareSignalUpdateRequest, WorkspaceMonitoringStartRequest, WorkspaceMonitoringStopRequest, WorkspaceProposalActionRequest, WorkspaceProposalPriorityPolicyUpdateRequest, WorkspaceTargetConfirmRequest, WorkspaceTargetResolveRequest
+from core.schemas import AdaptiveAutonomyBoundaryEvaluateRequest, WorkspaceActionPlanAbortRequest, WorkspaceActionPlanCreateRequest, WorkspaceActionPlanDecisionRequest, WorkspaceActionPlanExecuteRequest, WorkspaceActionPlanHandoffRequest, WorkspaceActionPlanReplanRequest, WorkspaceActionPlanSimulationRequest, WorkspaceAutonomousChainAdvanceRequest, WorkspaceAutonomousChainApprovalRequest, WorkspaceAutonomousChainCreateRequest, WorkspaceAutonomyOverrideRequest, WorkspaceCapabilityChainAdvanceRequest, WorkspaceCapabilityChainCreateRequest, WorkspaceExecutionPauseRequest, WorkspaceExecutionPredictChangeRequest, WorkspaceExecutionProposalActionRequest, WorkspaceExecutionProposalCreateRequest, WorkspaceExecutionResumeRequest, WorkspaceExecutionStopRequest, WorkspaceHumanAwareSignalUpdateRequest, WorkspaceMonitoringStartRequest, WorkspaceMonitoringStopRequest, WorkspaceProposalActionRequest, WorkspaceProposalPriorityPolicyUpdateRequest, WorkspaceTargetConfirmRequest, WorkspaceTargetResolveRequest
 
 router = APIRouter()
 
@@ -3266,6 +3272,72 @@ async def set_workspace_autonomy_override(
             for key, value in autonomy.items()
             if key != "recent_auto_actions"
         },
+    }
+
+
+@router.post("/autonomy/boundaries/evaluate")
+async def evaluate_workspace_adaptive_autonomy_boundaries(
+    payload: AdaptiveAutonomyBoundaryEvaluateRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    row = await evaluate_adaptive_autonomy_boundaries(
+        actor=payload.actor,
+        source=payload.source,
+        scope=payload.scope,
+        lookback_hours=payload.lookback_hours,
+        min_samples=payload.min_samples,
+        apply_recommended_boundaries=payload.apply_recommended_boundaries,
+        hard_ceiling_overrides=payload.hard_ceiling_overrides,
+        evidence_inputs_override=payload.evidence_inputs_override,
+        metadata_json=payload.metadata_json,
+        db=db,
+    )
+
+    await write_journal(
+        db,
+        actor=payload.actor,
+        action="workspace_adaptive_autonomy_boundaries_evaluated",
+        target_type="workspace_autonomy_boundary_profile",
+        target_id=str(row.id),
+        summary=f"Evaluated adaptive autonomy boundaries profile {row.id}",
+        metadata_json={
+            "source": payload.source,
+            "lookback_hours": payload.lookback_hours,
+            "min_samples": payload.min_samples,
+            "scope": payload.scope,
+            "apply_recommended_boundaries": payload.apply_recommended_boundaries,
+            **payload.metadata_json,
+        },
+    )
+
+    await db.commit()
+    return {
+        "profile": to_autonomy_boundary_profile_out(row),
+    }
+
+
+@router.get("/autonomy/boundaries")
+async def list_workspace_adaptive_autonomy_boundary_profiles(
+    status: str = Query(default=""),
+    limit: int = Query(default=50, ge=1, le=500),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    rows = await list_autonomy_boundary_profiles(db=db, status=status, limit=limit)
+    return {
+        "profiles": [to_autonomy_boundary_profile_out(item) for item in rows],
+    }
+
+
+@router.get("/autonomy/boundaries/{profile_id}")
+async def get_workspace_adaptive_autonomy_boundary_profile(
+    profile_id: int,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    row = await get_autonomy_boundary_profile(profile_id=profile_id, db=db)
+    if not row:
+        raise HTTPException(status_code=404, detail="autonomy_boundary_profile_not_found")
+    return {
+        "profile": to_autonomy_boundary_profile_out(row),
     }
 
 

@@ -904,3 +904,31 @@ class WorkspaceStrategyGoal(Base, TimestampMixin):
     linked_maintenance_run_ids_json: Mapped[list[int]] = mapped_column(JSON, default=list)
     operator_recommendations_json: Mapped[list[str]] = mapped_column(JSON, default=list)
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class WorkspaceAutonomyBoundaryProfile(Base, TimestampMixin):
+    __tablename__ = "workspace_autonomy_boundary_profiles"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    scope: Mapped[str] = mapped_column(String(120), default="global", index=True)
+    source: Mapped[str] = mapped_column(String(80), default="objective58", index=True)
+    actor: Mapped[str] = mapped_column(String(120), default="workspace")
+    profile_status: Mapped[str] = mapped_column(String(40), default="evaluated", index=True)
+    current_level: Mapped[str] = mapped_column(String(40), default="operator_required", index=True)
+    confidence: Mapped[float] = mapped_column(default=0.0)
+    evidence_inputs_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    last_adjusted: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    adjustment_reason: Mapped[str] = mapped_column(Text, default="")
+    lookback_hours: Mapped[int] = mapped_column(default=24)
+    sample_count: Mapped[int] = mapped_column(default=0)
+    success_rate: Mapped[float] = mapped_column(default=0.0)
+    escalation_rate: Mapped[float] = mapped_column(default=0.0)
+    retry_rate: Mapped[float] = mapped_column(default=0.0)
+    interruption_rate: Mapped[float] = mapped_column(default=0.0)
+    memory_delta_rate: Mapped[float] = mapped_column(default=0.0)
+    current_boundaries_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    recommended_boundaries_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    applied_boundaries_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    adaptation_summary: Mapped[str] = mapped_column(Text, default="")
+    adaptation_reasoning_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)

@@ -1164,6 +1164,46 @@ class StrategyGoalOut(BaseModel):
     created_at: datetime
 
 
+class AdaptiveAutonomyBoundaryEvaluateRequest(BaseModel):
+    actor: str = "workspace"
+    source: str = "objective58"
+    scope: str = "global"
+    lookback_hours: int = Field(default=24, ge=1, le=720)
+    min_samples: int = Field(default=3, ge=1, le=500)
+    apply_recommended_boundaries: bool = False
+    hard_ceiling_overrides: dict = Field(default_factory=dict)
+    evidence_inputs_override: dict = Field(default_factory=dict)
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class AdaptiveAutonomyBoundaryProfileOut(BaseModel):
+    boundary_id: int
+    profile_id: int
+    scope: str
+    source: str
+    actor: str
+    profile_status: str
+    current_level: str
+    confidence: float
+    evidence_inputs: dict
+    last_adjusted: datetime | None
+    adjustment_reason: str
+    lookback_hours: int
+    sample_count: int
+    success_rate: float
+    escalation_rate: float
+    retry_rate: float
+    interruption_rate: float
+    memory_delta_rate: float
+    current_boundaries: dict
+    recommended_boundaries: dict
+    applied_boundaries: dict
+    adaptation_summary: str
+    adaptation_reasoning: dict
+    metadata_json: dict
+    created_at: datetime
+
+
 class ImprovementRecommendationOut(BaseModel):
     recommendation_id: int
     source: str
