@@ -934,6 +934,30 @@ class WorkspaceCrossDomainReasoningContext(Base, TimestampMixin):
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
+class WorkspaceTaskOrchestration(Base, TimestampMixin):
+    __tablename__ = "workspace_task_orchestrations"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    source: Mapped[str] = mapped_column(String(80), default="objective63", index=True)
+    actor: Mapped[str] = mapped_column(String(120), default="workspace")
+    status: Mapped[str] = mapped_column(String(40), default="active", index=True)
+    orchestration_type: Mapped[str] = mapped_column(String(120), default="cross_domain_task_orchestration", index=True)
+    origin_context_id: Mapped[int | None] = mapped_column(ForeignKey("workspace_cross_domain_reasoning_contexts.id", ondelete="SET NULL"), nullable=True, index=True)
+    lookback_hours: Mapped[int] = mapped_column(default=24)
+    priority_score: Mapped[float] = mapped_column(default=0.0, index=True)
+    priority_label: Mapped[str] = mapped_column(String(40), default="normal", index=True)
+    contributing_domains_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    dependency_resolution_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    orchestration_reason: Mapped[str] = mapped_column(Text, default="")
+    reasoning_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    linked_goal_ids_json: Mapped[list[int]] = mapped_column(JSON, default=list)
+    linked_horizon_plan_ids_json: Mapped[list[int]] = mapped_column(JSON, default=list)
+    linked_improvement_proposal_ids_json: Mapped[list[int]] = mapped_column(JSON, default=list)
+    linked_inquiry_question_ids_json: Mapped[list[int]] = mapped_column(JSON, default=list)
+    downstream_artifacts_json: Mapped[list[dict]] = mapped_column(JSON, default=list)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
 class WorkspaceStrategyGoal(Base, TimestampMixin):
     __tablename__ = "workspace_strategy_goals"
 

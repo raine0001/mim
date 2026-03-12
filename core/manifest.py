@@ -7,7 +7,7 @@ from core.config import PROJECT_ROOT, settings
 
 CONTRACT_VERSION = "tod-mim-shared-contract-v1"
 MANIFEST_VERSION = "1"
-SCHEMA_VERSION = "2026-03-11-55"
+SCHEMA_VERSION = "2026-03-12-56"
 
 SIGNATURE_FILES = [
     "core/models.py",
@@ -38,11 +38,13 @@ SIGNATURE_FILES = [
     "core/cross_domain_reasoning_service.py",
     "core/goal_strategy_service.py",
     "core/inquiry_service.py",
+    "core/orchestration_service.py",
     "core/autonomy_boundary_service.py",
     "core/stewardship_service.py",
     "core/routers/autonomy_boundaries.py",
     "core/routers/strategy.py",
     "core/routers/inquiry.py",
+    "core/routers/orchestration.py",
     "core/routers/stewardship.py",
     "docs/tod-mim-bridge.md",
     "docs/objective-21-unified-input-gateway.md",
@@ -133,6 +135,9 @@ SIGNATURE_FILES = [
     "docs/objective-62-inquisitive-question-loop.md",
     "docs/objective-62-promotion-readiness-report.md",
     "docs/objective-62-prod-promotion-report.md",
+    "docs/objective-63-cross-domain-task-orchestration.md",
+    "docs/objective-63-promotion-readiness-report.md",
+    "docs/objective-63-prod-promotion-report.md",
     "config/vision_policy.json",
     "config/voice_policy.json",
 ]
@@ -219,6 +224,7 @@ CAPABILITIES = [
     "environment_stewardship_loop",
     "live_perception_adapters",
     "inquisitive_question_loop",
+    "cross_domain_task_orchestration",
 ]
 
 RECENT_CHANGES = [
@@ -279,6 +285,7 @@ RECENT_CHANGES = [
     "Added Objective 61 live perception adapters with camera/mic source ingestion, throttling, source health tracking, and inspectable adapter status",
     "Added Objective 61.1 regression recovery stabilization by restoring Objective 49/51 idempotent proposal generation behavior and re-establishing full green integration baseline",
     "Added Objective 62 inquisitive question loop with uncertainty-triggered inquiry generation, explainable question state, and answer-driven downstream planning effects",
+    "Added Objective 63 cross-domain task orchestration with dependency-aware coordination paths, inspectable orchestration state, and downstream artifact linking",
 ]
 
 
@@ -452,6 +459,9 @@ def build_manifest() -> dict:
             "/reasoning/context/build",
             "/reasoning/context",
             "/reasoning/context/{context_id}",
+            "/orchestration/build",
+            "/orchestration",
+            "/orchestration/{orchestration_id}",
             "/strategy/goals/build",
             "/strategy/goals",
             "/strategy/persistence/goals/recompute",

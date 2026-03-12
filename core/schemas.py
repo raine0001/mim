@@ -1226,6 +1226,43 @@ class StrategyGoalOut(BaseModel):
     created_at: datetime
 
 
+class CrossDomainTaskOrchestrationBuildRequest(BaseModel):
+    actor: str = "workspace"
+    source: str = "objective63"
+    lookback_hours: int = Field(default=24, ge=1, le=720)
+    max_items_per_domain: int = Field(default=50, ge=1, le=200)
+    min_context_confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    min_domains_required: int = Field(default=2, ge=1, le=10)
+    dependency_resolution_policy: Literal["ask", "defer", "replan", "escalate"] = "ask"
+    generate_goal: bool = True
+    generate_horizon_plan: bool = True
+    generate_improvement_proposals: bool = False
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class CrossDomainTaskOrchestrationOut(BaseModel):
+    orchestration_id: int
+    source: str
+    actor: str
+    status: str
+    orchestration_type: str
+    origin_context_id: int | None
+    lookback_hours: int
+    priority_score: float
+    priority_label: str
+    contributing_domains: list[str]
+    dependency_resolution: dict
+    orchestration_reason: str
+    reasoning: dict
+    linked_goal_ids: list[int]
+    linked_horizon_plan_ids: list[int]
+    linked_improvement_proposal_ids: list[int]
+    linked_inquiry_question_ids: list[int]
+    downstream_artifacts: list[dict]
+    metadata_json: dict
+    created_at: datetime
+
+
 class StrategyGoalPersistenceRecomputeRequest(BaseModel):
     actor: str = "workspace"
     source: str = "objective59"
