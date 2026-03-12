@@ -1,0 +1,35 @@
+{
+  "handshake_version": "mim-tod-shared-export-v1",
+  "generated_at": "2026-03-12T18:57:08.985752Z",
+  "mim_shared_export_root": "/home/testpilot/mim/runtime/shared",
+  "required_files": [
+    "/home/testpilot/mim/runtime/shared/MIM_CONTEXT_EXPORT.latest.json",
+    "/home/testpilot/mim/runtime/shared/MIM_CONTEXT_EXPORT.latest.yaml"
+  ],
+  "mirror_files": [
+    "/home/testpilot/mim/MIM_CONTEXT_EXPORT.latest.json",
+    "/home/testpilot/mim/MIM_CONTEXT_EXPORT.latest.yaml"
+  ],
+  "truth": {
+    "objective_active": "74",
+    "latest_completed_objective": "74",
+    "current_next_objective": "75",
+    "schema_version": "2026-03-12-67",
+    "release_tag": "objective-74",
+    "regression_status": "PASS",
+    "regression_tests": "66/66",
+    "prod_promotion_status": "SUCCESS",
+    "prod_smoke_status": "PASS",
+    "blockers": []
+  },
+  "source_of_truth": {
+    "manifest_endpoint_priority": [
+      "http://127.0.0.1:8000/manifest",
+      "http://127.0.0.1:8001/manifest",
+      "http://127.0.0.1:18001/manifest"
+    ],
+    "manifest_source_fallback": "core/manifest.py",
+    "manifest_source_used": "http://127.0.0.1:8000/manifest",
+    "objective_index": "docs/objective-index.md"
+  }
+}
