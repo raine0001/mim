@@ -32,7 +32,7 @@ Objective 67 converts repeated negotiation outcomes into durable, inspectable pr
      - collaboration mode resolution for auto mode
      - collaboration policy shaping (`ask_question`, concise updates, defer behavior)
      - fallback default path choice for negotiations
-     - auto-resolution candidate selection when transient pattern reuse is not sufficient
+   - negotiation default shaping without forcing auto-resolution of memory-only preferences
 
 4. **Safe decay and revision**
    - Divergent future outcomes can lower dominance ratio/confidence.
