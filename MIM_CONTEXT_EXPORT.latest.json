@@ -98,7 +98,7 @@
   "capability_count": 93,
   "current_next_objective": "75",
   "export_version": "mim-context-v2",
-  "exported_at": "2026-03-12T18:21:00.234221Z",
+  "exported_at": "2026-03-12T18:57:08.985752Z",
   "health": {
     "prod": {
       "base_url": "http://127.0.0.1:8000",
@@ -106,12 +106,13 @@
       "status": "ok"
     },
     "test": {
-      "base_url": "http://127.0.0.1:18001",
-      "reachable": false,
-      "status": "unreachable"
+      "base_url": "http://127.0.0.1:8001",
+      "reachable": true,
+      "status": "ok"
     }
   },
   "latest_completed_objective": "74",
+  "latest_objective_index_status": "promoted_verified",
   "next_actions": [
     "finalize verification gate",
     "begin objective 75 planning"
@@ -121,15 +122,31 @@
     "Replaces stale bootstrap snapshots (e.g., objective 17 warming phase)"
   ],
   "objective_active": "74",
+  "objective_in_flight": null,
   "phase": "operational",
   "release_tag": "objective-74",
   "schema_version": "2026-03-12-67",
   "source_of_truth": {
     "manifest_endpoint_priority": [
       "http://127.0.0.1:8000/manifest",
+      "http://127.0.0.1:8001/manifest",
       "http://127.0.0.1:18001/manifest"
     ],
     "manifest_source_fallback": "core/manifest.py",
+    "manifest_source_used": "http://127.0.0.1:8000/manifest",
     "objective_index": "docs/objective-index.md"
+  },
+  "verification": {
+    "prod_objective_probe_status": "PASS",
+    "prod_promotion_status": "SUCCESS",
+    "prod_smoke_status": "PASS",
+    "readiness_decision": "READY_FOR_PROMOTION",
+    "regression_status": "PASS",
+    "regression_tests": "66/66",
+    "sources": {
+      "maintenance_report": "docs/maintenance-*-test-stack-reconciliation.md",
+      "prod_report": "docs/objective-74-prod-promotion-report.md",
+      "readiness_report": "docs/objective-74-promotion-readiness-report.md"
+    }
   }
 }

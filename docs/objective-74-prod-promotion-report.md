@@ -51,7 +51,7 @@ Result: PASS (`1/1`)
 
 - Command: `/home/testpilot/Desktop/MIM/.venv/bin/python scripts/export_mim_context.py`
 - Result: PASS
-- Export Summary: `objective_active=73`, `schema_version=2026-03-12-67`, `release_tag=objective-74`
+- Export Summary: `objective_active=74`, `schema_version=2026-03-12-67`, `release_tag=objective-74`
 
 ## Status
 

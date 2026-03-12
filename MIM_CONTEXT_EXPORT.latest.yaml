@@ -1,20 +1,35 @@
 export_version: "mim-context-v2"
-exported_at: "2026-03-12T18:21:00.234221Z"
+exported_at: "2026-03-12T18:57:08.985752Z"
 source_of_truth:
   objective_index: "docs/objective-index.md"
   manifest_endpoint_priority:
     - "http://127.0.0.1:8000/manifest"
+    - "http://127.0.0.1:8001/manifest"
     - "http://127.0.0.1:18001/manifest"
+  manifest_source_used: "http://127.0.0.1:8000/manifest"
   manifest_source_fallback: "core/manifest.py"
 objective_active: "74"
+objective_in_flight: null
 phase: "operational"
 next_actions:
   - "finalize verification gate"
   - "begin objective 75 planning"
 latest_completed_objective: "74"
+latest_objective_index_status: "promoted_verified"
 current_next_objective: "75"
 schema_version: "2026-03-12-67"
 release_tag: "objective-74"
+verification:
+  readiness_decision: "READY_FOR_PROMOTION"
+  prod_promotion_status: "SUCCESS"
+  prod_smoke_status: "PASS"
+  prod_objective_probe_status: "PASS"
+  regression_status: "PASS"
+  regression_tests: "66/66"
+  sources:
+    readiness_report: "docs/objective-74-promotion-readiness-report.md"
+    prod_report: "docs/objective-74-prod-promotion-report.md"
+    maintenance_report: "docs/maintenance-*-test-stack-reconciliation.md"
 capabilities:
   - "health"
   - "status"
@@ -116,9 +131,9 @@ health:
     reachable: true
     status: "ok"
   test:
-    base_url: "http://127.0.0.1:18001"
-    reachable: false
-    status: "unreachable"
+    base_url: "http://127.0.0.1:8001"
+    reachable: true
+    status: "ok"
 blockers:
 
 notes:
