@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -8,10 +8,21 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from core.cross_domain_reasoning_service import build_cross_domain_reasoning_context, to_cross_domain_reasoning_out
 from core.horizon_planning_service import create_horizon_plan
 from core.improvement_service import generate_improvement_proposals
-from core.models import Goal, WorkspaceCrossDomainReasoningContext, WorkspaceInquiryQuestion, WorkspaceTaskOrchestration
+from core.models import (
+    Goal,
+    InputEvent,
+    UserPreference,
+    WorkspaceCrossDomainReasoningContext,
+    WorkspaceInquiryQuestion,
+    WorkspaceInterruptionEvent,
+    WorkspaceMonitoringState,
+    WorkspaceTaskOrchestration,
+)
 
 
 ORCHESTRATION_POLICIES = {"ask", "defer", "replan", "escalate"}
+COLLABORATION_MODES = {"autonomous", "assistive", "confirmation-first", "deferential"}
+COLLABORATION_POLICY_VERSION = "human-aware-collaboration-v1"
 
 
 def _bounded(value: float, *, lo: float = 0.0, hi: float = 1.0) -> float:
@@ -39,6 +50,18 @@ def _run_id(metadata_json: dict) -> str:
     if not isinstance(metadata_json, dict):
         return ""
     return str(metadata_json.get("run_id", "")).strip()
+
+
+def _default_human_aware_state() -> dict:
+    return {
+        "human_in_workspace": False,
+        "human_near_target_zone": False,
+        "human_near_motion_path": False,
+        "shared_workspace_active": False,
+        "operator_present": False,
+        "occupied_zones": [],
+        "high_proximity_zones": [],
+    }
 
 
 def _match_run_id(metadata_json: dict, run_id: str) -> bool:
@@ -136,6 +159,240 @@ async def _latest_reasoning_context(*, run_id: str, db: AsyncSession) -> Workspa
     return None
 
 
+async def _human_aware_state(*, db: AsyncSession) -> dict:
+    row = (
+        await db.execute(
+            select(WorkspaceMonitoringState)
+            .order_by(WorkspaceMonitoringState.id.desc())
+            .limit(1)
+        )
+    ).scalars().first()
+    if not row:
+        return _default_human_aware_state()
+    metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
+    state = metadata.get("human_aware", {}) if isinstance(metadata.get("human_aware", {}), dict) else {}
+    return {
+        **_default_human_aware_state(),
+        **state,
+    }
+
+
+async def _communication_urgency(
+    *,
+    lookback_hours: int,
+    run_id: str,
+    override: float | None,
+    db: AsyncSession,
+) -> tuple[float, dict]:
+    if override is not None:
+        return _bounded(float(override)), {"source": "override", "sample_count": 0}
+
+    since = datetime.now(timezone.utc) - timedelta(hours=max(1, int(lookback_hours)))
+    rows = (
+        await db.execute(
+            select(InputEvent)
+            .where(InputEvent.created_at >= since)
+            .order_by(InputEvent.id.desc())
+            .limit(300)
+        )
+    ).scalars().all()
+
+    if run_id:
+        rows = [
+            item
+            for item in rows
+            if _match_run_id(item.metadata_json if isinstance(item.metadata_json, dict) else {}, run_id)
+        ]
+
+    if not rows:
+        return 0.0, {"source": "input_events", "sample_count": 0}
+
+    urgent_hits = 0
+    very_recent_hits = 0
+    now = datetime.now(timezone.utc)
+    for item in rows:
+        metadata = item.metadata_json if isinstance(item.metadata_json, dict) else {}
+        raw = str(item.raw_input or "").lower()
+        intent = str(item.parsed_intent or "").lower()
+        urgency_hint = str(metadata.get("urgency", "")).lower()
+        if urgency_hint in {"high", "critical", "urgent"}:
+            urgent_hits += 1
+        elif any(token in raw for token in ["urgent", "asap", "immediately", "right away"]):
+            urgent_hits += 1
+        elif intent in {"operator_urgent_request", "urgent_request", "interruption"}:
+            urgent_hits += 1
+        age_seconds = max((now - item.created_at).total_seconds(), 0.0)
+        if age_seconds <= 300:
+            very_recent_hits += 1
+
+    urgency = _bounded((urgent_hits / max(1, len(rows))) * 0.8 + (very_recent_hits / max(1, len(rows))) * 0.2)
+    if urgent_hits > 0:
+        urgency = max(urgency, 0.65)
+    return urgency, {
+        "source": "input_events",
+        "sample_count": len(rows),
+        "urgent_hits": urgent_hits,
+        "very_recent_hits": very_recent_hits,
+    }
+
+
+async def _interruption_likelihood(*, human_aware: dict, db: AsyncSession) -> tuple[float, dict]:
+    rows = (
+        await db.execute(
+            select(WorkspaceInterruptionEvent)
+            .where(WorkspaceInterruptionEvent.status == "active")
+            .order_by(WorkspaceInterruptionEvent.id.desc())
+            .limit(100)
+        )
+    ).scalars().all()
+
+    high_risk_outcomes = 0
+    for item in rows:
+        outcome = str(item.applied_outcome or "").strip().lower()
+        if outcome in {"auto_pause", "auto_stop", "paused", "stopped", "require_operator_decision"}:
+            high_risk_outcomes += 1
+
+    human_weight = 0.0
+    if bool(human_aware.get("shared_workspace_active", False)):
+        human_weight += 0.35
+    if bool(human_aware.get("human_near_motion_path", False)):
+        human_weight += 0.35
+    if bool(human_aware.get("human_near_target_zone", False)):
+        human_weight += 0.2
+    if bool(human_aware.get("human_in_workspace", False)):
+        human_weight += 0.1
+
+    interruption_ratio = high_risk_outcomes / max(1, len(rows)) if rows else 0.0
+    score = _bounded((interruption_ratio * 0.7) + human_weight)
+    return score, {
+        "active_interruptions": len(rows),
+        "high_risk_outcomes": high_risk_outcomes,
+        "human_weight": round(human_weight, 6),
+    }
+
+
+async def _preferred_collaboration_mode(*, db: AsyncSession) -> str:
+    row = (
+        await db.execute(
+            select(UserPreference)
+            .where(UserPreference.user_id == "operator")
+            .where(UserPreference.preference_type.in_(["collaboration_mode", "collaboration_mode:default"]))
+            .order_by(UserPreference.last_updated.desc())
+            .limit(20)
+        )
+    ).scalars().first()
+    if not row:
+        return "autonomous"
+    value = row.value
+    if isinstance(value, str) and value in COLLABORATION_MODES:
+        return value
+    if isinstance(value, dict):
+        mode = str(value.get("mode", "")).strip().lower()
+        if mode in COLLABORATION_MODES:
+            return mode
+    return "autonomous"
+
+
+def _operator_presence_score(*, human_aware: dict) -> float:
+    score = 0.0
+    if bool(human_aware.get("operator_present", False)):
+        score += 0.55
+    if bool(human_aware.get("human_in_workspace", False)):
+        score += 0.25
+    if bool(human_aware.get("human_near_target_zone", False)):
+        score += 0.1
+    if bool(human_aware.get("shared_workspace_active", False)):
+        score += 0.1
+    return _bounded(score)
+
+
+def _resolve_collaboration_mode(
+    *,
+    requested_mode: str,
+    preferred_mode: str,
+    human_aware: dict,
+    communication_urgency: float,
+    interruption_likelihood: float,
+) -> tuple[str, str]:
+    requested = str(requested_mode or "auto").strip().lower()
+    if requested in COLLABORATION_MODES:
+        return requested, "requested_mode"
+
+    if bool(human_aware.get("shared_workspace_active", False)) and bool(human_aware.get("human_in_workspace", False)):
+        return "deferential", "shared_workspace_active"
+    if interruption_likelihood >= 0.7:
+        return "deferential", "high_interruption_likelihood"
+    if bool(human_aware.get("human_near_motion_path", False)) or bool(human_aware.get("operator_present", False)):
+        return "confirmation-first", "operator_or_motion_proximity"
+    if communication_urgency >= 0.65:
+        return "assistive", "urgent_communication_context"
+    return preferred_mode, "operator_preference_default"
+
+
+def _apply_collaboration_policy(
+    *,
+    mode: str,
+    human_aware: dict,
+    communication_urgency: float,
+    interruption_likelihood: float,
+    task_kind: str,
+    action_risk_level: str,
+) -> dict:
+    normalized_kind = str(task_kind or "mixed").strip().lower()
+    normalized_risk = str(action_risk_level or "medium").strip().lower()
+    physical = normalized_kind in {"physical", "mixed"}
+    informational = normalized_kind == "informational"
+    low_risk = normalized_risk == "low"
+
+    modifiers: list[str] = []
+    reprioritize_delta = 0.0
+    defer_physical_action = False
+    require_confirmation = False
+    ask_question = False
+    surface_concise_update = False
+
+    if communication_urgency >= 0.65:
+        reprioritize_delta += 0.08
+        modifiers.append("urgent_communication_reprioritize")
+
+    if mode == "assistive":
+        surface_concise_update = communication_urgency >= 0.5
+        if surface_concise_update:
+            modifiers.append("assistive_concise_update")
+        if physical and communication_urgency >= 0.75:
+            defer_physical_action = True
+            modifiers.append("assistive_defers_physical_for_urgent_comm")
+
+    if mode == "confirmation-first" and physical and not low_risk:
+        require_confirmation = True
+        ask_question = True
+        modifiers.append("confirmation_required_for_physical_action")
+
+    if mode == "deferential" and physical and not low_risk:
+        defer_physical_action = True
+        modifiers.append("deferential_shared_workspace_suppression")
+
+    if interruption_likelihood >= 0.7 and physical and not low_risk:
+        defer_physical_action = True
+        modifiers.append("elevated_interruption_likelihood_defer")
+
+    continue_allowed = informational and low_risk
+    if continue_allowed:
+        modifiers.append("low_risk_informational_continue_allowed")
+
+    return {
+        "task_kind": normalized_kind,
+        "action_risk_level": normalized_risk,
+        "reprioritize_delta": _bounded(reprioritize_delta, lo=0.0, hi=0.2),
+        "defer_physical_action": defer_physical_action,
+        "require_confirmation": require_confirmation,
+        "ask_question": ask_question,
+        "surface_concise_update": surface_concise_update,
+        "continue_allowed": continue_allowed,
+        "active_modifiers": modifiers,
+    }
+
+
 async def _get_or_create_orchestration_question(
     *,
     actor: str,
@@ -210,6 +467,81 @@ async def _get_or_create_orchestration_question(
     return question
 
 
+async def _get_or_create_collaboration_question(
+    *,
+    actor: str,
+    source: str,
+    context_id: int | None,
+    collaboration_mode: str,
+    policy: dict,
+    metadata_json: dict,
+    db: AsyncSession,
+) -> WorkspaceInquiryQuestion:
+    run_id = _run_id(metadata_json)
+    dedupe_key = f"collaboration_confirmation_required:context:{int(context_id or 0)}:mode:{collaboration_mode}:run:{run_id or 'na'}"
+    existing = (
+        await db.execute(
+            select(WorkspaceInquiryQuestion)
+            .where(WorkspaceInquiryQuestion.dedupe_key == dedupe_key)
+            .where(WorkspaceInquiryQuestion.status == "open")
+            .order_by(WorkspaceInquiryQuestion.id.desc())
+            .limit(1)
+        )
+    ).scalars().first()
+    if existing:
+        return existing
+
+    question = WorkspaceInquiryQuestion(
+        source=source,
+        actor=actor,
+        status="open",
+        dedupe_key=dedupe_key,
+        trigger_type="collaboration_confirmation_required",
+        uncertainty_type="human_aware_collaboration",
+        origin_strategy_goal_id=None,
+        origin_strategy_id=None,
+        origin_plan_id=None,
+        why_answer_matters="Human-aware collaboration policy requires confirmation before proceeding with the current action shape.",
+        waiting_decision="Choose whether to proceed now, defer action, or provide a concise status update.",
+        no_answer_behavior="System defers sensitive action and surfaces concise status instead of silent progression.",
+        candidate_answer_paths_json=[
+            {
+                "path_id": "proceed_with_confirmation",
+                "label": "Proceed with explicit confirmation",
+                "effect_type": "confirm_then_proceed",
+                "params": {},
+            },
+            {
+                "path_id": "defer_action",
+                "label": "Defer action until human context clears",
+                "effect_type": "defer",
+                "params": {},
+            },
+            {
+                "path_id": "status_update_only",
+                "label": "Surface concise update and avoid physical action",
+                "effect_type": "status_update",
+                "params": {},
+            },
+        ],
+        urgency="high",
+        priority="high",
+        safe_default_if_unanswered="defer_action",
+        trigger_evidence_json={
+            "collaboration_mode": collaboration_mode,
+            "policy": policy,
+            "origin_context_id": context_id,
+        },
+        metadata_json={
+            **(metadata_json if isinstance(metadata_json, dict) else {}),
+            "objective64_human_aware_collaboration": True,
+        },
+    )
+    db.add(question)
+    await db.flush()
+    return question
+
+
 async def build_cross_domain_task_orchestration(
     *,
     actor: str,
@@ -219,6 +551,11 @@ async def build_cross_domain_task_orchestration(
     min_context_confidence: float,
     min_domains_required: int,
     dependency_resolution_policy: str,
+    collaboration_mode_preference: str,
+    task_kind: str,
+    action_risk_level: str,
+    communication_urgency_override: float | None,
+    use_human_aware_signals: bool,
     generate_goal: bool,
     generate_horizon_plan: bool,
     generate_improvement_proposals: bool,
@@ -259,6 +596,34 @@ async def build_cross_domain_task_orchestration(
     )
 
     priority_score = _priority_score(context_confidence=context_confidence, signals=signals)
+    human_aware = await _human_aware_state(db=db)
+    if not bool(use_human_aware_signals):
+        human_aware = _default_human_aware_state()
+    communication_urgency, communication_details = await _communication_urgency(
+        lookback_hours=lookback_hours,
+        run_id=run_id,
+        override=communication_urgency_override,
+        db=db,
+    )
+    interruption_likelihood, interruption_details = await _interruption_likelihood(human_aware=human_aware, db=db)
+    operator_presence_score = _operator_presence_score(human_aware=human_aware)
+    preferred_mode = await _preferred_collaboration_mode(db=db)
+    collaboration_mode, collaboration_mode_reason = _resolve_collaboration_mode(
+        requested_mode=collaboration_mode_preference,
+        preferred_mode=preferred_mode,
+        human_aware=human_aware,
+        communication_urgency=communication_urgency,
+        interruption_likelihood=interruption_likelihood,
+    )
+    collaboration_policy = _apply_collaboration_policy(
+        mode=collaboration_mode,
+        human_aware=human_aware,
+        communication_urgency=communication_urgency,
+        interruption_likelihood=interruption_likelihood,
+        task_kind=task_kind,
+        action_risk_level=action_risk_level,
+    )
+    priority_score = _bounded(priority_score + float(collaboration_policy.get("reprioritize_delta", 0.0)))
     priority_label = _priority_label(priority_score)
 
     linked_goal_ids: list[int] = []
@@ -301,7 +666,45 @@ async def build_cross_domain_task_orchestration(
         else:
             status = "escalated"
 
-    if not dependency_gaps:
+    if bool(collaboration_policy.get("defer_physical_action", False)) and not bool(collaboration_policy.get("continue_allowed", False)):
+        status = "deferred"
+        downstream_artifacts.append(
+            {
+                "artifact_type": "collaboration_update",
+                "artifact_id": 0,
+                "status": "deferred_for_human_context",
+            }
+        )
+    if bool(collaboration_policy.get("surface_concise_update", False)):
+        downstream_artifacts.append(
+            {
+                "artifact_type": "collaboration_update",
+                "artifact_id": 0,
+                "status": "concise_update_surfaced",
+            }
+        )
+    if bool(collaboration_policy.get("ask_question", False)) and not bool(dependency_gaps):
+        question = await _get_or_create_collaboration_question(
+            actor=actor,
+            source=source,
+            context_id=int(context.id) if context else None,
+            collaboration_mode=collaboration_mode,
+            policy=collaboration_policy,
+            metadata_json=metadata_json,
+            db=db,
+        )
+        linked_inquiry_question_ids.append(int(question.id))
+        downstream_artifacts.append(
+            {
+                "artifact_type": "inquiry_question",
+                "artifact_id": int(question.id),
+                "status": "open",
+            }
+        )
+        if not bool(collaboration_policy.get("continue_allowed", False)):
+            status = "blocked_needs_input"
+
+    if not dependency_gaps and status == "active":
         if generate_goal:
             goal = Goal(
                 objective_id=None,
@@ -409,6 +812,29 @@ async def build_cross_domain_task_orchestration(
         "context_summary": context_out.get("reasoning_summary", ""),
         "cross_domain_links": reasoning.get("cross_domain_links", []),
     }
+    human_context_modifiers = {
+        "collaboration_mode": collaboration_mode,
+        "mode_reason": collaboration_mode_reason,
+        "task_kind": collaboration_policy.get("task_kind", "mixed"),
+        "action_risk_level": collaboration_policy.get("action_risk_level", "medium"),
+        "active_modifiers": collaboration_policy.get("active_modifiers", []),
+        "defer_physical_action": bool(collaboration_policy.get("defer_physical_action", False)),
+        "require_confirmation": bool(collaboration_policy.get("require_confirmation", False)),
+        "ask_question": bool(collaboration_policy.get("ask_question", False)),
+        "surface_concise_update": bool(collaboration_policy.get("surface_concise_update", False)),
+        "continue_allowed": bool(collaboration_policy.get("continue_allowed", False)),
+        "reprioritize_delta": float(collaboration_policy.get("reprioritize_delta", 0.0)),
+    }
+    collaboration_reasoning = {
+        "policy_version": COLLABORATION_POLICY_VERSION,
+        "preferred_mode": preferred_mode,
+        "communication_urgency": communication_urgency,
+        "communication_details": communication_details,
+        "interruption_likelihood": interruption_likelihood,
+        "interruption_details": interruption_details,
+        "operator_presence_score": operator_presence_score,
+        "human_aware_signals": human_aware,
+    }
 
     row = WorkspaceTaskOrchestration(
         source=source,
@@ -419,6 +845,9 @@ async def build_cross_domain_task_orchestration(
         lookback_hours=max(1, int(lookback_hours)),
         priority_score=priority_score,
         priority_label=priority_label,
+        collaboration_mode=collaboration_mode,
+        human_context_modifiers_json=human_context_modifiers,
+        collaboration_reasoning_json=collaboration_reasoning,
         contributing_domains_json=contributing_domains,
         dependency_resolution_json=dependency_resolution,
         orchestration_reason=orchestration_reason,
@@ -431,6 +860,7 @@ async def build_cross_domain_task_orchestration(
         metadata_json={
             **(metadata_json if isinstance(metadata_json, dict) else {}),
             "objective63_cross_domain_task_orchestration": True,
+            "objective64_human_aware_cross_domain_collaboration": True,
             "created_at_utc": datetime.now(timezone.utc).isoformat(),
         },
     )
@@ -483,6 +913,9 @@ def to_task_orchestration_out(row: WorkspaceTaskOrchestration) -> dict:
         "lookback_hours": int(row.lookback_hours or 0),
         "priority_score": float(row.priority_score or 0.0),
         "priority_label": row.priority_label,
+        "collaboration_mode": row.collaboration_mode,
+        "human_context_modifiers": row.human_context_modifiers_json if isinstance(row.human_context_modifiers_json, dict) else {},
+        "collaboration_reasoning": row.collaboration_reasoning_json if isinstance(row.collaboration_reasoning_json, dict) else {},
         "contributing_domains": row.contributing_domains_json if isinstance(row.contributing_domains_json, list) else [],
         "dependency_resolution": row.dependency_resolution_json if isinstance(row.dependency_resolution_json, dict) else {},
         "orchestration_reason": row.orchestration_reason,
@@ -495,3 +928,82 @@ def to_task_orchestration_out(row: WorkspaceTaskOrchestration) -> dict:
         "metadata_json": row.metadata_json if isinstance(row.metadata_json, dict) else {},
         "created_at": row.created_at,
     }
+
+
+async def inspect_collaboration_state(
+    *,
+    lookback_hours: int,
+    communication_urgency_override: float | None,
+    db: AsyncSession,
+) -> dict:
+    human_aware = await _human_aware_state(db=db)
+    communication_urgency, communication_details = await _communication_urgency(
+        lookback_hours=lookback_hours,
+        run_id="",
+        override=communication_urgency_override,
+        db=db,
+    )
+    interruption_likelihood, interruption_details = await _interruption_likelihood(human_aware=human_aware, db=db)
+    operator_presence_score = _operator_presence_score(human_aware=human_aware)
+    preferred_mode = await _preferred_collaboration_mode(db=db)
+    mode, mode_reason = _resolve_collaboration_mode(
+        requested_mode="auto",
+        preferred_mode=preferred_mode,
+        human_aware=human_aware,
+        communication_urgency=communication_urgency,
+        interruption_likelihood=interruption_likelihood,
+    )
+    policy = _apply_collaboration_policy(
+        mode=mode,
+        human_aware=human_aware,
+        communication_urgency=communication_urgency,
+        interruption_likelihood=interruption_likelihood,
+        task_kind="mixed",
+        action_risk_level="medium",
+    )
+    return {
+        "policy_version": COLLABORATION_POLICY_VERSION,
+        "collaboration_mode": mode,
+        "communication_urgency": communication_urgency,
+        "interruption_likelihood": interruption_likelihood,
+        "operator_presence_score": operator_presence_score,
+        "human_aware_signals": human_aware,
+        "active_modifiers": policy.get("active_modifiers", []),
+        "reasoning": {
+            "mode_reason": mode_reason,
+            "preferred_mode": preferred_mode,
+            "communication_details": communication_details,
+            "interruption_details": interruption_details,
+        },
+    }
+
+
+async def set_collaboration_mode_preference(
+    *,
+    actor: str,
+    mode: str,
+    reason: str,
+    metadata_json: dict,
+    db: AsyncSession,
+) -> UserPreference:
+    normalized_mode = str(mode or "").strip().lower()
+    if normalized_mode not in COLLABORATION_MODES:
+        raise ValueError("invalid_collaboration_mode")
+
+    row = UserPreference(
+        user_id="operator",
+        preference_type="collaboration_mode:default",
+        value={
+            "mode": normalized_mode,
+            "reason": reason,
+            "updated_by": actor,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "metadata_json": metadata_json if isinstance(metadata_json, dict) else {},
+        },
+        confidence=0.9,
+        source="operator",
+        last_updated=datetime.now(timezone.utc),
+    )
+    db.add(row)
+    await db.flush()
+    return row

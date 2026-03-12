@@ -7,7 +7,7 @@ from core.config import PROJECT_ROOT, settings
 
 CONTRACT_VERSION = "tod-mim-shared-contract-v1"
 MANIFEST_VERSION = "1"
-SCHEMA_VERSION = "2026-03-12-56"
+SCHEMA_VERSION = "2026-03-12-57"
 
 SIGNATURE_FILES = [
     "core/models.py",
@@ -138,6 +138,9 @@ SIGNATURE_FILES = [
     "docs/objective-63-cross-domain-task-orchestration.md",
     "docs/objective-63-promotion-readiness-report.md",
     "docs/objective-63-prod-promotion-report.md",
+    "docs/objective-64-human-aware-cross-domain-collaboration.md",
+    "docs/objective-64-promotion-readiness-report.md",
+    "docs/objective-64-prod-promotion-report.md",
     "config/vision_policy.json",
     "config/voice_policy.json",
 ]
@@ -225,6 +228,7 @@ CAPABILITIES = [
     "live_perception_adapters",
     "inquisitive_question_loop",
     "cross_domain_task_orchestration",
+    "human_aware_cross_domain_collaboration",
 ]
 
 RECENT_CHANGES = [
@@ -286,6 +290,7 @@ RECENT_CHANGES = [
     "Added Objective 61.1 regression recovery stabilization by restoring Objective 49/51 idempotent proposal generation behavior and re-establishing full green integration baseline",
     "Added Objective 62 inquisitive question loop with uncertainty-triggered inquiry generation, explainable question state, and answer-driven downstream planning effects",
     "Added Objective 63 cross-domain task orchestration with dependency-aware coordination paths, inspectable orchestration state, and downstream artifact linking",
+    "Added Objective 64 human-aware cross-domain collaboration with collaboration-mode policy, communication-aware task shaping, and explainable human-context modifiers",
 ]
 
 
@@ -462,6 +467,8 @@ def build_manifest() -> dict:
             "/orchestration/build",
             "/orchestration",
             "/orchestration/{orchestration_id}",
+            "/orchestration/collaboration/state",
+            "/orchestration/collaboration/mode",
             "/strategy/goals/build",
             "/strategy/goals",
             "/strategy/persistence/goals/recompute",

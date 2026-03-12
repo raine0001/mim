@@ -153,6 +153,7 @@ HUMAN_AWARE_PHYSICAL_CAPABILITIES = {
     "target_resolution",
     "proposal_resolution",
 }
+HUMAN_AWARE_SIGNAL_STALE_AFTER_SECONDS = 10
 PROPOSAL_PRIORITY_DEFAULT = {
     "weights": {
         "urgency": 0.28,
@@ -290,6 +291,20 @@ def _human_aware_state_from_monitoring(row: WorkspaceMonitoringState) -> dict:
         )
         if normalized
     ]
+    last_updated_at = str(merged.get("last_updated_at", "")).strip()
+    updated_at = _parse_iso_to_utc(last_updated_at) if last_updated_at else None
+    is_stale = True
+    if updated_at is not None:
+        age_seconds = max((datetime.now(timezone.utc) - updated_at).total_seconds(), 0.0)
+        is_stale = age_seconds > HUMAN_AWARE_SIGNAL_STALE_AFTER_SECONDS
+    if is_stale:
+        merged["human_in_workspace"] = False
+        merged["human_near_target_zone"] = False
+        merged["human_near_motion_path"] = False
+        merged["shared_workspace_active"] = False
+        merged["operator_present"] = False
+        merged["occupied_zones"] = []
+        merged["high_proximity_zones"] = []
     return merged
 
 

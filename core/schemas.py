@@ -1234,6 +1234,11 @@ class CrossDomainTaskOrchestrationBuildRequest(BaseModel):
     min_context_confidence: float = Field(default=0.5, ge=0.0, le=1.0)
     min_domains_required: int = Field(default=2, ge=1, le=10)
     dependency_resolution_policy: Literal["ask", "defer", "replan", "escalate"] = "ask"
+    collaboration_mode_preference: Literal["auto", "autonomous", "assistive", "confirmation-first", "deferential"] = "auto"
+    task_kind: Literal["mixed", "physical", "informational"] = "mixed"
+    action_risk_level: Literal["low", "medium", "high"] = "medium"
+    communication_urgency_override: float | None = Field(default=None, ge=0.0, le=1.0)
+    use_human_aware_signals: bool = False
     generate_goal: bool = True
     generate_horizon_plan: bool = True
     generate_improvement_proposals: bool = False
@@ -1250,6 +1255,9 @@ class CrossDomainTaskOrchestrationOut(BaseModel):
     lookback_hours: int
     priority_score: float
     priority_label: str
+    collaboration_mode: str
+    human_context_modifiers: dict
+    collaboration_reasoning: dict
     contributing_domains: list[str]
     dependency_resolution: dict
     orchestration_reason: str
@@ -1261,6 +1269,24 @@ class CrossDomainTaskOrchestrationOut(BaseModel):
     downstream_artifacts: list[dict]
     metadata_json: dict
     created_at: datetime
+
+
+class CollaborationModePreferenceRequest(BaseModel):
+    actor: str = "operator"
+    mode: Literal["autonomous", "assistive", "confirmation-first", "deferential"]
+    reason: str = ""
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class CollaborationStateOut(BaseModel):
+    policy_version: str
+    collaboration_mode: str
+    communication_urgency: float
+    interruption_likelihood: float
+    operator_presence_score: float
+    human_aware_signals: dict
+    active_modifiers: list[str]
+    reasoning: dict
 
 
 class StrategyGoalPersistenceRecomputeRequest(BaseModel):

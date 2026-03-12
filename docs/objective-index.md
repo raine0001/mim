@@ -49,6 +49,7 @@ This registry indexes objective evidence and promotion artifacts so objective hi
 | 61.1 | Regression Recovery and Baseline Stabilization | promoted_verified | 2026-03-11-54 | objective-61-1 | core/improvement_service.py; core/constraint_learning.py; core/horizon_planning.py; core/manifest.py | docs/objective-61_1-promotion-readiness-report.md | docs/objective-61_1-prod-promotion-report.md | regression_baseline_stabilization |
 | 62 | Inquisitive Question Loop | promoted_verified | 2026-03-11-55 | objective-62 | core/inquiry_service.py; core/routers/inquiry.py; core/models.py | docs/objective-62-promotion-readiness-report.md | docs/objective-62-prod-promotion-report.md | inquisitive_question_loop |
 | 63 | Cross-Domain Task Orchestration | promoted_verified | 2026-03-12-56 | objective-63 | core/orchestration_service.py; core/routers/orchestration.py; core/models.py | docs/objective-63-promotion-readiness-report.md | docs/objective-63-prod-promotion-report.md | cross_domain_task_orchestration |
+| 64 | Human-Aware Cross-Domain Collaboration | promoted_verified | 2026-03-12-57 | objective-64 | core/orchestration_service.py; core/routers/orchestration.py; core/models.py; core/schemas.py | docs/objective-64-promotion-readiness-report.md | docs/objective-64-prod-promotion-report.md | human_aware_cross_domain_collaboration |
 
 ## Notes
 

@@ -201,6 +201,9 @@ async def ensure_schema() -> None:
         await conn.execute(text("ALTER TABLE IF EXISTS workspace_inquiry_questions ADD COLUMN IF NOT EXISTS answered_by VARCHAR(120) DEFAULT ''"))
         await conn.execute(text("ALTER TABLE IF EXISTS workspace_inquiry_questions ADD COLUMN IF NOT EXISTS answered_at TIMESTAMPTZ"))
         await conn.execute(text("ALTER TABLE IF EXISTS workspace_inquiry_questions ADD COLUMN IF NOT EXISTS metadata_json JSONB DEFAULT '{}'::jsonb"))
+        await conn.execute(text("ALTER TABLE IF EXISTS workspace_task_orchestrations ADD COLUMN IF NOT EXISTS collaboration_mode VARCHAR(40) DEFAULT 'autonomous'"))
+        await conn.execute(text("ALTER TABLE IF EXISTS workspace_task_orchestrations ADD COLUMN IF NOT EXISTS human_context_modifiers_json JSONB DEFAULT '{}'::jsonb"))
+        await conn.execute(text("ALTER TABLE IF EXISTS workspace_task_orchestrations ADD COLUMN IF NOT EXISTS collaboration_reasoning_json JSONB DEFAULT '{}'::jsonb"))
 
     await initialize_workspace_monitoring_runtime()
 
