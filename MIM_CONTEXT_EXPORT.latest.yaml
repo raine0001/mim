@@ -1,18 +1,18 @@
 export_version: "mim-context-v2"
-exported_at: "2026-03-12T18:06:24.469356Z"
+exported_at: "2026-03-12T18:21:00.234221Z"
 source_of_truth:
   objective_index: "docs/objective-index.md"
   manifest_endpoint_priority:
     - "http://127.0.0.1:8000/manifest"
     - "http://127.0.0.1:18001/manifest"
   manifest_source_fallback: "core/manifest.py"
-objective_active: "73"
-phase: "execution"
+objective_active: "74"
+phase: "operational"
 next_actions:
   - "finalize verification gate"
-  - "begin objective 74 planning"
-latest_completed_objective: "73"
-current_next_objective: "74"
+  - "begin objective 75 planning"
+latest_completed_objective: "74"
+current_next_objective: "75"
 schema_version: "2026-03-12-67"
 release_tag: "objective-74"
 capabilities:

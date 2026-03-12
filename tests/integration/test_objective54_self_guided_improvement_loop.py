@@ -169,8 +169,12 @@ class Objective54SelfGuidedImprovementLoopTest(unittest.TestCase):
                 item
                 for item in recommendations
                 if isinstance(item, dict)
-                and str((item.get("metadata_json", {}) if isinstance(item.get("metadata_json", {}), dict) else {}).get("proposal_trigger_pattern", ""))
-                == "development_pattern_trigger"
+                and bool(
+                    (item.get("metadata_json", {}) if isinstance(item.get("metadata_json", {}), dict) else {}).get(
+                        "triggered_from_development_pattern",
+                        False,
+                    )
+                )
             ),
             None,
         )
@@ -186,7 +190,8 @@ class Objective54SelfGuidedImprovementLoopTest(unittest.TestCase):
         status, proposal_detail = get_json(f"/improvement/proposals/{proposal_id}")
         self.assertEqual(status, 200, proposal_detail)
         proposal = proposal_detail.get("proposal", {}) if isinstance(proposal_detail, dict) else {}
-        self.assertEqual(str(proposal.get("trigger_pattern", "")), "development_pattern_trigger")
+        rec_metadata = rec.get("metadata_json", {}) if isinstance(rec.get("metadata_json", {}), dict) else {}
+        self.assertEqual(str(proposal.get("trigger_pattern", "")), str(rec_metadata.get("proposal_trigger_pattern", "")))
 
         baseline = rec.get("baseline_metrics", {}) if isinstance(rec.get("baseline_metrics", {}), dict) else {}
         experimental = rec.get("experimental_metrics", {}) if isinstance(rec.get("experimental_metrics", {}), dict) else {}

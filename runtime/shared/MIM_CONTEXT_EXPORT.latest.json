@@ -96,9 +96,9 @@
     "operator_interface_channel_bridge"
   ],
   "capability_count": 93,
-  "current_next_objective": "74",
+  "current_next_objective": "75",
   "export_version": "mim-context-v2",
-  "exported_at": "2026-03-12T18:06:24.469356Z",
+  "exported_at": "2026-03-12T18:21:00.234221Z",
   "health": {
     "prod": {
       "base_url": "http://127.0.0.1:8000",
@@ -111,17 +111,17 @@
       "status": "unreachable"
     }
   },
-  "latest_completed_objective": "73",
+  "latest_completed_objective": "74",
   "next_actions": [
     "finalize verification gate",
-    "begin objective 74 planning"
+    "begin objective 75 planning"
   ],
   "notes": [
     "Export regenerated from live manifest and objective index",
     "Replaces stale bootstrap snapshots (e.g., objective 17 warming phase)"
   ],
-  "objective_active": "73",
-  "phase": "execution",
+  "objective_active": "74",
+  "phase": "operational",
   "release_tag": "objective-74",
   "schema_version": "2026-03-12-67",
   "source_of_truth": {
