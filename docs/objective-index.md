@@ -58,6 +58,7 @@ This registry indexes objective evidence and promotion artifacts so objective hi
 | 70 | Collaboration Strategy Profiles | promoted_verified | 2026-03-12-63 | objective-70 | core/models.py; core/orchestration_service.py; core/routers/orchestration.py; core/schemas.py; core/manifest.py | docs/objective-70-promotion-readiness-report.md | docs/objective-70-prod-promotion-report.md | collaboration_strategy_profiles |
 | 71 | Unified State Bus | promoted_verified | 2026-03-12-64 | objective-71 | core/models.py; core/state_bus_service.py; core/routers/state_bus.py; core/routers/orchestration.py; core/schemas.py; core/manifest.py | docs/objective-71-promotion-readiness-report.md | docs/objective-71-prod-promotion-report.md | unified_state_bus |
 | 72 | State Bus Consumers and Cross-System Subscription | promoted_verified | 2026-03-12-65 | objective-72 | core/models.py; core/state_bus_consumer_service.py; core/routers/state_bus.py; core/schemas.py; core/manifest.py | docs/objective-72-promotion-readiness-report.md | docs/objective-72-prod-promotion-report.md | state_bus_consumers_cross_system_subscription |
+| 73 | Bus-Driven Cross-System Reactions | promoted_verified | 2026-03-12-66 | objective-73 | core/state_bus_consumer_service.py; core/routers/state_bus.py; core/schemas.py; core/manifest.py | docs/objective-73-promotion-readiness-report.md | docs/objective-73-prod-promotion-report.md | bus_driven_cross_system_reactions |
 
 ## Notes
 

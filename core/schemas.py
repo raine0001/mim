@@ -1510,6 +1510,12 @@ class StateBusMimCoreStepRequest(BaseModel):
     metadata_json: dict = Field(default_factory=dict)
 
 
+class StateBusReactionStepRequest(BaseModel):
+    actor: str = "mim-reactor"
+    limit: int = Field(default=50, ge=1, le=200)
+    metadata_json: dict = Field(default_factory=dict)
+
+
 class StrategyGoalPersistenceRecomputeRequest(BaseModel):
     actor: str = "workspace"
     source: str = "objective59"

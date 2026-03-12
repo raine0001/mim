@@ -9,6 +9,7 @@ from core.models import MemoryEntry, WorkspaceStateBusConsumer, WorkspaceStateBu
 from core.state_bus_service import append_state_bus_event, to_state_bus_event_out
 
 STATE_BUS_CONSUMER_SOURCE = "objective72"
+STATE_BUS_REACTION_SOURCE = "objective73"
 
 
 def _normalize_list(value: object) -> list[str]:
@@ -358,6 +359,169 @@ async def run_mim_core_consumer_step(
         "strategy_event_ids": strategy_event_ids,
         "consumed_count": len(accepted_ids),
         "memory_written": len(memory_ids),
+    }
+
+
+async def run_mim_tod_reaction_step(
+    *,
+    actor: str,
+    limit: int,
+    metadata_json: dict,
+    db: AsyncSession,
+) -> dict:
+    existing_consumer = await get_state_bus_consumer(consumer_key="mim-tod-reaction-core", db=db)
+    existing_metadata = existing_consumer.metadata_json if (existing_consumer and isinstance(existing_consumer.metadata_json, dict)) else {}
+    stream_keys = _normalize_list((metadata_json if isinstance(metadata_json, dict) else {}).get("subscription_stream_keys", []))
+    consumer = await upsert_state_bus_consumer(
+        consumer_key="mim-tod-reaction-core",
+        actor=actor,
+        source=STATE_BUS_REACTION_SOURCE,
+        status="active",
+        subscription_json={
+            "domains": ["tod.runtime", "mim.perception"],
+            "event_types": ["execution.completed", "execution.failed", "camera.detected"],
+            "sources": [],
+            "stream_keys": stream_keys,
+        },
+        metadata_json={
+            "managed_by": "objective73",
+            **existing_metadata,
+            **(metadata_json if isinstance(metadata_json, dict) else {}),
+        },
+        db=db,
+    )
+
+    consumer, events = await poll_state_bus_consumer(
+        consumer_key=consumer.consumer_key,
+        limit=max(1, min(int(limit), 200)),
+        db=db,
+    )
+
+    consumer_metadata = consumer.metadata_json if isinstance(consumer.metadata_json, dict) else {}
+    reacted_event_ids = [
+        int(item)
+        for item in (consumer_metadata.get("reacted_event_ids") if isinstance(consumer_metadata.get("reacted_event_ids"), list) else [])
+        if int(item) > 0
+    ]
+    reacted_set = set(reacted_event_ids)
+    reaction_stream = f"reaction:{consumer.consumer_key}"
+    historical_reactions = (
+        await db.execute(
+            select(WorkspaceStateBusEvent)
+            .where(WorkspaceStateBusEvent.stream_key == reaction_stream)
+            .order_by(WorkspaceStateBusEvent.id.desc())
+            .limit(5000)
+        )
+    ).scalars().all()
+    for row in historical_reactions:
+        payload = row.payload_json if isinstance(row.payload_json, dict) else {}
+        source_event_id = int(payload.get("source_event_id", 0) or 0)
+        if source_event_id > 0:
+            reacted_set.add(source_event_id)
+
+    consumed_ids: list[int] = []
+    produced_event_ids: list[int] = []
+    memory_ids: list[int] = []
+    reacted_count = 0
+    skipped_count = 0
+
+    for event in events:
+        event_id = int(event.id)
+        consumed_ids.append(event_id)
+
+        if event_id in reacted_set:
+            skipped_count += 1
+            continue
+
+        payload = event.payload_json if isinstance(event.payload_json, dict) else {}
+        reaction_event_type = "reaction.observed"
+        reaction_domain = "mim.assist"
+        reaction_reason = "observed event"
+
+        if str(event.event_domain) == "tod.runtime" and str(event.event_type) == "execution.failed":
+            reaction_event_type = "tod.execution.failure_attention_required"
+            reaction_domain = "mim.assist"
+            reaction_reason = "TOD runtime failure requires assistance handling"
+        elif str(event.event_domain) == "tod.runtime" and str(event.event_type) == "execution.completed":
+            reaction_event_type = "tod.execution.completed_observed"
+            reaction_domain = "mim.strategy"
+            reaction_reason = "TOD runtime completion observed for strategy update"
+        elif str(event.event_domain) == "mim.perception" and str(event.event_type) == "camera.detected":
+            reaction_event_type = "perception.observation_received"
+            reaction_domain = "mim.assist"
+            reaction_reason = "Perception signal observed for cross-system awareness"
+
+        memory = MemoryEntry(
+            memory_class="cross_system_reaction",
+            content=f"Objective73 reacted to {event.event_domain}:{event.event_type} ({event_id})",
+            summary=f"Reaction generated for source event {event_id}",
+            metadata_json={
+                "objective": "objective73",
+                "source_event_id": event_id,
+                "source_event_domain": str(event.event_domain),
+                "source_event_type": str(event.event_type),
+                "source_stream_key": str(event.stream_key),
+                "reaction_event_type": reaction_event_type,
+                "reaction_domain": reaction_domain,
+                "reaction_reason": reaction_reason,
+                "consumer_key": consumer.consumer_key,
+                "payload": payload,
+                **(metadata_json if isinstance(metadata_json, dict) else {}),
+            },
+        )
+        db.add(memory)
+        await db.flush()
+        memory_ids.append(int(memory.id))
+
+        derived_event = await append_state_bus_event(
+            actor=actor,
+            source=STATE_BUS_REACTION_SOURCE,
+            event_domain=reaction_domain,
+            event_type=reaction_event_type,
+            stream_key=reaction_stream,
+            payload_json={
+                "source_event_id": event_id,
+                "source_event_domain": str(event.event_domain),
+                "source_event_type": str(event.event_type),
+                "derived_memory_id": int(memory.id),
+                "consumer_key": consumer.consumer_key,
+                "reaction_reason": reaction_reason,
+            },
+            metadata_json={
+                "objective": "objective73",
+                "reaction": "bus_driven_cross_system",
+                **(metadata_json if isinstance(metadata_json, dict) else {}),
+            },
+            db=db,
+        )
+        produced_event_ids.append(int(derived_event.id))
+        reacted_set.add(event_id)
+        reacted_count += 1
+
+    consumer, accepted_ids = await acknowledge_state_bus_consumer(
+        consumer_key=consumer.consumer_key,
+        event_ids=consumed_ids,
+        db=db,
+    )
+
+    updated_metadata = consumer.metadata_json if isinstance(consumer.metadata_json, dict) else {}
+    reacted_sorted = sorted(reacted_set)
+    if len(reacted_sorted) > 1000:
+        reacted_sorted = reacted_sorted[-1000:]
+    updated_metadata["reacted_event_ids"] = reacted_sorted
+    updated_metadata["last_reaction_source"] = STATE_BUS_REACTION_SOURCE
+    consumer.metadata_json = updated_metadata
+    await db.flush()
+
+    return {
+        "consumer": to_state_bus_consumer_out(consumer),
+        "consumed_event_ids": accepted_ids,
+        "produced_event_ids": produced_event_ids,
+        "memory_ids": memory_ids,
+        "consumed_count": len(accepted_ids),
+        "produced_count": len(produced_event_ids),
+        "reacted_count": reacted_count,
+        "skipped_count": skipped_count,
     }
 
 

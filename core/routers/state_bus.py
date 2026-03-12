@@ -10,6 +10,7 @@ from core.schemas import (
     StateBusConsumerReplayRequest,
     StateBusEventCreateRequest,
     StateBusMimCoreStepRequest,
+    StateBusReactionStepRequest,
     StateBusSnapshotUpsertRequest,
 )
 from core.state_bus_consumer_service import (
@@ -19,6 +20,7 @@ from core.state_bus_consumer_service import (
     poll_state_bus_consumer,
     replay_state_bus_consumer,
     run_mim_core_consumer_step,
+    run_mim_tod_reaction_step,
     to_state_bus_consumer_event_out,
     to_state_bus_consumer_out,
     upsert_state_bus_consumer,
@@ -336,6 +338,39 @@ async def run_mim_core_consumer_step_endpoint(
         metadata_json={
             "consumed_count": result.get("consumed_count", 0),
             "memory_written": result.get("memory_written", 0),
+            **payload.metadata_json,
+        },
+    )
+    await db.commit()
+    return result
+
+
+@router.post("/state-bus/reactions/mim-tod/step")
+async def run_mim_tod_reaction_step_endpoint(
+    payload: StateBusReactionStepRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    result = await run_mim_tod_reaction_step(
+        actor=payload.actor,
+        limit=payload.limit,
+        metadata_json=payload.metadata_json,
+        db=db,
+    )
+    await write_journal(
+        db,
+        actor=payload.actor,
+        action="state_bus_mim_tod_reaction_step",
+        target_type="workspace_state_bus_consumer",
+        target_id="mim-tod-reaction-core",
+        summary=(
+            "Ran mim-tod reaction step "
+            f"consumed={result.get('consumed_count', 0)} produced={result.get('produced_count', 0)}"
+        ),
+        metadata_json={
+            "consumed_count": result.get("consumed_count", 0),
+            "produced_count": result.get("produced_count", 0),
+            "reacted_count": result.get("reacted_count", 0),
+            "skipped_count": result.get("skipped_count", 0),
             **payload.metadata_json,
         },
     )

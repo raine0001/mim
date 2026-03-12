@@ -7,7 +7,7 @@ from core.config import PROJECT_ROOT, settings
 
 CONTRACT_VERSION = "tod-mim-shared-contract-v1"
 MANIFEST_VERSION = "1"
-SCHEMA_VERSION = "2026-03-12-65"
+SCHEMA_VERSION = "2026-03-12-66"
 
 SIGNATURE_FILES = [
     "core/models.py",
@@ -154,6 +154,7 @@ SIGNATURE_FILES = [
     "docs/objective-70-collaboration-strategy-profiles.md",
     "docs/objective-71-unified-state-bus.md",
     "docs/objective-72-state-bus-consumers-and-cross-system-subscription.md",
+    "docs/objective-73-bus-driven-cross-system-reactions.md",
     "config/vision_policy.json",
     "config/voice_policy.json",
 ]
@@ -250,6 +251,7 @@ CAPABILITIES = [
     "collaboration_strategy_profiles",
     "unified_state_bus",
     "state_bus_consumers_cross_system_subscription",
+    "bus_driven_cross_system_reactions",
 ]
 
 RECENT_CHANGES = [
@@ -320,6 +322,7 @@ RECENT_CHANGES = [
     "Added Objective 70 collaboration strategy profiles with synthesized collaboration modes, bounded profile influence, and inspectable profile recompute APIs",
     "Added Objective 71 unified state bus with durable snapshot/event-stream separation, multi-domain event ingestion, and inspectable state-bus APIs",
     "Added Objective 72 state bus consumers with filtered subscriptions, idempotent acknowledgment, replay controls, and mim-core cross-system consumption",
+    "Added Objective 73 bus-driven cross-system reactions with reaction consumer step, derived reaction events, and replay-safe idempotent handling",
 ]
 
 
@@ -611,6 +614,7 @@ def build_manifest() -> dict:
             "/state-bus/consumers/{consumer_key}/ack",
             "/state-bus/consumers/{consumer_key}/replay",
             "/state-bus/consumers/mim-core/step",
+            "/state-bus/reactions/mim-tod/step",
         ],
         "objects": {
             "Objective": [

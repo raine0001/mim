@@ -91,12 +91,13 @@
     "negotiation_pattern_abstraction",
     "collaboration_strategy_profiles",
     "unified_state_bus",
-    "state_bus_consumers_cross_system_subscription"
+    "state_bus_consumers_cross_system_subscription",
+    "bus_driven_cross_system_reactions"
   ],
-  "capability_count": 91,
+  "capability_count": 92,
   "current_next_objective": "73",
   "export_version": "mim-context-v2",
-  "exported_at": "2026-03-12T17:17:45.621304Z",
+  "exported_at": "2026-03-12T17:43:55.304610Z",
   "health": {
     "prod": {
       "base_url": "http://127.0.0.1:8000",
@@ -105,8 +106,8 @@
     },
     "test": {
       "base_url": "http://127.0.0.1:18001",
-      "reachable": true,
-      "status": "ok"
+      "reachable": false,
+      "status": "unreachable"
     }
   },
   "latest_completed_objective": "72",
@@ -119,9 +120,9 @@
     "Replaces stale bootstrap snapshots (e.g., objective 17 warming phase)"
   ],
   "objective_active": "72",
-  "phase": "operational",
-  "release_tag": "objective-72",
-  "schema_version": "2026-03-12-65",
+  "phase": "execution",
+  "release_tag": "objective-73",
+  "schema_version": "2026-03-12-66",
   "source_of_truth": {
     "manifest_endpoint_priority": [
       "http://127.0.0.1:8000/manifest",
