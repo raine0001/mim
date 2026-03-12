@@ -8,12 +8,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from core.cross_domain_reasoning_service import build_cross_domain_reasoning_context, to_cross_domain_reasoning_out
 from core.horizon_planning_service import create_horizon_plan
 from core.improvement_service import generate_improvement_proposals
+from core.preferences import DEFAULT_USER_ID, get_user_preference_value, upsert_user_preference
 from core.models import (
     Goal,
     InputEvent,
     UserPreference,
     WorkspaceCollaborationNegotiation,
     WorkspaceCrossDomainReasoningContext,
+    WorkspaceHorizonPlan,
     WorkspaceInquiryQuestion,
     WorkspaceInterruptionEvent,
     WorkspaceMonitoringState,
@@ -25,6 +27,9 @@ ORCHESTRATION_POLICIES = {"ask", "defer", "replan", "escalate"}
 COLLABORATION_MODES = {"autonomous", "assistive", "confirmation-first", "deferential"}
 COLLABORATION_POLICY_VERSION = "human-aware-collaboration-v1"
 NEGOTIATION_POLICY_VERSION = "human-aware-negotiation-v1"
+NEGOTIATION_PATTERN_PREFERENCE_TYPE = "collaboration_negotiation_patterns"
+NEGOTIATION_PATTERN_MIN_REUSE_COUNT = 2
+NEGOTIATION_PATTERN_MIN_CONFIDENCE = 0.8
 NEGOTIATION_OPTION_IDS = {
     "continue_now",
     "defer_action",
@@ -741,6 +746,133 @@ async def _create_collaboration_negotiation(
     return row
 
 
+def _negotiation_pattern_key(*, trigger_type: str, human_context_state: dict) -> str:
+    state = human_context_state if isinstance(human_context_state, dict) else {}
+    signals = state.get("signals", {}) if isinstance(state.get("signals", {}), dict) else {}
+    urgency = float(state.get("communication_urgency", 0.0) or 0.0)
+    urgency_bucket = "high" if urgency >= 0.65 else ("medium" if urgency >= 0.35 else "low")
+    parts = [
+        "collaboration_negotiation",
+        str(state.get("task_kind", "mixed")).strip().lower(),
+        str(state.get("action_risk_level", "medium")).strip().lower(),
+        f"shared:{bool(signals.get('shared_workspace_active', False))}",
+        f"operator:{bool(signals.get('operator_present', False))}",
+        f"urgency:{urgency_bucket}",
+    ]
+    return "|".join(parts)
+
+
+async def _load_negotiation_patterns(*, db: AsyncSession) -> dict:
+    payload = await get_user_preference_value(
+        db=db,
+        preference_type=NEGOTIATION_PATTERN_PREFERENCE_TYPE,
+        user_id=DEFAULT_USER_ID,
+    )
+    if isinstance(payload, dict):
+        return payload
+    return {"version": "objective66-v1", "patterns": {}}
+
+
+def _recommended_option_from_patterns(*, pattern_payload: dict, pattern_key: str, option_ids: set[str]) -> tuple[str | None, float, int]:
+    patterns = pattern_payload.get("patterns", {}) if isinstance(pattern_payload.get("patterns", {}), dict) else {}
+    item = patterns.get(pattern_key, {}) if isinstance(patterns.get(pattern_key, {}), dict) else {}
+    total = int(item.get("total", 0) or 0)
+    counts = item.get("counts", {}) if isinstance(item.get("counts", {}), dict) else {}
+    if total < NEGOTIATION_PATTERN_MIN_REUSE_COUNT:
+        return None, 0.0, total
+
+    best_option = ""
+    best_count = 0
+    for option_id, raw_count in counts.items():
+        candidate = str(option_id or "").strip()
+        count = int(raw_count or 0)
+        if candidate in option_ids and count > best_count:
+            best_option = candidate
+            best_count = count
+    if not best_option:
+        return None, 0.0, total
+
+    confidence = float(best_count / max(1, total))
+    if confidence < NEGOTIATION_PATTERN_MIN_CONFIDENCE:
+        return None, confidence, total
+    return best_option, confidence, total
+
+
+async def _record_negotiation_pattern_signal(
+    *,
+    trigger_type: str,
+    human_context_state: dict,
+    selected_option_id: str,
+    actor: str,
+    db: AsyncSession,
+) -> None:
+    pattern_key = _negotiation_pattern_key(trigger_type=trigger_type, human_context_state=human_context_state)
+    payload = await _load_negotiation_patterns(db=db)
+    patterns = payload.get("patterns", {}) if isinstance(payload.get("patterns", {}), dict) else {}
+    item = patterns.get(pattern_key, {}) if isinstance(patterns.get(pattern_key, {}), dict) else {}
+    counts = item.get("counts", {}) if isinstance(item.get("counts", {}), dict) else {}
+    option_id = str(selected_option_id or "").strip()
+    if not option_id:
+        return
+
+    counts[option_id] = int(counts.get(option_id, 0) or 0) + 1
+    total = int(item.get("total", 0) or 0) + 1
+    patterns[pattern_key] = {
+        "pattern_key": pattern_key,
+        "counts": counts,
+        "total": total,
+        "last_option": option_id,
+        "last_actor": actor,
+        "last_updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    payload = {
+        "version": "objective66-v1",
+        "patterns": patterns,
+    }
+    confidence = min(1.0, 0.25 + (total / 20.0))
+    await upsert_user_preference(
+        db=db,
+        preference_type=NEGOTIATION_PATTERN_PREFERENCE_TYPE,
+        value=payload,
+        confidence=confidence,
+        source="learning",
+        user_id=DEFAULT_USER_ID,
+    )
+
+
+async def _apply_negotiation_follow_through(
+    *,
+    negotiation: WorkspaceCollaborationNegotiation,
+    selected_option_id: str,
+    db: AsyncSession,
+) -> dict:
+    follow_through = {
+        "selected_option_id": selected_option_id,
+        "applied_at": datetime.now(timezone.utc).isoformat(),
+        "updated_horizon_plan": False,
+    }
+    if negotiation.origin_horizon_plan_id is None:
+        return follow_through
+
+    plan = await db.get(WorkspaceHorizonPlan, int(negotiation.origin_horizon_plan_id))
+    if not plan:
+        return follow_through
+
+    plan.metadata_json = {
+        **(plan.metadata_json if isinstance(plan.metadata_json, dict) else {}),
+        "negotiation_follow_through": {
+            "negotiation_id": int(negotiation.id),
+            "selected_option_id": selected_option_id,
+            "resolution_status": str(negotiation.resolution_status or ""),
+            "trigger_type": str(negotiation.trigger_type or ""),
+            "applied_at": follow_through["applied_at"],
+        },
+    }
+    follow_through["updated_horizon_plan"] = True
+    follow_through["horizon_plan_id"] = int(plan.id)
+    return follow_through
+
+
 async def build_cross_domain_task_orchestration(
     *,
     actor: str,
@@ -1130,6 +1262,24 @@ async def build_cross_domain_task_orchestration(
     await db.flush()
 
     if negotiation_payload:
+        trigger = negotiation_payload.get("trigger", {}) if isinstance(negotiation_payload.get("trigger", {}), dict) else {}
+        trigger_type = str(trigger.get("trigger_type", "")).strip()
+        pattern_key = _negotiation_pattern_key(
+            trigger_type=trigger_type,
+            human_context_state=negotiation_payload.get("human_context_state", {}),
+        )
+        pattern_payload = await _load_negotiation_patterns(db=db)
+        option_ids = {
+            str(item.get("option_id", "")).strip()
+            for item in (negotiation_payload.get("options_presented", []) if isinstance(negotiation_payload.get("options_presented", []), list) else [])
+            if isinstance(item, dict)
+        }
+        recommended_option_id, recommended_confidence, recommended_total = _recommended_option_from_patterns(
+            pattern_payload=pattern_payload,
+            pattern_key=pattern_key,
+            option_ids=option_ids,
+        )
+
         negotiation = await _create_collaboration_negotiation(
             actor=actor,
             source=source,
@@ -1160,6 +1310,71 @@ async def build_cross_domain_task_orchestration(
             **(row.metadata_json if isinstance(row.metadata_json, dict) else {}),
             "linked_collaboration_negotiation_ids": linked_negotiation_ids,
         }
+
+        if recommended_option_id:
+            selected_option = _option_by_id(
+                options=negotiation.options_presented_json if isinstance(negotiation.options_presented_json, list) else [],
+                option_id=recommended_option_id,
+            )
+            if selected_option:
+                applied_effect = _apply_negotiation_effect(negotiation=negotiation, orchestration=row, option=selected_option)
+                follow_through = await _apply_negotiation_follow_through(
+                    negotiation=negotiation,
+                    selected_option_id=recommended_option_id,
+                    db=db,
+                )
+                now = datetime.now(timezone.utc)
+                negotiation.status = "resolved"
+                negotiation.resolution_status = "reused_prior_pattern"
+                negotiation.selected_option_id = str(selected_option.get("option_id", "")).strip()
+                negotiation.selected_option_label = str(selected_option.get("label", "")).strip()
+                negotiation.resolved_by = "system_pattern"
+                negotiation.resolved_at = now
+                negotiation.applied_effect_json = {
+                    **(applied_effect if isinstance(applied_effect, dict) else {}),
+                    "pattern_reuse": {
+                        "pattern_key": pattern_key,
+                        "confidence": recommended_confidence,
+                        "observed_total": recommended_total,
+                    },
+                    "follow_through": follow_through,
+                }
+                negotiation.metadata_json = {
+                    **(negotiation.metadata_json if isinstance(negotiation.metadata_json, dict) else {}),
+                    "pattern_reuse": {
+                        "auto_resolved": True,
+                        "pattern_key": pattern_key,
+                        "confidence": recommended_confidence,
+                        "observed_total": recommended_total,
+                    },
+                }
+                row.downstream_artifacts_json = [
+                    {
+                        **item,
+                        "status": "resolved",
+                    }
+                    if isinstance(item, dict)
+                    and str(item.get("artifact_type", "")).strip() == "collaboration_negotiation"
+                    and int(item.get("artifact_id", 0) or 0) == int(negotiation.id)
+                    else item
+                    for item in (row.downstream_artifacts_json if isinstance(row.downstream_artifacts_json, list) else [])
+                ]
+                row.metadata_json = {
+                    **(row.metadata_json if isinstance(row.metadata_json, dict) else {}),
+                    "negotiation_pattern_reuse": {
+                        "pattern_key": pattern_key,
+                        "confidence": recommended_confidence,
+                        "observed_total": recommended_total,
+                        "selected_option_id": recommended_option_id,
+                    },
+                }
+                await _record_negotiation_pattern_signal(
+                    trigger_type=trigger_type,
+                    human_context_state=negotiation.human_context_state_json if isinstance(negotiation.human_context_state_json, dict) else {},
+                    selected_option_id=recommended_option_id,
+                    actor="system_pattern",
+                    db=db,
+                )
     return row, context
 
 
@@ -1359,16 +1574,23 @@ async def respond_collaboration_negotiation(
     if negotiation.origin_orchestration_id is not None:
         orchestration = await get_task_orchestration(orchestration_id=int(negotiation.origin_orchestration_id), db=db)
 
+    selected_option_id = str(option.get("option_id", "")).strip()
     applied_effect = _apply_negotiation_effect(negotiation=negotiation, orchestration=orchestration, option=option)
+    follow_through = await _apply_negotiation_follow_through(
+        negotiation=negotiation,
+        selected_option_id=selected_option_id,
+        db=db,
+    )
     negotiation.status = "resolved"
     negotiation.resolution_status = "operator_selected"
-    negotiation.selected_option_id = str(option.get("option_id", "")).strip()
+    negotiation.selected_option_id = selected_option_id
     negotiation.selected_option_label = str(option.get("label", "")).strip()
     negotiation.resolved_by = actor
     negotiation.resolved_at = datetime.now(timezone.utc)
     negotiation.applied_effect_json = {
         **(applied_effect if isinstance(applied_effect, dict) else {}),
         "reason": reason,
+        "follow_through": follow_through,
     }
     negotiation.metadata_json = {
         **(negotiation.metadata_json if isinstance(negotiation.metadata_json, dict) else {}),
@@ -1379,6 +1601,13 @@ async def respond_collaboration_negotiation(
             "responded_at": datetime.now(timezone.utc).isoformat(),
         },
     }
+    await _record_negotiation_pattern_signal(
+        trigger_type=str(negotiation.trigger_type or ""),
+        human_context_state=negotiation.human_context_state_json if isinstance(negotiation.human_context_state_json, dict) else {},
+        selected_option_id=selected_option_id,
+        actor=actor,
+        db=db,
+    )
     await db.flush()
     return negotiation, orchestration
 
@@ -1414,17 +1643,31 @@ async def apply_due_collaboration_negotiation_fallbacks(
         orchestration = None
         if row.origin_orchestration_id is not None:
             orchestration = await get_task_orchestration(orchestration_id=int(row.origin_orchestration_id), db=db)
+        selected_option_id = str(option.get("option_id", "")).strip()
         applied_effect = _apply_negotiation_effect(negotiation=row, orchestration=orchestration, option=option)
+        follow_through = await _apply_negotiation_follow_through(
+            negotiation=row,
+            selected_option_id=selected_option_id,
+            db=db,
+        )
         row.status = "fallback_applied"
         row.resolution_status = "fallback_safe_default"
-        row.selected_option_id = str(option.get("option_id", "")).strip()
+        row.selected_option_id = selected_option_id
         row.selected_option_label = str(option.get("label", "")).strip()
         row.resolved_by = "system"
         row.resolved_at = now
         row.applied_effect_json = {
             **(applied_effect if isinstance(applied_effect, dict) else {}),
             "fallback": True,
+            "follow_through": follow_through,
         }
+        await _record_negotiation_pattern_signal(
+            trigger_type=str(row.trigger_type or ""),
+            human_context_state=row.human_context_state_json if isinstance(row.human_context_state_json, dict) else {},
+            selected_option_id=selected_option_id,
+            actor="system",
+            db=db,
+        )
         applied.append(row)
 
     if applied:

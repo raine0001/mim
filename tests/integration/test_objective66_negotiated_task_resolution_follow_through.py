@@ -39,7 +39,7 @@ def get_json(path: str) -> tuple[int, dict | list]:
         return exc.code, parsed
 
 
-class Objective65HumanAwareCollaborationNegotiationTest(unittest.TestCase):
+class Objective66NegotiatedTaskResolutionFollowThroughTest(unittest.TestCase):
     def _reset_negotiation_patterns(self) -> None:
         status, payload = post_json(
             "/preferences",
@@ -53,22 +53,14 @@ class Objective65HumanAwareCollaborationNegotiationTest(unittest.TestCase):
         )
         self.assertEqual(status, 200, payload)
 
-    def _seed_cross_domain_inputs(self, run_id: str, zone: str, urgent: bool) -> None:
-        text = f"Objective65 routine update {run_id}"
-        intent = "operator_update"
-        metadata = {"run_id": run_id}
-        if urgent:
-            text = f"URGENT: collaboration conflict update {run_id}"
-            intent = "operator_urgent_request"
-            metadata["urgency"] = "high"
-
+    def _seed_cross_domain_inputs(self, run_id: str, zone: str) -> None:
         status, event = post_json(
             "/gateway/intake/text",
             {
-                "text": text,
-                "parsed_intent": intent,
-                "confidence": 0.96 if urgent else 0.9,
-                "metadata_json": metadata,
+                "text": f"URGENT: objective66 negotiation flow {run_id}",
+                "parsed_intent": "operator_urgent_request",
+                "confidence": 0.97,
+                "metadata_json": {"run_id": run_id, "urgency": "high"},
             },
         )
         self.assertEqual(status, 200, event)
@@ -86,8 +78,8 @@ class Objective65HumanAwareCollaborationNegotiationTest(unittest.TestCase):
                 "metadata_json": {"run_id": run_id},
                 "observations": [
                     {
-                        "object_label": "objective65-target",
-                        "confidence": 0.87,
+                        "object_label": "objective66-target",
+                        "confidence": 0.89,
                         "zone": zone,
                     }
                 ],
@@ -99,22 +91,22 @@ class Objective65HumanAwareCollaborationNegotiationTest(unittest.TestCase):
             "/memory",
             {
                 "memory_class": "external_signal",
-                "content": f"Objective65 external context {run_id}",
-                "summary": "External context for collaboration negotiation",
+                "content": f"Objective66 external context {run_id}",
+                "summary": "External context for objective66 negotiation learning",
                 "metadata_json": {"run_id": run_id},
             },
         )
         self.assertEqual(status, 200, memory)
 
-    def _set_human_signals(self, *, run_id: str, operator_present: bool, human_in_workspace: bool, shared_workspace_active: bool) -> None:
+    def _set_human_signals(self, *, run_id: str) -> None:
         status, payload = post_json(
             "/workspace/human-aware/signals",
             {
-                "actor": "objective65-test",
-                "reason": "objective65 focused setup",
-                "operator_present": operator_present,
-                "human_in_workspace": human_in_workspace,
-                "shared_workspace_active": shared_workspace_active,
+                "actor": "objective66-test",
+                "reason": "objective66 focused setup",
+                "operator_present": True,
+                "human_in_workspace": True,
+                "shared_workspace_active": True,
                 "metadata_json": {"run_id": run_id},
             },
         )
@@ -124,7 +116,7 @@ class Objective65HumanAwareCollaborationNegotiationTest(unittest.TestCase):
         status, payload = post_json(
             "/orchestration/build",
             {
-                "actor": "objective65-test",
+                "actor": "objective66-test",
                 "source": source,
                 "lookback_hours": 24,
                 "max_items_per_domain": 50,
@@ -155,72 +147,68 @@ class Objective65HumanAwareCollaborationNegotiationTest(unittest.TestCase):
                 return int(item.get("artifact_id", 0) or 0)
         return 0
 
-    def test_objective65_human_aware_collaboration_negotiation(self) -> None:
-        run_id = uuid4().hex[:8]
-        source = f"objective65-focused-{run_id}"
-        zone = f"obj65-zone-{run_id}"
-
-        self._reset_negotiation_patterns()
-        self._seed_cross_domain_inputs(run_id=run_id, zone=zone, urgent=True)
-        self._set_human_signals(
-            run_id=run_id,
-            operator_present=True,
-            human_in_workspace=True,
-            shared_workspace_active=True,
-        )
-
-        first_orchestration = self._build_orchestration(run_id=run_id, source=source)
-        self.assertIn(str(first_orchestration.get("status", "")), {"blocked_needs_input", "deferred"})
-
-        negotiation_id = self._negotiation_id_from_orchestration(first_orchestration)
-        self.assertGreater(negotiation_id, 0)
-
-        status, negotiation_payload = get_json(f"/collaboration/negotiations/{negotiation_id}")
-        self.assertEqual(status, 200, negotiation_payload)
-        negotiation = negotiation_payload.get("negotiation", {}) if isinstance(negotiation_payload, dict) else {}
-
-        options = negotiation.get("options_presented", []) if isinstance(negotiation.get("options_presented", []), list) else []
-        option_ids = {str(item.get("option_id", "")) for item in options if isinstance(item, dict)}
-        self.assertGreaterEqual(len(option_ids), 2)
-        self.assertIn("defer_action", option_ids)
-        self.assertIn("rescan_first", option_ids)
-
-        explainability = negotiation.get("explainability", {}) if isinstance(negotiation.get("explainability", {}), dict) else {}
-        self.assertTrue(bool(explainability.get("trigger_summary", [])))
-        self.assertTrue(bool(str(explainability.get("why_human_input_needed", "")).strip()))
-        self.assertTrue(bool(str(explainability.get("safe_fallback_if_unanswered", "")).strip()))
-
-        human_context_state = negotiation.get("human_context_state", {}) if isinstance(negotiation.get("human_context_state", {}), dict) else {}
-        signals = human_context_state.get("signals", {}) if isinstance(human_context_state.get("signals", {}), dict) else {}
-        self.assertTrue(bool(signals.get("shared_workspace_active", False)))
-
+    def _respond(self, negotiation_id: int, run_id: str) -> dict:
         status, response_payload = post_json(
             f"/collaboration/negotiations/{negotiation_id}/respond",
             {
-                "actor": "objective65-test",
+                "actor": "objective66-test",
                 "option_id": "rescan_first",
-                "reason": "prefer verification-first path",
+                "reason": "prefer validation-first negotiated path",
                 "metadata_json": {"run_id": run_id},
             },
         )
         self.assertEqual(status, 200, response_payload)
-        response_orchestration = response_payload.get("orchestration", {}) if isinstance(response_payload, dict) else {}
-        self.assertEqual(str(response_orchestration.get("status", "")), "replan_required")
+        return response_payload
 
-        fallback_orchestration = self._build_orchestration(run_id=run_id, source=source)
-        fallback_negotiation_id = self._negotiation_id_from_orchestration(fallback_orchestration)
-        self.assertGreater(fallback_negotiation_id, 0)
+    def test_objective66_negotiated_task_resolution_follow_through(self) -> None:
+        run_id = uuid4().hex[:8]
+        source = f"objective66-focused-{run_id}"
+        zone = f"obj66-zone-{run_id}"
 
-        status, fallback_payload = get_json(
-            f"/collaboration/negotiations/{fallback_negotiation_id}?apply_fallback=true&fallback_after_seconds=0"
-        )
-        self.assertEqual(status, 200, fallback_payload)
-        fallback_negotiation = fallback_payload.get("negotiation", {}) if isinstance(fallback_payload, dict) else {}
-        self.assertEqual(str(fallback_negotiation.get("status", "")), "fallback_applied")
+        self._reset_negotiation_patterns()
+        self._seed_cross_domain_inputs(run_id=run_id, zone=zone)
+        self._set_human_signals(run_id=run_id)
+
+        first = self._build_orchestration(run_id=run_id, source=source)
+        first_negotiation_id = self._negotiation_id_from_orchestration(first)
+        self.assertGreater(first_negotiation_id, 0)
+        first_response = self._respond(first_negotiation_id, run_id)
         self.assertEqual(
-            str(fallback_negotiation.get("selected_option_id", "")),
-            str(fallback_negotiation.get("default_safe_path", "")),
+            str((first_response.get("orchestration", {}) if isinstance(first_response, dict) else {}).get("status", "")),
+            "replan_required",
         )
+
+        second = self._build_orchestration(run_id=run_id, source=source)
+        second_negotiation_id = self._negotiation_id_from_orchestration(second)
+        self.assertGreater(second_negotiation_id, 0)
+        second_response = self._respond(second_negotiation_id, run_id)
+        self.assertEqual(
+            str((second_response.get("orchestration", {}) if isinstance(second_response, dict) else {}).get("status", "")),
+            "replan_required",
+        )
+
+        third = self._build_orchestration(run_id=run_id, source=source)
+        third_negotiation_id = self._negotiation_id_from_orchestration(third)
+        self.assertGreater(third_negotiation_id, 0)
+        self.assertEqual(str(third.get("status", "")), "replan_required")
+
+        status, negotiation_payload = get_json(f"/collaboration/negotiations/{third_negotiation_id}")
+        self.assertEqual(status, 200, negotiation_payload)
+        negotiation = negotiation_payload.get("negotiation", {}) if isinstance(negotiation_payload, dict) else {}
+        self.assertEqual(str(negotiation.get("status", "")), "resolved")
+        self.assertEqual(str(negotiation.get("resolution_status", "")), "reused_prior_pattern")
+        self.assertEqual(str(negotiation.get("selected_option_id", "")), "rescan_first")
+
+        applied_effect = negotiation.get("applied_effect", {}) if isinstance(negotiation.get("applied_effect", {}), dict) else {}
+        follow_through = applied_effect.get("follow_through", {}) if isinstance(applied_effect.get("follow_through", {}), dict) else {}
+        self.assertEqual(str(follow_through.get("selected_option_id", "")), "rescan_first")
+        self.assertIn("updated_horizon_plan", follow_through)
+
+        status, pref_payload = get_json("/preferences/collaboration_negotiation_patterns")
+        self.assertEqual(status, 200, pref_payload)
+        value = pref_payload.get("value", {}) if isinstance(pref_payload, dict) else {}
+        patterns = value.get("patterns", {}) if isinstance(value.get("patterns", {}), dict) else {}
+        self.assertTrue(bool(patterns))
 
 
 if __name__ == "__main__":
