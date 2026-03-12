@@ -5,10 +5,13 @@ from core.cross_domain_reasoning_service import to_cross_domain_reasoning_out
 from core.db import get_db
 from core.journal import write_journal
 from core.orchestration_service import (
+    acknowledge_collaboration_pattern,
     apply_due_collaboration_negotiation_fallbacks,
     build_cross_domain_task_orchestration,
     get_collaboration_negotiation,
+    get_collaboration_pattern,
     inspect_negotiation_preferences,
+    inspect_collaboration_patterns,
     get_task_orchestration,
     inspect_collaboration_state,
     list_collaboration_negotiations,
@@ -16,9 +19,10 @@ from core.orchestration_service import (
     list_task_orchestrations,
     set_collaboration_mode_preference,
     to_collaboration_negotiation_out,
+    to_collaboration_pattern_out,
     to_task_orchestration_out,
 )
-from core.schemas import CollaborationModePreferenceRequest, CollaborationNegotiationRespondRequest, CrossDomainTaskOrchestrationBuildRequest
+from core.schemas import CollaborationModePreferenceRequest, CollaborationNegotiationRespondRequest, CollaborationPatternAcknowledgeRequest, CrossDomainTaskOrchestrationBuildRequest
 
 router = APIRouter()
 
@@ -264,3 +268,72 @@ async def inspect_collaboration_preferences_endpoint(
         db=db,
     )
     return payload
+
+
+@router.get("/collaboration/patterns")
+async def inspect_collaboration_patterns_endpoint(
+    status: str = Query(default=""),
+    pattern_type: str = Query(default=""),
+    context_signature: str = Query(default=""),
+    limit: int = Query(default=50, ge=1, le=500),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    payload = await inspect_collaboration_patterns(
+        status=status,
+        pattern_type=pattern_type,
+        context_signature=context_signature,
+        limit=limit,
+        db=db,
+    )
+    return payload
+
+
+@router.get("/collaboration/patterns/{pattern_id}")
+async def get_collaboration_pattern_endpoint(
+    pattern_id: int,
+    context_signature: str = Query(default=""),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    row = await get_collaboration_pattern(pattern_id=pattern_id, db=db)
+    if not row:
+        raise HTTPException(status_code=404, detail="collaboration_pattern_not_found")
+    return {
+        "pattern": to_collaboration_pattern_out(row, context_signature=context_signature),
+    }
+
+
+@router.post("/collaboration/patterns/{pattern_id}/acknowledge")
+async def acknowledge_collaboration_pattern_endpoint(
+    pattern_id: int,
+    payload: CollaborationPatternAcknowledgeRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    try:
+        row = await acknowledge_collaboration_pattern(
+            pattern_id=pattern_id,
+            actor=payload.actor,
+            reason=payload.reason,
+            metadata_json=payload.metadata_json,
+            db=db,
+        )
+    except ValueError as exc:
+        if str(exc) == "collaboration_pattern_not_found":
+            raise HTTPException(status_code=404, detail="collaboration_pattern_not_found")
+        raise
+
+    await write_journal(
+        db,
+        actor=payload.actor,
+        action="collaboration_pattern_acknowledged",
+        target_type="workspace_collaboration_pattern",
+        target_id=str(row.id),
+        summary=f"Acknowledged collaboration pattern {row.id}",
+        metadata_json={
+            "reason": payload.reason,
+            **payload.metadata_json,
+        },
+    )
+    await db.commit()
+    return {
+        "pattern": to_collaboration_pattern_out(row),
+    }

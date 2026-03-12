@@ -7,7 +7,7 @@ from core.config import PROJECT_ROOT, settings
 
 CONTRACT_VERSION = "tod-mim-shared-contract-v1"
 MANIFEST_VERSION = "1"
-SCHEMA_VERSION = "2026-03-12-61"
+SCHEMA_VERSION = "2026-03-12-62"
 
 SIGNATURE_FILES = [
     "core/models.py",
@@ -147,6 +147,7 @@ SIGNATURE_FILES = [
     "docs/objective-66-negotiated-task-resolution-follow-through.md",
     "docs/objective-67-negotiation-memory-and-human-preference-consolidation.md",
     "docs/objective-68-negotiation-memory-decay-and-contextualization.md",
+    "docs/objective-69-negotiation-pattern-abstraction.md",
     "config/vision_policy.json",
     "config/voice_policy.json",
 ]
@@ -239,6 +240,7 @@ CAPABILITIES = [
     "negotiated_task_resolution_follow_through",
     "negotiation_memory_human_preference_consolidation",
     "negotiation_memory_decay_contextualization",
+    "negotiation_pattern_abstraction",
 ]
 
 RECENT_CHANGES = [
@@ -305,6 +307,7 @@ RECENT_CHANGES = [
     "Added Objective 66 negotiated task resolution follow-through with negotiation outcome memory, pattern-based reuse, and downstream follow-through propagation",
     "Added Objective 67 negotiation memory and human-preference consolidation with durable preference conversion, inspectable evidence, and safe revision behavior",
     "Added Objective 68 negotiation-memory decay and contextualization with freshness-aware confidence decay, context-scoped preference keys, and stale-pattern suppression",
+    "Added Objective 69 negotiation pattern abstraction with persistent collaboration concepts, rule-based extraction, bounded influence defaults, and inspectable pattern APIs",
 ]
 
 
@@ -487,6 +490,9 @@ def build_manifest() -> dict:
             "/collaboration/negotiations/{negotiation_id}",
             "/collaboration/negotiations/{negotiation_id}/respond",
             "/collaboration/preferences",
+            "/collaboration/patterns",
+            "/collaboration/patterns/{pattern_id}",
+            "/collaboration/patterns/{pattern_id}/acknowledge",
             "/strategy/goals/build",
             "/strategy/goals",
             "/strategy/persistence/goals/recompute",
@@ -1336,6 +1342,26 @@ def build_manifest() -> dict:
                 "applied_effect_json",
                 "answered_by",
                 "answered_at",
+                "metadata_json",
+                "created_at",
+            ],
+            "CollaborationPattern": [
+                "pattern_id",
+                "source",
+                "actor",
+                "pattern_type",
+                "context_signature",
+                "evidence_count",
+                "confidence",
+                "dominant_outcome",
+                "affected_domains",
+                "status",
+                "evidence_summary",
+                "explainability",
+                "influence_profile",
+                "acknowledged_by",
+                "acknowledged_at",
+                "last_observed_at",
                 "metadata_json",
                 "created_at",
             ],

@@ -988,6 +988,28 @@ class WorkspaceCollaborationNegotiation(Base, TimestampMixin):
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
+class WorkspaceCollaborationPattern(Base, TimestampMixin):
+    __tablename__ = "workspace_collaboration_patterns"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    source: Mapped[str] = mapped_column(String(80), default="objective69", index=True)
+    actor: Mapped[str] = mapped_column(String(120), default="workspace")
+    pattern_type: Mapped[str] = mapped_column(String(120), default="contextual_collaboration_preference", index=True)
+    context_signature: Mapped[str] = mapped_column(String(320), index=True)
+    evidence_count: Mapped[int] = mapped_column(default=0)
+    confidence: Mapped[float] = mapped_column(default=0.0)
+    dominant_outcome: Mapped[str] = mapped_column(String(120), default="", index=True)
+    affected_domains_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    status: Mapped[str] = mapped_column(String(40), default="learning", index=True)
+    evidence_summary: Mapped[str] = mapped_column(Text, default="")
+    explainability_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    influence_profile_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    acknowledged_by: Mapped[str] = mapped_column(String(120), default="")
+    acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_observed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
 class WorkspaceStrategyGoal(Base, TimestampMixin):
     __tablename__ = "workspace_strategy_goals"
 

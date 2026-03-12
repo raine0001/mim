@@ -1342,6 +1342,38 @@ class CollaborationNegotiationRespondRequest(BaseModel):
     metadata_json: dict = Field(default_factory=dict)
 
 
+class CollaborationPatternOut(BaseModel):
+    pattern_id: int
+    source: str
+    actor: str
+    pattern_type: str
+    context_signature: str
+    evidence_count: int
+    confidence: float
+    raw_confidence: float
+    dominant_outcome: str
+    affected_domains: list[str]
+    status: str
+    evidence_summary: str
+    freshness: str
+    decay_factor: float
+    age_days: float
+    context_match_score: float
+    explainability: dict
+    influence_profile: dict
+    acknowledged_by: str
+    acknowledged_at: datetime | None
+    last_observed_at: datetime | None
+    metadata_json: dict
+    created_at: datetime
+
+
+class CollaborationPatternAcknowledgeRequest(BaseModel):
+    actor: str = "operator"
+    reason: str = ""
+    metadata_json: dict = Field(default_factory=dict)
+
+
 class StrategyGoalPersistenceRecomputeRequest(BaseModel):
     actor: str = "workspace"
     source: str = "objective59"
