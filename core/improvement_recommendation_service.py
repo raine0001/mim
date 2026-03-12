@@ -6,7 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.improvement_service import generate_improvement_proposals, get_improvement_proposal, list_improvement_artifacts_for_proposal, list_improvement_proposals, to_improvement_artifact_out
-from core.models import WorkspaceImprovementArtifact, WorkspaceImprovementRecommendation
+from core.models import WorkspaceImprovementArtifact, WorkspaceImprovementBacklog, WorkspaceImprovementRecommendation
 from core.policy_experiment_service import run_policy_experiment
 
 
@@ -210,6 +210,24 @@ async def approve_improvement_recommendation(
         "approved_at": datetime.now(timezone.utc).isoformat(),
         **(metadata_json if isinstance(metadata_json, dict) else {}),
     }
+
+    backlog = (
+        await db.execute(
+            select(WorkspaceImprovementBacklog)
+            .where(WorkspaceImprovementBacklog.proposal_id == int(row.proposal_id))
+            .order_by(WorkspaceImprovementBacklog.id.desc())
+        )
+    ).scalars().first()
+    if backlog:
+        backlog.recommendation_id = int(row.id)
+        backlog.status = "approved"
+        backlog.metadata_json = {
+            **(backlog.metadata_json if isinstance(backlog.metadata_json, dict) else {}),
+            "recommendation_review": "approved",
+            "reviewed_by": actor,
+            "reviewed_at": datetime.now(timezone.utc).isoformat(),
+        }
+
     await db.flush()
     return artifact
 
@@ -234,6 +252,24 @@ async def reject_improvement_recommendation(
         "rejected_at": datetime.now(timezone.utc).isoformat(),
         **(metadata_json if isinstance(metadata_json, dict) else {}),
     }
+
+    backlog = (
+        await db.execute(
+            select(WorkspaceImprovementBacklog)
+            .where(WorkspaceImprovementBacklog.proposal_id == int(row.proposal_id))
+            .order_by(WorkspaceImprovementBacklog.id.desc())
+        )
+    ).scalars().first()
+    if backlog:
+        backlog.recommendation_id = int(row.id)
+        backlog.status = "rejected"
+        backlog.metadata_json = {
+            **(backlog.metadata_json if isinstance(backlog.metadata_json, dict) else {}),
+            "recommendation_review": "rejected",
+            "reviewed_by": actor,
+            "reviewed_at": datetime.now(timezone.utc).isoformat(),
+        }
+
     return row
 
 

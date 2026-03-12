@@ -59,11 +59,13 @@ This roadmap is the master sequencing document for MIM objective development. It
 - Objective 52 — Concept and pattern memory
 - Objective 53 — Multi-session developmental memory
 - Objective 54 — Self-guided improvement loop
+- Objective 55 — Improvement prioritization and governance
 
 ## Future Objectives
 
-- Objective 55+ — Cross-domain integration and cognition bridge
-- Objective 56+ — Experience graph operationalization at scale
+- Objective 56 — Cross-domain reasoning (workspace state + communication inputs + external information)
+- Objective 57 — Goal strategy engine (longer-term environment goals)
+- Objective 58 — Adaptive autonomy boundaries (experience-conditioned autonomy limits)
 
 ## Layered Objective Grouping (Canonical Sequence)
 

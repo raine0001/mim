@@ -2,6 +2,12 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.db import get_db
+from core.improvement_governance_service import (
+    get_improvement_backlog_item,
+    list_improvement_backlog,
+    refresh_improvement_backlog,
+    to_improvement_backlog_out,
+)
 from core.improvement_recommendation_service import (
     approve_improvement_recommendation,
     generate_improvement_recommendations,
@@ -23,6 +29,7 @@ from core.improvement_service import (
 )
 from core.journal import write_journal
 from core.schemas import (
+    ImprovementBacklogRefreshRequest,
     ImprovementProposalGenerateRequest,
     ImprovementProposalReviewRequest,
     ImprovementRecommendationGenerateRequest,
@@ -336,4 +343,92 @@ async def reject_improvement_recommendation_endpoint(
     return {
         "updated": True,
         "recommendation": await to_improvement_recommendation_out_resolved(row=row, db=db),
+    }
+
+
+@router.post("/improvement/backlog/refresh")
+async def refresh_improvement_backlog_endpoint(
+    payload: ImprovementBacklogRefreshRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    rows = await refresh_improvement_backlog(
+        actor=payload.actor,
+        source=payload.source,
+        lookback_hours=payload.lookback_hours,
+        min_occurrence_count=payload.min_occurrence_count,
+        max_items=payload.max_items,
+        auto_experiment_limit=payload.auto_experiment_limit,
+        metadata_json=payload.metadata_json,
+        db=db,
+    )
+    await write_journal(
+        db,
+        actor=payload.actor,
+        action="improvement_backlog_refreshed",
+        target_type="workspace_improvement_backlog",
+        target_id="backlog_batch",
+        summary=f"Refreshed improvement backlog with {len(rows)} item(s)",
+        metadata_json={
+            "source": payload.source,
+            "lookback_hours": payload.lookback_hours,
+            "min_occurrence_count": payload.min_occurrence_count,
+            "auto_experiment_limit": payload.auto_experiment_limit,
+            **payload.metadata_json,
+        },
+    )
+    await db.commit()
+    return {
+        "items": [to_improvement_backlog_out(item) for item in rows],
+    }
+
+
+@router.get("/improvement/backlog")
+async def list_improvement_backlog_endpoint(
+    refresh: bool = Query(default=False),
+    actor: str = Query(default="workspace"),
+    source: str = Query(default="objective55"),
+    lookback_hours: int = Query(default=24, ge=1, le=720),
+    min_occurrence_count: int = Query(default=2, ge=2, le=500),
+    auto_experiment_limit: int = Query(default=3, ge=0, le=50),
+    status: str = Query(default=""),
+    risk_level: str = Query(default=""),
+    limit: int = Query(default=50, ge=1, le=500),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    if refresh:
+        rows = await refresh_improvement_backlog(
+            actor=actor,
+            source=source,
+            lookback_hours=lookback_hours,
+            min_occurrence_count=min_occurrence_count,
+            max_items=limit,
+            auto_experiment_limit=auto_experiment_limit,
+            metadata_json={
+                "refresh_via_get": True,
+            },
+            db=db,
+        )
+        await db.commit()
+    else:
+        rows = await list_improvement_backlog(
+            db=db,
+            status=status,
+            risk_level=risk_level,
+            limit=limit,
+        )
+    return {
+        "backlog": [to_improvement_backlog_out(item) for item in rows],
+    }
+
+
+@router.get("/improvement/backlog/{improvement_id}")
+async def get_improvement_backlog_item_endpoint(
+    improvement_id: int,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    row = await get_improvement_backlog_item(backlog_id=improvement_id, db=db)
+    if not row:
+        raise HTTPException(status_code=404, detail="improvement_backlog_item_not_found")
+    return {
+        "backlog_item": to_improvement_backlog_out(row),
     }

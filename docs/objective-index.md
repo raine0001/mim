@@ -39,6 +39,7 @@ This registry indexes objective evidence and promotion artifacts so objective hi
 | 52 | Concept and Pattern Memory | promoted_verified | 2026-03-11-43 | objective-52 | core/concept_memory_service.py; core/routers/memory.py; core/models.py | docs/objective-52-promotion-readiness-report.md | docs/objective-52-prod-promotion-report.md | concept_pattern_memory |
 | 53 | Multi-Session Developmental Memory | promoted_verified | 2026-03-11-44 | objective-53 | core/development_memory_service.py; core/routers/memory.py; core/models.py | docs/objective-53-promotion-readiness-report.md | docs/objective-53-prod-promotion-report.md | multi_session_developmental_memory |
 | 54 | Self-Guided Improvement Loop | promoted_verified | 2026-03-11-45 | objective-54 | core/improvement_recommendation_service.py; core/routers/improvement.py; core/policy_experiment_service.py | docs/objective-54-promotion-readiness-report.md | docs/objective-54-prod-promotion-report.md | self_guided_improvement_loop |
+| 55 | Improvement Prioritization and Governance | promoted_verified | 2026-03-11-46 | objective-55 | core/improvement_governance_service.py; core/routers/improvement.py; core/models.py | docs/objective-55-promotion-readiness-report.md | docs/objective-55-prod-promotion-report.md | improvement_prioritization_governance |
 
 ## Notes
 

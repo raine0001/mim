@@ -834,3 +834,29 @@ class WorkspaceImprovementRecommendation(Base, TimestampMixin):
     reviewed_by: Mapped[str] = mapped_column(String(120), default="")
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class WorkspaceImprovementBacklog(Base, TimestampMixin):
+    __tablename__ = "workspace_improvement_backlog"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    source: Mapped[str] = mapped_column(String(80), default="objective55", index=True)
+    actor: Mapped[str] = mapped_column(String(120), default="workspace")
+    proposal_id: Mapped[int] = mapped_column(ForeignKey("workspace_improvement_proposals.id", ondelete="CASCADE"), index=True)
+    recommendation_id: Mapped[int | None] = mapped_column(ForeignKey("workspace_improvement_recommendations.id", ondelete="SET NULL"), nullable=True, index=True)
+    priority_score: Mapped[float] = mapped_column(default=0.0, index=True)
+    impact_estimate: Mapped[float] = mapped_column(default=0.0)
+    evidence_strength: Mapped[float] = mapped_column(default=0.0)
+    risk_level: Mapped[str] = mapped_column(String(40), default="medium", index=True)
+    risk_score: Mapped[float] = mapped_column(default=0.5)
+    affected_capabilities: Mapped[list[str]] = mapped_column(JSON, default=list)
+    operator_preference_weight: Mapped[float] = mapped_column(default=0.5)
+    proposal_type: Mapped[str] = mapped_column(String(120), default="", index=True)
+    evidence_count: Mapped[int] = mapped_column(default=0)
+    governance_decision: Mapped[str] = mapped_column(String(60), default="request_operator_review", index=True)
+    ranking_reason: Mapped[str] = mapped_column(Text, default="")
+    evidence_summary: Mapped[str] = mapped_column(Text, default="")
+    risk_summary: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(40), default="proposed", index=True)
+    reasoning_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)

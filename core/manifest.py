@@ -7,7 +7,7 @@ from core.config import PROJECT_ROOT, settings
 
 CONTRACT_VERSION = "tod-mim-shared-contract-v1"
 MANIFEST_VERSION = "1"
-SCHEMA_VERSION = "2026-03-11-45"
+SCHEMA_VERSION = "2026-03-11-46"
 
 SIGNATURE_FILES = [
     "core/models.py",
@@ -33,6 +33,7 @@ SIGNATURE_FILES = [
     "core/routers/policy_experiments.py",
     "core/routers/maintenance.py",
     "core/improvement_recommendation_service.py",
+    "core/improvement_governance_service.py",
     "docs/tod-mim-bridge.md",
     "docs/objective-21-unified-input-gateway.md",
     "docs/objective-22-mim-tod-execution-feedback-integration.md",
@@ -100,6 +101,8 @@ SIGNATURE_FILES = [
     "docs/objective-53-prod-promotion-report.md",
     "docs/objective-54-self-guided-improvement-loop.md",
     "docs/objective-54-promotion-readiness-report.md",
+    "docs/objective-55-improvement-prioritization-and-governance.md",
+    "docs/objective-55-promotion-readiness-report.md",
     "config/vision_policy.json",
     "config/voice_policy.json",
 ]
@@ -178,6 +181,7 @@ CAPABILITIES = [
     "concept_pattern_memory",
     "multi_session_developmental_memory",
     "self_guided_improvement_loop",
+    "improvement_prioritization_governance",
 ]
 
 RECENT_CHANGES = [
@@ -229,6 +233,7 @@ RECENT_CHANGES = [
     "Added Objective 52 concept and pattern memory with rule-based concept extraction, inspectable concept records, and concept-influenced strategy weighting",
     "Added Objective 53 multi-session developmental memory with cross-session pattern aggregation, inspectable development patterns, and self-improvement feedback influence",
     "Added Objective 54 self-guided improvement loop with pattern-triggered proposals, sandbox orchestration, standardized experiment metrics, and review-gated recommendations",
+    "Added Objective 55 improvement prioritization and governance with weighted backlog scoring, lifecycle state orchestration, and operator-visible ranking/risk reasoning",
 ]
 
 
@@ -392,6 +397,9 @@ def build_manifest() -> dict:
             "/improvement/recommendations/{recommendation_id}",
             "/improvement/recommendations/{recommendation_id}/approve",
             "/improvement/recommendations/{recommendation_id}/reject",
+            "/improvement/backlog/refresh",
+            "/improvement/backlog",
+            "/improvement/backlog/{improvement_id}",
             "/maintenance/cycle",
             "/maintenance/runs",
             "/maintenance/runs/{run_id}",
@@ -1032,6 +1040,27 @@ def build_manifest() -> dict:
                 "metadata_json",
                 "created_at",
                 "latest_artifact",
+            ],
+            "ImprovementBacklogItem": [
+                "improvement_id",
+                "proposal_id",
+                "recommendation_id",
+                "priority_score",
+                "proposal_type",
+                "evidence_count",
+                "risk_level",
+                "impact_estimate",
+                "evidence_strength",
+                "affected_capabilities",
+                "operator_preference_weight",
+                "governance_decision",
+                "status",
+                "why_ranked",
+                "evidence_summary",
+                "risk_summary",
+                "reasoning",
+                "metadata_json",
+                "created_at",
             ],
         },
     }
