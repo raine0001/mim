@@ -12,6 +12,7 @@ from core.models import (
     Goal,
     InputEvent,
     UserPreference,
+    WorkspaceCollaborationNegotiation,
     WorkspaceCrossDomainReasoningContext,
     WorkspaceInquiryQuestion,
     WorkspaceInterruptionEvent,
@@ -23,6 +24,14 @@ from core.models import (
 ORCHESTRATION_POLICIES = {"ask", "defer", "replan", "escalate"}
 COLLABORATION_MODES = {"autonomous", "assistive", "confirmation-first", "deferential"}
 COLLABORATION_POLICY_VERSION = "human-aware-collaboration-v1"
+NEGOTIATION_POLICY_VERSION = "human-aware-negotiation-v1"
+NEGOTIATION_OPTION_IDS = {
+    "continue_now",
+    "defer_action",
+    "rescan_first",
+    "speak_summary_only",
+    "request_confirmation_later",
+}
 
 
 def _bounded(value: float, *, lo: float = 0.0, hi: float = 1.0) -> float:
@@ -542,6 +551,196 @@ async def _get_or_create_collaboration_question(
     return question
 
 
+def _negotiation_triggers(
+    *,
+    collaboration_mode: str,
+    preferred_mode: str,
+    human_aware: dict,
+    communication_urgency: float,
+    task_kind: str,
+    action_risk_level: str,
+    collaboration_policy: dict,
+) -> list[dict]:
+    triggers: list[dict] = []
+    physical = str(task_kind or "mixed").strip().lower() == "physical"
+    risk = str(action_risk_level or "medium").strip().lower()
+    operator_present = bool(human_aware.get("operator_present", False))
+    shared_workspace_active = bool(human_aware.get("shared_workspace_active", False))
+
+    if collaboration_mode == "deferential":
+        triggers.append(
+            {
+                "trigger_type": "deferential_mode_requires_human_decision",
+                "reason": "collaboration mode is deferential",
+            }
+        )
+
+    if physical and preferred_mode == "autonomous" and communication_urgency >= 0.65:
+        triggers.append(
+            {
+                "trigger_type": "urgent_communication_vs_autonomous_physical_conflict",
+                "reason": "urgent communication conflicts with autonomous physical action",
+            }
+        )
+
+    if physical and shared_workspace_active and bool(collaboration_policy.get("defer_physical_action", False)):
+        triggers.append(
+            {
+                "trigger_type": "shared_workspace_suppressed_preferred_action",
+                "reason": "shared workspace suppresses preferred action",
+            }
+        )
+
+    if operator_present and risk in {"medium", "high"}:
+        triggers.append(
+            {
+                "trigger_type": "operator_presence_raises_decision_significance",
+                "reason": "operator presence raises decision significance",
+            }
+        )
+
+    return triggers
+
+
+def _negotiation_options(
+    *,
+    task_kind: str,
+    action_risk_level: str,
+    communication_urgency: float,
+    human_aware: dict,
+) -> list[dict]:
+    physical = str(task_kind or "mixed").strip().lower() == "physical"
+    risk = str(action_risk_level or "medium").strip().lower()
+    shared_workspace_active = bool(human_aware.get("shared_workspace_active", False))
+    operator_present = bool(human_aware.get("operator_present", False))
+
+    options: list[dict] = []
+    if not (physical and shared_workspace_active and risk in {"medium", "high"}):
+        options.append(
+            {
+                "option_id": "continue_now",
+                "label": "Continue now",
+                "description": "Continue the current orchestration path now with current safeguards.",
+                "effect": "set_orchestration_active",
+                "safety_class": "guarded_continue",
+            }
+        )
+
+    options.append(
+        {
+            "option_id": "defer_action",
+            "label": "Defer action",
+            "description": "Defer sensitive action until human-context constraints clear.",
+            "effect": "defer_orchestration",
+            "safety_class": "safe_default",
+        }
+    )
+
+    if physical:
+        options.append(
+            {
+                "option_id": "rescan_first",
+                "label": "Rescan first",
+                "description": "Rescan workspace context before deciding the next physical step.",
+                "effect": "require_replan_rescan",
+                "safety_class": "verification_first",
+            }
+        )
+
+    if communication_urgency >= 0.5:
+        options.append(
+            {
+                "option_id": "speak_summary_only",
+                "label": "Speak summary only",
+                "description": "Surface a concise update now and hold physical execution.",
+                "effect": "status_update_only",
+                "safety_class": "communication_first",
+            }
+        )
+
+    if operator_present:
+        options.append(
+            {
+                "option_id": "request_confirmation_later",
+                "label": "Request confirmation later",
+                "description": "Schedule explicit confirmation before final execution commitment.",
+                "effect": "confirmation_follow_up",
+                "safety_class": "human_confirmation",
+            }
+        )
+
+    deduped: list[dict] = []
+    seen: set[str] = set()
+    for option in options:
+        option_id = str(option.get("option_id", "")).strip()
+        if not option_id or option_id in seen:
+            continue
+        if option_id not in NEGOTIATION_OPTION_IDS:
+            continue
+        seen.add(option_id)
+        deduped.append(option)
+    return deduped
+
+
+def _default_safe_path(*, options: list[dict], task_kind: str, action_risk_level: str, human_aware: dict, communication_urgency: float) -> str:
+    option_ids = {str(item.get("option_id", "")).strip() for item in options if isinstance(item, dict)}
+    physical = str(task_kind or "mixed").strip().lower() == "physical"
+    risk = str(action_risk_level or "medium").strip().lower()
+
+    if physical and bool(human_aware.get("shared_workspace_active", False)) and "defer_action" in option_ids:
+        return "defer_action"
+    if physical and communication_urgency >= 0.65 and "speak_summary_only" in option_ids:
+        return "speak_summary_only"
+    if risk == "high" and "rescan_first" in option_ids:
+        return "rescan_first"
+    if "defer_action" in option_ids:
+        return "defer_action"
+    return "continue_now" if "continue_now" in option_ids else next(iter(option_ids), "defer_action")
+
+
+async def _create_collaboration_negotiation(
+    *,
+    actor: str,
+    source: str,
+    origin_context_id: int | None,
+    origin_goal_id: int | None,
+    origin_horizon_plan_id: int | None,
+    trigger: dict,
+    requested_decision: str,
+    options_presented: list[dict],
+    default_safe_path: str,
+    human_context_state: dict,
+    explainability: dict,
+    metadata_json: dict,
+    db: AsyncSession,
+) -> WorkspaceCollaborationNegotiation:
+    row = WorkspaceCollaborationNegotiation(
+        source=source,
+        actor=actor,
+        status="open",
+        resolution_status="pending",
+        origin_orchestration_id=None,
+        origin_context_id=origin_context_id,
+        origin_goal_id=origin_goal_id,
+        origin_horizon_plan_id=origin_horizon_plan_id,
+        trigger_type=str(trigger.get("trigger_type", "human_context_conflict")),
+        trigger_reason=str(trigger.get("reason", "human-aware collaboration negotiation required")),
+        requested_decision=requested_decision,
+        options_presented_json=options_presented,
+        default_safe_path=default_safe_path,
+        human_context_state_json=human_context_state if isinstance(human_context_state, dict) else {},
+        explainability_json=explainability if isinstance(explainability, dict) else {},
+        metadata_json={
+            **(metadata_json if isinstance(metadata_json, dict) else {}),
+            "objective65_human_aware_collaboration_negotiation": True,
+            "policy_version": NEGOTIATION_POLICY_VERSION,
+        },
+    )
+    db.add(row)
+    await db.flush()
+    return row
+
+
 async def build_cross_domain_task_orchestration(
     *,
     actor: str,
@@ -630,6 +829,7 @@ async def build_cross_domain_task_orchestration(
     linked_horizon_plan_ids: list[int] = []
     linked_improvement_proposal_ids: list[int] = []
     linked_inquiry_question_ids: list[int] = []
+    linked_negotiation_ids: list[int] = []
     downstream_artifacts: list[dict] = []
 
     status = "active"
@@ -703,6 +903,66 @@ async def build_cross_domain_task_orchestration(
         )
         if not bool(collaboration_policy.get("continue_allowed", False)):
             status = "blocked_needs_input"
+
+    negotiation_triggers = _negotiation_triggers(
+        collaboration_mode=collaboration_mode,
+        preferred_mode=preferred_mode,
+        human_aware=human_aware,
+        communication_urgency=communication_urgency,
+        task_kind=task_kind,
+        action_risk_level=action_risk_level,
+        collaboration_policy=collaboration_policy,
+    )
+    options_presented = _negotiation_options(
+        task_kind=task_kind,
+        action_risk_level=action_risk_level,
+        communication_urgency=communication_urgency,
+        human_aware=human_aware,
+    )
+    if len(options_presented) >= 2 and bool(human_aware.get("operator_present", False)):
+        negotiation_triggers.append(
+            {
+                "trigger_type": "multiple_safe_paths_human_preference_sensitive",
+                "reason": "multiple safe paths exist and human preference matters",
+            }
+        )
+
+    negotiation_payload: dict | None = None
+    if negotiation_triggers:
+        default_path = _default_safe_path(
+            options=options_presented,
+            task_kind=task_kind,
+            action_risk_level=action_risk_level,
+            human_aware=human_aware,
+            communication_urgency=communication_urgency,
+        )
+        negotiation_payload = {
+            "trigger": negotiation_triggers[0],
+            "requested_decision": "Select preferred safe collaboration path for current orchestration conflict.",
+            "options_presented": options_presented,
+            "default_safe_path": default_path,
+            "human_context_state": {
+                "collaboration_mode": collaboration_mode,
+                "preferred_mode": preferred_mode,
+                "task_kind": task_kind,
+                "action_risk_level": action_risk_level,
+                "communication_urgency": communication_urgency,
+                "interruption_likelihood": interruption_likelihood,
+                "operator_presence_score": operator_presence_score,
+                "signals": human_aware,
+            },
+            "explainability": {
+                "policy_version": NEGOTIATION_POLICY_VERSION,
+                "trigger_summary": [item.get("reason", "") for item in negotiation_triggers],
+                "why_human_input_needed": "Human-aware policy detected meaningful trade-offs among safe options requiring cooperative decision-making.",
+                "safe_fallback_if_unanswered": default_path,
+            },
+        }
+        if not bool(collaboration_policy.get("continue_allowed", False)):
+            if bool(collaboration_policy.get("defer_physical_action", False)):
+                status = "deferred"
+            else:
+                status = "blocked_needs_input"
 
     if not dependency_gaps and status == "active":
         if generate_goal:
@@ -824,6 +1084,7 @@ async def build_cross_domain_task_orchestration(
         "surface_concise_update": bool(collaboration_policy.get("surface_concise_update", False)),
         "continue_allowed": bool(collaboration_policy.get("continue_allowed", False)),
         "reprioritize_delta": float(collaboration_policy.get("reprioritize_delta", 0.0)),
+        "negotiation_required": bool(negotiation_payload),
     }
     collaboration_reasoning = {
         "policy_version": COLLABORATION_POLICY_VERSION,
@@ -861,11 +1122,44 @@ async def build_cross_domain_task_orchestration(
             **(metadata_json if isinstance(metadata_json, dict) else {}),
             "objective63_cross_domain_task_orchestration": True,
             "objective64_human_aware_cross_domain_collaboration": True,
+            "objective65_human_aware_collaboration_negotiation": bool(negotiation_payload),
             "created_at_utc": datetime.now(timezone.utc).isoformat(),
         },
     )
     db.add(row)
     await db.flush()
+
+    if negotiation_payload:
+        negotiation = await _create_collaboration_negotiation(
+            actor=actor,
+            source=source,
+            origin_context_id=int(context.id) if context else None,
+            origin_goal_id=(int(linked_goal_ids[0]) if linked_goal_ids else None),
+            origin_horizon_plan_id=(int(linked_horizon_plan_ids[0]) if linked_horizon_plan_ids else None),
+            trigger=negotiation_payload.get("trigger", {}),
+            requested_decision=str(negotiation_payload.get("requested_decision", "")),
+            options_presented=negotiation_payload.get("options_presented", []),
+            default_safe_path=str(negotiation_payload.get("default_safe_path", "defer_action")),
+            human_context_state=negotiation_payload.get("human_context_state", {}),
+            explainability=negotiation_payload.get("explainability", {}),
+            metadata_json=metadata_json,
+            db=db,
+        )
+        negotiation.origin_orchestration_id = int(row.id)
+        linked_negotiation_ids.append(int(negotiation.id))
+        row.downstream_artifacts_json = [
+            *(row.downstream_artifacts_json if isinstance(row.downstream_artifacts_json, list) else []),
+            {
+                "artifact_type": "collaboration_negotiation",
+                "artifact_id": int(negotiation.id),
+                "status": str(negotiation.status or "open"),
+                "default_safe_path": str(negotiation.default_safe_path or "defer_action"),
+            },
+        ]
+        row.metadata_json = {
+            **(row.metadata_json if isinstance(row.metadata_json, dict) else {}),
+            "linked_collaboration_negotiation_ids": linked_negotiation_ids,
+        }
     return row, context
 
 
@@ -928,6 +1222,214 @@ def to_task_orchestration_out(row: WorkspaceTaskOrchestration) -> dict:
         "metadata_json": row.metadata_json if isinstance(row.metadata_json, dict) else {},
         "created_at": row.created_at,
     }
+
+
+def to_collaboration_negotiation_out(row: WorkspaceCollaborationNegotiation) -> dict:
+    return {
+        "negotiation_id": int(row.id),
+        "source": row.source,
+        "actor": row.actor,
+        "status": row.status,
+        "resolution_status": row.resolution_status,
+        "origin_orchestration_id": int(row.origin_orchestration_id) if row.origin_orchestration_id is not None else None,
+        "origin_context_id": int(row.origin_context_id) if row.origin_context_id is not None else None,
+        "origin_goal_id": int(row.origin_goal_id) if row.origin_goal_id is not None else None,
+        "origin_horizon_plan_id": int(row.origin_horizon_plan_id) if row.origin_horizon_plan_id is not None else None,
+        "trigger_type": row.trigger_type,
+        "trigger_reason": row.trigger_reason,
+        "requested_decision": row.requested_decision,
+        "options_presented": row.options_presented_json if isinstance(row.options_presented_json, list) else [],
+        "default_safe_path": row.default_safe_path,
+        "selected_option_id": row.selected_option_id,
+        "selected_option_label": row.selected_option_label,
+        "human_context_state": row.human_context_state_json if isinstance(row.human_context_state_json, dict) else {},
+        "explainability": row.explainability_json if isinstance(row.explainability_json, dict) else {},
+        "applied_effect": row.applied_effect_json if isinstance(row.applied_effect_json, dict) else {},
+        "resolved_by": row.resolved_by,
+        "resolved_at": row.resolved_at,
+        "metadata_json": row.metadata_json if isinstance(row.metadata_json, dict) else {},
+        "created_at": row.created_at,
+    }
+
+
+async def list_collaboration_negotiations(
+    *,
+    db: AsyncSession,
+    status: str = "",
+    source: str = "",
+    limit: int = 50,
+) -> list[WorkspaceCollaborationNegotiation]:
+    rows = (
+        await db.execute(
+            select(WorkspaceCollaborationNegotiation)
+            .order_by(WorkspaceCollaborationNegotiation.id.desc())
+        )
+    ).scalars().all()
+
+    filtered = rows
+    if status.strip():
+        requested_status = status.strip().lower()
+        filtered = [item for item in filtered if str(item.status or "").strip().lower() == requested_status]
+    if source.strip():
+        requested_source = source.strip().lower()
+        filtered = [item for item in filtered if str(item.source or "").strip().lower() == requested_source]
+
+    return filtered[: max(1, min(500, int(limit)))]
+
+
+async def get_collaboration_negotiation(*, negotiation_id: int, db: AsyncSession) -> WorkspaceCollaborationNegotiation | None:
+    return (
+        await db.execute(
+            select(WorkspaceCollaborationNegotiation).where(WorkspaceCollaborationNegotiation.id == negotiation_id)
+        )
+    ).scalars().first()
+
+
+def _option_by_id(*, options: list[dict], option_id: str) -> dict | None:
+    normalized = str(option_id or "").strip()
+    for item in options:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("option_id", "")).strip() == normalized:
+            return item
+    return None
+
+
+def _apply_negotiation_effect(*, negotiation: WorkspaceCollaborationNegotiation, orchestration: WorkspaceTaskOrchestration | None, option: dict) -> dict:
+    option_id = str(option.get("option_id", "")).strip()
+    effect = str(option.get("effect", "")).strip()
+    result: dict = {
+        "option_id": option_id,
+        "effect": effect,
+        "updated_orchestration": bool(orchestration),
+    }
+    if not orchestration:
+        return result
+
+    modifiers = orchestration.human_context_modifiers_json if isinstance(orchestration.human_context_modifiers_json, dict) else {}
+    active_modifiers = modifiers.get("active_modifiers", []) if isinstance(modifiers.get("active_modifiers", []), list) else []
+
+    if option_id == "continue_now":
+        orchestration.status = "active"
+    elif option_id == "defer_action":
+        orchestration.status = "deferred"
+    elif option_id == "rescan_first":
+        orchestration.status = "replan_required"
+        active_modifiers.append("negotiated_rescan_first")
+    elif option_id == "speak_summary_only":
+        orchestration.status = "active"
+        active_modifiers.append("negotiated_summary_only")
+        modifiers["surface_concise_update"] = True
+        modifiers["defer_physical_action"] = True
+    elif option_id == "request_confirmation_later":
+        orchestration.status = "blocked_needs_input"
+        active_modifiers.append("negotiated_confirmation_follow_up")
+
+    modifiers["active_modifiers"] = sorted(list({str(item) for item in active_modifiers if str(item).strip()}))
+    modifiers["negotiation_required"] = False
+    modifiers["negotiation_selected_option"] = option_id
+    orchestration.human_context_modifiers_json = modifiers
+    result["orchestration_status"] = orchestration.status
+    return result
+
+
+async def respond_collaboration_negotiation(
+    *,
+    negotiation_id: int,
+    actor: str,
+    option_id: str,
+    reason: str,
+    metadata_json: dict,
+    db: AsyncSession,
+) -> tuple[WorkspaceCollaborationNegotiation, WorkspaceTaskOrchestration | None]:
+    negotiation = await get_collaboration_negotiation(negotiation_id=negotiation_id, db=db)
+    if not negotiation:
+        raise ValueError("negotiation_not_found")
+    if str(negotiation.status or "").strip().lower() != "open":
+        raise ValueError("negotiation_not_open")
+
+    option = _option_by_id(
+        options=negotiation.options_presented_json if isinstance(negotiation.options_presented_json, list) else [],
+        option_id=option_id,
+    )
+    if not option:
+        raise ValueError("invalid_negotiation_option")
+
+    orchestration = None
+    if negotiation.origin_orchestration_id is not None:
+        orchestration = await get_task_orchestration(orchestration_id=int(negotiation.origin_orchestration_id), db=db)
+
+    applied_effect = _apply_negotiation_effect(negotiation=negotiation, orchestration=orchestration, option=option)
+    negotiation.status = "resolved"
+    negotiation.resolution_status = "operator_selected"
+    negotiation.selected_option_id = str(option.get("option_id", "")).strip()
+    negotiation.selected_option_label = str(option.get("label", "")).strip()
+    negotiation.resolved_by = actor
+    negotiation.resolved_at = datetime.now(timezone.utc)
+    negotiation.applied_effect_json = {
+        **(applied_effect if isinstance(applied_effect, dict) else {}),
+        "reason": reason,
+    }
+    negotiation.metadata_json = {
+        **(negotiation.metadata_json if isinstance(negotiation.metadata_json, dict) else {}),
+        "response": {
+            "actor": actor,
+            "reason": reason,
+            "metadata_json": metadata_json if isinstance(metadata_json, dict) else {},
+            "responded_at": datetime.now(timezone.utc).isoformat(),
+        },
+    }
+    await db.flush()
+    return negotiation, orchestration
+
+
+async def apply_due_collaboration_negotiation_fallbacks(
+    *,
+    fallback_after_seconds: int,
+    db: AsyncSession,
+) -> list[WorkspaceCollaborationNegotiation]:
+    threshold = max(0, int(fallback_after_seconds))
+    now = datetime.now(timezone.utc)
+    rows = (
+        await db.execute(
+            select(WorkspaceCollaborationNegotiation)
+            .where(WorkspaceCollaborationNegotiation.status == "open")
+            .order_by(WorkspaceCollaborationNegotiation.id.asc())
+            .limit(200)
+        )
+    ).scalars().all()
+
+    applied: list[WorkspaceCollaborationNegotiation] = []
+    for row in rows:
+        age_seconds = max((now - row.created_at).total_seconds(), 0.0)
+        if age_seconds < threshold:
+            continue
+        option = _option_by_id(
+            options=row.options_presented_json if isinstance(row.options_presented_json, list) else [],
+            option_id=str(row.default_safe_path or "").strip(),
+        )
+        if not option:
+            continue
+
+        orchestration = None
+        if row.origin_orchestration_id is not None:
+            orchestration = await get_task_orchestration(orchestration_id=int(row.origin_orchestration_id), db=db)
+        applied_effect = _apply_negotiation_effect(negotiation=row, orchestration=orchestration, option=option)
+        row.status = "fallback_applied"
+        row.resolution_status = "fallback_safe_default"
+        row.selected_option_id = str(option.get("option_id", "")).strip()
+        row.selected_option_label = str(option.get("label", "")).strip()
+        row.resolved_by = "system"
+        row.resolved_at = now
+        row.applied_effect_json = {
+            **(applied_effect if isinstance(applied_effect, dict) else {}),
+            "fallback": True,
+        }
+        applied.append(row)
+
+    if applied:
+        await db.flush()
+    return applied
 
 
 async def inspect_collaboration_state(

@@ -5,14 +5,19 @@ from core.cross_domain_reasoning_service import to_cross_domain_reasoning_out
 from core.db import get_db
 from core.journal import write_journal
 from core.orchestration_service import (
+    apply_due_collaboration_negotiation_fallbacks,
     build_cross_domain_task_orchestration,
+    get_collaboration_negotiation,
     get_task_orchestration,
     inspect_collaboration_state,
+    list_collaboration_negotiations,
+    respond_collaboration_negotiation,
     list_task_orchestrations,
     set_collaboration_mode_preference,
+    to_collaboration_negotiation_out,
     to_task_orchestration_out,
 )
-from core.schemas import CollaborationModePreferenceRequest, CrossDomainTaskOrchestrationBuildRequest
+from core.schemas import CollaborationModePreferenceRequest, CollaborationNegotiationRespondRequest, CrossDomainTaskOrchestrationBuildRequest
 
 router = APIRouter()
 
@@ -152,4 +157,95 @@ async def set_orchestration_collaboration_mode_endpoint(
         "updated": True,
         "preference_id": int(row.id),
         "mode": payload.mode,
+    }
+
+
+@router.get("/collaboration/negotiations")
+async def list_collaboration_negotiations_endpoint(
+    status: str = Query(default=""),
+    source: str = Query(default=""),
+    limit: int = Query(default=50, ge=1, le=500),
+    apply_fallback: bool = Query(default=False),
+    fallback_after_seconds: int = Query(default=300, ge=0, le=86400),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    if apply_fallback:
+        await apply_due_collaboration_negotiation_fallbacks(
+            fallback_after_seconds=fallback_after_seconds,
+            db=db,
+        )
+        await db.commit()
+    rows = await list_collaboration_negotiations(
+        db=db,
+        status=status,
+        source=source,
+        limit=limit,
+    )
+    return {
+        "negotiations": [to_collaboration_negotiation_out(item) for item in rows],
+    }
+
+
+@router.get("/collaboration/negotiations/{negotiation_id}")
+async def get_collaboration_negotiation_endpoint(
+    negotiation_id: int,
+    apply_fallback: bool = Query(default=False),
+    fallback_after_seconds: int = Query(default=300, ge=0, le=86400),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    if apply_fallback:
+        await apply_due_collaboration_negotiation_fallbacks(
+            fallback_after_seconds=fallback_after_seconds,
+            db=db,
+        )
+        await db.commit()
+    row = await get_collaboration_negotiation(negotiation_id=negotiation_id, db=db)
+    if not row:
+        raise HTTPException(status_code=404, detail="collaboration_negotiation_not_found")
+    return {
+        "negotiation": to_collaboration_negotiation_out(row),
+    }
+
+
+@router.post("/collaboration/negotiations/{negotiation_id}/respond")
+async def respond_collaboration_negotiation_endpoint(
+    negotiation_id: int,
+    payload: CollaborationNegotiationRespondRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    try:
+        negotiation, orchestration = await respond_collaboration_negotiation(
+            negotiation_id=negotiation_id,
+            actor=payload.actor,
+            option_id=payload.option_id,
+            reason=payload.reason,
+            metadata_json=payload.metadata_json,
+            db=db,
+        )
+    except ValueError as exc:
+        error_code = str(exc)
+        if error_code in {"negotiation_not_found"}:
+            raise HTTPException(status_code=404, detail=error_code)
+        if error_code in {"negotiation_not_open", "invalid_negotiation_option"}:
+            raise HTTPException(status_code=422, detail=error_code)
+        raise
+
+    await write_journal(
+        db,
+        actor=payload.actor,
+        action="collaboration_negotiation_responded",
+        target_type="workspace_collaboration_negotiation",
+        target_id=str(negotiation.id),
+        summary=f"Responded to collaboration negotiation {negotiation.id} with {payload.option_id}",
+        metadata_json={
+            "option_id": payload.option_id,
+            "reason": payload.reason,
+            "origin_orchestration_id": negotiation.origin_orchestration_id,
+            **payload.metadata_json,
+        },
+    )
+    await db.commit()
+    return {
+        "negotiation": to_collaboration_negotiation_out(negotiation),
+        "orchestration": to_task_orchestration_out(orchestration) if orchestration else None,
     }

@@ -1289,6 +1289,59 @@ class CollaborationStateOut(BaseModel):
     reasoning: dict
 
 
+class CollaborationNegotiationOptionOut(BaseModel):
+    option_id: Literal[
+        "continue_now",
+        "defer_action",
+        "rescan_first",
+        "speak_summary_only",
+        "request_confirmation_later",
+    ]
+    label: str
+    description: str
+    effect: str
+    safety_class: str
+
+
+class CollaborationNegotiationOut(BaseModel):
+    negotiation_id: int
+    source: str
+    actor: str
+    status: str
+    resolution_status: str
+    origin_orchestration_id: int | None
+    origin_context_id: int | None
+    origin_goal_id: int | None
+    origin_horizon_plan_id: int | None
+    trigger_type: str
+    trigger_reason: str
+    requested_decision: str
+    options_presented: list[CollaborationNegotiationOptionOut]
+    default_safe_path: str
+    selected_option_id: str
+    selected_option_label: str
+    human_context_state: dict
+    explainability: dict
+    applied_effect: dict
+    resolved_by: str
+    resolved_at: datetime | None
+    metadata_json: dict
+    created_at: datetime
+
+
+class CollaborationNegotiationRespondRequest(BaseModel):
+    actor: str = "operator"
+    option_id: Literal[
+        "continue_now",
+        "defer_action",
+        "rescan_first",
+        "speak_summary_only",
+        "request_confirmation_later",
+    ]
+    reason: str = ""
+    metadata_json: dict = Field(default_factory=dict)
+
+
 class StrategyGoalPersistenceRecomputeRequest(BaseModel):
     actor: str = "workspace"
     source: str = "objective59"

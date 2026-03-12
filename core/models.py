@@ -961,6 +961,33 @@ class WorkspaceTaskOrchestration(Base, TimestampMixin):
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
+class WorkspaceCollaborationNegotiation(Base, TimestampMixin):
+    __tablename__ = "workspace_collaboration_negotiations"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    source: Mapped[str] = mapped_column(String(80), default="objective65", index=True)
+    actor: Mapped[str] = mapped_column(String(120), default="workspace")
+    status: Mapped[str] = mapped_column(String(40), default="open", index=True)
+    resolution_status: Mapped[str] = mapped_column(String(40), default="pending", index=True)
+    origin_orchestration_id: Mapped[int | None] = mapped_column(ForeignKey("workspace_task_orchestrations.id", ondelete="SET NULL"), nullable=True, index=True)
+    origin_context_id: Mapped[int | None] = mapped_column(ForeignKey("workspace_cross_domain_reasoning_contexts.id", ondelete="SET NULL"), nullable=True, index=True)
+    origin_goal_id: Mapped[int | None] = mapped_column(ForeignKey("goals.id", ondelete="SET NULL"), nullable=True, index=True)
+    origin_horizon_plan_id: Mapped[int | None] = mapped_column(ForeignKey("workspace_horizon_plans.id", ondelete="SET NULL"), nullable=True, index=True)
+    trigger_type: Mapped[str] = mapped_column(String(120), default="human_context_conflict", index=True)
+    trigger_reason: Mapped[str] = mapped_column(Text, default="")
+    requested_decision: Mapped[str] = mapped_column(Text, default="")
+    options_presented_json: Mapped[list[dict]] = mapped_column(JSON, default=list)
+    default_safe_path: Mapped[str] = mapped_column(String(120), default="defer_action")
+    selected_option_id: Mapped[str] = mapped_column(String(120), default="")
+    selected_option_label: Mapped[str] = mapped_column(String(200), default="")
+    human_context_state_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    explainability_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    applied_effect_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    resolved_by: Mapped[str] = mapped_column(String(120), default="")
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
 class WorkspaceStrategyGoal(Base, TimestampMixin):
     __tablename__ = "workspace_strategy_goals"
 

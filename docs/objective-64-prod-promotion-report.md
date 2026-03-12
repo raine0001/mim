@@ -39,6 +39,21 @@ Release Tag: objective-64
 
 Result: PASS (`1/1`)
 
+### Collaboration State Snapshot (Production)
+
+- Endpoint: `/orchestration/collaboration/state`
+- Snapshot Shape: `{"collaboration": {...}}`
+- Policy Version: `human-aware-collaboration-v1`
+- Collaboration Mode: `deferential`
+- Active Modifiers:
+	- `urgent_communication_reprioritize`
+	- `deferential_shared_workspace_suppression`
+- Reasoning Mode Source: `reasoning.mode_reason=shared_workspace_active`
+- Human-Aware Signal Highlights:
+	- `operator_present=true`
+	- `human_in_workspace=true`
+	- `shared_workspace_active=true`
+
 ## Status
 
 Objective 64 is promoted and production-verified.
