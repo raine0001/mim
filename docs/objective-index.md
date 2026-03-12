@@ -56,7 +56,7 @@ This registry indexes objective evidence and promotion artifacts so objective hi
 | 68 | Negotiation Memory Decay and Contextualization | promoted_verified | 2026-03-12-61 | objective-68 | core/orchestration_service.py; core/preferences.py; core/manifest.py | docs/objective-68-promotion-readiness-report.md | docs/objective-68-prod-promotion-report.md | negotiation_memory_decay_contextualization |
 | 69 | Negotiation Pattern Abstraction | promoted_verified | 2026-03-12-62 | objective-69 | core/models.py; core/orchestration_service.py; core/routers/orchestration.py; core/schemas.py; core/manifest.py | docs/objective-69-promotion-readiness-report.md | docs/objective-69-prod-promotion-report.md | negotiation_pattern_abstraction |
 | 70 | Collaboration Strategy Profiles | promoted_verified | 2026-03-12-63 | objective-70 | core/models.py; core/orchestration_service.py; core/routers/orchestration.py; core/schemas.py; core/manifest.py | docs/objective-70-promotion-readiness-report.md | docs/objective-70-prod-promotion-report.md | collaboration_strategy_profiles |
-| 71 | Unified State Bus | implemented | 2026-03-12-64 | pending | core/models.py; core/state_bus_service.py; core/routers/state_bus.py; core/routers/orchestration.py; core/schemas.py; core/manifest.py | pending | pending | unified_state_bus |
+| 71 | Unified State Bus | promoted_verified | 2026-03-12-64 | objective-71 | core/models.py; core/state_bus_service.py; core/routers/state_bus.py; core/routers/orchestration.py; core/schemas.py; core/manifest.py | docs/objective-71-promotion-readiness-report.md | docs/objective-71-prod-promotion-report.md | unified_state_bus |
 
 ## Notes
 
