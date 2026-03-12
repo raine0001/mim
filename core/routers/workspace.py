@@ -60,6 +60,7 @@ MONITORING_DEFAULT_MAX_SCAN_RATE = 6
 MONITORING_CONFIDENCE_DELTA_THRESHOLD = 0.02
 MONITORING_DELTA_HISTORY_SECONDS = 30
 MONITORING_DELTA_HISTORY_MAX_ITEMS = 200
+MONITORING_AUTONOMY_STEP_TIMEOUT_SECONDS = 0.25
 CHAIN_DEFAULT_STEP_POLICY = {
     "terminal_statuses": ["accepted", "rejected"],
     "failure_statuses": ["rejected"],
@@ -1837,6 +1838,14 @@ def _snapshot_from_objects(rows: list[WorkspaceObjectMemory]) -> dict[str, dict]
     }
 
 
+def _as_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
 def _compute_object_deltas(*, previous_snapshot: dict, current_rows: list[WorkspaceObjectMemory]) -> list[dict]:
     deltas: list[dict] = []
     current_snapshot = _snapshot_from_objects(current_rows)
@@ -1994,6 +2003,8 @@ def _monitoring_should_scan(
     objects: list[WorkspaceObjectMemory],
     now: datetime,
 ) -> tuple[bool, str]:
+    last_started_at = _as_utc(row.last_started_at)
+    last_scan_at = _as_utc(row.last_scan_at)
     metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
     recent_scans_raw = metadata.get("recent_scans", [])
     recent_scans: list[datetime] = []
@@ -2010,7 +2021,7 @@ def _monitoring_should_scan(
                 parsed = parsed.replace(tzinfo=timezone.utc)
             else:
                 parsed = parsed.astimezone(timezone.utc)
-            if row.last_started_at and parsed < row.last_started_at:
+            if last_started_at and parsed < last_started_at:
                 continue
             if (now - parsed).total_seconds() <= 60:
                 recent_scans.append(parsed)
@@ -2018,7 +2029,7 @@ def _monitoring_should_scan(
     if len(recent_scans) >= max(1, int(row.max_scan_rate)):
         return False, "max_scan_rate"
 
-    if row.last_scan_at and (now - row.last_scan_at).total_seconds() < max(0, int(row.cooldown_seconds)):
+    if last_scan_at and (now - last_scan_at).total_seconds() < max(0, int(row.cooldown_seconds)):
         return False, "cooldown"
 
     if row.scan_trigger_mode == "freshness":
@@ -2032,18 +2043,30 @@ def _monitoring_should_scan(
                 return True, "freshness_drop"
         return False, "freshness_not_due"
 
-    if not row.last_scan_at:
+    if not last_scan_at:
         return True, "interval_bootstrap"
-    if (now - row.last_scan_at).total_seconds() >= max(1, int(row.interval_seconds)):
+    if (now - last_scan_at).total_seconds() >= max(1, int(row.interval_seconds)):
         return True, "interval_tick"
     return False, "interval_wait"
 
 
+def _monitoring_priority_zones(row: WorkspaceMonitoringState) -> list[str]:
+    zones: list[str] = []
+    raw = row.priority_zones if isinstance(row.priority_zones, list) else []
+    for item in raw:
+        value = str(item).strip()
+        if value:
+            zones.append(value)
+    return zones
+
+
 async def _run_monitoring_scan_cycle(*, db: AsyncSession, row: WorkspaceMonitoringState, reason: str) -> None:
     now = datetime.now(timezone.utc)
-    objects = (
-        await db.execute(select(WorkspaceObjectMemory).order_by(WorkspaceObjectMemory.id.asc()))
-    ).scalars().all()
+    stmt = select(WorkspaceObjectMemory).order_by(WorkspaceObjectMemory.id.asc())
+    priority_zones = _monitoring_priority_zones(row)
+    if priority_zones:
+        stmt = stmt.where(WorkspaceObjectMemory.zone.in_(priority_zones))
+    objects = (await db.execute(stmt)).scalars().all()
 
     previous_snapshot = row.last_snapshot_json if isinstance(row.last_snapshot_json, dict) else {}
     deltas = _compute_object_deltas(previous_snapshot=previous_snapshot, current_rows=objects)
@@ -2088,6 +2111,7 @@ async def _run_monitoring_scan_cycle(*, db: AsyncSession, row: WorkspaceMonitori
     recent_scan_strings = [item for item in recent_scans_raw if isinstance(item, str)] if isinstance(recent_scans_raw, list) else []
     recent_scan_strings.append(now.isoformat())
     filtered_recent: list[str] = []
+    last_started_at = _as_utc(row.last_started_at)
     for item in recent_scan_strings:
         candidate = item.replace("Z", "+00:00")
         try:
@@ -2098,7 +2122,7 @@ async def _run_monitoring_scan_cycle(*, db: AsyncSession, row: WorkspaceMonitori
             parsed = parsed.replace(tzinfo=timezone.utc)
         else:
             parsed = parsed.astimezone(timezone.utc)
-        if row.last_started_at and parsed < row.last_started_at:
+        if last_started_at and parsed < last_started_at:
             continue
         if (now - parsed).total_seconds() <= 60:
             filtered_recent.append(item)
@@ -2177,21 +2201,18 @@ async def _workspace_monitoring_loop() -> None:
                     await db.commit()
                     return
 
-                objects = (await db.execute(select(WorkspaceObjectMemory))).scalars().all()
+                objects_stmt = select(WorkspaceObjectMemory)
+                priority_zones = _monitoring_priority_zones(row)
+                if priority_zones:
+                    objects_stmt = objects_stmt.where(WorkspaceObjectMemory.zone.in_(priority_zones))
+                objects = (await db.execute(objects_stmt)).scalars().all()
                 should_scan, reason = _monitoring_should_scan(row=row, objects=objects, now=datetime.now(timezone.utc))
                 if should_scan:
                     await _run_monitoring_scan_cycle(db=db, row=row, reason=reason)
                 else:
                     row.runtime_status = "running"
-                try:
-                    await _run_autonomy_controller_step(
-                        db=db,
-                        actor="workspace-autonomy-loop",
-                        reason="objective41_monitoring_loop_tick",
-                    )
-                except Exception:
-                    pass
                 await db.commit()
+                await _run_monitoring_autonomy_controller_step()
         except asyncio.CancelledError:
             return
         except Exception:
@@ -2215,6 +2236,22 @@ async def _stop_monitoring_runtime() -> None:
         except asyncio.CancelledError:
             pass
     MONITORING_RUNTIME.task = None
+
+
+async def _run_monitoring_autonomy_controller_step() -> None:
+    async with SessionLocal() as autonomy_db:
+        try:
+            await asyncio.wait_for(
+                _run_autonomy_controller_step(
+                    db=autonomy_db,
+                    actor="workspace-autonomy-loop",
+                    reason="objective41_monitoring_loop_tick",
+                ),
+                timeout=MONITORING_AUTONOMY_STEP_TIMEOUT_SECONDS,
+            )
+            await autonomy_db.commit()
+        except Exception:
+            await autonomy_db.rollback()
 
 
 async def initialize_workspace_monitoring_runtime() -> None:
@@ -2986,6 +3023,7 @@ async def start_workspace_monitoring(
     payload: WorkspaceMonitoringStartRequest,
     db: AsyncSession = Depends(get_db),
 ) -> dict:
+    await _stop_monitoring_runtime()
     row = await _get_or_create_monitoring_state(db)
     existing_metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
     row.desired_running = True
@@ -3001,6 +3039,7 @@ async def start_workspace_monitoring(
     row.scan_count = 0
     row.last_deltas_json = []
     row.last_proposal_ids = []
+    row.last_snapshot_json = {}
     row.last_started_at = datetime.now(timezone.utc)
     row.metadata_json = {
         **existing_metadata,
