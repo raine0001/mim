@@ -1454,6 +1454,62 @@ class StateBusSnapshotOut(BaseModel):
     created_at: datetime
 
 
+class StateBusConsumerRegisterRequest(BaseModel):
+    actor: str = "workspace"
+    source: str = "objective72"
+    status: Literal["active", "paused", "disabled"] = "active"
+    subscription_domains: list[Literal["tod.runtime", "mim.perception", "mim.strategy", "mim.improvement", "mim.assist"]] = Field(default_factory=list)
+    subscription_event_types: list[str] = Field(default_factory=list)
+    subscription_sources: list[str] = Field(default_factory=list)
+    subscription_stream_keys: list[str] = Field(default_factory=list)
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class StateBusConsumerOut(BaseModel):
+    consumer_id: int
+    source: str
+    actor: str
+    consumer_key: str
+    status: str
+    subscription: dict
+    cursor_event_id: int
+    cursor_occurred_at: datetime | None
+    processed_event_ids: list[int]
+    poll_count: int
+    ack_count: int
+    lag_count: int
+    replay_from_snapshot_scope: str
+    last_polled_at: datetime | None
+    last_acked_at: datetime | None
+    last_replayed_at: datetime | None
+    metadata_json: dict
+    updated_at: datetime
+    created_at: datetime
+
+
+class StateBusConsumerPollRequest(BaseModel):
+    limit: int = Field(default=50, ge=1, le=500)
+
+
+class StateBusConsumerAckRequest(BaseModel):
+    actor: str = "workspace"
+    event_ids: list[int] = Field(default_factory=list)
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class StateBusConsumerReplayRequest(BaseModel):
+    actor: str = "workspace"
+    from_event_id: int | None = Field(default=None, ge=0)
+    from_snapshot_scope: str = ""
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class StateBusMimCoreStepRequest(BaseModel):
+    actor: str = "mim-core"
+    limit: int = Field(default=50, ge=1, le=200)
+    metadata_json: dict = Field(default_factory=dict)
+
+
 class StrategyGoalPersistenceRecomputeRequest(BaseModel):
     actor: str = "workspace"
     source: str = "objective59"

@@ -1063,6 +1063,29 @@ class WorkspaceStateBusSnapshot(Base, TimestampMixin):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), index=True)
 
 
+class WorkspaceStateBusConsumer(Base, TimestampMixin):
+    __tablename__ = "workspace_state_bus_consumers"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    source: Mapped[str] = mapped_column(String(80), default="objective72", index=True)
+    actor: Mapped[str] = mapped_column(String(120), default="workspace")
+    consumer_key: Mapped[str] = mapped_column(String(180), unique=True, index=True)
+    status: Mapped[str] = mapped_column(String(40), default="active", index=True)
+    subscription_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    cursor_event_id: Mapped[int] = mapped_column(default=0, index=True)
+    cursor_occurred_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    processed_event_ids_json: Mapped[list[int]] = mapped_column(JSON, default=list)
+    poll_count: Mapped[int] = mapped_column(default=0)
+    ack_count: Mapped[int] = mapped_column(default=0)
+    lag_count: Mapped[int] = mapped_column(default=0)
+    replay_from_snapshot_scope: Mapped[str] = mapped_column(String(240), default="")
+    last_polled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_acked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_replayed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), index=True)
+
+
 class WorkspaceStrategyGoal(Base, TimestampMixin):
     __tablename__ = "workspace_strategy_goals"
 

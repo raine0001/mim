@@ -7,7 +7,7 @@ from core.config import PROJECT_ROOT, settings
 
 CONTRACT_VERSION = "tod-mim-shared-contract-v1"
 MANIFEST_VERSION = "1"
-SCHEMA_VERSION = "2026-03-12-64"
+SCHEMA_VERSION = "2026-03-12-65"
 
 SIGNATURE_FILES = [
     "core/models.py",
@@ -40,6 +40,7 @@ SIGNATURE_FILES = [
     "core/inquiry_service.py",
     "core/orchestration_service.py",
     "core/state_bus_service.py",
+    "core/state_bus_consumer_service.py",
     "core/autonomy_boundary_service.py",
     "core/stewardship_service.py",
     "core/routers/autonomy_boundaries.py",
@@ -152,6 +153,7 @@ SIGNATURE_FILES = [
     "docs/objective-69-negotiation-pattern-abstraction.md",
     "docs/objective-70-collaboration-strategy-profiles.md",
     "docs/objective-71-unified-state-bus.md",
+    "docs/objective-72-state-bus-consumers-and-cross-system-subscription.md",
     "config/vision_policy.json",
     "config/voice_policy.json",
 ]
@@ -247,6 +249,7 @@ CAPABILITIES = [
     "negotiation_pattern_abstraction",
     "collaboration_strategy_profiles",
     "unified_state_bus",
+    "state_bus_consumers_cross_system_subscription",
 ]
 
 RECENT_CHANGES = [
@@ -316,6 +319,7 @@ RECENT_CHANGES = [
     "Added Objective 69 negotiation pattern abstraction with persistent collaboration concepts, rule-based extraction, bounded influence defaults, and inspectable pattern APIs",
     "Added Objective 70 collaboration strategy profiles with synthesized collaboration modes, bounded profile influence, and inspectable profile recompute APIs",
     "Added Objective 71 unified state bus with durable snapshot/event-stream separation, multi-domain event ingestion, and inspectable state-bus APIs",
+    "Added Objective 72 state bus consumers with filtered subscriptions, idempotent acknowledgment, replay controls, and mim-core cross-system consumption",
 ]
 
 
@@ -601,6 +605,12 @@ def build_manifest() -> dict:
             "/state-bus/events/{event_id}",
             "/state-bus/snapshots",
             "/state-bus/snapshots/{snapshot_scope}",
+            "/state-bus/consumers/{consumer_key}",
+            "/state-bus/consumers",
+            "/state-bus/consumers/{consumer_key}/poll",
+            "/state-bus/consumers/{consumer_key}/ack",
+            "/state-bus/consumers/{consumer_key}/replay",
+            "/state-bus/consumers/mim-core/step",
         ],
         "objects": {
             "Objective": [
@@ -1423,6 +1433,27 @@ def build_manifest() -> dict:
                 "last_event_sequence",
                 "last_event_domain",
                 "last_event_type",
+                "metadata_json",
+                "updated_at",
+                "created_at",
+            ],
+            "StateBusConsumer": [
+                "consumer_id",
+                "source",
+                "actor",
+                "consumer_key",
+                "status",
+                "subscription",
+                "cursor_event_id",
+                "cursor_occurred_at",
+                "processed_event_ids",
+                "poll_count",
+                "ack_count",
+                "lag_count",
+                "replay_from_snapshot_scope",
+                "last_polled_at",
+                "last_acked_at",
+                "last_replayed_at",
                 "metadata_json",
                 "updated_at",
                 "created_at",
