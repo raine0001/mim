@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Objective 75 Nightly Summary at 00:20 (User)
+
+[Timer]
+OnCalendar=*-*-* 00:20:00
+Persistent=true
+RandomizedDelaySec=120
+Unit=mim-objective75-nightly-summary.service
+
+[Install]
+WantedBy=timers.target

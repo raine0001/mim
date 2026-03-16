@@ -1,6 +1,6 @@
 {
   "handshake_version": "mim-tod-shared-export-v1",
-  "generated_at": "2026-03-12T20:41:13.001432Z",
+  "generated_at": "2026-03-13T01:05:55.638516Z",
   "mim_shared_export_root": "/home/testpilot/mim/runtime/shared",
   "required_files": [
     "/home/testpilot/mim/runtime/shared/MIM_CONTEXT_EXPORT.latest.json",
@@ -11,7 +11,7 @@
     "/home/testpilot/mim/MIM_CONTEXT_EXPORT.latest.yaml"
   ],
   "truth": {
-    "objective_active": "74",
+    "objective_active": "75",
     "latest_completed_objective": "74",
     "current_next_objective": "75",
     "schema_version": "2026-03-12-67",

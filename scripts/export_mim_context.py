@@ -12,6 +12,7 @@ from urllib.request import urlopen
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT_DIR = ROOT / "runtime" / "shared"
 PROMOTED_STATUSES = {"promoted", "promoted_verified", "promoted_with_regression_exceptions"}
+ACTIVE_IN_FLIGHT_STATUSES = {"implemented", "in_progress"}
 
 
 def _fetch_json(url: str, timeout: float = 2.5) -> dict | None:
@@ -43,9 +44,9 @@ def _health(base_urls: list[str]) -> dict:
     }
 
 
-def _parse_objective_index(index_path: Path) -> tuple[str, str | None, str, str]:
+def _parse_objective_index(index_path: Path) -> tuple[str, str | None, str | None, str, str]:
     if not index_path.exists():
-        return "0", None, "1", "none"
+        return "0", None, None, "1", "none"
 
     rows: list[tuple[tuple[int, int], str, str]] = []
     for line in index_path.read_text(encoding="utf-8").splitlines():
@@ -73,9 +74,11 @@ def _parse_objective_index(index_path: Path) -> tuple[str, str | None, str, str]
 
     in_flight_rows = [row for row in rows if row[2] not in PROMOTED_STATUSES]
     objective_in_flight: str | None = None
+    objective_in_flight_status: str | None = None
     if in_flight_rows:
         in_flight_rows.sort(key=lambda item: item[0])
         objective_in_flight = in_flight_rows[-1][1]
+        objective_in_flight_status = in_flight_rows[-1][2]
 
     major_part = int(latest_obj.split(".")[0]) if latest_obj.split(".")[0].isdigit() else 0
     next_obj = str(major_part + 1 if major_part > 0 else 1)
@@ -85,7 +88,7 @@ def _parse_objective_index(index_path: Path) -> tuple[str, str | None, str, str]
         rows.sort(key=lambda item: item[0])
         most_recent_status = rows[-1][2]
 
-    return latest_obj, objective_in_flight, next_obj, most_recent_status
+    return latest_obj, objective_in_flight, objective_in_flight_status, next_obj, most_recent_status
 
 
 def _extract_first(text: str, pattern: str, default: str = "unknown") -> str:
@@ -162,6 +165,21 @@ def _fallback_manifest_from_source(manifest_path: Path) -> dict:
     }
 
 
+def _manifest_from_shared_snapshot(snapshot_path: Path) -> dict | None:
+    if not snapshot_path.exists():
+        return None
+    try:
+        payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    manifest = payload.get("manifest")
+    if isinstance(manifest, dict):
+        return manifest
+    return None
+
+
 def _to_yaml(value, indent: int = 0) -> str:
     prefix = " " * indent
     if isinstance(value, dict):
@@ -202,19 +220,34 @@ def build_payload() -> dict:
             manifest_source_used = source
             break
     if manifest is None:
+        shared_manifest_path = ROOT / "runtime" / "shared" / "MIM_MANIFEST.latest.json"
+        snapshot_manifest = _manifest_from_shared_snapshot(shared_manifest_path)
+        if snapshot_manifest is not None:
+            manifest = snapshot_manifest
+            manifest_source_used = str(shared_manifest_path.relative_to(ROOT))
+
+    if manifest is None:
         manifest = _fallback_manifest_from_source(ROOT / "core" / "manifest.py")
 
-    latest_completed_objective, objective_in_flight, next_objective, latest_row_status = _parse_objective_index(
+    (
+        latest_completed_objective,
+        objective_in_flight,
+        objective_in_flight_status,
+        next_objective,
+        latest_row_status,
+    ) = _parse_objective_index(
         ROOT / "docs" / "objective-index.md"
     )
-    objective_active = objective_in_flight or latest_completed_objective
+    objective_active = latest_completed_objective
+    if objective_in_flight and objective_in_flight_status in ACTIVE_IN_FLIGHT_STATUSES:
+        objective_active = objective_in_flight
     verification = _verification_summary(latest_completed_objective)
 
     now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     capabilities = manifest.get("capabilities", []) if isinstance(manifest.get("capabilities", []), list) else []
 
     phase = "operational"
-    if latest_row_status in {"implemented", "in_progress", "not_started"}:
+    if objective_in_flight and objective_in_flight_status in ACTIVE_IN_FLIGHT_STATUSES:
         phase = "execution"
 
     health_prod = _health(["http://127.0.0.1:8000"])

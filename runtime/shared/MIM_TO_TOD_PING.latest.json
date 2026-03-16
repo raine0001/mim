@@ -1,0 +1,10 @@
+{
+  "generated_at": "2026-03-16T16:20:14Z",
+  "packet_type": "mim-tod-liveness-ping-v1",
+  "source_actor": "MIM",
+  "target_actor": "TOD",
+  "reason": "tod_artifacts_stale",
+  "suspected_stale_seconds": 530,
+  "requested_action": "respond_with_alive_status",
+  "response_file_expected": "TOD_TO_MIM_PING.latest.json"
+}

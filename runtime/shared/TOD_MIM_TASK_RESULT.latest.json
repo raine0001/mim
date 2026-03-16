@@ -1,0 +1,88 @@
+{
+    "generated_at":  "2026-03-16T16:11:46.8510639Z",
+    "source":  "tod-mim-task-result-v1",
+    "listener_version":  "2026-03-15T21:58Z",
+    "request_id":  "objective-75-task-3140",
+    "status":  "completed",
+    "action":  "get-state-bus",
+    "execution_mode":  "lightweight_guard",
+    "started_at":  "2026-03-16T16:11:24.0195761Z",
+    "completed_at":  "2026-03-16T16:11:24.0195761Z",
+    "error":  "",
+    "request_action_raw":  "",
+    "request_tod_action_raw":  "",
+    "mim_review_decision":  "accepted",
+    "review_gate":  {
+                        "request_id":  "objective-75-task-3140",
+                        "passed":  true,
+                        "expected":  {
+                                         "compatible":  true,
+                                         "objective_alignment_status":  "aligned",
+                                         "tod_current_objective":  "75",
+                                         "mim_objective_active":  "75",
+                                         "mim_refresh_failure_reason":  ""
+                                     },
+                        "actual":  {
+                                       "compatible":  true,
+                                       "objective_alignment_status":  "in_sync",
+                                       "tod_current_objective":  "75",
+                                       "mim_objective_active":  "75",
+                                       "mim_refresh_failure_reason":  ""
+                                   },
+                        "checks":  [
+                                       {
+                                           "name":  "compatible",
+                                           "expected":  true,
+                                           "actual":  true,
+                                           "passed":  true
+                                       },
+                                       {
+                                           "name":  "objective_alignment",
+                                           "expected":  "aligned",
+                                           "actual":  "in_sync",
+                                           "passed":  true
+                                       },
+                                       {
+                                           "name":  "tod_current_objective",
+                                           "expected":  "75",
+                                           "actual":  "75",
+                                           "passed":  true
+                                       },
+                                       {
+                                           "name":  "mim_objective_active",
+                                           "expected":  "75",
+                                           "actual":  "75",
+                                           "passed":  true
+                                       },
+                                       {
+                                           "name":  "mim_refresh_failure_reason_empty",
+                                           "expected":  "",
+                                           "actual":  "",
+                                           "passed":  true
+                                       }
+                                   ]
+                    },
+    "validator":  {
+                      "attempted":  true,
+                      "passed":  true,
+                      "message":  "validator_passed",
+                      "output":  "{\r\n    \"generated_at\":  \"2026-03-16T16:11:46.7743583Z\",\r\n    \"request_id\":  \"objective-75-task-3140\",\r\n    \"review_decision\":  \"accepted\",\r\n    \"checks\":  [\r\n                   {\r\n                       \"name\":  \"compatible\",\r\n                       \"passed\":  true,\r\n                       \"actual\":  true,\r\n                       \"expected\":  true\r\n                   },\r\n                   {\r\n                       \"name\":  \"objective_alignment\",\r\n                       \"passed\":  true,\r\n                       \"actual\":  \"in_sync\",\r\n                       \"expected\":  \"aligned\"\r\n                   },\r\n                   {\r\n                       \"name\":  \"tod_current_objective\",\r\n                       \"passed\":  true,\r\n                       \"actual\":  \"75\",\r\n                       \"expected\":  \"75\"\r\n                   },\r\n                   {\r\n                       \"name\":  \"mim_objective_active\",\r\n                       \"passed\":  true,\r\n                       \"actual\":  \"75\",\r\n                       \"expected\":  \"75\"\r\n                   },\r\n                   {\r\n                       \"name\":  \"mim_refresh_failure_reason_empty\",\r\n                       \"passed\":  true,\r\n                       \"actual\":  \"\",\r\n                       \"expected\":  \"\"\r\n                   }\r\n               ],\r\n    \"passed\":  true\r\n}\r\n"
+                  },
+    "integration":  {
+                        "compatible":  true,
+                        "alignment_status":  "in_sync",
+                        "tod_current_objective":  "75",
+                        "mim_objective_active":  "75",
+                        "mim_refresh_failure_reason":  ""
+                    },
+    "output_preview":  "get-state-bus: lightweight success (in-process state read bypassed; state.json=1573.94 MiB)",
+    "regression_snapshot":  {
+                                "available":  true,
+                                "passed":  77,
+                                "failed":  0,
+                                "total":  77,
+                                "generated_at":  "2026-03-16T09:22:51.3343954Z",
+                                "signature":  "2026-03-16T09:22:51.3343954Z|77|0|77"
+                            },
+    "sync_warning":  "fatal: not a git repository (or any of the parent directories): .git"
+}

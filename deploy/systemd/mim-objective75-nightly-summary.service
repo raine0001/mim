@@ -1,0 +1,13 @@
+[Unit]
+Description=MIM Objective 75 Nightly Summary Snapshot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=testpilot
+Group=testpilot
+WorkingDirectory=/home/testpilot/mim
+Environment=REFRESH_RECOVERY_CHECK=1
+Environment=APPEND_JSONL=1
+ExecStart=/home/testpilot/mim/scripts/generate_objective75_nightly_summary.sh

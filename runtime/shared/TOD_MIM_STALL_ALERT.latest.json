@@ -1,0 +1,19 @@
+{
+    "generated_at":  "2026-03-15T21:15:28.9883175Z",
+    "source":  "tod-mim-stall-alert-v1",
+    "request_id":  "objective-75-task-2642",
+    "objective_id":  "objective-75",
+    "issue_code":  "stalled_regression_no_delta",
+    "issue_detail":  "stalled_regression_no_delta: regression snapshot unchanged for 31 consecutive cycles while failures remain (42/77 failed).",
+    "unchanged_cycles":  31,
+    "threshold":  4,
+    "regression_snapshot":  {
+                                "available":  true,
+                                "passed":  35,
+                                "failed":  42,
+                                "total":  77,
+                                "generated_at":  "2026-03-15T01:30:09.8986770Z",
+                                "signature":  "2026-03-15T01:30:09.8986770Z|35|42|77"
+                            },
+    "requested_action":  "dispatch_remediation_task"
+}

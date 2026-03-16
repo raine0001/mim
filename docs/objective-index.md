@@ -60,6 +60,7 @@ This registry indexes objective evidence and promotion artifacts so objective hi
 | 72 | State Bus Consumers and Cross-System Subscription | promoted_verified | 2026-03-12-65 | objective-72 | core/models.py; core/state_bus_consumer_service.py; core/routers/state_bus.py; core/schemas.py; core/manifest.py | docs/objective-72-promotion-readiness-report.md | docs/objective-72-prod-promotion-report.md | state_bus_consumers_cross_system_subscription |
 | 73 | Bus-Driven Cross-System Reactions | promoted_verified | 2026-03-12-66 | objective-73 | core/state_bus_consumer_service.py; core/routers/state_bus.py; core/schemas.py; core/manifest.py | docs/objective-73-promotion-readiness-report.md | docs/objective-73-prod-promotion-report.md | bus_driven_cross_system_reactions |
 | 74 | Operator Interface and Channel Bridge | promoted_verified | 2026-03-12-67 | objective-74 | core/models.py; core/interface_service.py; core/routers/interface.py; core/schemas.py; core/manifest.py | docs/objective-74-promotion-readiness-report.md | docs/objective-74-prod-promotion-report.md | operator_interface_channel_bridge |
+| 75 | MIM→TOD Interface Hardening (First Project) | planned | 2026-03-12-68 (target) | objective-75 (target) | runtime/shared/MIM_CONTEXT_EXPORT.latest.json; runtime/shared/MIM_TOD_HANDSHAKE_PACKET.latest.json; runtime/shared/MIM_MANIFEST.latest.json; runtime/shared/MIM_TOD_ALIGNMENT_REQUEST.latest.json | n/a | n/a | mim_tod_interface_hardening |
 
 ## Notes
 

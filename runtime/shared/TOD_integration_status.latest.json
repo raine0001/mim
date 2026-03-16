@@ -1,0 +1,99 @@
+{
+    "generated_at":  "2026-03-16T14:03:41.6688112Z",
+    "source":  "tod-integration-status-v1",
+    "mim_schema":  "2026-03-12-67",
+    "tod_contract":  "tod-mim-shared-contract-v1",
+    "mim_contract":  "tod-mim-shared-contract-v1",
+    "compatible":  true,
+    "compatibility_reason":  "contract_version_match",
+    "mim_status":  {
+                       "available":  true,
+                       "source_path":  "tod/out/context-sync/MIM_CONTEXT_EXPORT.latest.json",
+                       "generated_at":  "2026-03-15T18:27:10.677258Z",
+                       "age_hours":  19.61,
+                       "stale_after_hours":  6,
+                       "is_stale":  true,
+                       "objective_active":  "74",
+                       "phase":  "operational",
+                       "blockers":  ""
+                   },
+    "mim_handshake":  {
+                          "available":  true,
+                          "source_path":  "E:\\TOD\\tod\\out\\context-sync\\ssh-shared\\MIM_TOD_HANDSHAKE_PACKET.latest.json",
+                          "generated_at":  "2026-03-13T01:05:55.638516Z",
+                          "handshake_version":  "mim-tod-shared-export-v1",
+                          "objective_active":  "75",
+                          "latest_completed_objective":  "74",
+                          "current_next_objective":  "75",
+                          "schema_version":  "2026-03-12-67",
+                          "release_tag":  "objective-74",
+                          "regression_status":  "PASS",
+                          "regression_tests":  "66/66",
+                          "prod_promotion_status":  "SUCCESS",
+                          "prod_smoke_status":  "PASS",
+                          "blockers":  [
+
+                                       ]
+                      },
+    "mim_refresh":  {
+                        "attempted":  true,
+                        "copied_json":  true,
+                        "copied_yaml":  true,
+                        "copied_manifest":  true,
+                        "source_json":  "E:\\TOD\\tod\\out\\context-sync\\ssh-shared\\MIM_CONTEXT_EXPORT.latest.json",
+                        "source_yaml":  "E:\\TOD\\tod\\out\\context-sync\\ssh-shared\\MIM_CONTEXT_EXPORT.latest.yaml",
+                        "source_manifest":  "E:\\TOD\\tod\\out\\context-sync\\ssh-shared\\MIM_MANIFEST.latest.json",
+                        "source_handshake_packet":  "E:\\TOD\\tod\\out\\context-sync\\ssh-shared\\MIM_TOD_HANDSHAKE_PACKET.latest.json",
+                        "resolved_source_root":  "E:\\TOD\\tod\\out\\context-sync\\ssh-shared",
+                        "candidate_paths_tried":  [
+                                                      "E:\\TOD\\tod\\out\\context-sync\\ssh-shared\\MIM_CONTEXT_EXPORT.latest.json",
+                                                      "E:\\TOD\\tod\\out\\context-sync\\ssh-shared\\MIM_CONTEXT_EXPORT.latest.yaml",
+                                                      "E:\\TOD\\tod\\out\\context-sync\\ssh-shared\\MIM_MANIFEST.latest.json"
+                                                  ],
+                        "failure_reason":  "",
+                        "ssh_attempted":  true,
+                        "ssh_host":  "mim",
+                        "ssh_resolved_host":  "192.168.1.120",
+                        "ssh_remote_root":  "/home/testpilot/mim/runtime/shared",
+                        "ssh_stage_root":  "tod/out/context-sync/ssh-shared",
+                        "ssh_auth_mode":  "sftp_password",
+                        "ssh_pull":  {
+                                         "json":  {
+                                                      "ok":  true,
+                                                      "remote_path":  "/home/testpilot/mim/runtime/shared/MIM_CONTEXT_EXPORT.latest.json",
+                                                      "local_path":  "E:\\TOD\\tod\\out\\context-sync\\ssh-shared\\MIM_CONTEXT_EXPORT.latest.json",
+                                                      "required":  true,
+                                                      "error":  ""
+                                                  },
+                                         "yaml":  {
+                                                      "ok":  true,
+                                                      "remote_path":  "/home/testpilot/mim/runtime/shared/MIM_CONTEXT_EXPORT.latest.yaml",
+                                                      "local_path":  "E:\\TOD\\tod\\out\\context-sync\\ssh-shared\\MIM_CONTEXT_EXPORT.latest.yaml",
+                                                      "required":  true,
+                                                      "error":  ""
+                                                  },
+                                         "manifest":  {
+                                                          "ok":  true,
+                                                          "remote_path":  "/home/testpilot/mim/runtime/shared/MIM_MANIFEST.latest.json",
+                                                          "local_path":  "E:\\TOD\\tod\\out\\context-sync\\ssh-shared\\MIM_MANIFEST.latest.json",
+                                                          "required":  false,
+                                                          "error":  ""
+                                                      },
+                                         "handshake_packet":  {
+                                                                  "ok":  true,
+                                                                  "remote_path":  "/home/testpilot/mim/runtime/shared/MIM_TOD_HANDSHAKE_PACKET.latest.json",
+                                                                  "local_path":  "E:\\TOD\\tod\\out\\context-sync\\ssh-shared\\MIM_TOD_HANDSHAKE_PACKET.latest.json",
+                                                                  "required":  false,
+                                                                  "error":  ""
+                                                              }
+                                     }
+                    },
+    "objective_alignment":  {
+                                "status":  "in_sync",
+                                "aligned":  true,
+                                "tod_current_objective":  "75",
+                                "mim_objective_active":  "75",
+                                "mim_objective_source":  "handshake_packet",
+                                "delta":  0
+                            }
+}

@@ -1,0 +1,20 @@
+{
+  "version": "1.0",
+  "source": "MIM",
+  "target": "TOD",
+  "generated_at": "2026-03-16T13:58:03Z",
+  "objective_id": "objective-75",
+  "alert_type": "overnight_runner_guardrail_stop",
+  "reason": "integration_alias_drift",
+  "task_num": 3134,
+  "metrics": {
+    "consecutive_fails": 1,
+    "same_task_fails": 1,
+    "recent_fail_count": 1,
+    "window_size": 10,
+    "max_consecutive_fails": 4,
+    "max_same_task_fails": 3,
+    "max_fails_in_window": 6
+  },
+  "action_required": "investigate_and_restart_runner"
+}

@@ -1,0 +1,30 @@
+{
+  "generated_at": "2026-03-12T21:08:27Z",
+  "packet_type": "mim-tod-alignment-request-v1",
+  "from_system": "MIM",
+  "to_system": "TOD",
+  "priority": "high",
+  "mim_truth": {
+    "objective_active": "74",
+    "latest_completed_objective": "74",
+    "current_next_objective": "75",
+    "schema_version": "2026-03-12-67",
+    "release_tag": "objective-74",
+    "contract": "tod-mim-shared-contract-v1"
+  },
+  "requested_actions": [
+    "Run TOD shared-folder refresh against /home/testpilot/mim/runtime/shared",
+    "Pull required files: MIM_CONTEXT_EXPORT.latest.json and MIM_CONTEXT_EXPORT.latest.yaml",
+    "Pull optional files: MIM_MANIFEST.latest.json and MIM_TOD_HANDSHAKE_PACKET.latest.json",
+    "Publish a fresh TOD_INTEGRATION_STATUS.latest.json after refresh",
+    "Resolve objective alignment mismatch: tod_current_objective must align to MIM objective_active=74"
+  ],
+  "success_criteria": {
+    "compatible": true,
+    "objective_alignment_status": "aligned",
+    "tod_current_objective": "74",
+    "mim_objective_active": "74",
+    "mim_refresh_failure_reason": ""
+  },
+  "notes": "Transport path and handshake availability are confirmed healthy from MIM side; remaining blocker is TOD objective alignment."
+}

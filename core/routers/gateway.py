@@ -1,8 +1,14 @@
 import json
+import base64
+import io
+import asyncio
+import logging
+import os
 from hashlib import sha256
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Body, Depends, Header, HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -32,6 +38,7 @@ from core.schemas import (
 )
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 OBSERVATION_DEDUPE_WINDOW_SECONDS = 300
 OBSERVATION_RECENT_WINDOW_SECONDS = 600
@@ -42,6 +49,56 @@ OBJECT_MATCH_THRESHOLD = 0.65
 PROPOSAL_DEDUPE_WINDOW_SECONDS = 900
 
 PERCEPTION_STALE_SECONDS = 60
+MIC_TRANSCRIBE_DEBUG_LOG = Path(__file__).resolve().parents[2] / "runtime" / "logs" / "mic_transcribe_debug.jsonl"
+
+
+def _mic_debug_enabled(payload: dict) -> bool:
+    if str(os.getenv("MIM_MIC_DEBUG", "")).strip().lower() in {"1", "true", "yes", "on"}:
+        return True
+    return bool(payload.get("debug"))
+
+
+def _append_mic_debug_event(event: dict) -> None:
+    try:
+        MIC_TRANSCRIBE_DEBUG_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with MIC_TRANSCRIBE_DEBUG_LOG.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n")
+    except Exception as exc:
+        logger.debug("mic_debug_event_write_failed: %s", exc)
+
+
+def _mic_debug_detail(message: str, trace_id: str) -> dict:
+    return {
+        "message": message,
+        "trace_id": trace_id,
+        "debug_log_path": str(MIC_TRANSCRIBE_DEBUG_LOG),
+    }
+
+
+def _classify_provider_error(detail: str) -> dict:
+    lowered = detail.lower()
+    forbidden_hint = "forbidden" in lowered or " 403" in lowered or "status 403" in lowered
+    unauthorized_hint = "unauthorized" in lowered or " 401" in lowered or "status 401" in lowered
+    quota_hint = "quota" in lowered or "rate" in lowered or "429" in lowered
+    blocked_hint = "blocked" in lowered or "denied" in lowered
+    return {
+        "forbidden_hint": forbidden_hint,
+        "unauthorized_hint": unauthorized_hint,
+        "quota_or_rate_hint": quota_hint,
+        "blocked_hint": blocked_hint,
+        "upstream_status_hint": 403 if forbidden_hint else (401 if unauthorized_hint else (429 if quota_hint else None)),
+    }
+
+
+def _resolve_mic_provider_mode(payload: dict) -> str:
+    raw = str(payload.get("provider") or os.getenv("MIM_MIC_PROVIDER") or "").strip().lower()
+    if raw in {"local", "pocketsphinx", "offline"}:
+        return "local"
+    if raw in {"google", "google_web_speech", "cloud"}:
+        return "google"
+    if raw == "auto":
+        return "auto"
+    return "auto" if settings.allow_web_access else "local"
 
 AUTONOMY_PROPOSAL_POLICY_MAP: dict[str, str] = {
     "confirm_target_ready": "auto_safe",
@@ -1954,6 +2011,302 @@ async def live_mic_adapter(payload: LiveMicAdapterRequest, db: AsyncSession = De
         "accepted": True,
         "event": event_out,
     }
+
+
+@router.post("/perception/mic/transcribe")
+async def transcribe_mic_audio(payload: dict = Body(...)) -> dict:
+    started_at = datetime.now(timezone.utc)
+    trace_id = sha256(f"{started_at.isoformat()}|{id(payload)}".encode("utf-8")).hexdigest()[:12]
+    raw_audio = str(payload.get("audio_wav_base64") or "").strip()
+    language = str(payload.get("language") or "en-US").strip() or "en-US"
+    debug_enabled = _mic_debug_enabled(payload)
+    provider_mode = _resolve_mic_provider_mode(payload)
+
+    def _debug_event(stage: str, **fields: dict) -> dict:
+        elapsed_ms = int((datetime.now(timezone.utc) - started_at).total_seconds() * 1000)
+        event = {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "trace_id": trace_id,
+            "stage": stage,
+            "elapsed_ms": elapsed_ms,
+            "language": language,
+            "audio_base64_chars": len(raw_audio),
+        }
+        event.update(fields)
+        return event
+
+    _append_mic_debug_event(_debug_event("received", debug_enabled=debug_enabled, provider_mode=provider_mode))
+
+    if not raw_audio:
+        _append_mic_debug_event(_debug_event("reject", reason="missing_audio_base64"))
+        raise HTTPException(
+            status_code=400,
+            detail=_mic_debug_detail("audio_wav_base64 is required", trace_id) if debug_enabled else "audio_wav_base64 is required",
+        )
+
+    try:
+        import speech_recognition as sr
+    except Exception as exc:
+        _append_mic_debug_event(
+            _debug_event(
+                "import_backend_failed",
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=_mic_debug_detail("speech_recognition backend unavailable", trace_id) if debug_enabled else "speech_recognition backend unavailable",
+        )
+
+    try:
+        audio_bytes = base64.b64decode(raw_audio, validate=True)
+    except Exception as exc:
+        _append_mic_debug_event(
+            _debug_event(
+                "decode_base64_failed",
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=_mic_debug_detail("invalid base64 audio payload", trace_id) if debug_enabled else "invalid base64 audio payload",
+        )
+
+    audio_sha_prefix = sha256(audio_bytes).hexdigest()[:16]
+    _append_mic_debug_event(
+        _debug_event(
+            "base64_decoded",
+            audio_bytes_len=len(audio_bytes),
+            audio_sha256_prefix=audio_sha_prefix,
+        )
+    )
+
+    recognizer = sr.Recognizer()
+    recognizer.energy_threshold = 120
+    recognizer.dynamic_energy_threshold = True
+    recognizer.operation_timeout = 10
+
+    async def _recognize_with_local_fallback(trigger: str, upstream_detail: str = "") -> dict | None:
+        if not str(language or "").lower().startswith("en"):
+            _append_mic_debug_event(
+                _debug_event(
+                    "recognize_local_skip",
+                    provider="pocketsphinx",
+                    trigger=trigger,
+                    reason="unsupported_language",
+                    language=language,
+                    audio_sha256_prefix=audio_sha_prefix,
+                )
+            )
+            return None
+
+        try:
+            local_transcript = await asyncio.wait_for(
+                asyncio.to_thread(recognizer.recognize_sphinx, audio_data),
+                timeout=14,
+            )
+        except asyncio.TimeoutError:
+            _append_mic_debug_event(
+                _debug_event(
+                    "recognize_local_timeout",
+                    provider="pocketsphinx",
+                    trigger=trigger,
+                    timeout_seconds=14,
+                    audio_sha256_prefix=audio_sha_prefix,
+                )
+            )
+            return None
+        except Exception as local_exc:
+            _append_mic_debug_event(
+                _debug_event(
+                    "recognize_local_error",
+                    provider="pocketsphinx",
+                    trigger=trigger,
+                    error_type=type(local_exc).__name__,
+                    detail=str(local_exc),
+                    audio_sha256_prefix=audio_sha_prefix,
+                )
+            )
+            return None
+
+        transcript_text = str(local_transcript or "").strip()
+        if not transcript_text:
+            _append_mic_debug_event(
+                _debug_event(
+                    "recognize_local_no_match",
+                    provider="pocketsphinx",
+                    trigger=trigger,
+                    audio_sha256_prefix=audio_sha_prefix,
+                )
+            )
+            return {
+                "ok": True,
+                "transcript": "",
+                "confidence": 0.0,
+                "provider": "pocketsphinx",
+                "reason": "no_match",
+                "trace_id": trace_id,
+                **({"fallback_from": "google_web_speech"} if trigger.startswith("google") else {}),
+            }
+
+        _append_mic_debug_event(
+            _debug_event(
+                "recognize_local_success",
+                provider="pocketsphinx",
+                trigger=trigger,
+                transcript_chars=len(transcript_text),
+                audio_sha256_prefix=audio_sha_prefix,
+            )
+        )
+        return {
+            "ok": True,
+            "transcript": transcript_text,
+            "confidence": 0.58,
+            "provider": "pocketsphinx",
+            "trace_id": trace_id,
+            **({"fallback_from": "google_web_speech"} if trigger.startswith("google") else {}),
+            **({"upstream_detail": upstream_detail} if debug_enabled and upstream_detail else {}),
+        }
+
+    try:
+        def _read_audio_file() -> sr.AudioData:
+            with sr.AudioFile(io.BytesIO(audio_bytes)) as source:
+                return recognizer.record(source)
+
+        audio_data = await asyncio.wait_for(asyncio.to_thread(_read_audio_file), timeout=6)
+    except Exception as exc:
+        _append_mic_debug_event(
+            _debug_event(
+                "wav_parse_failed",
+                error_type=type(exc).__name__,
+                error=str(exc),
+                audio_bytes_len=len(audio_bytes),
+                audio_sha256_prefix=audio_sha_prefix,
+            )
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=_mic_debug_detail("invalid wav audio payload", trace_id) if debug_enabled else "invalid wav audio payload",
+        )
+
+    if provider_mode == "local":
+        _append_mic_debug_event(
+            _debug_event(
+                "recognize_provider_selected",
+                provider="pocketsphinx",
+                mode=provider_mode,
+                audio_sha256_prefix=audio_sha_prefix,
+            )
+        )
+        local_result = await _recognize_with_local_fallback(trigger="local_primary")
+        if local_result is not None:
+            return local_result
+        return {
+            "ok": False,
+            "transcript": "",
+            "confidence": 0.0,
+            "provider": "pocketsphinx",
+            "reason": "provider_unavailable",
+            "detail": "local speech provider unavailable",
+            "trace_id": trace_id,
+        }
+
+    try:
+        transcript = await asyncio.wait_for(
+            asyncio.to_thread(recognizer.recognize_google, audio_data, language),
+            timeout=12,
+        )
+        _append_mic_debug_event(
+            _debug_event(
+                "recognize_success",
+                transcript_chars=len(str(transcript or "").strip()),
+                provider="google_web_speech",
+                mode=provider_mode,
+                audio_sha256_prefix=audio_sha_prefix,
+            )
+        )
+        return {
+            "ok": True,
+            "transcript": str(transcript or "").strip(),
+            "confidence": 0.74,
+            "provider": "google_web_speech",
+            "trace_id": trace_id,
+        }
+    except asyncio.TimeoutError:
+        _append_mic_debug_event(
+            _debug_event(
+                "recognize_timeout",
+                timeout_seconds=12,
+                provider="google_web_speech",
+                mode=provider_mode,
+                audio_sha256_prefix=audio_sha_prefix,
+            )
+        )
+        if provider_mode == "auto":
+            local_result = await _recognize_with_local_fallback(trigger="google_timeout", upstream_detail="speech request timeout")
+            if local_result is not None:
+                return local_result
+        raise HTTPException(
+            status_code=504,
+            detail=_mic_debug_detail("speech request timeout", trace_id) if debug_enabled else "speech request timeout",
+        )
+    except sr.UnknownValueError:
+        _append_mic_debug_event(
+            _debug_event(
+                "recognize_no_match",
+                provider="google_web_speech",
+                mode=provider_mode,
+                audio_sha256_prefix=audio_sha_prefix,
+            )
+        )
+        return {
+            "ok": True,
+            "transcript": "",
+            "confidence": 0.0,
+            "provider": "google_web_speech",
+            "reason": "no_match",
+            "trace_id": trace_id,
+        }
+    except sr.RequestError as exc:
+        detail = str(exc)
+        provider_error = _classify_provider_error(detail)
+        debug_event = _debug_event(
+            "recognize_provider_error",
+            provider="google_web_speech",
+            mode=provider_mode,
+            error_type=type(exc).__name__,
+            detail=detail,
+            audio_sha256_prefix=audio_sha_prefix,
+            **provider_error,
+        )
+        _append_mic_debug_event(debug_event)
+        logger.warning("mic_transcribe_provider_error trace_id=%s detail=%s", trace_id, detail)
+
+        if provider_mode == "auto":
+            local_result = await _recognize_with_local_fallback(trigger="google_provider_error", upstream_detail=detail)
+            if local_result is not None:
+                return local_result
+
+        debug_payload = {
+            "trace_id": trace_id,
+            "provider_error": provider_error,
+            "audio_bytes_len": len(audio_bytes),
+            "audio_sha256_prefix": audio_sha_prefix,
+            "language": language,
+            "mode": provider_mode,
+        }
+        return {
+            "ok": False,
+            "transcript": "",
+            "confidence": 0.0,
+            "provider": "google_web_speech",
+            "reason": "provider_unavailable",
+            "detail": detail,
+            "trace_id": trace_id,
+            **({"debug": debug_payload} if debug_enabled else {}),
+        }
 
 
 @router.get("/perception/sources")

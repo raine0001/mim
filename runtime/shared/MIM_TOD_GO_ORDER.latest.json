@@ -1,0 +1,17 @@
+{
+  "version": "1.0",
+  "source": "MIM",
+  "target": "TOD",
+  "generated_at": "2026-03-16T16:11:15Z",
+  "order": {
+    "correlation_id": "obj75-task3140-go",
+    "task_id": "objective-75-task-3140",
+    "objective_id": "objective-75",
+    "type": "execute_now",
+    "instructions": [
+      "Acknowledge current task packet",
+      "Execute and post task result packet",
+      "Keep objective gate alignment true"
+    ]
+  }
+}

@@ -98,7 +98,7 @@
   "capability_count": 93,
   "current_next_objective": "75",
   "export_version": "mim-context-v2",
-  "exported_at": "2026-03-12T20:41:13.001432Z",
+  "exported_at": "2026-03-15T18:27:10.677258Z",
   "health": {
     "prod": {
       "base_url": "http://127.0.0.1:8000",
@@ -112,7 +112,7 @@
     }
   },
   "latest_completed_objective": "74",
-  "latest_objective_index_status": "promoted_verified",
+  "latest_objective_index_status": "planned",
   "next_actions": [
     "finalize verification gate",
     "begin objective 75 planning"
@@ -122,9 +122,9 @@
     "Replaces stale bootstrap snapshots (e.g., objective 17 warming phase)"
   ],
   "objective_active": "74",
-  "objective_in_flight": null,
+  "objective_in_flight": "75",
   "phase": "operational",
-  "release_tag": "objective-74",
+  "release_tag": "objective-22-fallback-timeouts",
   "schema_version": "2026-03-12-67",
   "source_of_truth": {
     "manifest_endpoint_priority": [

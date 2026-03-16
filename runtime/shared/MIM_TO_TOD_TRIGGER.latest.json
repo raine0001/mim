@@ -1,0 +1,10 @@
+{
+  "generated_at": "2026-03-16T16:20:14Z",
+  "packet_type": "shared-trigger-v1",
+  "source_actor": "MIM",
+  "target_actor": "TOD",
+  "trigger": "liveness_ping",
+  "artifact": "MIM_TO_TOD_PING.latest.json",
+  "action_required": "pull_latest_and_ack",
+  "ack_file_expected": "TOD_TO_MIM_TRIGGER_ACK.latest.json"
+}

@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Objective 75 JSONL retention pruning daily at 00:40
+
+[Timer]
+OnCalendar=*-*-* 00:40:00
+Persistent=true
+RandomizedDelaySec=120
+Unit=mim-objective75-jsonl-retention.service
+
+[Install]
+WantedBy=timers.target

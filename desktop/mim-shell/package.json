@@ -1,0 +1,15 @@
+{
+  "name": "mim-desktop-shell",
+  "version": "0.1.0",
+  "private": true,
+  "description": "MIM native desktop interaction shell",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "start:service": "electron --no-sandbox --disable-setuid-sandbox .",
+    "dev": "MIM_UI_URL=http://127.0.0.1:8001/mim electron ."
+  },
+  "devDependencies": {
+    "electron": "^31.7.7"
+  }
+}

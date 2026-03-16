@@ -1,0 +1,18 @@
+[Unit]
+Description=MIM Objective 75 Overnight Loop
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=testpilot
+Group=testpilot
+WorkingDirectory=/home/testpilot/mim
+Environment=LOOP_INTERVAL_SECONDS=600
+Environment=SOAK_WAIT_TIMEOUT_SECONDS=75
+ExecStart=/home/testpilot/mim/scripts/run_objective75_overnight_loop.sh
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

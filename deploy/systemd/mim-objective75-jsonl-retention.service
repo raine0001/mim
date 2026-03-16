@@ -1,0 +1,13 @@
+[Unit]
+Description=MIM Objective 75 JSONL Retention Prune
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=testpilot
+Group=testpilot
+WorkingDirectory=/home/testpilot/mim
+Environment=RETENTION_DAYS=30
+Environment=APPEND_RUN_JSONL=1
+ExecStart=/home/testpilot/mim/scripts/prune_objective75_jsonl_retention.sh

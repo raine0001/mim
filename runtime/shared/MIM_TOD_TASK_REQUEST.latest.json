@@ -1,0 +1,21 @@
+{
+  "version": "1.0",
+  "source": "MIM",
+  "target": "TOD",
+  "generated_at": "2026-03-16T16:11:15Z",
+  "correlation_id": "obj75-task3140",
+  "task_id": "objective-75-task-3140",
+  "objective_id": "objective-75",
+  "title": "Overnight autonomous reliability run",
+  "scope": "Maintain unattended MIM↔TOD cadence with strict suite checkpoints.",
+  "priority": "high",
+  "acceptance_criteria": [
+    "Objective 75 gate PASS",
+    "Strict trigger-ack regression suite PASS"
+  ],
+  "constraints": [
+    "Do not regress objective compatibility/alignment semantics",
+    "Preserve trigger ACK monotonic mutation behavior"
+  ],
+  "notes": "Automated overnight loop-generated task request"
+}

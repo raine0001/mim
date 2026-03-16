@@ -1,0 +1,16 @@
+[Unit]
+Description=MIM Watch Objective 75 Cycle PASS Staleness (User)
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/testpilot/mim
+Environment=MAX_IDLE_SECONDS=1200
+Environment=POLL_SECONDS=30
+Environment=COOLDOWN_SECONDS=300
+ExecStart=/home/testpilot/mim/scripts/watch_objective75_cycle_pass.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

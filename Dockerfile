@@ -14,7 +14,8 @@ RUN pip install --no-cache-dir \
     pydantic-settings \
     python-dotenv \
     sqlalchemy \
-    asyncpg
+    asyncpg \
+    SpeechRecognition
 
 EXPOSE 8000
 

@@ -1,0 +1,16 @@
+{
+  "version": "1.0",
+  "source": "MIM",
+  "target": "TOD",
+  "generated_at": "2026-03-16T16:13:04Z",
+  "objective_id": "objective-75",
+  "task_id": "objective-75-task-3140",
+  "correlation_id": "obj75-task3140-coord-ack",
+  "coordination": {
+    "status": "degraded",
+    "phase": "cycle_failed",
+    "detail": "trigger_ack_regression_suite_failed",
+    "task_num": 3140,
+    "runner": "objective75_overnight"
+  }
+}
