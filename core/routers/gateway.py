@@ -4,18 +4,25 @@ import io
 import asyncio
 import logging
 import os
+import importlib
+import uuid
+import re
+from urllib import error as urllib_error
+from urllib import request as urllib_request
+from urllib.parse import urlparse
 from hashlib import sha256
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi import APIRouter, Body, Depends, Header, HTTPException
+from fastapi.responses import Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.db import get_db
 from core.config import settings
 from core.journal import write_journal
-from core.models import CapabilityExecution, CapabilityRegistration, Goal, InputEvent, InputEventResolution, SpeechOutputAction, Task, WorkspaceMonitoringState, WorkspaceObservation, WorkspaceObjectMemory, WorkspaceObjectRelation, WorkspacePerceptionSource, WorkspaceProposal, WorkspaceZone, WorkspaceZoneRelation
+from core.models import CapabilityExecution, CapabilityRegistration, Goal, InputEvent, InputEventResolution, MemoryEntry, SpeechOutputAction, Task, WorkspaceMonitoringState, WorkspaceObservation, WorkspaceObjectMemory, WorkspaceObjectRelation, WorkspacePerceptionSource, WorkspaceProposal, WorkspaceZone, WorkspaceZoneRelation
 from core.voice_policy import evaluate_voice_policy, load_voice_policy, validate_voice_output
 from core.vision_policy import evaluate_vision_policy
 from core.vision_policy import load_vision_policy
@@ -39,6 +46,11 @@ from core.schemas import (
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+try:
+    edge_tts = importlib.import_module("edge_tts")
+except Exception:  # pragma: no cover - optional runtime dependency
+    edge_tts = None
 
 OBSERVATION_DEDUPE_WINDOW_SECONDS = 300
 OBSERVATION_RECENT_WINDOW_SECONDS = 600
@@ -94,11 +106,210 @@ def _resolve_mic_provider_mode(payload: dict) -> str:
     raw = str(payload.get("provider") or os.getenv("MIM_MIC_PROVIDER") or "").strip().lower()
     if raw in {"local", "pocketsphinx", "offline"}:
         return "local"
+    if raw in {"openai", "whisper", "gpt4o", "gpt-4o-mini-transcribe"}:
+        return "openai"
     if raw in {"google", "google_web_speech", "cloud"}:
         return "google"
     if raw == "auto":
         return "auto"
     return "auto" if settings.allow_web_access else "local"
+
+
+def _local_stt_min_confidence() -> float:
+    raw = str(os.getenv("MIM_LOCAL_STT_MIN_CONFIDENCE") or "0.55").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        value = 0.55
+    return max(0.0, min(1.0, value))
+
+
+def _openai_auto_stt_enabled() -> bool:
+    raw = str(os.getenv("MIM_MIC_OPENAI_AUTO") or "1").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _is_low_quality_local_transcript(text: str) -> bool:
+    normalized = re.sub(r"[^a-z\s]", " ", str(text or "").lower())
+    tokens = [token for token in normalized.split() if token]
+    if not tokens:
+        return True
+
+    compact = "".join(tokens)
+    if len(compact) < 5:
+        return True
+
+    if len(tokens) >= 2 and all(len(token) <= 2 for token in tokens):
+        return True
+
+    unique_ratio = len(set(tokens)) / float(len(tokens))
+    if len(tokens) >= 4 and unique_ratio < 0.5:
+        return True
+
+    filler_words = {"um", "uh", "erm", "hmm", "mm", "ah", "eh"}
+    if all(token in filler_words for token in tokens):
+        return True
+
+    return False
+
+
+def _normalize_prompt_key(text: str) -> str:
+    return " ".join(str(text or "").strip().lower().split())
+
+
+def _is_clarification_driven(escalation_reasons: list[str], outcome: str) -> bool:
+    reasons = {str(item).strip().lower() for item in (escalation_reasons or []) if str(item).strip()}
+    clarification_reasons = {
+        "requires_clarification",
+        "ambiguous_command",
+        "missing_target",
+        "low_transcript_confidence",
+    }
+    if "unsafe_action_request" in reasons:
+        return False
+    return outcome in {"store_only", "requires_confirmation", "blocked"} and bool(reasons.intersection(clarification_reasons))
+
+
+def _build_one_clarifier_prompt(transcript: str) -> str:
+    request = _normalize_prompt_key(transcript)[:72]
+    if request:
+        return (
+            f"For '{request}', I'm missing one detail: do you want me to answer a question, suggest a plan, or take an action?"
+        )
+    return "I'm missing one detail: do you want me to answer a question, suggest a plan, or take an action?"
+
+
+def _build_clarification_limit_prompt(escalation_reasons: list[str], transcript: str) -> str:
+    reasons = {str(item).strip().lower() for item in (escalation_reasons or []) if str(item).strip()}
+    if "missing_target" in reasons:
+        missing = "the exact object or location"
+    elif "low_transcript_confidence" in reasons:
+        missing = "a clearer request"
+    else:
+        missing = "the intended outcome"
+    request = _normalize_prompt_key(transcript)[:72]
+    if request:
+        return (
+            f"For '{request}', I am still missing {missing}. Options: 1) ask a question, 2) suggest a short plan, 3) request an action."
+        )
+    return f"I am still missing {missing}. Options: 1) ask a question, 2) suggest a short plan, 3) request an action."
+
+
+async def _recent_voice_clarification_count(db: AsyncSession, *, within_seconds: int = 180) -> int:
+    threshold = datetime.now(timezone.utc) - timedelta(seconds=max(30, int(within_seconds)))
+    rows = (
+        await db.execute(
+            select(InputEventResolution)
+            .where(InputEventResolution.created_at >= threshold)
+            .where(InputEventResolution.clarification_prompt != "")
+            .order_by(InputEventResolution.id.desc())
+            .limit(12)
+        )
+    ).scalars().all()
+
+    count = 0
+    for row in rows:
+        meta = row.metadata_json if isinstance(row.metadata_json, dict) else {}
+        if str(meta.get("source", "")).strip().lower() != "voice":
+            continue
+        if not _is_clarification_driven(row.escalation_reasons or [], str(row.outcome or "")):
+            continue
+        count += 1
+    return count
+
+
+def _lang_to_iso639_1(language: str) -> str:
+    normalized = str(language or "en-US").strip().replace("_", "-").lower()
+    if not normalized:
+        return "en"
+    if "-" in normalized:
+        return normalized.split("-", 1)[0]
+    return normalized[:2]
+
+
+def _select_tts_voice(language: str, requested_voice: str) -> str:
+    requested = str(requested_voice or "").strip()
+    if requested:
+        return requested
+
+    lang = str(language or "en-US").strip().lower()
+    if lang.startswith("en"):
+        return "en-US-EmmaMultilingualNeural"
+    if lang.startswith("es"):
+        return "es-ES-ElviraNeural"
+    if lang.startswith("fr"):
+        return "fr-FR-DeniseNeural"
+    if lang.startswith("de"):
+        return "de-DE-SeraphinaMultilingualNeural"
+    if lang.startswith("it"):
+        return "it-IT-ElsaNeural"
+    if lang.startswith("pt"):
+        return "pt-BR-FranciscaNeural"
+    return "en-US-EmmaMultilingualNeural"
+
+
+def _is_safe_web_url(raw_url: str) -> bool:
+    try:
+        parsed = urlparse(str(raw_url or "").strip())
+    except Exception:
+        return False
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    hostname = str(parsed.hostname or "").strip().lower()
+    if not hostname:
+        return False
+    blocked_hosts = {
+        "localhost",
+        "127.0.0.1",
+        "0.0.0.0",
+        "::1",
+    }
+    if hostname in blocked_hosts:
+        return False
+    if hostname.endswith(".local"):
+        return False
+    return True
+
+
+def _extract_visible_text_from_html(raw_html: str, *, max_chars: int = 12000) -> tuple[str, str]:
+    html = str(raw_html or "")
+    title_match = re.search(r"<title[^>]*>(.*?)</title>", html, flags=re.IGNORECASE | re.DOTALL)
+    title = re.sub(r"\s+", " ", title_match.group(1)).strip() if title_match else ""
+
+    without_scripts = re.sub(r"<script\b[^>]*>.*?</script>", " ", html, flags=re.IGNORECASE | re.DOTALL)
+    without_styles = re.sub(r"<style\b[^>]*>.*?</style>", " ", without_scripts, flags=re.IGNORECASE | re.DOTALL)
+    with_breaks = re.sub(r"</?(p|div|h1|h2|h3|h4|h5|h6|li|br|tr|section|article)[^>]*>", "\n", without_styles, flags=re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", " ", with_breaks)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > max_chars:
+        text = text[:max_chars].rstrip() + "..."
+    return title, text
+
+
+def _build_web_summary(*, title: str, text: str, max_sentences: int = 4) -> str:
+    cleaned = str(text or "").strip()
+    if not cleaned:
+        return "I could access the page, but I could not extract readable text to summarize."
+
+    # Keep summarization deterministic and dependency-free.
+    sentences = re.split(r"(?<=[.!?])\s+", cleaned)
+    sentences = [item.strip() for item in sentences if item and item.strip()]
+    selected: list[str] = []
+    seen: set[str] = set()
+    for sentence in sentences:
+        normalized = sentence.lower()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        selected.append(sentence)
+        if len(selected) >= max(1, min(8, int(max_sentences))):
+            break
+
+    if not selected:
+        selected = [cleaned[:420].rstrip()]
+
+    prefix = f"Page title: {title}. " if title else ""
+    return prefix + " ".join(selected)
 
 AUTONOMY_PROPOSAL_POLICY_MAP: dict[str, str] = {
     "confirm_target_ready": "auto_safe",
@@ -1265,6 +1476,14 @@ async def _resolve_event(event: InputEvent, db: AsyncSession) -> InputEventResol
         outcome = policy_eval["outcome"]
         escalation_reasons = policy_eval["escalation_reasons"]
         clarification_prompt = policy_eval["clarification_prompt"]
+        if _is_clarification_driven(escalation_reasons, outcome):
+            prior_clarifications = await _recent_voice_clarification_count(db, within_seconds=180)
+            if prior_clarifications <= 0:
+                clarification_prompt = _build_one_clarifier_prompt(event.raw_input)
+            else:
+                clarification_prompt = _build_clarification_limit_prompt(escalation_reasons, event.raw_input)
+                if "clarification_limit_reached" not in escalation_reasons:
+                    escalation_reasons.append("clarification_limit_reached")
         safety_decision = outcome
         reason = escalation_reasons[0] if escalation_reasons else "voice_policy_outcome"
     else:
@@ -1390,6 +1609,7 @@ async def _resolve_event(event: InputEvent, db: AsyncSession) -> InputEventResol
             "safety_flags": event.safety_flags,
             "target_system": event.target_system,
             "memory_signal": memory_signal,
+            "clarification_prompt_key": _normalize_prompt_key(clarification_prompt),
         },
     )
     db.add(resolution)
@@ -1639,6 +1859,110 @@ def _to_perception_source_out(row: WorkspacePerceptionSource) -> dict:
     }
 
 
+def _normalize_text_for_learning(raw: str) -> str:
+    return " ".join(str(raw or "").strip().split())
+
+
+def _interaction_pref_signal(transcript: str) -> tuple[str, str]:
+    text = _normalize_text_for_learning(transcript)
+    lowered = text.lower()
+    if not lowered:
+        return "", ""
+
+    patterns = [
+        ("call_me", ["call me ", "my name is ", "i am ", "i'm "]),
+        ("preference", ["i prefer ", "please use ", "i would like "]),
+        ("like", ["i like ", "i love "]),
+        ("dislike", ["i do not like ", "i don't like ", "i hate "]),
+    ]
+    for signal, prefixes in patterns:
+        for prefix in prefixes:
+            idx = lowered.find(prefix)
+            if idx < 0:
+                continue
+            value = text[idx + len(prefix):].strip(" .,!?")
+            if value:
+                return signal, value[:140]
+    return "", ""
+
+
+async def _store_interaction_learning(
+    *,
+    transcript: str,
+    confidence: float,
+    source: WorkspacePerceptionSource,
+    payload_metadata: dict,
+    db: AsyncSession,
+) -> int | None:
+    clean = _normalize_text_for_learning(transcript)
+    if not clean:
+        return None
+
+    compact = "".join(ch for ch in clean.lower() if ch.isalnum() or ch.isspace()).strip()
+    if compact in {"hi", "hello", "hey", "ok", "okay", "thanks", "thank you"}:
+        return None
+
+    pref_type, pref_value = _interaction_pref_signal(clean)
+    word_count = len([part for part in compact.split(" ") if part])
+    if not pref_type and (word_count < 4 or float(confidence) < 0.6):
+        return None
+
+    transcript_hash = sha256(clean.lower().encode("utf-8")).hexdigest()[:16]
+    existing = (
+        await db.execute(
+            select(MemoryEntry)
+            .where(MemoryEntry.memory_class == "interaction_learning")
+            .order_by(MemoryEntry.id.desc())
+            .limit(8)
+        )
+    ).scalars().all()
+    for row in existing:
+        meta = row.metadata_json if isinstance(row.metadata_json, dict) else {}
+        if str(meta.get("transcript_hash", "")) == transcript_hash:
+            return None
+
+    camera_row = (
+        (
+            await db.execute(
+                select(WorkspacePerceptionSource)
+                .where(WorkspacePerceptionSource.source_type == "camera")
+                .order_by(WorkspacePerceptionSource.id.desc())
+                .limit(1)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    camera_payload = camera_row.last_event_payload_json if camera_row and isinstance(camera_row.last_event_payload_json, dict) else {}
+    camera_label = str(camera_payload.get("object_label", "")).strip()
+
+    summary = f"User said: {clean[:110]}"
+    if pref_type and pref_value:
+        summary = f"Preference learned ({pref_type}): {pref_value[:110]}"
+    if camera_label:
+        summary = f"{summary} | Surrounding: {camera_label}"
+
+    memory = MemoryEntry(
+        memory_class="interaction_learning",
+        content=clean,
+        summary=summary,
+        metadata_json={
+            "source": "live_mic_adapter",
+            "device_id": source.device_id,
+            "session_id": source.session_id,
+            "confidence": float(confidence),
+            "preference_signal": pref_type,
+            "preference_value": pref_value,
+            "camera_label": camera_label,
+            "transcript_hash": transcript_hash,
+            "adapter_metadata": payload_metadata if isinstance(payload_metadata, dict) else {},
+        },
+    )
+    db.add(memory)
+    await db.flush()
+    return int(memory.id)
+
+
 @router.post("/intake")
 async def intake_normalized(payload: NormalizedInputCreate, db: AsyncSession = Depends(get_db)) -> dict:
     return await _store_normalized(payload, db)
@@ -1754,6 +2078,134 @@ async def voice_output(payload: SpeechOutputRequest, db: AsyncSession = Depends(
         "delivery_status": delivery_status,
         "failure_reason": failure_reason,
         "metadata_json": payload.metadata_json,
+    }
+
+
+@router.post("/voice/tts")
+async def voice_tts(payload: dict = Body(...)) -> Response:
+    message = str(payload.get("message") or "").strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="message is required")
+
+    if edge_tts is None:
+        raise HTTPException(status_code=503, detail="edge-tts is not installed")
+
+    language = str(payload.get("language") or "en-US").strip()
+    requested_voice = str(payload.get("voice") or "").strip()
+    voice = _select_tts_voice(language, requested_voice)
+
+    # Keep payload bounded to prevent unreasonably large synthesis requests.
+    safe_message = message[:800]
+
+    try:
+        communicator = edge_tts.Communicate(text=safe_message, voice=voice)
+        audio_chunks: list[bytes] = []
+        async for chunk in communicator.stream():
+            if chunk.get("type") == "audio" and chunk.get("data"):
+                audio_chunks.append(chunk["data"])
+        audio_bytes = b"".join(audio_chunks)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"tts_synthesis_failed: {exc}") from exc
+
+    if not audio_bytes:
+        raise HTTPException(status_code=502, detail="tts_synthesis_failed: empty_audio")
+
+    return Response(
+        content=audio_bytes,
+        media_type="audio/mpeg",
+        headers={
+            "Cache-Control": "no-store",
+            "X-MIM-TTS-Voice": voice,
+        },
+    )
+
+
+@router.post("/web/summarize")
+async def summarize_web_page(payload: dict = Body(...), db: AsyncSession = Depends(get_db)) -> dict:
+    if not settings.allow_web_access:
+        raise HTTPException(status_code=403, detail="web_access_disabled")
+
+    raw_url = str(payload.get("url") or "").strip()
+    if not raw_url:
+        raise HTTPException(status_code=400, detail="url is required")
+    if not _is_safe_web_url(raw_url):
+        raise HTTPException(status_code=422, detail="unsupported_or_unsafe_url")
+
+    timeout_seconds = max(3, min(20, int(payload.get("timeout_seconds") or 12)))
+    max_extract_chars = max(1200, min(30000, int(payload.get("max_extract_chars") or 12000)))
+    max_summary_sentences = max(1, min(8, int(payload.get("max_summary_sentences") or 4)))
+
+    req = urllib_request.Request(
+        url=raw_url,
+        headers={
+            "User-Agent": "MIM-WebSummarizer/1.0 (+https://mim.local)",
+            "Accept": "text/html,text/plain;q=0.9,*/*;q=0.3",
+        },
+    )
+
+    try:
+        with urllib_request.urlopen(req, timeout=timeout_seconds) as response:
+            status_code = int(getattr(response, "status", 200) or 200)
+            content_type = str(response.headers.get("Content-Type", "")).lower()
+            raw_bytes = response.read(1_000_000)
+    except urllib_error.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"web_fetch_http_error:{exc.code}") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"web_fetch_failed:{type(exc).__name__}") from exc
+
+    decoded = raw_bytes.decode("utf-8", errors="replace")
+    if "text/plain" in content_type:
+        title = ""
+        extracted = re.sub(r"\s+", " ", decoded).strip()
+        if len(extracted) > max_extract_chars:
+            extracted = extracted[:max_extract_chars].rstrip() + "..."
+    else:
+        title, extracted = _extract_visible_text_from_html(decoded, max_chars=max_extract_chars)
+
+    summary = _build_web_summary(title=title, text=extracted, max_sentences=max_summary_sentences)
+
+    memory = MemoryEntry(
+        memory_class="external_web_summary",
+        content=extracted[:2000],
+        summary=summary[:400],
+        metadata_json={
+            "url": raw_url,
+            "title": title,
+            "content_type": content_type,
+            "status_code": status_code,
+            "extract_chars": len(extracted),
+            "summary_sentences": max_summary_sentences,
+            "source": "gateway_web_summarize",
+        },
+    )
+    db.add(memory)
+    await db.flush()
+
+    await write_journal(
+        db,
+        actor="gateway",
+        action="web_page_summarized",
+        target_type="external_web",
+        target_id=str(memory.id),
+        summary=f"Summarized {raw_url}",
+        metadata_json={
+            "url": raw_url,
+            "title": title,
+            "status_code": status_code,
+            "extract_chars": len(extracted),
+        },
+    )
+    await db.commit()
+
+    return {
+        "ok": True,
+        "url": raw_url,
+        "title": title,
+        "summary": summary,
+        "excerpt": extracted[:800],
+        "content_type": content_type,
+        "status_code": status_code,
+        "memory_id": int(memory.id),
     }
 
 
@@ -1928,6 +2380,27 @@ async def live_mic_adapter(payload: LiveMicAdapterRequest, db: AsyncSession = De
 
     transcript = str(payload.transcript or "").strip()
     confidence = float(payload.confidence)
+
+    if not transcript:
+        # Heartbeat-only update: preserve mic activity visibility without storing a voice input.
+        source.last_seen_at = now
+        source.health_status = "healthy"
+        source.dropped_count = int(source.dropped_count or 0) + 1
+        source.last_event_payload_json = {
+            "type": "microphone",
+            "transcript": "",
+            "confidence": confidence,
+            "timestamp": now.isoformat(),
+            "status": "heartbeat_no_transcript",
+        }
+        await db.commit()
+        return {
+            "status": "heartbeat_no_transcript",
+            "reason": "no_transcript",
+            "source": _to_perception_source_out(source),
+            "accepted": False,
+        }
+
     fingerprint = _hash_payload([source.source_type, source.device_id, source.session_id, transcript.lower(), round(confidence, 3)])
 
     if confidence < float(source.confidence_floor) and bool(payload.discard_low_confidence):
@@ -1987,6 +2460,13 @@ async def live_mic_adapter(payload: LiveMicAdapterRequest, db: AsyncSession = De
         },
     )
     event_out = await _store_normalized(normalized, db)
+    learning_memory_id = await _store_interaction_learning(
+        transcript=transcript,
+        confidence=confidence,
+        source=source,
+        payload_metadata=(payload.metadata_json if isinstance(payload.metadata_json, dict) else {}),
+        db=db,
+    )
 
     source.last_seen_at = now
     source.last_accepted_at = now
@@ -2002,6 +2482,7 @@ async def live_mic_adapter(payload: LiveMicAdapterRequest, db: AsyncSession = De
     source.metadata_json = {
         **(source.metadata_json if isinstance(source.metadata_json, dict) else {}),
         "objective61_live_adapter": True,
+        **({"interaction_learning_memory_id": int(learning_memory_id)} if learning_memory_id else {}),
     }
     await db.commit()
 
@@ -2010,6 +2491,7 @@ async def live_mic_adapter(payload: LiveMicAdapterRequest, db: AsyncSession = De
         "source": _to_perception_source_out(source),
         "accepted": True,
         "event": event_out,
+        "interaction_learning_memory_id": int(learning_memory_id) if learning_memory_id else None,
     }
 
 
@@ -2021,6 +2503,34 @@ async def transcribe_mic_audio(payload: dict = Body(...)) -> dict:
     language = str(payload.get("language") or "en-US").strip() or "en-US"
     debug_enabled = _mic_debug_enabled(payload)
     provider_mode = _resolve_mic_provider_mode(payload)
+    payload_metadata = payload.get("metadata_json") if isinstance(payload.get("metadata_json"), dict) else {}
+    purpose = str(payload_metadata.get("purpose") or payload.get("purpose") or "").strip().lower()
+    helper_mode_enabled = str(os.getenv("MIM_OPENAI_HELPER_ENABLED", "")).strip().lower() in {"1", "true", "yes", "on"}
+    always_openai_stt = str(os.getenv("MIM_OPENAI_STT_ALWAYS", "")).strip().lower() in {"1", "true", "yes", "on"}
+    openai_helper_purposes = {
+        "training",
+        "learning",
+        "evaluation",
+        "research",
+        "information",
+        "object_identification",
+        "object-id",
+        "subject_context",
+        "subject-and-context",
+        "context",
+    }
+    openai_helper_request = bool(
+        helper_mode_enabled
+        or always_openai_stt
+        or
+        payload.get("training_mode")
+        or payload.get("learning_mode")
+        or payload.get("openai_helper")
+        or payload_metadata.get("training_mode")
+        or payload_metadata.get("learning_mode")
+        or payload_metadata.get("openai_helper")
+        or purpose in openai_helper_purposes
+    )
 
     def _debug_event(stage: str, **fields: dict) -> dict:
         elapsed_ms = int((datetime.now(timezone.utc) - started_at).total_seconds() * 1000)
@@ -2031,6 +2541,10 @@ async def transcribe_mic_audio(payload: dict = Body(...)) -> dict:
             "elapsed_ms": elapsed_ms,
             "language": language,
             "audio_base64_chars": len(raw_audio),
+            "openai_helper_request": openai_helper_request,
+            "helper_mode_enabled": helper_mode_enabled,
+            "always_openai_stt": always_openai_stt,
+            "purpose": purpose,
         }
         event.update(fields)
         return event
@@ -2087,6 +2601,167 @@ async def transcribe_mic_audio(payload: dict = Body(...)) -> dict:
     recognizer.energy_threshold = 120
     recognizer.dynamic_energy_threshold = True
     recognizer.operation_timeout = 10
+
+    def _openai_ready(*, allow_general: bool = False) -> tuple[bool, str]:
+        openai_general_allowed = allow_general and _openai_auto_stt_enabled()
+        if not openai_helper_request and not always_openai_stt and not openai_general_allowed:
+            return False, "openai_helper_only"
+        api_key = str(settings.openai_api_key or os.getenv("MIM_OPENAI_API_KEY") or "").strip()
+        forced_disable = str(os.getenv("MIM_DISABLE_OPENAI", "")).strip().lower() in {"1", "true", "yes", "on"}
+        openai_allowed = bool((settings.allow_openai or bool(api_key) or str(os.getenv("MIM_ALLOW_OPENAI", "")).strip().lower() in {"1", "true", "yes", "on"}) and not forced_disable)
+        if not openai_allowed:
+            return False, "openai_not_allowed"
+        if not api_key:
+            return False, "openai_api_key_missing"
+        return True, "ready"
+
+    async def _recognize_with_openai(trigger: str) -> dict | None:
+        ready, reason = _openai_ready(allow_general=(provider_mode == "auto"))
+        if not ready:
+            _append_mic_debug_event(
+                _debug_event(
+                    "recognize_openai_skip",
+                    provider="openai",
+                    trigger=trigger,
+                    reason=reason,
+                    audio_sha256_prefix=audio_sha_prefix,
+                )
+            )
+            return None
+
+        api_key = str(settings.openai_api_key or os.getenv("MIM_OPENAI_API_KEY") or "").strip()
+        model = str(os.getenv("MIM_OPENAI_STT_MODEL") or "gpt-4o-mini-transcribe").strip() or "gpt-4o-mini-transcribe"
+        language_short = _lang_to_iso639_1(language)
+
+        def _build_multipart(model_name: str) -> tuple[bytes, str]:
+            boundary = f"----mimBoundary{uuid.uuid4().hex}"
+            chunks: list[bytes] = []
+
+            def _field(name: str, value: str) -> None:
+                chunks.append(f"--{boundary}\r\n".encode("utf-8"))
+                chunks.append(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode("utf-8"))
+                chunks.append(str(value).encode("utf-8"))
+                chunks.append(b"\r\n")
+
+            _field("model", model_name)
+            _field("language", language_short)
+            _field("temperature", "0")
+
+            chunks.append(f"--{boundary}\r\n".encode("utf-8"))
+            chunks.append(b'Content-Disposition: form-data; name="file"; filename="input.wav"\r\n')
+            chunks.append(b"Content-Type: audio/wav\r\n\r\n")
+            chunks.append(audio_bytes)
+            chunks.append(b"\r\n")
+            chunks.append(f"--{boundary}--\r\n".encode("utf-8"))
+            return b"".join(chunks), boundary
+
+        def _call_openai(model_name: str) -> dict:
+            body, boundary = _build_multipart(model_name)
+            req = urllib_request.Request(
+                url="https://api.openai.com/v1/audio/transcriptions",
+                data=body,
+                method="POST",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": f"multipart/form-data; boundary={boundary}",
+                },
+            )
+            with urllib_request.urlopen(req, timeout=22) as response:
+                payload_raw = response.read().decode("utf-8", errors="replace")
+            return json.loads(payload_raw)
+
+        try_models = [model]
+        if model != "whisper-1":
+            try_models.append("whisper-1")
+
+        for model_name in try_models:
+            try:
+                response_json = await asyncio.wait_for(asyncio.to_thread(_call_openai, model_name), timeout=24)
+                transcript_text = str(response_json.get("text") or "").strip()
+                if transcript_text:
+                    _append_mic_debug_event(
+                        _debug_event(
+                            "recognize_openai_success",
+                            provider="openai",
+                            trigger=trigger,
+                            model=model_name,
+                            transcript_chars=len(transcript_text),
+                            audio_sha256_prefix=audio_sha_prefix,
+                        )
+                    )
+                    return {
+                        "ok": True,
+                        "transcript": transcript_text,
+                        "confidence": 0.9,
+                        "provider": "openai_transcribe",
+                        "model": model_name,
+                        "trace_id": trace_id,
+                    }
+
+                _append_mic_debug_event(
+                    _debug_event(
+                        "recognize_openai_no_match",
+                        provider="openai",
+                        trigger=trigger,
+                        model=model_name,
+                        audio_sha256_prefix=audio_sha_prefix,
+                    )
+                )
+                return {
+                    "ok": True,
+                    "transcript": "",
+                    "confidence": 0.0,
+                    "provider": "openai_transcribe",
+                    "reason": "no_match",
+                    "trace_id": trace_id,
+                }
+            except urllib_error.HTTPError as exc:
+                body = ""
+                try:
+                    body = exc.read().decode("utf-8", errors="replace")
+                except Exception:
+                    body = ""
+                detail = f"http_{exc.code}: {body[:220]}".strip()
+                _append_mic_debug_event(
+                    _debug_event(
+                        "recognize_openai_http_error",
+                        provider="openai",
+                        trigger=trigger,
+                        model=model_name,
+                        status_code=exc.code,
+                        detail=detail,
+                        audio_sha256_prefix=audio_sha_prefix,
+                    )
+                )
+                # Retry with fallback model on 4xx/5xx once.
+                continue
+            except asyncio.TimeoutError:
+                _append_mic_debug_event(
+                    _debug_event(
+                        "recognize_openai_timeout",
+                        provider="openai",
+                        trigger=trigger,
+                        model=model_name,
+                        timeout_seconds=24,
+                        audio_sha256_prefix=audio_sha_prefix,
+                    )
+                )
+                continue
+            except Exception as exc:
+                _append_mic_debug_event(
+                    _debug_event(
+                        "recognize_openai_error",
+                        provider="openai",
+                        trigger=trigger,
+                        model=model_name,
+                        error_type=type(exc).__name__,
+                        detail=str(exc),
+                        audio_sha256_prefix=audio_sha_prefix,
+                    )
+                )
+                continue
+
+        return None
 
     async def _recognize_with_local_fallback(trigger: str, upstream_detail: str = "") -> dict | None:
         if not str(language or "").lower().startswith("en"):
@@ -2151,6 +2826,50 @@ async def transcribe_mic_audio(payload: dict = Body(...)) -> dict:
                 **({"fallback_from": "google_web_speech"} if trigger.startswith("google") else {}),
             }
 
+        if _is_low_quality_local_transcript(transcript_text):
+            _append_mic_debug_event(
+                _debug_event(
+                    "recognize_local_low_quality",
+                    provider="pocketsphinx",
+                    trigger=trigger,
+                    transcript_chars=len(transcript_text),
+                    audio_sha256_prefix=audio_sha_prefix,
+                )
+            )
+            return {
+                "ok": True,
+                "transcript": "",
+                "confidence": 0.0,
+                "provider": "pocketsphinx",
+                "reason": "low_quality_transcript",
+                "trace_id": trace_id,
+                **({"fallback_from": "google_web_speech"} if trigger.startswith("google") else {}),
+            }
+
+        local_confidence = 0.58
+        local_confidence_min = _local_stt_min_confidence()
+        if local_confidence < local_confidence_min:
+            _append_mic_debug_event(
+                _debug_event(
+                    "recognize_local_low_confidence",
+                    provider="pocketsphinx",
+                    trigger=trigger,
+                    confidence=local_confidence,
+                    min_confidence=local_confidence_min,
+                    transcript_chars=len(transcript_text),
+                    audio_sha256_prefix=audio_sha_prefix,
+                )
+            )
+            return {
+                "ok": True,
+                "transcript": "",
+                "confidence": local_confidence,
+                "provider": "pocketsphinx",
+                "reason": "low_confidence",
+                "trace_id": trace_id,
+                **({"fallback_from": "google_web_speech"} if trigger.startswith("google") else {}),
+            }
+
         _append_mic_debug_event(
             _debug_event(
                 "recognize_local_success",
@@ -2163,7 +2882,7 @@ async def transcribe_mic_audio(payload: dict = Body(...)) -> dict:
         return {
             "ok": True,
             "transcript": transcript_text,
-            "confidence": 0.58,
+            "confidence": local_confidence,
             "provider": "pocketsphinx",
             "trace_id": trace_id,
             **({"fallback_from": "google_web_speech"} if trigger.startswith("google") else {}),
@@ -2212,6 +2931,46 @@ async def transcribe_mic_audio(payload: dict = Body(...)) -> dict:
             "detail": "local speech provider unavailable",
             "trace_id": trace_id,
         }
+
+    if provider_mode == "openai":
+        if not openai_helper_request and not always_openai_stt:
+            _append_mic_debug_event(
+                _debug_event(
+                    "recognize_openai_blocked",
+                    provider="openai",
+                    mode=provider_mode,
+                    reason="openai_helper_only",
+                    audio_sha256_prefix=audio_sha_prefix,
+                )
+            )
+            provider_mode = "auto"
+
+    if provider_mode == "openai":
+        _append_mic_debug_event(
+            _debug_event(
+                "recognize_provider_selected",
+                provider="openai",
+                mode=provider_mode,
+                audio_sha256_prefix=audio_sha_prefix,
+            )
+        )
+        openai_result = await _recognize_with_openai(trigger="openai_primary")
+        if openai_result is not None:
+            return openai_result
+        return {
+            "ok": False,
+            "transcript": "",
+            "confidence": 0.0,
+            "provider": "openai_transcribe",
+            "reason": "provider_unavailable",
+            "detail": "openai speech provider unavailable",
+            "trace_id": trace_id,
+        }
+
+    if provider_mode == "auto":
+        openai_result = await _recognize_with_openai(trigger="auto_preferred")
+        if openai_result is not None:
+            return openai_result
 
     try:
         transcript = await asyncio.wait_for(

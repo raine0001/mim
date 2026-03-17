@@ -1,4 +1,6 @@
 from datetime import datetime, timezone
+from hashlib import sha256
+import re
 
 from fastapi import APIRouter, Depends
 from fastapi.responses import HTMLResponse
@@ -6,9 +8,12 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.db import get_db
-from core.models import SpeechOutputAction, WorkspacePerceptionSource
+from core.models import InputEvent, MemoryEntry, SpeechOutputAction, WorkspaceInquiryQuestion, WorkspacePerceptionSource, WorkspaceStrategyGoal
 
 router = APIRouter(tags=["mim-ui"])
+
+MIC_PROMPT_MIN_CONFIDENCE = 0.66
+MIC_PROMPT_MAX_AGE_SECONDS = 25.0
 
 
 def _known_people() -> set[str]:
@@ -23,11 +28,291 @@ def _known_people() -> set[str]:
 
 def _age_seconds(now: datetime, ts: datetime | None) -> float | None:
     if ts is None:
-      return None
+        return None
     if ts.tzinfo is None:
-      ts = ts.replace(tzinfo=timezone.utc)
+        ts = ts.replace(tzinfo=timezone.utc)
     return max(0.0, (now - ts.astimezone(timezone.utc)).total_seconds())
 
+
+def _parse_payload_timestamp(raw: object) -> datetime | None:
+    if not isinstance(raw, str):
+        return None
+    value = raw.strip()
+    if not value:
+        return None
+    if value.endswith("Z"):
+        value = value[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(value)
+    except Exception:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _compact_sentence(raw: str, *, max_len: int = 180) -> str:
+    text = " ".join(str(raw or "").split())
+    if len(text) <= max_len:
+        return text
+    return f"{text[: max_len - 3].rstrip()}..."
+
+
+def _tokenize(text: str) -> set[str]:
+    cleaned = re.sub(r"[^a-z0-9\s]", " ", str(text or "").lower())
+    return {token for token in cleaned.split() if token}
+
+
+def _looks_like_direct_question(text: str) -> bool:
+    prompt = str(text or "").strip().lower()
+    if not prompt:
+      return False
+    if "?" in prompt:
+      return True
+    question_starts = (
+      "what ", "why ", "how ", "when ", "where ", "who ", "which ",
+      "does ", "do ", "can ", "could ", "is ", "are ", "will ", "would ",
+    )
+    return prompt.startswith(question_starts)
+
+
+def _is_clarifier_prompt_text(text: str) -> bool:
+    normalized = " ".join(str(text or "").strip().lower().split())
+    if not normalized:
+      return False
+    return (
+      "missing one detail" in normalized
+      or "options: 1)" in normalized
+      or "i am still missing" in normalized
+    )
+
+
+def _plain_answer_from_context(
+    *,
+    latest_mic_transcript: str,
+    environment_now: str,
+    goal_summary: str,
+    memory_summary: str,
+    ) -> str:
+    question = str(latest_mic_transcript or "").strip()
+    ql = question.lower()
+    question_stub = _compact_sentence(question, max_len=72)
+    if "task 75" in ql and ("what" in ql or "does" in ql):
+      return "Task 75 checks whether MIM and TOD stay synchronized without drift."
+
+    if goal_summary:
+      return _compact_sentence(f"{goal_summary.rstrip('.')}.", max_len=180)
+    if memory_summary:
+      return _compact_sentence(f"{memory_summary.rstrip('.')}.", max_len=180)
+    if environment_now:
+      if environment_now.startswith("camera has no clear"):
+        return f"For '{question_stub}', I do not have enough current state to answer directly yet."
+      return _compact_sentence(f"For '{question_stub}', current state is {environment_now.rstrip('.')}.", max_len=180)
+    return f"For '{question_stub}', I do not have enough current state to answer directly yet."
+
+
+def _apply_anti_drift_rewrite(
+    *,
+    text: str,
+    latest_mic_transcript: str,
+    environment_now: str,
+    goal_summary: str,
+    memory_summary: str,
+    ) -> str:
+    candidate = str(text or "").strip()
+    if not candidate:
+      return ""
+
+    lowered = candidate.lower()
+    drift_openers = (
+      "what you're really asking",
+      "what you are really asking",
+      "at a high level",
+      "in broad terms",
+      "more generally",
+    )
+    if lowered.startswith(drift_openers):
+      first_sentence = candidate.split(".", 1)[0].strip()
+      candidate = first_sentence if first_sentence else candidate
+
+    if _looks_like_direct_question(latest_mic_transcript):
+      user_tokens = _tokenize(latest_mic_transcript)
+      reply_tokens = _tokenize(candidate)
+      overlap = len(user_tokens.intersection(reply_tokens))
+      if overlap < 2:
+        direct = _plain_answer_from_context(
+          latest_mic_transcript=latest_mic_transcript,
+          environment_now=environment_now,
+          goal_summary=goal_summary,
+          memory_summary=memory_summary,
+        )
+        return direct
+    return _compact_sentence(candidate, max_len=220)
+
+
+def _is_low_quality_learning_entry(entry: MemoryEntry) -> bool:
+    meta = entry.metadata_json if isinstance(entry.metadata_json, dict) else {}
+    signal = str(meta.get("preference_signal", "")).strip().lower()
+    value = str(meta.get("preference_value", "")).strip().lower()
+    try:
+        confidence = float(meta.get("confidence", 0.0) or 0.0)
+    except Exception:
+        confidence = 0.0
+
+    if confidence and confidence < 0.68:
+        return True
+
+    if signal == "call_me":
+        low_value_tokens = {
+            "what",
+            "that",
+            "there",
+            "here",
+            "hello",
+            "hi",
+            "hey",
+            "him",
+            "you",
+            "see",
+        }
+        if not value or len(value) < 3 or value in low_value_tokens:
+            return True
+
+    return False
+
+
+def _looks_like_identity_prompt(raw: str) -> bool:
+    text = str(raw or "").strip().lower()
+    if not text:
+        return False
+    return (
+        "what should i call you" in text
+        or "what's your name" in text
+        or "tell me your name" in text
+    )
+
+
+def _rewrite_state_output_text(
+    raw_text: str,
+    *,
+    needs_identity_prompt: bool,
+    open_question_summary: str,
+    goal_summary: str,
+    latest_mic_transcript: str,
+    environment_now: str,
+    memory_summary: str,
+) -> str:
+  text = str(raw_text or "").strip()
+  if not text:
+    return ""
+
+  normalized = " ".join(text.lower().split())
+  if normalized in {"hello, i am mim.", "hello i am mim.", "hello i am mim"}:
+    return ""
+
+  if needs_identity_prompt:
+    return text
+
+  if _looks_like_identity_prompt(text):
+    if open_question_summary:
+      return f"Before I proceed, I need one decision: {open_question_summary}"
+    if goal_summary:
+      return f"I am tracking this goal: {goal_summary}. Tell me what you want me to do next."
+    return ""
+
+  return _apply_anti_drift_rewrite(
+      text=text,
+      latest_mic_transcript=latest_mic_transcript,
+      environment_now=environment_now,
+      goal_summary=goal_summary,
+      memory_summary=memory_summary,
+  )
+
+
+def _choose_phrase(options: list[str], key: str) -> str:
+    phrases = [item.strip() for item in options if str(item or "").strip()]
+    if not phrases:
+        return ""
+    digest = sha256(str(key or "seed").encode("utf-8")).hexdigest()
+    idx = int(digest[:8], 16) % len(phrases)
+    return phrases[idx]
+
+
+def _build_curiosity_prompt(
+    *,
+    environment_now: str,
+    goal_summary: str,
+    memory_summary: str,
+    latest_mic_transcript: str,
+    learning_summary: str,
+    clarification_budget_exhausted: bool = False,
+) -> str:
+    env = _compact_sentence(environment_now, max_len=96)
+    goal = _compact_sentence(goal_summary, max_len=110)
+    memory = _compact_sentence(memory_summary, max_len=110)
+    mic = _compact_sentence(latest_mic_transcript, max_len=90)
+    learning = _compact_sentence(learning_summary, max_len=110)
+
+    if mic:
+      if _looks_like_direct_question(mic):
+        return _plain_answer_from_context(
+          latest_mic_transcript=mic,
+          environment_now=env,
+          goal_summary=goal,
+          memory_summary=memory,
+        )
+      if clarification_budget_exhausted:
+        return f"For '{mic}', I still need one detail. Options: 1) answer, 2) plan, 3) action."
+      return (
+        f"For '{mic}', I'm missing one detail: do you want me to answer a question, suggest a plan, or take an action?"
+      )
+
+    if learning:
+      return _choose_phrase(
+        [
+          f"Current preference signal: {learning}.",
+          f"Stored interaction pattern: {learning}.",
+          f"Recent preference memory: {learning}.",
+        ],
+        key=f"learn:{learning}|env:{env}",
+      )
+
+    if goal and env:
+      return _choose_phrase(
+        [
+          f"Current scene: {env}. Active goal: {goal}.",
+          f"I can see {env}. I am tracking {goal}.",
+          f"Context: {env}. Goal in play: {goal}.",
+        ],
+        key=f"goal-env:{goal}|{env}",
+      )
+
+    if goal:
+      return _choose_phrase(
+        [
+          f"I am tracking this goal: {goal}.",
+          f"Goal status: {goal}.",
+        ],
+        key=f"goal:{goal}",
+      )
+
+    if memory:
+      return _choose_phrase(
+        [
+          f"From memory: {memory}.",
+          f"I remember: {memory}.",
+        ],
+        key=f"memory:{memory}",
+      )
+
+    return _choose_phrase(
+      [
+        "I am ready. Choose one: answer a question, suggest a plan, or take an action.",
+        "I am ready. Options: answer, plan, or action.",
+        "I am available. Pick one path: answer, plan, or action.",
+      ],
+      key="fallback-curiosity",
+    )
 
 @router.get("/mim", response_class=HTMLResponse)
 async def mim_ui_page() -> str:
@@ -136,6 +421,29 @@ async def mim_ui_page() -> str:
       color: #d7efff;
       margin-bottom: 8px;
     }
+    .settings-tabs {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      margin-bottom: 10px;
+    }
+    .settings-tab {
+      background: #0a2c3f;
+      color: var(--muted);
+      border: 1px solid #1b6a8d;
+      border-radius: 8px;
+      padding: 7px 8px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .settings-tab.active {
+      color: #e8f7ff;
+      background: #12506f;
+      border-color: #2aa6d4;
+    }
+    .settings-view { display: none; }
+    .settings-view.active { display: block; }
     .settings-row {
       display: grid;
       grid-template-columns: 1fr;
@@ -160,6 +468,18 @@ async def mim_ui_page() -> str:
       font-size: 11px;
       color: var(--muted);
       margin-top: -4px;
+    }
+    .camera-preview {
+      width: 100%;
+      height: 150px;
+      border-radius: 8px;
+      border: 1px solid #1a4f68;
+      background: #081a25;
+      object-fit: cover;
+    }
+    .camera-preview.inactive {
+      opacity: 0.55;
+      filter: grayscale(0.15);
     }
     .toggle-row {
       display: flex;
@@ -271,58 +591,93 @@ async def mim_ui_page() -> str:
 </head>
 <body>
   <div class="top-right">
-    <button id="settingsBtn" class="icon-btn" title="Voice settings" aria-label="Voice settings">⚙</button>
+    <button id="settingsBtn" class="icon-btn" title="MIM settings" aria-label="MIM settings">⚙</button>
   </div>
 
   <div id="settingsPanel" class="settings-panel" role="dialog" aria-label="MIM settings">
-    <div class="settings-title">Voice Settings</div>
-
-    <div class="settings-row">
-      <label for="voiceSelect">Fixed Voice</label>
-      <select id="voiceSelect"></select>
-      <div class="settings-note">This stays fixed until you change it.</div>
+    <div class="settings-title">MIM Settings</div>
+    <div class="settings-tabs">
+      <button id="settingsTabVoice" class="settings-tab active" type="button">Voice</button>
+      <button id="settingsTabCamera" class="settings-tab" type="button">Camera</button>
     </div>
 
-    <div class="settings-row">
-      <label for="defaultLang">Default Listen Language</label>
-      <input id="defaultLang" type="text" value="en-US" placeholder="en-US" />
+    <div id="settingsViewVoice" class="settings-view active">
+      <div class="settings-row">
+        <label for="voiceSelect">Fixed Voice</label>
+        <select id="voiceSelect"></select>
+        <div class="settings-note">This stays fixed until you change it.</div>
+      </div>
+
+      <div class="settings-row toggle-row">
+        <input id="serverTtsToggle" type="checkbox" checked />
+        <label for="serverTtsToggle">Use Neural Server TTS (recommended)</label>
+      </div>
+
+      <div class="settings-row">
+        <label for="serverTtsVoiceSelect">Neural Server Voice</label>
+        <select id="serverTtsVoiceSelect"></select>
+        <div class="settings-note">Higher quality voice rendered by backend TTS.</div>
+      </div>
+
+      <div class="settings-row">
+        <label for="defaultLang">Default Listen Language</label>
+        <input id="defaultLang" type="text" value="en-US" placeholder="en-US" />
+      </div>
+
+      <div class="settings-row">
+        <label for="micSelect">Microphone Input</label>
+        <select id="micSelect"></select>
+        <div class="settings-note">If you have multiple mics, choose the one MIM should use.</div>
+      </div>
+
+      <div class="settings-row toggle-row">
+        <input id="autoLangToggle" type="checkbox" checked />
+        <label for="autoLangToggle">Speak in detected input language</label>
+      </div>
+
+      <div class="settings-row toggle-row">
+        <input id="naturalVoiceToggle" type="checkbox" checked />
+        <label for="naturalVoiceToggle">Natural Voice preset (smoother)</label>
+      </div>
+
+      <div class="settings-row">
+        <label for="voiceRate">Voice Speed (<span id="voiceRateValue">1.00</span>)</label>
+        <input id="voiceRate" type="range" min="0.70" max="1.35" step="0.05" value="1.00" />
+      </div>
+
+      <div class="settings-row">
+        <label for="voicePitch">Voice Tone (<span id="voicePitchValue">1.00</span>)</label>
+        <input id="voicePitch" type="range" min="0.70" max="1.35" step="0.05" value="1.00" />
+      </div>
+
+      <div class="settings-row">
+        <label for="voiceDepth">Voice Depth (<span id="voiceDepthValue">0</span>)</label>
+        <input id="voiceDepth" type="range" min="0" max="100" step="5" value="0" />
+        <div class="settings-note">Higher depth lowers perceived pitch.</div>
+      </div>
+
+      <div class="settings-row">
+        <label for="voiceVolume">Voice Volume (<span id="voiceVolumeValue">1.00</span>)</label>
+        <input id="voiceVolume" type="range" min="0.40" max="1.00" step="0.05" value="1.00" />
+      </div>
     </div>
 
-    <div class="settings-row">
-      <label for="micSelect">Microphone Input</label>
-      <select id="micSelect"></select>
-      <div class="settings-note">If you have multiple mics, choose the one MIM should use.</div>
-    </div>
-
-    <div class="settings-row toggle-row">
-      <input id="autoLangToggle" type="checkbox" checked />
-      <label for="autoLangToggle">Speak in detected input language</label>
-    </div>
-
-    <div class="settings-row toggle-row">
-      <input id="naturalVoiceToggle" type="checkbox" checked />
-      <label for="naturalVoiceToggle">Natural Voice preset (smoother)</label>
-    </div>
-
-    <div class="settings-row">
-      <label for="voiceRate">Voice Speed (<span id="voiceRateValue">1.00</span>)</label>
-      <input id="voiceRate" type="range" min="0.70" max="1.35" step="0.05" value="1.00" />
-    </div>
-
-    <div class="settings-row">
-      <label for="voicePitch">Voice Tone (<span id="voicePitchValue">1.00</span>)</label>
-      <input id="voicePitch" type="range" min="0.70" max="1.35" step="0.05" value="1.00" />
-    </div>
-
-    <div class="settings-row">
-      <label for="voiceDepth">Voice Depth (<span id="voiceDepthValue">0</span>)</label>
-      <input id="voiceDepth" type="range" min="0" max="100" step="5" value="0" />
-      <div class="settings-note">Higher depth lowers perceived pitch.</div>
-    </div>
-
-    <div class="settings-row">
-      <label for="voiceVolume">Voice Volume (<span id="voiceVolumeValue">1.00</span>)</label>
-      <input id="voiceVolume" type="range" min="0.40" max="1.00" step="0.05" value="1.00" />
+    <div id="settingsViewCamera" class="settings-view">
+      <div class="settings-row">
+        <label for="cameraSelect">Camera Device</label>
+        <select id="cameraSelect"></select>
+      </div>
+      <div class="settings-row">
+        <video id="cameraPreview" class="camera-preview inactive" autoplay muted playsinline></video>
+        <div id="cameraSettingsStatus" class="settings-note">Camera preview is idle.</div>
+      </div>
+      <div class="settings-row">
+        <button id="cameraRefreshBtn" type="button">Refresh Camera List</button>
+      </div>
+      <div class="settings-row">
+        <button id="cameraToggleBtn" type="button">Start Camera Preview</button>
+      </div>
+      <div class="settings-note">Use this panel to verify framing and permissions for MIM camera sensing.</div>
     </div>
   </div>
 
@@ -367,6 +722,8 @@ async def mim_ui_page() -> str:
     const settingsBtn = document.getElementById('settingsBtn');
     const settingsPanel = document.getElementById('settingsPanel');
     const voiceSelect = document.getElementById('voiceSelect');
+    const serverTtsToggle = document.getElementById('serverTtsToggle');
+    const serverTtsVoiceSelect = document.getElementById('serverTtsVoiceSelect');
     const micSelect = document.getElementById('micSelect');
     const defaultLangInput = document.getElementById('defaultLang');
     const autoLangToggle = document.getElementById('autoLangToggle');
@@ -379,6 +736,15 @@ async def mim_ui_page() -> str:
     const voicePitchValueEl = document.getElementById('voicePitchValue');
     const voiceDepthValueEl = document.getElementById('voiceDepthValue');
     const voiceVolumeValueEl = document.getElementById('voiceVolumeValue');
+    const settingsTabVoice = document.getElementById('settingsTabVoice');
+    const settingsTabCamera = document.getElementById('settingsTabCamera');
+    const settingsViewVoice = document.getElementById('settingsViewVoice');
+    const settingsViewCamera = document.getElementById('settingsViewCamera');
+    const cameraSelect = document.getElementById('cameraSelect');
+    const cameraPreview = document.getElementById('cameraPreview');
+    const cameraSettingsStatus = document.getElementById('cameraSettingsStatus');
+    const cameraRefreshBtn = document.getElementById('cameraRefreshBtn');
+    const cameraToggleBtn = document.getElementById('cameraToggleBtn');
 
     window.addEventListener('error', (event) => {
       const msg = String(event?.message || 'unknown_js_error');
@@ -392,6 +758,14 @@ async def mim_ui_page() -> str:
     let micListening = false;
     let recognition = null;
     let motionInterval = null;
+    let availableCameras = [];
+    let selectedCameraDeviceId = localStorage.getItem('mim_camera_device_id') || '';
+    let cameraStream = null;
+    let cameraWatcherVideo = null;
+    let cameraWatcherCanvas = null;
+    let cameraWatcherCtx = null;
+    let cameraLastFrame = null;
+    let cameraLastSentAt = 0;
     let lastSpokenOutputId = Number(localStorage.getItem('mim_last_spoken_output_id') || 0);
     let availableVoices = [];
     let availableMics = [];
@@ -399,10 +773,11 @@ async def mim_ui_page() -> str:
     let selectedVoiceName = localStorage.getItem('mim_voice_name') || '';
     let selectedMicDeviceId = localStorage.getItem('mim_mic_device_id') || '';
     let selectedMicLabel = localStorage.getItem('mim_mic_device_label') || '';
-    let voiceRate = Number(localStorage.getItem('mim_voice_rate') || 0.96);
-    let voicePitch = Number(localStorage.getItem('mim_voice_pitch') || 0.98);
-    let voiceDepth = Number(localStorage.getItem('mim_voice_depth') || 0);
-    let voiceVolume = Number(localStorage.getItem('mim_voice_volume') || 0.92);
+    let voiceRate = Number(localStorage.getItem('mim_voice_rate') || 0.90);
+    let voicePitch = Number(localStorage.getItem('mim_voice_pitch') || 0.90);
+    let voiceDepth = Number(localStorage.getItem('mim_voice_depth') || 22);
+    let voiceVolume = Number(localStorage.getItem('mim_voice_volume') || 0.95);
+    const VOICE_PROFILE_MIGRATION_VERSION = 'voice-natural-v2';
     const healthState = {
       backendOk: true,
       micOk: true,
@@ -453,16 +828,48 @@ async def mim_ui_page() -> str:
     const MIC_EVENT_MIN_INTERVAL_SECONDS = 0;
     const MIC_EVENT_DUPLICATE_WINDOW_SECONDS = 2;
     const MIC_EVENT_CONFIDENCE_FLOOR = 0.2;
-    const FORCE_FALLBACK_STT = true;
-    const STARTUP_IDENTITY_INQUIRY = "I can see someone. Hi there — who are you? What's your name?";
+    const MIC_POCKETSPHINX_CONFIDENCE_MIN = 0.55;
+    const MIC_FALLBACK_CAPTURE_MS = 3600;
+    const MIC_FALLBACK_INTERVAL_MS = 5200;
+    const MIC_LOCAL_PROVIDER_BACKOFF_MS = 300000;
+    const MIC_POST_TTS_SUPPRESS_MS = 1100;
+    const MIC_ECHO_MATCH_WINDOW_MS = 20000;
+    const MIC_ECHO_MIN_SIGNATURE_LEN = 6;
+    const STATE_POLL_SPEAK_ENABLED = false;
+    const WAKE_WORD_REQUIRED_FOR_LIVE_REPLY = true;
+    const LOW_VALUE_CLARIFY_COOLDOWN_MS = 15000;
+    const LOW_VALUE_SPEAK_COOLDOWN_MS = 180000;
+    const SPOKEN_PHRASE_DEDUPE_MS = 2500;
+    const GREETING_CLARIFY_COOLDOWN_MS = 12000;
+    const SPOKEN_DUPLICATE_COOLDOWN_MS = 45000;
+    const BACKEND_INQUIRY_SPEAK_COOLDOWN_MS = 25000;
+    const FORCE_FALLBACK_STT = false;
+    const PIN_TO_SYSTEM_DEFAULT_MIC = true;
     const WEAK_IDENTITY_WORDS = new Set(['there', 'here', 'their', 'theyre', 'unknown', 'person', 'human', 'visitor']);
     let startupInquiryIssued = false;
+    let latestUiState = null;
     let lastInquiryPromptSpoken = '';
     let weakIdentityClarifyCooldownUntil = 0;
     let weakIdentityLastPromptKey = '';
+    let lowValueClarifyCooldownUntil = 0;
+    let lowValueSpeakCooldownUntil = 0;
+    let lowValueClarifyLastCompact = '';
+    let greetingClarifyCooldownUntil = 0;
+    let startupFeedbackCooldownUntil = 0;
+    let startupFeedbackLastCompact = '';
+    let suppressBackendInquiryUntil = 0;
+    let backendInquirySpeakCooldownUntil = 0;
+    let lastBackendInquirySignature = '';
+    let locallyAcceptedIdentity = '';
     let lastLocalTtsError = '';
     let micPermissionState = 'unknown';
     let micPermissionStream = null;
+    let micKeepAliveAudioContext = null;
+    let micKeepAliveSourceNode = null;
+    let micKeepAliveGainNode = null;
+    let micKeepAliveProcessorNode = null;
+    let micKeepAliveRecorder = null;
+    let micProviderLocalBackoffUntil = 0;
     const SYSTEM_DEFAULT_LANG = 'en-US';
     let defaultListenLang = localStorage.getItem('mim_default_listen_lang') || SYSTEM_DEFAULT_LANG;
     let autoLanguageMode = localStorage.getItem('mim_auto_lang_mode') !== '0';
@@ -472,6 +879,36 @@ async def mim_ui_page() -> str:
     let lastVisualIdentity = '';
     let interactionMemory = {};
     let greetingCooldownByIdentity = {};
+    let lastSpokenSignature = localStorage.getItem('mim_last_spoken_signature') || '';
+    let lastSpokenSignatureAt = Number(localStorage.getItem('mim_last_spoken_signature_at') || 0);
+    let serverTtsEnabled = localStorage.getItem('mim_server_tts_enabled') !== '0';
+    let selectedServerTtsVoice = localStorage.getItem('mim_server_tts_voice') || 'en-US-EmmaMultilingualNeural';
+    let activeServerTtsAudio = null;
+    let activeServerTtsUrl = '';
+    let speechRequestSeq = 0;
+    let speechInFlight = false;
+    let speechPlaybackActive = false;
+    let activeSpeechOwner = '';
+    let micSuppressedUntil = 0;
+    let recentSpokenUtterances = [];
+    let localTtsPlaybackToken = 0;
+    let lastSpokenPhraseCompact = '';
+    let lastSpokenPhraseAt = 0;
+    let refreshInFlight = false;
+    let refreshPending = false;
+
+    const SERVER_TTS_VOICES = [
+      { value: 'en-US-EmmaMultilingualNeural', label: 'Emma (en-US, multilingual)' },
+      { value: 'en-US-AvaMultilingualNeural', label: 'Ava (en-US, multilingual)' },
+      { value: 'en-US-AriaNeural', label: 'Aria (en-US)' },
+      { value: 'en-US-JennyNeural', label: 'Jenny (en-US)' },
+      { value: 'en-GB-SoniaNeural', label: 'Sonia (en-GB)' },
+      { value: 'es-ES-ElviraNeural', label: 'Elvira (es-ES)' },
+      { value: 'fr-FR-DeniseNeural', label: 'Denise (fr-FR)' },
+      { value: 'de-DE-SeraphinaMultilingualNeural', label: 'Seraphina (de-DE, multilingual)' },
+      { value: 'it-IT-ElsaNeural', label: 'Elsa (it-IT)' },
+      { value: 'pt-BR-FranciscaNeural', label: 'Francisca (pt-BR)' },
+    ];
 
     try {
       interactionMemory = JSON.parse(localStorage.getItem('mim_identity_language_memory') || '{}') || {};
@@ -482,6 +919,21 @@ async def mim_ui_page() -> str:
       greetingCooldownByIdentity = JSON.parse(localStorage.getItem('mim_identity_greeting_cooldown') || '{}') || {};
     } catch (_) {
       greetingCooldownByIdentity = {};
+    }
+
+    const appliedVoiceMigration = localStorage.getItem('mim_voice_profile_migration') || '';
+    if (appliedVoiceMigration !== VOICE_PROFILE_MIGRATION_VERSION) {
+      voiceRate = 0.90;
+      voicePitch = 0.90;
+      voiceDepth = 22;
+      voiceVolume = 0.95;
+      naturalVoicePreset = true;
+      localStorage.setItem('mim_voice_rate', String(voiceRate));
+      localStorage.setItem('mim_voice_pitch', String(voicePitch));
+      localStorage.setItem('mim_voice_depth', String(voiceDepth));
+      localStorage.setItem('mim_voice_volume', String(voiceVolume));
+      localStorage.setItem('mim_voice_natural_preset', '1');
+      localStorage.setItem('mim_voice_profile_migration', VOICE_PROFILE_MIGRATION_VERSION);
     }
 
     for (let i = 0; i < 90; i += 1) {
@@ -501,7 +953,283 @@ async def mim_ui_page() -> str:
       return Math.min(max, Math.max(min, value));
     }
 
+    function chooseDialogVariant(options, key = '') {
+      const variants = Array.isArray(options) ? options.filter(Boolean) : [];
+      if (!variants.length) return '';
+      const seedText = `${String(key || '')}|${Date.now()}`;
+      let hash = 0;
+      for (let i = 0; i < seedText.length; i += 1) {
+        hash = ((hash << 5) - hash + seedText.charCodeAt(i)) | 0;
+      }
+      const index = Math.abs(hash) % variants.length;
+      return String(variants[index]);
+    }
+
+    function normalizeDialogSnippet(raw, maxLen = 120) {
+      const text = String(raw || '').replace(/\s+/g, ' ').trim();
+      if (!text) return '';
+      if (text.length <= maxLen) return text;
+      return `${text.slice(0, maxLen - 3).trim()}...`;
+    }
+
+    function getConversationContext() {
+      const context = latestUiState?.conversation_context;
+      return context && typeof context === 'object' ? context : {};
+    }
+
+    function shouldAskForNameNow() {
+      return Boolean(getConversationContext().needs_identity_prompt);
+    }
+
+    function buildContextLead() {
+      const context = getConversationContext();
+      const snippets = [];
+      const environmentNow = normalizeDialogSnippet(context.environment_now, 90);
+      const activeGoal = normalizeDialogSnippet(context.active_goal, 95);
+      const openQuestion = normalizeDialogSnippet(context.open_question, 95);
+      const memoryHint = normalizeDialogSnippet(context.memory_hint, 95);
+
+      if (environmentNow) snippets.push(`Right now ${environmentNow}.`);
+      if (activeGoal) snippets.push(`Current goal: ${activeGoal}.`);
+      if (openQuestion) {
+        snippets.push(`Open decision: ${openQuestion}.`);
+      } else if (memoryHint) {
+        snippets.push(`From memory: ${memoryHint}.`);
+      }
+
+      return snippets.join(' ').trim();
+    }
+
+    function isIdentityInquiryText(textRaw) {
+      const text = String(textRaw || '').toLowerCase();
+      if (!text.trim()) return false;
+      return text.includes('what should i call you')
+        || text.includes("what's your name")
+        || text.includes('tell me your name');
+    }
+
+    function normalizeSpeechSignature(textRaw) {
+      return String(textRaw || '')
+        .toLowerCase()
+        .replace(/[^a-z0-9\s]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+    }
+
+    function shortSpeechSignature(textRaw) {
+      const signature = normalizeSpeechSignature(textRaw);
+      if (!signature) return '-';
+      let hash = 2166136261;
+      for (let i = 0; i < signature.length; i += 1) {
+        hash ^= signature.charCodeAt(i);
+        hash = Math.imul(hash, 16777619);
+      }
+      return `h${(hash >>> 0).toString(16).padStart(8, '0')}:${signature.slice(0, 24)}`;
+    }
+
+    function suppressionWindowMs() {
+      return Math.max(0, micSuppressedUntil - Date.now());
+    }
+
+    function addSpeechDebug(stage, detail = '') {
+      const detailText = String(detail || '').trim();
+      addMicDebug(`speech:${stage}`, detailText);
+      try {
+        console.debug(`[mim:speech] ${stage}${detailText ? ` ${detailText}` : ''}`);
+      } catch (_) {
+      }
+    }
+
+    function logTranscriptDrop(reason, transcript, mode = 'unknown', detail = '') {
+      const preview = String(transcript || '').slice(0, 48);
+      const signature = shortSpeechSignature(transcript);
+      const suffix = detail ? ` ${detail}` : '';
+      addMicDebug(
+        'transcript-drop',
+        `reason=${reason} mode=${mode} sig=${signature} token=${localTtsPlaybackToken} suppressMs=${suppressionWindowMs()} text=${preview}${suffix}`,
+      );
+    }
+
+    function setMicSuppression(durationMs, reason = '') {
+      const until = Date.now() + Math.max(0, Number(durationMs) || 0);
+      if (until > micSuppressedUntil) {
+        micSuppressedUntil = until;
+      }
+      if (reason) {
+        addMicDebug('mic-suppress', `${reason} until=${micSuppressedUntil}`);
+      }
+    }
+
+    function isMicSuppressedNow() {
+      return speechInFlight || speechPlaybackActive || Date.now() < micSuppressedUntil;
+    }
+
+    function rememberSpokenUtterance(text, sourceTag = 'unknown') {
+      const signature = normalizeSpeechSignature(text);
+      if (!signature || signature.length < MIC_ECHO_MIN_SIGNATURE_LEN) return;
+      recentSpokenUtterances.push({ signature, sourceTag, at: Date.now() });
+      if (recentSpokenUtterances.length > 14) {
+        recentSpokenUtterances = recentSpokenUtterances.slice(-14);
+      }
+    }
+
+    function isLikelyEchoTranscript(transcript) {
+      const signature = normalizeSpeechSignature(transcript);
+      if (!signature || signature.length < MIC_ECHO_MIN_SIGNATURE_LEN) return false;
+      const now = Date.now();
+      recentSpokenUtterances = recentSpokenUtterances.filter((item) => (now - Number(item.at || 0)) <= MIC_ECHO_MATCH_WINDOW_MS);
+      return recentSpokenUtterances.some((item) => {
+        if (!item || !item.signature) return false;
+        if (item.signature === signature) return true;
+        return item.signature.includes(signature) || signature.includes(item.signature);
+      });
+    }
+
+    function hasWakePhrase(transcript) {
+      const text = ` ${String(transcript || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim()} `;
+      if (!text.trim()) return false;
+      return text.includes(' mim ') || text.includes(' hey mim ') || text.includes(' okay mim ') || text.includes(' ok mim ');
+    }
+
+    function shouldSpeakBackendInquiryPrompt(inquiryPrompt, conversationContext = {}) {
+      const prompt = String(inquiryPrompt || '').trim();
+      if (!prompt) return false;
+
+      const now = Date.now();
+      const signature = normalizeSpeechSignature(prompt);
+      const needsIdentityPrompt = Boolean(conversationContext?.needs_identity_prompt);
+      const hasOpenQuestion = Boolean(String(conversationContext?.open_question || '').trim());
+
+      if (needsIdentityPrompt || hasOpenQuestion) {
+        backendInquirySpeakCooldownUntil = now + 6000;
+        lastBackendInquirySignature = signature;
+        return true;
+      }
+
+      if (signature && signature === lastBackendInquirySignature && now < backendInquirySpeakCooldownUntil) {
+        return false;
+      }
+
+      if (now < backendInquirySpeakCooldownUntil) {
+        return false;
+      }
+
+      backendInquirySpeakCooldownUntil = now + BACKEND_INQUIRY_SPEAK_COOLDOWN_MS;
+      lastBackendInquirySignature = signature;
+      return true;
+    }
+
+    function rewriteQueuedOutputText(textRaw, data = {}) {
+      let text = String(textRaw || '').replace(/\s+/g, ' ').trim();
+      if (!text) return '';
+
+      const context = (data && typeof data.conversation_context === 'object')
+        ? data.conversation_context
+        : getConversationContext();
+      const needsIdentityPrompt = Boolean(context?.needs_identity_prompt);
+      const openQuestion = normalizeDialogSnippet(context?.open_question || '', 140);
+      const activeGoal = normalizeDialogSnippet(context?.active_goal || '', 140);
+
+      // Drop stale identity asks when context says identity is no longer required.
+      if (!needsIdentityPrompt && isIdentityInquiryText(text)) {
+        if (openQuestion) {
+          return `Before I proceed, I need one decision: ${openQuestion}`;
+        }
+        if (activeGoal) {
+          return `I am tracking this goal: ${activeGoal}. Tell me what you want me to do next.`;
+        }
+        return '';
+      }
+
+      text = text
+        .replace(/^i\s+can\s+see\s+someone\.\s*/i, '')
+        .replace(/^hi\s+there[,\s]*/i, '');
+
+      const signature = normalizeSpeechSignature(text);
+      const cannedAckOnly = new Set([
+        'ok', 'okay', 'got it', 'understood', 'noted', 'thanks', 'thank you',
+        'all right', 'alright', 'copy that', 'hello i am mim', 'hello i am mim.',
+      ]);
+      if (cannedAckOnly.has(signature)) {
+        return '';
+      }
+
+      return text;
+    }
+
+    function buildDialogPrompt(kind, context = {}) {
+      const name = String(context?.name || '').trim();
+      const transcript = String(context?.transcript || '').trim();
+      const contextLead = buildContextLead();
+      const askForName = shouldAskForNameNow();
+      if (kind === 'startup_identity') {
+        if (askForName) {
+          return chooseDialogVariant([
+            `${contextLead ? `${contextLead} ` : ''}Hi there. What should I call you?`,
+            `${contextLead ? `${contextLead} ` : ''}I can continue right away, and I only need the name you prefer.`,
+            `${contextLead ? `${contextLead} ` : ''}Before we continue, what name do you want me to use?`,
+          ], transcript || contextLead || 'startup-name');
+        }
+        return chooseDialogVariant([
+          `${contextLead ? `${contextLead} ` : ''}I am listening. What do you want to work on right now?`,
+          `${contextLead ? `${contextLead} ` : ''}I am here with full context. Tell me the next thing you want to do.`,
+          `${contextLead ? `${contextLead} ` : ''}We can continue from where we are. What should I do now?`,
+        ], transcript || contextLead || 'startup-open');
+      }
+      if (kind === 'low_value') {
+        if (askForName) {
+          return chooseDialogVariant([
+            'I only caught part of that. Please say just your name once.',
+            'I heard fragments. Please tell me the name you want me to use.',
+            'I missed part of that. Could you repeat your name clearly?',
+          ], transcript || contextLead || 'low-value-name');
+        }
+        return chooseDialogVariant([
+          'I only caught part of that. Say your request again in one sentence.',
+          'I heard fragments. Please repeat what you want me to do now.',
+          'I am missing part of your intent. Tell me the next action clearly.',
+        ], transcript || contextLead || 'low-value-action');
+      }
+      if (kind === 'greeting_only') {
+        if (askForName) {
+          return chooseDialogVariant([
+            `${contextLead ? `${contextLead} ` : ''}Hi. What should I call you?`,
+            `${contextLead ? `${contextLead} ` : ''}Hello. Share the name you want me to use and we can continue.`,
+            `${contextLead ? `${contextLead} ` : ''}Hey. I am ready. What name should I address you by?`,
+          ], transcript || contextLead || 'greeting-name');
+        }
+        return chooseDialogVariant([
+          `${contextLead ? `${contextLead} ` : ''}Hi. What do you want to do next?`,
+          `${contextLead ? `${contextLead} ` : ''}Hello. Tell me your next request and I will act on it.`,
+          `${contextLead ? `${contextLead} ` : ''}Hey. I am ready for the next step.`,
+        ], transcript || contextLead || 'greeting-action');
+      }
+      if (kind === 'uncertain_name') {
+        if (!askForName) {
+          return chooseDialogVariant([
+            `${contextLead ? `${contextLead} ` : ''}I heard you, but I am not certain about the request. Say the next action in one clear sentence.`,
+            `${contextLead ? `${contextLead} ` : ''}I may have misheard. Please restate exactly what you want me to do now.`,
+            `${contextLead ? `${contextLead} ` : ''}I am uncertain about your intent. Give me one concise instruction.`,
+          ], transcript || contextLead || 'uncertain-action');
+        }
+        return chooseDialogVariant([
+          `${contextLead ? `${contextLead} ` : ''}I heard you, but I am not fully sure about the name. Please say only your name once.`,
+          `${contextLead ? `${contextLead} ` : ''}I may have misheard the name. Please say just your name clearly.`,
+          `${contextLead ? `${contextLead} ` : ''}I am uncertain about the name. Please repeat only your name, one word if possible.`,
+        ], transcript || contextLead || 'uncertain-name');
+      }
+      if (kind === 'identity_ack') {
+        return chooseDialogVariant([
+          `${contextLead ? `${contextLead} ` : ''}Nice to meet you, ${name}. What should we tackle first?`,
+          `${contextLead ? `${contextLead} ` : ''}Great to meet you, ${name}. What is the next step you want?`,
+          `${contextLead ? `${contextLead} ` : ''}Thanks, ${name}. I am ready when you are.`,
+        ], name || transcript || contextLead || 'identity-ack');
+      }
+      return '';
+    }
+
     function stopMicPermissionStream() {
+      stopMicKeepAliveMonitor();
       if (!micPermissionStream) return;
       try {
         for (const track of micPermissionStream.getTracks()) {
@@ -513,6 +1241,99 @@ async def mim_ui_page() -> str:
       } catch (_) {
       }
       micPermissionStream = null;
+    }
+
+    function stopMicKeepAliveMonitor() {
+      if (micKeepAliveRecorder) {
+        try {
+          if (micKeepAliveRecorder.state !== 'inactive') {
+            micKeepAliveRecorder.stop();
+          }
+        } catch (_) {
+        }
+        micKeepAliveRecorder.ondataavailable = null;
+        micKeepAliveRecorder.onerror = null;
+      }
+      if (micKeepAliveProcessorNode) {
+        try {
+          micKeepAliveProcessorNode.disconnect();
+        } catch (_) {
+        }
+        micKeepAliveProcessorNode.onaudioprocess = null;
+      }
+      if (micKeepAliveSourceNode) {
+        try {
+          micKeepAliveSourceNode.disconnect();
+        } catch (_) {
+        }
+      }
+      if (micKeepAliveGainNode) {
+        try {
+          micKeepAliveGainNode.disconnect();
+        } catch (_) {
+        }
+      }
+      if (micKeepAliveAudioContext) {
+        try {
+          micKeepAliveAudioContext.close();
+        } catch (_) {
+        }
+      }
+      micKeepAliveAudioContext = null;
+      micKeepAliveSourceNode = null;
+      micKeepAliveGainNode = null;
+      micKeepAliveProcessorNode = null;
+      micKeepAliveRecorder = null;
+    }
+
+    function startMicKeepAliveMonitor() {
+      if (!micPermissionStream || !micPermissionStream.active) return;
+      if (micKeepAliveRecorder && micKeepAliveRecorder.state !== 'inactive') return;
+      if (micKeepAliveAudioContext && micKeepAliveSourceNode) return;
+
+      // Prefer MediaRecorder keepalive because desktop audio stacks treat it as
+      // an explicit ongoing capture session and keep mic indicators lit.
+      if (typeof window.MediaRecorder === 'function') {
+        try {
+          micKeepAliveRecorder = new MediaRecorder(micPermissionStream, { mimeType: 'audio/webm;codecs=opus' });
+          micKeepAliveRecorder.ondataavailable = () => {};
+          micKeepAliveRecorder.onerror = (event) => {
+            addMicDebug('keepalive-recorder-error', String(event?.error?.message || event?.message || 'unknown'));
+          };
+          micKeepAliveRecorder.start(2000);
+          addMicDebug('keepalive', 'recorder-active');
+          return;
+        } catch (_) {
+          // Fall back to AudioContext pipeline below.
+          micKeepAliveRecorder = null;
+        }
+      }
+
+      const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
+      if (!AudioContextCtor) {
+        addMicDebug('keepalive', 'AudioContext unavailable');
+        return;
+      }
+
+      try {
+        micKeepAliveAudioContext = new AudioContextCtor();
+        micKeepAliveSourceNode = micKeepAliveAudioContext.createMediaStreamSource(micPermissionStream);
+        micKeepAliveProcessorNode = micKeepAliveAudioContext.createScriptProcessor(1024, 1, 1);
+        micKeepAliveProcessorNode.onaudioprocess = () => {};
+        micKeepAliveGainNode = micKeepAliveAudioContext.createGain();
+        // Keep the stream active while producing effectively silent output.
+        micKeepAliveGainNode.gain.value = 0.00001;
+        micKeepAliveSourceNode.connect(micKeepAliveProcessorNode);
+        micKeepAliveProcessorNode.connect(micKeepAliveGainNode);
+        micKeepAliveGainNode.connect(micKeepAliveAudioContext.destination);
+        if (micKeepAliveAudioContext.state === 'suspended') {
+          micKeepAliveAudioContext.resume().catch(() => {});
+        }
+        addMicDebug('keepalive', 'active');
+      } catch (error) {
+        addMicDebug('keepalive-error', String(error?.message || 'failed'));
+        stopMicKeepAliveMonitor();
+      }
     }
 
     function addMicDebug(label, detail = '') {
@@ -529,12 +1350,48 @@ async def mim_ui_page() -> str:
       }
     }
 
+    function setSettingsTab(tabName) {
+      const isCamera = tabName === 'camera';
+      settingsTabVoice.classList.toggle('active', !isCamera);
+      settingsTabCamera.classList.toggle('active', isCamera);
+      settingsViewVoice.classList.toggle('active', !isCamera);
+      settingsViewCamera.classList.toggle('active', isCamera);
+    }
+
+    function updateCameraSettingsUi() {
+      const active = Boolean(cameraStream && cameraStream.active);
+      cameraToggleBtn.textContent = active ? 'Stop Camera Preview' : 'Start Camera Preview';
+      cameraPreview.classList.toggle('inactive', !active);
+      if (active) {
+        cameraSettingsStatus.textContent = 'Camera preview is live.';
+      } else if (!cameraSettingsStatus.textContent.trim()) {
+        cameraSettingsStatus.textContent = 'Camera preview is idle.';
+      }
+    }
+
     function syncVoiceControlAvailability() {
       const manualMode = !naturalVoicePreset;
       voiceRateInput.disabled = !manualMode;
       voicePitchInput.disabled = !manualMode;
       voiceDepthInput.disabled = !manualMode;
       voiceVolumeInput.disabled = !manualMode;
+      serverTtsVoiceSelect.disabled = !serverTtsEnabled;
+    }
+
+    function buildServerTtsVoiceOptions() {
+      serverTtsVoiceSelect.innerHTML = '';
+      for (const voice of SERVER_TTS_VOICES) {
+        const option = document.createElement('option');
+        option.value = voice.value;
+        option.textContent = voice.label;
+        serverTtsVoiceSelect.appendChild(option);
+      }
+
+      const hasSelected = SERVER_TTS_VOICES.some((voice) => voice.value === selectedServerTtsVoice);
+      if (!hasSelected) {
+        selectedServerTtsVoice = 'en-US-EmmaMultilingualNeural';
+      }
+      serverTtsVoiceSelect.value = selectedServerTtsVoice;
     }
 
     function clearMicFallbackTimer() {
@@ -558,17 +1415,62 @@ async def mim_ui_page() -> str:
         if (!micAutoMode) return;
         noteMicEvent('fallback', 'scheduled-start');
         captureFallbackTranscription();
-      }, 1400);
+      }, 900);
       micFallbackInterval = setInterval(() => {
         if (!micAutoMode) return;
         captureFallbackTranscription();
-      }, 9000);
+      }, MIC_FALLBACK_INTERVAL_MS);
     }
 
     function writeAscii(view, offset, value) {
       for (let index = 0; index < value.length; index += 1) {
         view.setUint8(offset + index, value.charCodeAt(index));
       }
+    }
+
+    function downsampleChunksToRate(floatChunks, sourceRate, targetRate) {
+      if (!Array.isArray(floatChunks) || !floatChunks.length) return [];
+
+      const source = [];
+      for (const chunk of floatChunks) {
+        for (let index = 0; index < chunk.length; index += 1) {
+          source.push(chunk[index]);
+        }
+      }
+
+      const safeSourceRate = Math.max(8000, Math.round(Number(sourceRate || 16000)));
+      const safeTargetRate = Math.max(8000, Math.round(Number(targetRate || 16000)));
+      if (safeTargetRate >= safeSourceRate) {
+        return [new Float32Array(source)];
+      }
+
+      const ratio = safeSourceRate / safeTargetRate;
+      const outputLength = Math.max(1, Math.floor(source.length / ratio));
+      const output = new Float32Array(outputLength);
+
+      let outputIndex = 0;
+      let inputIndex = 0;
+      while (outputIndex < outputLength) {
+        const nextInputIndex = Math.min(source.length, Math.floor((outputIndex + 1) * ratio));
+        let sum = 0;
+        let count = 0;
+        for (let idx = inputIndex; idx < nextInputIndex; idx += 1) {
+          sum += source[idx];
+          count += 1;
+        }
+        output[outputIndex] = count > 0 ? sum / count : source[Math.min(inputIndex, source.length - 1)] || 0;
+        outputIndex += 1;
+        inputIndex = nextInputIndex;
+      }
+
+      return [output];
+    }
+
+    function getMicTranscribeProvider() {
+      if (Date.now() < micProviderLocalBackoffUntil) {
+        return 'local';
+      }
+      return 'auto';
     }
 
     function encodeWavBlob(floatChunks, sampleRate) {
@@ -631,35 +1533,187 @@ async def mim_ui_page() -> str:
       }
     }
 
+    function extractFirstUrl(rawText) {
+      const text = String(rawText || '');
+      const match = text.match(/https?:\/\/[^\s)]+/i);
+      return match ? String(match[0]).trim() : '';
+    }
+
+    async function handleWebSummaryCommand(url, sourceMode = 'ui') {
+      const targetUrl = String(url || '').trim();
+      if (!targetUrl) return false;
+
+      inquiryEl.textContent = `Summarizing website: ${targetUrl}`;
+      statusEl.textContent = `Fetching website summary (${sourceMode})...`;
+
+      try {
+        const res = await fetchWithTimeout('/gateway/web/summarize', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            url: targetUrl,
+            timeout_seconds: 12,
+            max_summary_sentences: 4,
+          }),
+        }, 16000);
+
+        let payload = {};
+        try {
+          payload = await res.json();
+        } catch (_) {
+          payload = {};
+        }
+
+        if (!res.ok) {
+          const detail = String(payload?.detail || '').trim();
+          let message = `I could not summarize that website (${detail || `http_${res.status}`}).`;
+          if (detail.includes('web_access_disabled')) {
+            message = 'Web access is currently disabled. Set ALLOW_WEB_ACCESS=true to enable website summaries.';
+          }
+          inquiryEl.textContent = message;
+          statusEl.textContent = message;
+          await speakLocally(message, true, `web_summary_error:${sourceMode}`);
+          addMicDebug('web-summary-failed', `mode=${sourceMode} detail=${detail || `http_${res.status}`}`);
+          return true;
+        }
+
+        const title = String(payload?.title || '').trim();
+        const summary = String(payload?.summary || '').trim();
+        const spoken = summary || 'I fetched the page, but there was no useful summary text.';
+        const display = title ? `Web summary (${title}): ${spoken}` : `Web summary: ${spoken}`;
+        inquiryEl.textContent = display;
+        statusEl.textContent = `Website summarized (${sourceMode}).`;
+        await speakLocally(display, true, `web_summary_result:${sourceMode}`);
+        addMicDebug('web-summary-ok', `mode=${sourceMode} url=${targetUrl}`);
+        return true;
+      } catch (error) {
+        const message = `I could not summarize that website right now (${String(error?.message || 'network_error')}).`;
+        inquiryEl.textContent = message;
+        statusEl.textContent = message;
+        await speakLocally(message, true, `web_summary_exception:${sourceMode}`);
+        addMicDebug('web-summary-error', `mode=${sourceMode} error=${String(error?.message || 'unknown')}`);
+        return true;
+      }
+    }
+
+    async function handleCapabilitiesCommand(sourceMode = 'ui') {
+      try {
+        const res = await fetchWithTimeout('/manifest', {}, 8000);
+        if (!res.ok) {
+          const message = `I could not read my manifest right now (http_${res.status}).`;
+          inquiryEl.textContent = message;
+          statusEl.textContent = message;
+          await speakLocally(message, true, `capabilities_error:${sourceMode}`);
+          return true;
+        }
+        const manifest = await res.json();
+        const capabilities = Array.isArray(manifest?.capabilities) ? manifest.capabilities : [];
+        const hasWebSummary = capabilities.includes('web_page_summarization');
+        const message = hasWebSummary
+          ? `I currently expose ${capabilities.length} capabilities. Web page summarization is available through gateway web summarize.`
+          : `I currently expose ${capabilities.length} capabilities. You can inspect them through the manifest endpoint.`;
+        inquiryEl.textContent = message;
+        statusEl.textContent = `Capabilities summary ready (${sourceMode}).`;
+        await speakLocally(message, true, `capabilities_result:${sourceMode}`);
+        addMicDebug('capabilities-summary', `mode=${sourceMode} count=${capabilities.length}`);
+        return true;
+      } catch (error) {
+        const message = `I could not retrieve capability details right now (${String(error?.message || 'network_error')}).`;
+        inquiryEl.textContent = message;
+        statusEl.textContent = message;
+        await speakLocally(message, true, `capabilities_exception:${sourceMode}`);
+        addMicDebug('capabilities-summary-error', `mode=${sourceMode} error=${String(error?.message || 'unknown')}`);
+        return true;
+      }
+    }
+
+    async function maybeHandleWebOrCapabilityCommand(transcript, sourceMode = 'ui') {
+      const text = String(transcript || '').trim();
+      if (!text) return false;
+
+      const lowered = text.toLowerCase();
+      const askedWebsiteSummary =
+        lowered.includes('summarize this website')
+        || lowered.includes('summary of this website')
+        || lowered.includes('summarize this url')
+        || lowered.includes('summarize this site')
+        || (lowered.includes('summarize') && lowered.includes('http'));
+
+      if (askedWebsiteSummary) {
+        const url = extractFirstUrl(text);
+        if (!url) {
+          const prompt = 'Please include a full http or https URL so I can summarize the website.';
+          inquiryEl.textContent = prompt;
+          statusEl.textContent = prompt;
+          await speakLocally(prompt, true, `web_summary_prompt:${sourceMode}`);
+          return true;
+        }
+        return await handleWebSummaryCommand(url, sourceMode);
+      }
+
+      const askedCapabilities =
+        lowered.includes('capabilities')
+        || lowered.includes('what can you do')
+        || lowered.includes('access the capabilities')
+        || lowered.includes('application capabilities');
+
+      if (askedCapabilities) {
+        return await handleCapabilitiesCommand(sourceMode);
+      }
+
+      return false;
+    }
+
     async function captureFallbackTranscription() {
       if (micFallbackCaptureInFlight) return;
+      if (isMicSuppressedNow()) {
+        noteMicEvent('fallback-suppressed', 'tts-active');
+        return;
+      }
       micFallbackCaptureInFlight = true;
       clearMicFallbackTimer();
       const captureStartedAt = Date.now();
       addMicDebug('fallback:start', `lang=${defaultListenLang}`);
 
       try {
-        const preferredMic = resolvePreferredMicDevice();
-        const fallbackAudioConstraints = {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        };
-        if (preferredMic?.deviceId && preferredMic.deviceId !== 'default' && preferredMic.deviceId !== 'communications') {
-          fallbackAudioConstraints.deviceId = { exact: preferredMic.deviceId };
+        let stream = null;
+        let ownsStream = false;
+
+        if (micPermissionStream && micPermissionStream.active) {
+          stream = micPermissionStream;
+          addMicDebug('fallback:getUserMedia', 'reuse-shared-stream');
+        } else {
+          addMicDebug('fallback:getUserMedia', `new-stream required active=${Boolean(micPermissionStream && micPermissionStream.active)}`);
+          const preferredMic = resolvePreferredMicDevice();
+          const fallbackAudioConstraints = {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          };
+          if (preferredMic?.deviceId && preferredMic.deviceId !== 'default' && preferredMic.deviceId !== 'communications') {
+            fallbackAudioConstraints.deviceId = { exact: preferredMic.deviceId };
+          }
+
+          stream = await navigator.mediaDevices.getUserMedia({
+            audio: fallbackAudioConstraints,
+            video: false,
+          });
+          ownsStream = true;
+          addMicDebug('fallback:getUserMedia', 'ok');
         }
 
-        const stream = await navigator.mediaDevices.getUserMedia({
-          audio: fallbackAudioConstraints,
-          video: false,
-        });
-        addMicDebug('fallback:getUserMedia', 'ok');
+        const activeTrackCount = (stream && typeof stream.getAudioTracks === 'function')
+          ? stream.getAudioTracks().filter((track) => track.readyState === 'live').length
+          : 0;
+        addMicDebug('fallback:stream-state', `owns=${ownsStream} activeTracks=${activeTrackCount}`);
 
         const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
         if (!AudioContextCtor) {
           noteMicEvent('fallback-error', 'AudioContext unavailable');
-          for (const track of stream.getTracks()) {
-            track.stop();
+          if (stream && ownsStream) {
+            for (const track of stream.getTracks()) {
+              track.stop();
+            }
           }
           micFallbackCaptureInFlight = false;
           return;
@@ -681,7 +1735,7 @@ async def mim_ui_page() -> str:
         noteMicEvent('fallback', 'capturing-audio');
         addMicDebug('fallback:capture', `sampleRate=${fallbackSampleRate}`);
 
-        await new Promise((resolve) => setTimeout(resolve, 3200));
+        await new Promise((resolve) => setTimeout(resolve, MIC_FALLBACK_CAPTURE_MS));
 
         try {
           processorNode.disconnect();
@@ -692,8 +1746,10 @@ async def mim_ui_page() -> str:
           await audioContext.close();
         } catch (_) {
         }
-        for (const track of stream.getTracks()) {
-          track.stop();
+        if (stream && ownsStream) {
+          for (const track of stream.getTracks()) {
+            track.stop();
+          }
         }
 
         if (!floatChunks.length) {
@@ -703,17 +1759,21 @@ async def mim_ui_page() -> str:
           return;
         }
 
-        const wavBlob = encodeWavBlob(floatChunks, fallbackSampleRate);
+        const targetSampleRate = 16000;
+        const normalizedChunks = downsampleChunksToRate(floatChunks, fallbackSampleRate, targetSampleRate);
+        const wavBlob = encodeWavBlob(normalizedChunks, targetSampleRate);
         const audioBase64 = await blobToBase64(wavBlob);
         addMicDebug('fallback:wav-ready', `bytes≈${Math.round((audioBase64.length * 3) / 4)}`);
         noteMicEvent('fallback', 'transcribe-request');
         const transcribeStartedAt = Date.now();
+        const transcribeProvider = getMicTranscribeProvider();
         const transcribeRes = await fetchWithTimeout('/gateway/perception/mic/transcribe', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             audio_wav_base64: audioBase64,
             language: defaultListenLang,
+            provider: transcribeProvider,
             debug: true,
           }),
         }, 12000);
@@ -741,6 +1801,10 @@ async def mim_ui_page() -> str:
           const isProviderForbidden = detailLower.includes('recognition request failed: forbidden') || detailLower.includes('forbidden');
           const isProviderError = isProviderForbidden || detailLower.includes('speech request failed') || detailLower.includes('recognition request failed');
           const isUpstreamUnavailable = Number(transcribeRes.status || 0) >= 500;
+          if (isProviderForbidden) {
+            micProviderLocalBackoffUntil = Date.now() + MIC_LOCAL_PROVIDER_BACKOFF_MS;
+            addMicDebug('fallback:provider-backoff', `local-for=${MIC_LOCAL_PROVIDER_BACKOFF_MS}ms`);
+          }
           const traceSuffix = traceId ? ` trace=${traceId}` : '';
           if (isProviderError || isUpstreamUnavailable) {
             noteMicEvent('fallback-degraded', `provider-unavailable${traceSuffix}`);
@@ -759,35 +1823,61 @@ async def mim_ui_page() -> str:
         const payload = await transcribeRes.json();
         noteMicEvent('fallback', 'transcribe-response');
         addMicDebug('fallback:transcribe-ok', `${Date.now() - transcribeStartedAt}ms`);
+        addMicDebug('fallback:provider', `${String(payload?.provider || 'unknown')} conf=${Number(payload?.confidence || 0).toFixed(2)}`);
         if (payload && payload.ok === false && String(payload.reason || '') === 'provider_unavailable') {
+          const providerDetailLower = String(payload?.detail || '').toLowerCase();
+          if (providerDetailLower.includes('forbidden')) {
+            micProviderLocalBackoffUntil = Date.now() + MIC_LOCAL_PROVIDER_BACKOFF_MS;
+            addMicDebug('fallback:provider-backoff', `local-for=${MIC_LOCAL_PROVIDER_BACKOFF_MS}ms`);
+          }
           noteMicEvent('fallback-degraded', 'provider-unavailable');
           statusEl.textContent = 'Listening... (speech provider unavailable)';
+          await submitMicTranscript('', 0.0, 'fallback_audio_heartbeat_provider_unavailable', true);
           micFallbackCaptureInFlight = false;
           return;
         }
         const transcript = String(payload?.transcript || '').trim();
+        const fallbackProvider = String(payload?.provider || '').toLowerCase();
+        const fallbackConfidence = Number(payload?.confidence || 0.74);
+        if (fallbackProvider.includes('pocketsphinx') && fallbackConfidence < MIC_POCKETSPHINX_CONFIDENCE_MIN) {
+          noteMicEvent('fallback-low-confidence', `${fallbackProvider}:${fallbackConfidence.toFixed(2)}`);
+          addMicDebug('fallback:low-confidence-drop', `provider=${fallbackProvider} conf=${fallbackConfidence.toFixed(2)} transcript=${transcript.slice(0, 48)}`);
+          statusEl.textContent = 'Listening... (low-confidence speech capture, please repeat)';
+          await submitMicTranscript('', fallbackConfidence, 'fallback_audio_heartbeat_low_confidence', true);
+          micFallbackCaptureInFlight = false;
+          return;
+        }
         if (!transcript) {
           const reason = String(payload?.reason || 'no-transcript').trim() || 'no-transcript';
           noteMicEvent('fallback-empty', reason);
           addMicDebug('fallback:no-transcript', `reason=${reason}`);
+          await submitMicTranscript('', 0.0, 'fallback_audio_heartbeat_no_transcript', true);
+          micFallbackCaptureInFlight = false;
+          return;
+        }
+
+        if (isMicSuppressedNow()) {
+          noteMicEvent('fallback-drop', 'tts-suppressed');
+          addMicDebug('fallback:drop-suppressed', transcript.slice(0, 48));
+          logTranscriptDrop('suppressed', transcript, 'fallback_audio');
+          micFallbackCaptureInFlight = false;
+          return;
+        }
+        if (isLikelyEchoTranscript(transcript)) {
+          noteMicEvent('fallback-echo-drop', transcript.slice(0, 24));
+          addMicDebug('fallback:echo-drop', transcript.slice(0, 48));
+          logTranscriptDrop('echo', transcript, 'fallback_audio');
           micFallbackCaptureInFlight = false;
           return;
         }
 
         noteMicEvent('fallback-result', transcript.slice(0, 48));
-        if (isLikelyLowValueTranscript(transcript)) {
-          noteMicEvent('fallback-short', transcript.slice(0, 24));
-          addMicDebug('fallback:short-transcript-skipped', transcript);
-          micFallbackCaptureInFlight = false;
-          return;
-        }
-        statusEl.textContent = `Heard: ${transcript}`;
-        const handledWeakIdentity = await maybeHandleWeakIdentityIntroduction(transcript);
-        if (!handledWeakIdentity) {
-          await maybeHandleIdentityIntroduction(transcript);
-        }
-
-        const micSync = await submitMicTranscript(transcript, Number(payload?.confidence || 0.74), 'fallback_audio');
+        const isLowValueFallback = isLikelyLowValueTranscript(transcript);
+        const micSync = await submitMicTranscript(
+          transcript,
+          isLowValueFallback ? Math.min(fallbackConfidence, 0.33) : fallbackConfidence,
+          isLowValueFallback ? 'fallback_audio_short' : 'fallback_audio',
+        );
         if (!micSync.ok) {
           noteMicEvent('fallback-sync-error', micSync.status);
           addMicDebug('fallback:event-sync', `status=${micSync.status}`);
@@ -797,6 +1887,48 @@ async def mim_ui_page() -> str:
         } else {
           addMicDebug('fallback:event-sync', `ok total=${Date.now() - captureStartedAt}ms`);
         }
+
+        if (isLowValueFallback) {
+          noteMicEvent('fallback-short', transcript.slice(0, 24));
+          addMicDebug('fallback:short-transcript-forwarded', transcript);
+          logTranscriptDrop('low_value', transcript, 'fallback_audio');
+          await maybeHandleLowValueTranscript(transcript, 'fallback_audio');
+          refreshState();
+          return;
+        }
+
+        const handledWebOrCapabilityFallback = await maybeHandleWebOrCapabilityCommand(transcript, 'fallback_audio');
+        if (handledWebOrCapabilityFallback) {
+          refreshState();
+          return;
+        }
+
+        statusEl.textContent = `Heard: ${transcript}`;
+        const wakePresent = hasWakePhrase(transcript);
+        if (WAKE_WORD_REQUIRED_FOR_LIVE_REPLY && !wakePresent) {
+          addMicDebug('wake-gate-drop', `mode=fallback transcript=${transcript.slice(0, 40)}`);
+          logTranscriptDrop('no_wake', transcript, 'fallback_audio');
+          statusEl.textContent = 'Listening... (wake word required: "MIM")';
+          refreshState();
+          return;
+        }
+        const handledGreetingOnly = await maybeHandleGreetingWithoutIntent(transcript);
+        if (!handledGreetingOnly) {
+          const handledWeakIdentity = await maybeHandleWeakIdentityIntroduction(transcript);
+          if (!handledWeakIdentity) {
+            const handledUnparsedIdentityIntent = await maybeHandleUnparsedIdentityIntent(transcript);
+            if (!handledUnparsedIdentityIntent) {
+              const handledIdentity = await maybeHandleIdentityIntroduction(transcript);
+              if (!handledIdentity) {
+                const handledStandaloneName = await maybeHandleStandaloneNameDuringStartup(transcript);
+                if (!handledStandaloneName) {
+                  await maybeHandleStartupUncertainTranscript(transcript);
+                }
+              }
+            }
+          }
+        }
+
         refreshState();
       } catch (error) {
         const errorName = String(error?.name || '').trim();
@@ -858,6 +1990,13 @@ async def mim_ui_page() -> str:
 
     function resolvePreferredMicDevice() {
       if (!availableMics.length) return null;
+
+      if (PIN_TO_SYSTEM_DEFAULT_MIC) {
+        const defaultDevice = availableMics.find((d) => d.deviceId === 'default');
+        if (defaultDevice) {
+          return defaultDevice;
+        }
+      }
 
       const explicit = availableMics.find((d) => d.deviceId === selectedMicDeviceId);
       if (explicit && selectedMicDeviceId && selectedMicDeviceId !== 'default' && selectedMicDeviceId !== 'communications') {
@@ -930,6 +2069,59 @@ async def mim_ui_page() -> str:
       localStorage.setItem('mim_mic_device_id', selectedMicDeviceId);
       localStorage.setItem('mim_mic_device_label', selectedMicLabel);
       updateMicDiagnostics();
+    }
+
+    async function enumerateCameraDevices() {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) {
+        availableCameras = [];
+        cameraSelect.innerHTML = '';
+        const option = document.createElement('option');
+        option.value = '';
+        option.textContent = 'Camera listing unavailable';
+        cameraSelect.appendChild(option);
+        cameraSettingsStatus.textContent = 'Camera listing unavailable in this runtime.';
+        updateCameraSettingsUi();
+        return;
+      }
+
+      try {
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        availableCameras = devices.filter((d) => d.kind === 'videoinput');
+      } catch (_) {
+        availableCameras = [];
+      }
+
+      cameraSelect.innerHTML = '';
+      if (!availableCameras.length) {
+        const option = document.createElement('option');
+        option.value = '';
+        option.textContent = 'No cameras detected';
+        cameraSelect.appendChild(option);
+        cameraSettingsStatus.textContent = 'No camera devices detected.';
+        updateCameraSettingsUi();
+        return;
+      }
+
+      let selected = availableCameras.find((d) => d.deviceId === selectedCameraDeviceId);
+      if (!selected) {
+        selected = availableCameras[0];
+      }
+
+      for (let index = 0; index < availableCameras.length; index += 1) {
+        const camera = availableCameras[index];
+        const option = document.createElement('option');
+        option.value = camera.deviceId;
+        option.textContent = camera.label || `Camera ${index + 1}`;
+        cameraSelect.appendChild(option);
+      }
+
+      selectedCameraDeviceId = selected?.deviceId || '';
+      cameraSelect.value = selectedCameraDeviceId;
+      localStorage.setItem('mim_camera_device_id', selectedCameraDeviceId);
+      if (!(cameraStream && cameraStream.active)) {
+        cameraSettingsStatus.textContent = `Selected camera: ${selected?.label || 'default camera'}`;
+      }
+      updateCameraSettingsUi();
     }
 
     function syncVoiceControlLabels() {
@@ -1149,10 +2341,15 @@ async def mim_ui_page() -> str:
       }
     }
 
-    async function submitMicTranscript(transcript, confidence, mode = 'always_listening') {
+    async function submitMicTranscript(transcript, confidence, mode = 'always_listening', allowEmpty = false) {
       const safeTranscript = String(transcript || '').trim();
-      if (!safeTranscript) {
+      if (!safeTranscript && !allowEmpty) {
         return { ok: false, accepted: false, status: 'empty_transcript' };
+      }
+
+      if (safeTranscript && isLikelyEchoTranscript(safeTranscript)) {
+        logTranscriptDrop('echo', safeTranscript, mode);
+        return { ok: true, accepted: false, status: 'echo_suppressed' };
       }
 
       const safeConfidence = clamp(Number(confidence || 0.72), 0.0, 1.0);
@@ -1207,13 +2404,164 @@ async def mim_ui_page() -> str:
       if (!text) return true;
 
       const compact = text.replace(/[^a-z]/g, '');
-      if (compact.length >= 3) return false;
+      if (!compact) return true;
+      if (compact.length <= 2) return true;
 
-      const allowedShortUtterances = new Set(['hi', 'ok', 'no', 'yo']);
-      return !allowedShortUtterances.has(compact);
+      const normalized = text.replace(/[^a-z'\s]/g, ' ').replace(/\s+/g, ' ').trim();
+      const tokens = normalized ? normalized.split(' ').filter(Boolean) : [];
+      if (!tokens.length) return true;
+      if (tokens.length >= 2 && tokens.every((token) => token.length <= 2)) {
+        return true;
+      }
+
+      const fillerTokens = new Set(['um', 'uh', 'hmm', 'mm', 'erm', 'ah', 'eh']);
+      if (tokens.every((token) => fillerTokens.has(token))) {
+        return true;
+      }
+
+      return compact.length < 5;
     }
 
-    function speakLocally(text, interrupt = true) {
+    async function maybeHandleLowValueTranscript(transcript, sourceMode = 'mic') {
+      if (!isLikelyLowValueTranscript(transcript)) {
+        return false;
+      }
+
+      logTranscriptDrop('low_value', transcript, sourceMode);
+
+      const compact = String(transcript || '').toLowerCase().replace(/[^a-z]/g, '');
+      const now = Date.now();
+      if (now < lowValueClarifyCooldownUntil && compact && compact === lowValueClarifyLastCompact) {
+        return true;
+      }
+
+      if (now < lowValueSpeakCooldownUntil) {
+        addMicDebug('low-value-suppressed', `mode=${sourceMode} transcript=${String(transcript || '').slice(0, 24)}`);
+        return true;
+      }
+
+      if (compact.length < 3) {
+        addMicDebug('low-value-muted', `mode=${sourceMode} transcript=${String(transcript || '').slice(0, 24)}`);
+        lowValueClarifyLastCompact = compact;
+        lowValueClarifyCooldownUntil = now + LOW_VALUE_CLARIFY_COOLDOWN_MS;
+        return true;
+      }
+
+      lowValueClarifyLastCompact = compact;
+      lowValueClarifyCooldownUntil = now + LOW_VALUE_CLARIFY_COOLDOWN_MS;
+      lowValueSpeakCooldownUntil = now + LOW_VALUE_SPEAK_COOLDOWN_MS;
+
+      const clarify = buildDialogPrompt('low_value', { transcript });
+
+      statusEl.textContent = `Low-confidence input ignored (${sourceMode}).`;
+      inquiryEl.textContent = clarify;
+      addMicDebug('low-value-clarify', `mode=${sourceMode} transcript=${String(transcript || '').slice(0, 24)}`);
+      return true;
+    }
+
+    function isGreetingOnlyTranscript(transcript) {
+      const text = String(transcript || '').toLowerCase();
+      if (!text.trim()) return false;
+      if (text.includes('my name is') || text.includes("i am") || text.includes("i'm")) return false;
+
+      const normalized = text.replace(/[^a-z'\s]/g, ' ').replace(/\s+/g, ' ').trim();
+      if (!normalized) return false;
+      return /^(hello|hi|hey)(\s+(ma'?am|mam|maam|sir|mim))*$/.test(normalized);
+    }
+
+    async function maybeHandleGreetingWithoutIntent(transcript) {
+      if (!isGreetingOnlyTranscript(transcript)) {
+        return false;
+      }
+
+      const now = Date.now();
+      if (now < greetingClarifyCooldownUntil) {
+        return true;
+      }
+
+      greetingClarifyCooldownUntil = now + GREETING_CLARIFY_COOLDOWN_MS;
+      startupInquiryIssued = true;
+      const prompt = buildDialogPrompt('greeting_only', { transcript });
+      inquiryEl.textContent = prompt;
+      await speakLocally(prompt, true, 'greeting_only');
+      lastInquiryPromptSpoken = prompt;
+      addMicDebug('greeting-clarify', String(transcript || '').slice(0, 32));
+      return true;
+    }
+
+    async function maybeHandleStandaloneNameDuringStartup(transcript) {
+      if (!startupInquiryIssued || !shouldAskForNameNow()) return false;
+      const text = String(transcript || '').toLowerCase().replace(/[^a-z'\-\s]/g, ' ').replace(/\s+/g, ' ').trim();
+      if (!text) return false;
+      if (text.includes('my name is') || text.includes("i'm") || text.includes('i am')) return false;
+
+      const filler = new Set(['hello', 'hi', 'hey', 'it', 'had', 'a', 'the', 'is', 'name', 'my', 'maam', 'mam', 'sir', 'there']);
+      const parts = text.split(' ').map((s) => s.trim()).filter(Boolean);
+      if (!parts.length || parts.length > 2) return false;
+
+      const candidates = parts.filter((part) => part.length >= 2 && part.length <= 24 && !filler.has(part) && !WEAK_IDENTITY_WORDS.has(part));
+      if (!candidates.length) return false;
+
+      const candidate = candidates[candidates.length - 1];
+      addMicDebug('identity-standalone', `candidate=${candidate}`);
+      return await acknowledgeIntroducedIdentity(candidate);
+    }
+
+    function isLikelyIdentityAttemptTranscript(transcript) {
+      const text = String(transcript || '').toLowerCase().replace(/[^a-z'\s]/g, ' ').replace(/\s+/g, ' ').trim();
+      if (!text) return false;
+      if (text.includes('my name is') || text.includes('name is') || text.includes('i am') || text.includes("i'm")) return true;
+
+      const parts = text.split(' ').map((s) => s.trim()).filter(Boolean);
+      if (parts.length >= 1 && parts.length <= 2) {
+        return parts.every((part) => part.length >= 2 && part.length <= 24);
+      }
+
+      return false;
+    }
+
+    async function maybeHandleStartupUncertainTranscript(transcript) {
+      if (!startupInquiryIssued || !shouldAskForNameNow()) return false;
+      if (!isLikelyIdentityAttemptTranscript(transcript)) return false;
+      const compact = String(transcript || '').toLowerCase().replace(/[^a-z]/g, '');
+      if (!compact) return false;
+
+      const now = Date.now();
+      if (now < startupFeedbackCooldownUntil) {
+        return true;
+      }
+
+      startupFeedbackCooldownUntil = now + 45000;
+      startupFeedbackLastCompact = compact;
+      const prompt = buildDialogPrompt('uncertain_name', { transcript });
+      inquiryEl.textContent = prompt;
+      await speakLocally(prompt, true, 'startup_uncertain_name');
+      lastInquiryPromptSpoken = prompt;
+      addMicDebug('startup-uncertain', String(transcript || '').slice(0, 36));
+      return true;
+    }
+
+    function stopServerTtsPlayback() {
+      if (activeServerTtsAudio) {
+        try {
+          activeServerTtsAudio.pause();
+          activeServerTtsAudio.src = '';
+        } catch (_) {
+        }
+      }
+      activeServerTtsAudio = null;
+      if (activeServerTtsUrl) {
+        try {
+          URL.revokeObjectURL(activeServerTtsUrl);
+        } catch (_) {
+        }
+      }
+      activeServerTtsUrl = '';
+      speechPlaybackActive = false;
+      setSpeaking(false);
+    }
+
+    function speakWithBrowserTts(text, interrupt = true) {
       const phrase = String(text || '').trim();
       const smoothedPhrase = phrase.replace(/\s*[—-]\s*/g, ', ').replace(/\s{2,}/g, ' ').trim();
       if (!phrase) return false;
@@ -1224,10 +2572,16 @@ async def mim_ui_page() -> str:
       }
 
       try {
+        const playbackToken = ++localTtsPlaybackToken;
+        activeSpeechOwner = 'browser_tts';
+        rememberSpokenUtterance(phrase, 'browser_tts');
+        addSpeechDebug('queued', `source=browser_tts path=local sig=${shortSpeechSignature(phrase)} interrupt=${Boolean(interrupt)} token=${playbackToken} suppressMs=${suppressionWindowMs()}`);
+        setMicSuppression(2500, 'browser_tts_start');
         if (window.speechSynthesis.resume) {
           window.speechSynthesis.resume();
         }
         if (interrupt) {
+          addSpeechDebug('canceled', `source=browser_tts reason=interrupt token=${playbackToken}`);
           window.speechSynthesis.cancel();
         }
 
@@ -1244,32 +2598,53 @@ async def mim_ui_page() -> str:
         }
 
         const appliedRate = naturalVoicePreset
-          ? clamp(voiceRate, 0.86, 1.08)
+          ? clamp(voiceRate, 0.88, 1.00)
           : clamp(voiceRate, 0.1, 10.0);
         const appliedPitch = naturalVoicePreset
-          ? clamp(effectivePitchValue(), 0.82, 1.08)
+          ? clamp(effectivePitchValue(), 0.78, 0.98)
           : effectivePitchValue();
         const appliedVolume = naturalVoicePreset
-          ? clamp(voiceVolume, 0.65, 1.0)
+          ? clamp(voiceVolume, 0.75, 1.0)
           : clamp(voiceVolume, 0.0, 1.0);
         utterance.rate = appliedRate;
         utterance.pitch = appliedPitch;
         utterance.volume = appliedVolume;
         utterance.onstart = () => {
+          if (playbackToken !== localTtsPlaybackToken) return;
           started = true;
           lastLocalTtsError = '';
+          speechPlaybackActive = true;
+          activeSpeechOwner = 'browser_tts';
+          setMicSuppression(2500, 'browser_tts_onstart');
+          addSpeechDebug('started', `source=browser_tts path=local sig=${shortSpeechSignature(phrase)} token=${playbackToken} suppressMs=${suppressionWindowMs()}`);
           setSpeaking(true);
         };
-        utterance.onend = () => setSpeaking(false);
+        utterance.onend = () => {
+          if (playbackToken !== localTtsPlaybackToken) return;
+          speechPlaybackActive = false;
+          if (activeSpeechOwner === 'browser_tts') {
+            activeSpeechOwner = '';
+          }
+          setMicSuppression(MIC_POST_TTS_SUPPRESS_MS, 'browser_tts_onend');
+          addSpeechDebug('ended', `source=browser_tts path=local token=${playbackToken} suppressMs=${suppressionWindowMs()}`);
+          setSpeaking(false);
+        };
         utterance.onerror = (event) => {
+          if (playbackToken !== localTtsPlaybackToken) return;
           lastLocalTtsError = String(event?.error || 'unknown_tts_error');
+          speechPlaybackActive = false;
+          if (activeSpeechOwner === 'browser_tts') {
+            activeSpeechOwner = '';
+          }
+          setMicSuppression(MIC_POST_TTS_SUPPRESS_MS, 'browser_tts_onerror');
+          addSpeechDebug('canceled', `source=browser_tts reason=error:${lastLocalTtsError} token=${playbackToken} suppressMs=${suppressionWindowMs()}`);
           setSpeaking(false);
           statusEl.textContent = `Local voice playback failed (${lastLocalTtsError}).`;
         };
         window.speechSynthesis.speak(utterance);
 
         const tryBareRetry = () => {
-          if (started || retriedBare) return;
+          if (playbackToken !== localTtsPlaybackToken || started || retriedBare) return;
           retriedBare = true;
           try {
             window.speechSynthesis.cancel();
@@ -1278,13 +2653,34 @@ async def mim_ui_page() -> str:
             fallbackUtterance.pitch = appliedPitch;
             fallbackUtterance.volume = appliedVolume;
             fallbackUtterance.onstart = () => {
+              if (playbackToken !== localTtsPlaybackToken) return;
               started = true;
               lastLocalTtsError = '';
+              speechPlaybackActive = true;
+              activeSpeechOwner = 'browser_tts';
+              setMicSuppression(2500, 'browser_tts_fallback_onstart');
+              addSpeechDebug('started', `source=browser_tts path=local-retry sig=${shortSpeechSignature(phrase)} token=${playbackToken} suppressMs=${suppressionWindowMs()}`);
               setSpeaking(true);
             };
-            fallbackUtterance.onend = () => setSpeaking(false);
+            fallbackUtterance.onend = () => {
+              if (playbackToken !== localTtsPlaybackToken) return;
+              speechPlaybackActive = false;
+              if (activeSpeechOwner === 'browser_tts') {
+                activeSpeechOwner = '';
+              }
+              setMicSuppression(MIC_POST_TTS_SUPPRESS_MS, 'browser_tts_fallback_onend');
+              addSpeechDebug('ended', `source=browser_tts path=local-retry token=${playbackToken} suppressMs=${suppressionWindowMs()}`);
+              setSpeaking(false);
+            };
             fallbackUtterance.onerror = (event) => {
+              if (playbackToken !== localTtsPlaybackToken) return;
               lastLocalTtsError = String(event?.error || 'fallback_tts_error');
+              speechPlaybackActive = false;
+              if (activeSpeechOwner === 'browser_tts') {
+                activeSpeechOwner = '';
+              }
+              setMicSuppression(MIC_POST_TTS_SUPPRESS_MS, 'browser_tts_fallback_onerror');
+              addSpeechDebug('canceled', `source=browser_tts path=local-retry reason=error:${lastLocalTtsError} token=${playbackToken} suppressMs=${suppressionWindowMs()}`);
               setSpeaking(false);
               statusEl.textContent = `Local voice playback failed (${lastLocalTtsError}).`;
             };
@@ -1294,13 +2690,13 @@ async def mim_ui_page() -> str:
         };
 
         setTimeout(() => {
-          if (!started) {
+          if (playbackToken === localTtsPlaybackToken && !started) {
             tryBareRetry();
           }
         }, 1200);
 
         setTimeout(() => {
-          if (!started) {
+          if (playbackToken === localTtsPlaybackToken && !started) {
             const voices = window.speechSynthesis.getVoices ? window.speechSynthesis.getVoices() : [];
             const voiceCount = Array.isArray(voices) ? voices.length : 0;
             lastLocalTtsError = `tts_not_started voices=${voiceCount}`;
@@ -1316,17 +2712,170 @@ async def mim_ui_page() -> str:
       }
     }
 
-    function maybeSpeakFromState(data) {
+    async function speakWithServerTts(text, interrupt = true) {
+      const phrase = String(text || '').trim();
+      if (!phrase || !serverTtsEnabled) return false;
+
+      try {
+        const playbackToken = localTtsPlaybackToken;
+        activeSpeechOwner = 'server_tts';
+        rememberSpokenUtterance(phrase, 'server_tts');
+        addSpeechDebug('queued', `source=server_tts path=server sig=${shortSpeechSignature(phrase)} interrupt=${Boolean(interrupt)} token=${playbackToken} suppressMs=${suppressionWindowMs()}`);
+        setMicSuppression(2500, 'server_tts_start');
+        if (interrupt) {
+          addSpeechDebug('canceled', `source=server_tts reason=interrupt token=${playbackToken}`);
+          stopServerTtsPlayback();
+        }
+        if (window.speechSynthesis && window.speechSynthesis.cancel) {
+          window.speechSynthesis.cancel();
+        }
+
+        const res = await fetch('/gateway/voice/tts', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            message: phrase,
+            language: getPreferredInteractionLanguage(),
+            voice: selectedServerTtsVoice,
+          }),
+        });
+        if (!res.ok) {
+          lastLocalTtsError = `server_tts_http_${res.status}`;
+          addSpeechDebug('suppressed', `source=server_tts reason=http_${res.status} sig=${shortSpeechSignature(phrase)} token=${playbackToken}`);
+          return false;
+        }
+
+        const audioBlob = await res.blob();
+        if (!audioBlob || audioBlob.size < 256) {
+          lastLocalTtsError = 'server_tts_empty_audio';
+          addSpeechDebug('suppressed', `source=server_tts reason=empty-audio sig=${shortSpeechSignature(phrase)} token=${playbackToken}`);
+          return false;
+        }
+
+        stopServerTtsPlayback();
+        activeServerTtsUrl = URL.createObjectURL(audioBlob);
+        activeServerTtsAudio = new Audio(activeServerTtsUrl);
+        activeServerTtsAudio.preload = 'auto';
+        speechPlaybackActive = true;
+        addSpeechDebug('started', `source=server_tts path=server sig=${shortSpeechSignature(phrase)} token=${playbackToken} suppressMs=${suppressionWindowMs()}`);
+        setSpeaking(true);
+
+        activeServerTtsAudio.onended = () => {
+          speechPlaybackActive = false;
+          if (activeSpeechOwner === 'server_tts') {
+            activeSpeechOwner = '';
+          }
+          setMicSuppression(MIC_POST_TTS_SUPPRESS_MS, 'server_tts_onend');
+          addSpeechDebug('ended', `source=server_tts path=server token=${playbackToken} suppressMs=${suppressionWindowMs()}`);
+          setSpeaking(false);
+          stopServerTtsPlayback();
+        };
+        activeServerTtsAudio.onerror = () => {
+          speechPlaybackActive = false;
+          if (activeSpeechOwner === 'server_tts') {
+            activeSpeechOwner = '';
+          }
+          setMicSuppression(MIC_POST_TTS_SUPPRESS_MS, 'server_tts_onerror');
+          addSpeechDebug('canceled', `source=server_tts path=server reason=playback-error token=${playbackToken} suppressMs=${suppressionWindowMs()}`);
+          setSpeaking(false);
+          stopServerTtsPlayback();
+        };
+
+        const playPromise = activeServerTtsAudio.play();
+        if (playPromise && typeof playPromise.then === 'function') {
+          await playPromise;
+        }
+
+        lastLocalTtsError = '';
+        return true;
+      } catch (error) {
+        lastLocalTtsError = String(error?.message || 'server_tts_failed');
+        addSpeechDebug('suppressed', `source=server_tts reason=${lastLocalTtsError} sig=${shortSpeechSignature(phrase)} token=${localTtsPlaybackToken}`);
+        stopServerTtsPlayback();
+        setSpeaking(false);
+        return false;
+      }
+    }
+
+    async function speakLocally(text, interrupt = true, sourceTag = 'unspecified') {
+      const phrase = String(text || '').trim();
+      if (!phrase) return false;
+
+      const compact = phrase.toLowerCase().replace(/[^a-z0-9]/g, '');
+      const now = Date.now();
+      if (compact && compact === lastSpokenPhraseCompact && (now - lastSpokenPhraseAt) < SPOKEN_PHRASE_DEDUPE_MS) {
+        addSpeechDebug('suppressed', `source=${sourceTag} reason=dedupe sig=${shortSpeechSignature(phrase)} token=${localTtsPlaybackToken}`);
+        return false;
+      }
+
+      if ((speechInFlight || speechPlaybackActive) && !interrupt) {
+        addSpeechDebug('suppressed', `source=${sourceTag} reason=busy_no_interrupt sig=${shortSpeechSignature(phrase)} token=${localTtsPlaybackToken}`);
+        return false;
+      }
+
+      if ((speechInFlight || speechPlaybackActive) && interrupt) {
+        addSpeechDebug('canceled', `source=${sourceTag} reason=interrupt-active-owner owner=${activeSpeechOwner || '-'} token=${localTtsPlaybackToken}`);
+        stopServerTtsPlayback();
+        localTtsPlaybackToken += 1;
+        if (window.speechSynthesis && window.speechSynthesis.cancel) {
+          window.speechSynthesis.cancel();
+        }
+      }
+
+      if (compact) {
+        lastSpokenPhraseCompact = compact;
+        lastSpokenPhraseAt = now;
+      }
+
+      const requestId = ++speechRequestSeq;
+      speechInFlight = true;
+      addSpeechDebug('queued', `source=${sourceTag} route=auto sig=${shortSpeechSignature(phrase)} request=${requestId} token=${localTtsPlaybackToken} suppressMs=${suppressionWindowMs()}`);
+      try {
+        const serverSpoken = await speakWithServerTts(phrase, interrupt);
+        if (serverSpoken) {
+          return true;
+        }
+        return speakWithBrowserTts(phrase, interrupt);
+      } finally {
+        if (requestId === speechRequestSeq) {
+          speechInFlight = false;
+        }
+      }
+    }
+
+    async function maybeSpeakFromState(data) {
+      if (!STATE_POLL_SPEAK_ENABLED) return false;
       const outputId = Number(data.latest_output_action_id || 0);
       const text = String(data.latest_output_text || '').trim();
       const allowed = Boolean(data.latest_output_allowed);
-      if (!allowed || !text || outputId <= 0) return;
-      if (outputId <= lastSpokenOutputId) return;
+      if (!allowed || !text || outputId <= 0) return false;
+      if (outputId <= lastSpokenOutputId) return false;
 
-      if (speakLocally(text, true)) {
+      const rewritten = rewriteQueuedOutputText(text, data);
+      if (!rewritten) {
         lastSpokenOutputId = outputId;
         localStorage.setItem('mim_last_spoken_output_id', String(outputId));
+        return false;
       }
+
+      const signature = normalizeSpeechSignature(rewritten);
+      const now = Date.now();
+      if (signature && signature === lastSpokenSignature && (now - lastSpokenSignatureAt) < SPOKEN_DUPLICATE_COOLDOWN_MS) {
+        lastSpokenOutputId = outputId;
+        localStorage.setItem('mim_last_spoken_output_id', String(outputId));
+        return false;
+      }
+
+      if (await speakLocally(rewritten, true, 'state_poll_output')) {
+        lastSpokenOutputId = outputId;
+        localStorage.setItem('mim_last_spoken_output_id', String(outputId));
+        lastSpokenSignature = signature;
+        lastSpokenSignatureAt = now;
+        localStorage.setItem('mim_last_spoken_signature', lastSpokenSignature);
+        localStorage.setItem('mim_last_spoken_signature_at', String(lastSpokenSignatureAt));
+        return true;
+      }
+      return false;
     }
 
     function persistIdentityMemory() {
@@ -1416,48 +2965,52 @@ async def mim_ui_page() -> str:
       return `Hello ${name}, great to see you again.`;
     }
 
+    function extractNameAfterLeadIns(textRaw, leadIns) {
+      const text = String(textRaw || '').toLowerCase();
+      for (const leadIn of leadIns) {
+        const idx = text.indexOf(leadIn);
+        if (idx < 0) continue;
+        const tail = text.slice(idx + leadIn.length)
+          .replace(/[^a-z'\-\s]/g, ' ')
+          .replace(/\s+/g, ' ')
+          .trim();
+        if (tail) return tail;
+      }
+      return '';
+    }
+
     function extractIntroducedIdentity(transcript) {
       const text = String(transcript || '').trim();
       if (!text) return '';
 
-      const patterns = [
-        /\bmy name is\s+([a-z][a-z'\-]{1,24}(?:\s+[a-z][a-z'\-]{1,24})?)/i,
-        /\bi am\s+([a-z][a-z'\-]{1,24}(?:\s+[a-z][a-z'\-]{1,24})?)/i,
-        /\bi'm\s+([a-z][a-z'\-]{1,24}(?:\s+[a-z][a-z'\-]{1,24})?)/i,
-      ];
-
-      let candidate = '';
-      for (const pattern of patterns) {
-        const match = text.match(pattern);
-        if (match && match[1]) {
-          candidate = String(match[1]).trim();
-          break;
-        }
-      }
+      const candidate = extractNameAfterLeadIns(text, ['my name is ', "i'm ", 'i am ']);
       if (!candidate) return '';
 
-      candidate = candidate.replace(/[^a-z'\-\s]/gi, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
-      if (!candidate || WEAK_IDENTITY_WORDS.has(candidate)) return '';
-      return candidate;
+      const filler = new Set(['hello', 'hi', 'hey', 'maam', 'mam', 'sir', 'there']);
+      const pieces = candidate.split(' ').map((s) => s.trim()).filter(Boolean);
+      const filtered = pieces.filter((part) => !filler.has(part) && !WEAK_IDENTITY_WORDS.has(part));
+      if (!filtered.length) return '';
+
+      const preferredSingle = filtered.find((part) => part.length >= 2 && part.length <= 24);
+      if (preferredSingle && !WEAK_IDENTITY_WORDS.has(preferredSingle)) {
+        return preferredSingle;
+      }
+
+      const merged = filtered.slice(0, 2).join(' ').trim();
+      if (!merged || WEAK_IDENTITY_WORDS.has(merged)) return '';
+      return merged;
     }
 
     function extractWeakIntroducedIdentity(transcript) {
       const text = String(transcript || '').trim();
       if (!text) return '';
 
-      const patterns = [
-        /\bmy name is\s+([a-z][a-z'\-]{1,24}(?:\s+[a-z][a-z'\-]{1,24})?)/i,
-        /\bi am\s+([a-z][a-z'\-]{1,24}(?:\s+[a-z][a-z'\-]{1,24})?)/i,
-        /\bi'm\s+([a-z][a-z'\-]{1,24}(?:\s+[a-z][a-z'\-]{1,24})?)/i,
-      ];
-
-      for (const pattern of patterns) {
-        const match = text.match(pattern);
-        if (!match || !match[1]) continue;
-        const candidate = String(match[1]).replace(/[^a-z'\-\s]/gi, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
-        if (candidate && WEAK_IDENTITY_WORDS.has(candidate)) {
-          return candidate;
-        }
+      const candidate = extractNameAfterLeadIns(text, ['my name is ', "i'm ", 'i am ']);
+      if (!candidate) return '';
+      const parts = candidate.split(' ').map((s) => s.trim()).filter(Boolean);
+      const weakPart = parts.find((part) => WEAK_IDENTITY_WORDS.has(part));
+      if (weakPart) {
+        return weakPart;
       }
 
       return '';
@@ -1473,27 +3026,27 @@ async def mim_ui_page() -> str:
         return true;
       }
 
-      const clarification = 'I may have misheard your name. Please say: my name is, then your name.';
+      const clarification = buildDialogPrompt('low_value', { transcript });
       startupInquiryIssued = true;
       inquiryEl.textContent = clarification;
-      speakLocally(clarification, false);
+      await speakLocally(clarification, false, 'weak_identity_clarify');
       lastInquiryPromptSpoken = clarification;
       weakIdentityLastPromptKey = promptKey;
       weakIdentityClarifyCooldownUntil = now + 20000;
       return true;
     }
 
-    async function maybeHandleIdentityIntroduction(transcript) {
-      const spokenIdentity = extractIntroducedIdentity(transcript);
-      if (!spokenIdentity) return false;
-
-      const normalized = normalizeIdentityLabel(spokenIdentity);
+    async function acknowledgeIntroducedIdentity(identityRaw) {
+      const normalized = normalizeIdentityLabel(identityRaw);
       if (!normalized || isUnknownOrMissingIdentity(normalized)) return false;
 
       const displayName = normalized.charAt(0).toUpperCase() + normalized.slice(1);
+      const greeting = buildDialogPrompt('identity_ack', { name: displayName });
       startupInquiryIssued = true;
-      inquiryEl.textContent = `Nice to meet you, ${displayName}.`;
-      speakLocally(`Nice to meet you, ${displayName}.`, false);
+      locallyAcceptedIdentity = normalized;
+      suppressBackendInquiryUntil = Date.now() + 120000;
+      inquiryEl.textContent = greeting;
+      await speakLocally(greeting, true, 'identity_ack');
       lastInquiryPromptSpoken = `identity:${normalized}`;
 
       activeVisualIdentity = normalized;
@@ -1522,6 +3075,51 @@ async def mim_ui_page() -> str:
       }
 
       return true;
+    }
+
+    async function maybeHandleUnparsedIdentityIntent(transcript) {
+      const text = String(transcript || '').toLowerCase();
+      if (!text.includes('my name is')) {
+        return false;
+      }
+
+      const parsed = extractIntroducedIdentity(transcript);
+      if (parsed) {
+        addMicDebug('identity-direct', `parsed=${parsed}`);
+        return await acknowledgeIntroducedIdentity(parsed);
+      }
+
+      const tail = extractNameAfterLeadIns(String(transcript || ''), ['my name is ']);
+      if (tail) {
+        const filler = new Set(['hello', 'hi', 'hey', 'maam', 'mam', 'sir', 'there']);
+        const parts = tail.split(' ').map((s) => s.trim()).filter(Boolean);
+        const candidate = parts.find((part) => part.length >= 2 && part.length <= 24 && !filler.has(part) && !WEAK_IDENTITY_WORDS.has(part));
+        if (candidate) {
+          addMicDebug('identity-recovery', `candidate=${candidate}`);
+          return await acknowledgeIntroducedIdentity(candidate);
+        }
+      }
+
+      const now = Date.now();
+      const promptKey = 'unparsed-name-intent';
+      if (now < weakIdentityClarifyCooldownUntil && weakIdentityLastPromptKey === promptKey) {
+        return true;
+      }
+
+      const clarification = buildDialogPrompt('uncertain_name', { transcript });
+      startupInquiryIssued = true;
+      inquiryEl.textContent = clarification;
+      await speakLocally(clarification, true, 'identity_unparsed_clarify');
+      lastInquiryPromptSpoken = clarification;
+      weakIdentityLastPromptKey = promptKey;
+      weakIdentityClarifyCooldownUntil = now + 20000;
+      return true;
+    }
+
+    async function maybeHandleIdentityIntroduction(transcript) {
+      const spokenIdentity = extractIntroducedIdentity(transcript);
+      if (!spokenIdentity) return false;
+      return await acknowledgeIntroducedIdentity(spokenIdentity);
     }
 
     async function maybeGreetRecognizedIdentity(identity) {
@@ -1572,38 +3170,19 @@ async def mim_ui_page() -> str:
       if (backendPrompt) {
         startupInquiryIssued = true;
         inquiryEl.textContent = backendPrompt;
-        speakLocally(backendPrompt, false);
         lastInquiryPromptSpoken = backendPrompt;
         return;
       }
 
-      if (!isUnknownOrMissingIdentity(data?.camera_last_label)) {
+      if (!isUnknownOrMissingIdentity(data?.camera_last_label) && !shouldAskForNameNow()) {
         startupInquiryIssued = true;
         return;
       }
 
       startupInquiryIssued = true;
-      inquiryEl.textContent = STARTUP_IDENTITY_INQUIRY;
-      speakLocally(STARTUP_IDENTITY_INQUIRY, false);
-      lastInquiryPromptSpoken = STARTUP_IDENTITY_INQUIRY;
-
-      try {
-        await fetch('/gateway/voice/output', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            message: STARTUP_IDENTITY_INQUIRY,
-            voice_profile: 'default',
-            channel: 'ui',
-            priority: 'normal',
-            metadata_json: {
-              source: 'mim_ui_sketch',
-              reason: 'startup_identity_inquiry',
-            },
-          }),
-        });
-      } catch (_) {
-      }
+      const startupPrompt = buildDialogPrompt('startup_identity');
+      inquiryEl.textContent = startupPrompt;
+      lastInquiryPromptSpoken = startupPrompt;
     }
 
     function detectLanguageFromTranscript(transcript) {
@@ -1636,9 +3215,9 @@ async def mim_ui_page() -> str:
       if (voice?.default) score += 12;
       if (voice?.localService) score += 8;
 
-      if (/(neural|natural|enhanced|premium|wavenet|studio)/.test(name)) score += 22;
-      if (/(siri|samantha|victoria|daniel|karen|moira|zira|aria)/.test(name)) score += 12;
-      if (/(espeak|compact|robot|test|default voice)/.test(name)) score -= 20;
+      if (/(neural|natural|enhanced|premium|wavenet|studio|online|hq)/.test(name)) score += 30;
+      if (/(siri|samantha|victoria|daniel|karen|moira|zira|aria|alloy|nova)/.test(name)) score += 15;
+      if (/(espeak|compact|robot|test|default voice|mbrola|festival)/.test(name)) score -= 38;
 
       return score;
     }
@@ -1686,6 +3265,12 @@ async def mim_ui_page() -> str:
 
       autoLanguageMode = Boolean(autoLangToggle.checked);
       localStorage.setItem('mim_auto_lang_mode', autoLanguageMode ? '1' : '0');
+
+      serverTtsEnabled = Boolean(serverTtsToggle.checked);
+      localStorage.setItem('mim_server_tts_enabled', serverTtsEnabled ? '1' : '0');
+
+      selectedServerTtsVoice = String(serverTtsVoiceSelect.value || selectedServerTtsVoice || '').trim() || 'en-US-EmmaMultilingualNeural';
+      localStorage.setItem('mim_server_tts_voice', selectedServerTtsVoice);
 
       naturalVoicePreset = Boolean(naturalVoiceToggle.checked);
       localStorage.setItem('mim_voice_natural_preset', naturalVoicePreset ? '1' : '0');
@@ -1820,6 +3405,7 @@ async def mim_ui_page() -> str:
         if (keepStreamAlive) {
           stopMicPermissionStream();
           micPermissionStream = stream;
+          startMicKeepAliveMonitor();
           noteMicEvent('permission-stream', 'active');
         } else {
           try {
@@ -1919,6 +3505,12 @@ async def mim_ui_page() -> str:
     }
 
     async function refreshState() {
+      if (refreshInFlight) {
+        refreshPending = true;
+        return;
+      }
+
+      refreshInFlight = true;
       try {
         const res = await fetch('/mim/ui/state');
         if (!res.ok) {
@@ -1928,26 +3520,34 @@ async def mim_ui_page() -> str:
         }
         markBackendReachability(true);
         const data = await res.json();
+        latestUiState = data;
         setSpeaking(Boolean(data.speaking));
-        maybeSpeakFromState(data);
+        const spokeFromState = await maybeSpeakFromState(data).catch(() => false);
         maybeIssueStartupIdentityInquiry(data);
 
         const cameraLabel = data.camera_last_label || '(none)';
         const cameraConfidence = Number(data.camera_last_confidence || 0).toFixed(2);
         cameraEl.textContent = `Camera: ${cameraLabel} (confidence ${cameraConfidence})`;
         const inquiryPrompt = String(data.inquiry_prompt || '').trim();
-        if (inquiryPrompt) {
+        const conversationContext = (data && typeof data.conversation_context === 'object') ? data.conversation_context : {};
+        const cameraIdentityKnown = !isUnknownOrMissingIdentity(cameraLabel);
+        const shouldSuppressInquiryReplay = Date.now() < suppressBackendInquiryUntil && (Boolean(locallyAcceptedIdentity) || cameraIdentityKnown);
+        if (inquiryPrompt && !shouldSuppressInquiryReplay && !spokeFromState) {
           inquiryEl.textContent = inquiryPrompt;
-          if (inquiryPrompt !== lastInquiryPromptSpoken) {
-            speakLocally(inquiryPrompt, false);
-            lastInquiryPromptSpoken = inquiryPrompt;
-          }
+          lastInquiryPromptSpoken = inquiryPrompt;
+        } else if (shouldSuppressInquiryReplay && isIdentityInquiryText(inquiryEl.textContent)) {
+          inquiryEl.textContent = locallyAcceptedIdentity
+            ? `Nice to meet you, ${locallyAcceptedIdentity.charAt(0).toUpperCase()}${locallyAcceptedIdentity.slice(1)}.`
+            : inquiryEl.textContent;
         } else if (!startupInquiryIssued) {
           inquiryEl.textContent = '';
           lastInquiryPromptSpoken = '';
         }
 
         activeVisualIdentity = normalizeIdentityLabel(cameraLabel);
+        if (activeVisualIdentity) {
+          locallyAcceptedIdentity = activeVisualIdentity;
+        }
         if (activeVisualIdentity && activeVisualIdentity !== lastVisualIdentity) {
           maybeGreetRecognizedIdentity(activeVisualIdentity);
         }
@@ -1957,27 +3557,28 @@ async def mim_ui_page() -> str:
       } catch (_) {
         markBackendReachability(false);
         updateIconGlow();
+      } finally {
+        refreshInFlight = false;
+        if (refreshPending) {
+          refreshPending = false;
+          setTimeout(() => {
+            refreshState();
+          }, 0);
+        }
       }
     }
 
     async function speakNow() {
       const message = sayInput.value.trim();
       if (!message) return;
-      const localSpoken = speakLocally(message, true);
-      try {
-        await fetch('/gateway/voice/output', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            message,
-            voice_profile: 'default',
-            channel: 'ui',
-            priority: 'normal',
-            metadata_json: { source: 'mim_ui_sketch' },
-          }),
-        });
-      } catch (_) {
+
+      const handledWebOrCapabilityText = await maybeHandleWebOrCapabilityCommand(message, 'typed_input');
+      if (handledWebOrCapabilityText) {
+        refreshState();
+        return;
       }
+
+      const localSpoken = await speakLocally(message, true, 'typed_input');
       if (!localSpoken) {
         const detail = lastLocalTtsError ? ` (${lastLocalTtsError})` : '';
         statusEl.textContent = `Speak requested, but local TTS is unavailable${detail}.`;
@@ -2025,7 +3626,7 @@ async def mim_ui_page() -> str:
         return;
       }
 
-      const micReady = await ensureMicPermission({ keepStreamAlive: false });
+      const micReady = await ensureMicPermission({ keepStreamAlive: FORCE_FALLBACK_STT });
       if (!micReady) {
         micAutoMode = false;
         listenBtn.textContent = 'Listening Off';
@@ -2041,6 +3642,7 @@ async def mim_ui_page() -> str:
         healthState.micOk = true;
         micLastErrorCode = '';
         statusEl.textContent = 'Always listening...';
+        startMicKeepAliveMonitor();
         noteMicEvent('fallback', 'forced-mode-active');
         startMicFallbackLoop();
         updateIconGlow();
@@ -2070,7 +3672,7 @@ async def mim_ui_page() -> str:
           noteMicLifecycleEvent();
           noteMicEvent('recognition', 'onstart');
           stopMicPermissionStream();
-          startMicFallbackLoop();
+          stopMicFallbackLoop();
           clearMicStartTimeout();
           micStartInFlight = false;
           micRestartPending = false;
@@ -2134,6 +3736,18 @@ async def mim_ui_page() -> str:
           const transcript = (last?.transcript || '').trim();
           const confidence = Number(last?.confidence || 0.8);
           if (!transcript) return;
+          if (isMicSuppressedNow()) {
+            noteMicEvent('recognition-drop', 'tts-suppressed');
+            addMicDebug('recognition:drop-suppressed', transcript.slice(0, 48));
+            logTranscriptDrop('suppressed', transcript, 'always_listening');
+            return;
+          }
+          if (isLikelyEchoTranscript(transcript)) {
+            noteMicEvent('recognition-echo-drop', transcript.slice(0, 24));
+            addMicDebug('recognition:echo-drop', transcript.slice(0, 48));
+            logTranscriptDrop('echo', transcript, 'always_listening');
+            return;
+          }
 
           micConsecutiveOnend = 0;
           micErrorStreak = 0;
@@ -2171,24 +3785,59 @@ async def mim_ui_page() -> str:
             }
           }
 
-          if (isLikelyLowValueTranscript(transcript)) {
-            noteMicEvent('recognition-short', transcript.slice(0, 24));
-            addMicDebug('recognition:short-transcript-skipped', transcript);
-            return;
-          }
-
-          statusEl.textContent = `Heard: ${transcript}`;
-          const handledWeakIdentity = await maybeHandleWeakIdentityIntroduction(transcript);
-          if (!handledWeakIdentity) {
-            await maybeHandleIdentityIntroduction(transcript);
-          }
-
-          const micSync = await submitMicTranscript(transcript, confidence, 'always_listening');
+          const isLowValueRecognition = isLikelyLowValueTranscript(transcript);
+          const micSync = await submitMicTranscript(
+            transcript,
+            isLowValueRecognition ? Math.min(confidence, 0.33) : confidence,
+            isLowValueRecognition ? 'always_listening_short' : 'always_listening',
+          );
           if (!micSync.ok) {
             statusEl.textContent = `Heard: ${transcript} (backend sync delayed)`;
           } else if (!micSync.accepted) {
             statusEl.textContent = `Heard: ${transcript} (${micSync.status})`;
           }
+
+          if (isLowValueRecognition) {
+            noteMicEvent('recognition-short', transcript.slice(0, 24));
+            addMicDebug('recognition:short-transcript-forwarded', transcript);
+            logTranscriptDrop('low_value', transcript, 'always_listening');
+            await maybeHandleLowValueTranscript(transcript, 'always_listening');
+            refreshState();
+            return;
+          }
+
+          const handledWebOrCapabilityRecognition = await maybeHandleWebOrCapabilityCommand(transcript, 'always_listening');
+          if (handledWebOrCapabilityRecognition) {
+            refreshState();
+            return;
+          }
+
+          statusEl.textContent = `Heard: ${transcript}`;
+          const wakePresent = hasWakePhrase(transcript);
+          if (WAKE_WORD_REQUIRED_FOR_LIVE_REPLY && !wakePresent) {
+            addMicDebug('wake-gate-drop', `mode=recognition transcript=${transcript.slice(0, 40)}`);
+            logTranscriptDrop('no_wake', transcript, 'always_listening');
+            statusEl.textContent = 'Listening... (wake word required: "MIM")';
+            refreshState();
+            return;
+          }
+          const handledGreetingOnly = await maybeHandleGreetingWithoutIntent(transcript);
+          if (!handledGreetingOnly) {
+            const handledWeakIdentity = await maybeHandleWeakIdentityIntroduction(transcript);
+            if (!handledWeakIdentity) {
+              const handledUnparsedIdentityIntent = await maybeHandleUnparsedIdentityIntent(transcript);
+              if (!handledUnparsedIdentityIntent) {
+                const handledIdentity = await maybeHandleIdentityIntroduction(transcript);
+                if (!handledIdentity) {
+                  const handledStandaloneName = await maybeHandleStandaloneNameDuringStartup(transcript);
+                  if (!handledStandaloneName) {
+                    await maybeHandleStartupUncertainTranscript(transcript);
+                  }
+                }
+              }
+            }
+          }
+
           refreshState();
         };
 
@@ -2273,7 +3922,10 @@ async def mim_ui_page() -> str:
           }
           updateIconGlow();
           if (micAutoMode) {
-            captureFallbackTranscription();
+            const shouldUseFallback = micErrorStreak > 0 || micHardErrorStreak > 0 || micConsecutiveOnend > 2;
+            if (shouldUseFallback) {
+              captureFallbackTranscription();
+            }
             const backoffMs = micErrorStreak > 0 ? Math.min(15000, 1500 + micErrorStreak * 800) : 350;
             scheduleMicRetry(backoffMs);
           } else {
@@ -2355,31 +4007,91 @@ async def mim_ui_page() -> str:
       }
     }
 
+    function stopCameraWatcher() {
+      if (motionInterval) {
+        clearInterval(motionInterval);
+        motionInterval = null;
+      }
+
+      if (cameraWatcherVideo) {
+        try {
+          cameraWatcherVideo.pause();
+        } catch (_) {
+        }
+        cameraWatcherVideo.srcObject = null;
+      }
+
+      if (cameraStream) {
+        try {
+          for (const track of cameraStream.getTracks()) {
+            try {
+              track.stop();
+            } catch (_) {
+            }
+          }
+        } catch (_) {
+        }
+      }
+
+      cameraStream = null;
+      cameraWatcherVideo = null;
+      cameraWatcherCanvas = null;
+      cameraWatcherCtx = null;
+      cameraLastFrame = null;
+      cameraLastSentAt = 0;
+
+      if (cameraPreview) {
+        cameraPreview.srcObject = null;
+      }
+      updateCameraSettingsUi();
+    }
+
     async function startCameraWatcher() {
       if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
         cameraEl.textContent = 'Camera: browser camera API not available';
+        cameraSettingsStatus.textContent = 'Camera API is unavailable in this runtime.';
         healthState.cameraOk = false;
+        updateCameraSettingsUi();
         updateIconGlow();
         return;
       }
 
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
-        const video = document.createElement('video');
-        video.srcObject = stream;
-        video.muted = true;
-        video.playsInline = true;
-        await video.play();
+      stopCameraWatcher();
 
-        const canvas = document.createElement('canvas');
-        const ctx = canvas.getContext('2d', { willReadFrequently: true });
+      try {
+        const videoConstraints = { facingMode: 'user' };
+        if (selectedCameraDeviceId) {
+          videoConstraints.deviceId = { exact: selectedCameraDeviceId };
+        }
+        cameraStream = await navigator.mediaDevices.getUserMedia({ video: videoConstraints, audio: false });
+        const firstTrack = cameraStream.getVideoTracks ? cameraStream.getVideoTracks()[0] : null;
+        if (firstTrack) {
+          const settings = firstTrack.getSettings ? firstTrack.getSettings() : {};
+          const resolvedDeviceId = String(settings?.deviceId || selectedCameraDeviceId || '').trim();
+          if (resolvedDeviceId) {
+            selectedCameraDeviceId = resolvedDeviceId;
+            localStorage.setItem('mim_camera_device_id', selectedCameraDeviceId);
+          }
+        }
+
+        cameraWatcherVideo = document.createElement('video');
+        cameraWatcherVideo.srcObject = cameraStream;
+        cameraWatcherVideo.muted = true;
+        cameraWatcherVideo.playsInline = true;
+        await cameraWatcherVideo.play();
+
+        cameraPreview.srcObject = cameraStream;
+        try {
+          await cameraPreview.play();
+        } catch (_) {
+        }
+
+        cameraWatcherCanvas = document.createElement('canvas');
+        cameraWatcherCtx = cameraWatcherCanvas.getContext('2d', { willReadFrequently: true });
         const width = 96;
         const height = 72;
-        canvas.width = width;
-        canvas.height = height;
-
-        let lastFrame = null;
-        let lastSentAt = 0;
+        cameraWatcherCanvas.width = width;
+        cameraWatcherCanvas.height = height;
 
         const postCameraActivity = async (activityScore) => {
           await fetch('/gateway/perception/camera/events', {
@@ -2397,41 +4109,48 @@ async def mim_ui_page() -> str:
           refreshState();
         };
 
-        if (motionInterval) clearInterval(motionInterval);
         motionInterval = setInterval(async () => {
-          if (!ctx || video.readyState < 2) return;
-          ctx.drawImage(video, 0, 0, width, height);
-          const frame = ctx.getImageData(0, 0, width, height).data;
+          if (!cameraWatcherCtx || !cameraWatcherVideo || cameraWatcherVideo.readyState < 2) return;
+          cameraWatcherCtx.drawImage(cameraWatcherVideo, 0, 0, width, height);
+          const frame = cameraWatcherCtx.getImageData(0, 0, width, height).data;
 
-          if (!lastFrame) {
-            lastFrame = new Uint8ClampedArray(frame);
+          if (!cameraLastFrame) {
+            cameraLastFrame = new Uint8ClampedArray(frame);
             return;
           }
 
           let delta = 0;
           const stride = 16;
           for (let i = 0; i < frame.length; i += stride) {
-            delta += Math.abs(frame[i] - lastFrame[i]);
+            delta += Math.abs(frame[i] - cameraLastFrame[i]);
           }
           const samples = Math.floor(frame.length / stride);
           const avgDelta = samples > 0 ? delta / samples : 0;
           const normalized = Math.max(0, Math.min(1, avgDelta / 40));
 
-          lastFrame.set(frame);
+          cameraLastFrame.set(frame);
           const now = Date.now();
-          if (normalized >= 0.18 && now - lastSentAt >= 1200) {
-            lastSentAt = now;
+          if (normalized >= 0.18 && now - cameraLastSentAt >= 1200) {
+            cameraLastSentAt = now;
             cameraEl.textContent = `Camera: activity detected (${normalized.toFixed(2)})`;
             await postCameraActivity(normalized);
           }
         }, 900);
 
+        await enumerateCameraDevices();
+
+        const activeLabel = firstTrack?.label ? ` (${firstTrack.label})` : '';
+        cameraSettingsStatus.textContent = `Camera preview live${activeLabel}.`;
         cameraEl.textContent = 'Camera: always watching for activity';
         healthState.cameraOk = true;
+        updateCameraSettingsUi();
         updateIconGlow();
       } catch (_) {
+        stopCameraWatcher();
         cameraEl.textContent = 'Camera permission denied or unavailable';
+        cameraSettingsStatus.textContent = 'Unable to start camera. Check permission and selected device.';
         healthState.cameraOk = false;
+        updateCameraSettingsUi();
         updateIconGlow();
       }
     }
@@ -2441,7 +4160,33 @@ async def mim_ui_page() -> str:
     settingsBtn.addEventListener('click', () => {
       settingsPanel.classList.toggle('open');
     });
+    settingsTabVoice.addEventListener('click', () => setSettingsTab('voice'));
+    settingsTabCamera.addEventListener('click', () => setSettingsTab('camera'));
+    cameraSelect.addEventListener('change', async () => {
+      selectedCameraDeviceId = String(cameraSelect.value || '').trim();
+      localStorage.setItem('mim_camera_device_id', selectedCameraDeviceId);
+      cameraSettingsStatus.textContent = 'Switching camera...';
+      await startCameraWatcher();
+    });
+    cameraRefreshBtn.addEventListener('click', async () => {
+      cameraSettingsStatus.textContent = 'Refreshing camera list...';
+      await enumerateCameraDevices();
+    });
+    cameraToggleBtn.addEventListener('click', async () => {
+      if (cameraStream && cameraStream.active) {
+        stopCameraWatcher();
+        cameraEl.textContent = 'Camera: preview stopped by user';
+        healthState.cameraOk = false;
+        cameraSettingsStatus.textContent = 'Camera preview stopped.';
+        updateIconGlow();
+        return;
+      }
+      cameraSettingsStatus.textContent = 'Starting camera preview...';
+      await startCameraWatcher();
+    });
     voiceSelect.addEventListener('change', applyVoiceSettings);
+    serverTtsToggle.addEventListener('change', applyVoiceSettings);
+    serverTtsVoiceSelect.addEventListener('change', applyVoiceSettings);
     micSelect.addEventListener('change', async () => {
       selectedMicDeviceId = String(micSelect.value || '').trim();
       const selected = availableMics.find((d) => d.deviceId === selectedMicDeviceId);
@@ -2504,6 +4249,7 @@ async def mim_ui_page() -> str:
     }
     defaultLangInput.value = normalizeLangCode(defaultListenLang || SYSTEM_DEFAULT_LANG);
     autoLangToggle.checked = autoLanguageMode;
+    serverTtsToggle.checked = serverTtsEnabled;
     naturalVoiceToggle.checked = naturalVoicePreset;
     voiceRateInput.value = clamp(voiceRate, 0.7, 1.35).toFixed(2);
     voicePitchInput.value = clamp(voicePitch, 0.7, 1.35).toFixed(2);
@@ -2512,7 +4258,9 @@ async def mim_ui_page() -> str:
     syncVoiceControlAvailability();
     syncVoiceControlLabels();
     enumerateMicDevices();
+    enumerateCameraDevices();
     buildVoiceOptions();
+    buildServerTtsVoiceOptions();
     startVoiceRecoveryLoop();
     if (window.speechSynthesis) {
       window.speechSynthesis.onvoiceschanged = () => {
@@ -2520,6 +4268,8 @@ async def mim_ui_page() -> str:
         applyVoiceSettings();
       };
     }
+    setSettingsTab('voice');
+    updateCameraSettingsUi();
     applyVoiceSettings();
     refreshState();
     listenBtn.textContent = 'Listening Off';
@@ -2565,6 +4315,19 @@ async def mim_ui_state(db: AsyncSession = Depends(get_db)) -> dict:
         .first()
     )
 
+    mic_row = (
+        (
+            await db.execute(
+            select(WorkspacePerceptionSource)
+            .where(WorkspacePerceptionSource.source_type == "microphone")
+            .order_by(WorkspacePerceptionSource.id.desc())
+            .limit(1)
+            )
+        )
+        .scalars()
+        .first()
+    )
+
     camera_payload = camera_row.last_event_payload_json if camera_row and isinstance(camera_row.last_event_payload_json, dict) else {}
     label_raw = str(camera_payload.get("object_label", "")).strip()
     label = label_raw.lower()
@@ -2577,17 +4340,204 @@ async def mim_ui_state(db: AsyncSession = Depends(get_db)) -> dict:
         elif "person" in label and label not in _known_people():
             unknown_person = True
 
-    inquiry_prompt = ""
+    latest_goal = (
+      (
+        await db.execute(
+          select(WorkspaceStrategyGoal)
+          .order_by(WorkspaceStrategyGoal.id.desc())
+          .limit(1)
+        )
+      )
+      .scalars()
+      .first()
+    )
+
+    open_question = (
+      (
+        await db.execute(
+          select(WorkspaceInquiryQuestion)
+          .where(WorkspaceInquiryQuestion.status == "open")
+          .order_by(WorkspaceInquiryQuestion.id.desc())
+          .limit(1)
+        )
+      )
+      .scalars()
+      .first()
+    )
+
+    latest_memory = (
+      (
+        await db.execute(
+          select(MemoryEntry)
+          .order_by(MemoryEntry.id.desc())
+          .limit(1)
+        )
+      )
+      .scalars()
+      .first()
+    )
+
+    latest_interaction_learning = (
+      (
+        await db.execute(
+          select(MemoryEntry)
+          .where(MemoryEntry.memory_class == "interaction_learning")
+          .order_by(MemoryEntry.id.desc())
+          .limit(1)
+        )
+      )
+      .scalars()
+      .first()
+    )
+
+    goal_summary = ""
+    if latest_goal:
+      goal_summary = _compact_sentence(
+        latest_goal.reasoning_summary
+        or latest_goal.success_criteria
+        or latest_goal.evidence_summary
+        or latest_goal.strategy_type.replace("_", " "),
+        max_len=160,
+      )
+
+    open_question_summary = ""
+    should_surface_open_question = False
+    if open_question:
+      urgency = str(open_question.urgency or "").strip().lower()
+      priority = str(open_question.priority or "").strip().lower()
+      age_seconds = (now - open_question.created_at.astimezone(timezone.utc)).total_seconds() if open_question.created_at else 0.0
+      urgent_flag = urgency in {"critical", "high", "urgent"} or priority in {"critical", "high", "urgent"}
+      open_question_summary = _compact_sentence(
+        open_question.waiting_decision
+        or open_question.why_answer_matters
+        or open_question.safe_default_if_unanswered,
+        max_len=170,
+      )
+
+    memory_summary = ""
+    if latest_memory:
+      memory_summary = _compact_sentence(
+        latest_memory.summary or latest_memory.content,
+        max_len=140,
+      )
+
+    learning_summary = ""
+    if latest_interaction_learning and not _is_low_quality_learning_entry(latest_interaction_learning):
+      learning_summary = _compact_sentence(
+        latest_interaction_learning.summary or latest_interaction_learning.content,
+        max_len=140,
+      )
+
+    mic_payload = mic_row.last_event_payload_json if mic_row and isinstance(mic_row.last_event_payload_json, dict) else {}
+    mic_confidence = float(mic_payload.get("confidence", 0.0) or 0.0)
+    mic_timestamp = _parse_payload_timestamp(mic_payload.get("timestamp"))
+    mic_age_seconds = _age_seconds(now, mic_timestamp)
+    mic_transcript_raw = str(mic_payload.get("transcript", "")).strip()
+    latest_mic_transcript = ""
+    if (
+      mic_transcript_raw
+      and mic_confidence >= MIC_PROMPT_MIN_CONFIDENCE
+      and (mic_age_seconds is None or mic_age_seconds <= MIC_PROMPT_MAX_AGE_SECONDS)
+    ):
+      latest_mic_transcript = _compact_sentence(mic_transcript_raw, max_len=120)
+
+    latest_input_event = (
+      (
+        await db.execute(
+          select(InputEvent)
+          .where(InputEvent.source.in_(["text", "voice", "ui", "api"]))
+          .order_by(InputEvent.id.desc())
+          .limit(1)
+        )
+      )
+      .scalars()
+      .first()
+    )
+    latest_input_text = ""
+    if latest_input_event:
+      latest_input_text = _compact_sentence(str(latest_input_event.raw_input or "").strip(), max_len=120)
+
+    latest_user_input = latest_mic_transcript or latest_input_text
+
+    recent_speech_actions = (
+      (
+        await db.execute(
+          select(SpeechOutputAction)
+          .order_by(SpeechOutputAction.id.desc())
+          .limit(6)
+        )
+      )
+      .scalars()
+      .all()
+    )
+    clarification_budget_exhausted = any(
+      _is_clarifier_prompt_text(str(row.requested_text or ""))
+      for row in recent_speech_actions
+    )
+
+    if open_question_summary and open_question:
+      urgency = str(open_question.urgency or "").strip().lower()
+      priority = str(open_question.priority or "").strip().lower()
+      age_seconds = (now - open_question.created_at.astimezone(timezone.utc)).total_seconds() if open_question.created_at else 0.0
+      critical_interrupt = urgency in {"critical", "urgent", "emergency"} or priority in {"critical", "urgent", "emergency"}
+      elevated_priority = urgency in {"high", "critical", "urgent", "emergency"} or priority in {"high", "critical", "urgent", "emergency"}
+      conversational_signal = bool(latest_mic_transcript or learning_summary)
+      should_surface_open_question = bool(
+        critical_interrupt
+        or (not conversational_signal and (elevated_priority or age_seconds <= 1200))
+      )
+
+    environment_now = ""
     if unknown_person:
-        inquiry_prompt = "I can see someone. Hi there — who are you? What's your name?"
+      environment_now = "there is an unidentified person in view"
+    elif label_raw:
+      environment_now = f"{label_raw} is visible on camera with confidence {confidence:.2f}"
+    else:
+      environment_now = "camera has no clear person in view"
+
+    needs_identity_prompt = bool(unknown_person and not goal_summary and not (open_question_summary and should_surface_open_question))
+
+    inquiry_prompt = ""
+    if open_question_summary and should_surface_open_question:
+      inquiry_prompt = f"If you want me to continue this workflow, I need one decision: {open_question_summary}"
+    elif needs_identity_prompt:
+      inquiry_prompt = "I can see someone nearby. What should I call you?"
+    else:
+      inquiry_prompt = _build_curiosity_prompt(
+          environment_now=environment_now,
+          goal_summary=goal_summary,
+          memory_summary=memory_summary,
+            latest_mic_transcript=latest_user_input,
+          learning_summary=learning_summary,
+            clarification_budget_exhausted=clarification_budget_exhausted,
+      )
+
+    latest_output_text = _rewrite_state_output_text(
+        str(speech_row.requested_text or "") if speech_row else "",
+        needs_identity_prompt=needs_identity_prompt,
+        open_question_summary=open_question_summary,
+        goal_summary=goal_summary,
+        latest_mic_transcript=latest_user_input,
+      environment_now=environment_now,
+      memory_summary=memory_summary,
+    )
 
     return {
         "speaking": speaking,
         "camera_last_label": label_raw,
         "camera_last_confidence": confidence,
         "inquiry_prompt": inquiry_prompt,
+      "conversation_context": {
+        "environment_now": environment_now,
+        "active_goal": goal_summary,
+        "open_question": open_question_summary,
+        "memory_hint": memory_summary,
+        "recent_user_input": latest_user_input,
+        "interaction_learning": learning_summary,
+        "needs_identity_prompt": needs_identity_prompt,
+      },
       "latest_output_action_id": int(speech_row.id) if speech_row else 0,
-      "latest_output_text": str(speech_row.requested_text or "") if speech_row else "",
+      "latest_output_text": latest_output_text,
       "latest_output_allowed": bool(str(speech_row.delivery_status or "") == "queued") if speech_row else False,
     }
 

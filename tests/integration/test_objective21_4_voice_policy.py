@@ -143,6 +143,45 @@ class Objective214VoicePolicyTest(unittest.TestCase):
         self.assertEqual(voice_policy["policy_version"], "voice-policy-v1")
         self.assertIn("max_output_chars", voice_policy)
 
+    def test_one_clarifier_then_options_fallback(self) -> None:
+        first_transcript = "do something with that thing near there"
+        second_transcript = "still do it around there now"
+
+        status, turn1 = post_json(
+            "/gateway/voice/input",
+            {
+                "transcript": first_transcript,
+                "parsed_intent": "execute_capability",
+                "confidence": 0.72,
+            },
+        )
+        self.assertEqual(status, 200, turn1)
+        res1 = turn1["resolution"]
+        prompt1 = str(res1.get("clarification_prompt", ""))
+        self.assertTrue(prompt1)
+        self.assertIn("missing one detail", prompt1.lower())
+        self.assertIn("answer", prompt1.lower())
+        self.assertIn("plan", prompt1.lower())
+        self.assertIn("action", prompt1.lower())
+        self.assertNotIn("clarification_limit_reached", res1.get("escalation_reasons", []))
+
+        status, turn2 = post_json(
+            "/gateway/voice/input",
+            {
+                "transcript": second_transcript,
+                "parsed_intent": "execute_capability",
+                "confidence": 0.72,
+            },
+        )
+        self.assertEqual(status, 200, turn2)
+        res2 = turn2["resolution"]
+        prompt2 = str(res2.get("clarification_prompt", ""))
+        self.assertTrue(prompt2)
+        self.assertIn("options: 1)", prompt2.lower())
+        self.assertIn("clarification_limit_reached", res2.get("escalation_reasons", []))
+        self.assertNotEqual(prompt1, prompt2)
+        self.assertNotIn("do you want me to answer a question", prompt2.lower())
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

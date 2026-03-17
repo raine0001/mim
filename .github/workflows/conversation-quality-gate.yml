@@ -1,0 +1,146 @@
+name: Conversation Quality Gate
+
+on:
+  pull_request:
+    branches: ["main"]
+  schedule:
+    - cron: "15 3 * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Gate mode to run"
+        required: true
+        default: "pr"
+        type: choice
+        options:
+          - pr
+          - nightly
+
+jobs:
+  quality-gate-pr:
+    if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'pr')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Runtime Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install fastapi uvicorn pydantic pydantic-settings python-dotenv sqlalchemy asyncpg SpeechRecognition
+
+      - name: Prepare Runtime Directories
+        run: mkdir -p runtime/logs runtime/reports
+
+      - name: Start API Server
+        run: |
+          nohup python -m uvicorn core.app:app --host 127.0.0.1 --port 18001 > runtime/logs/uvicorn_ci.log 2>&1 &
+
+      - name: Wait For Health
+        run: |
+          python - <<'PY'
+          import json
+          import time
+          import urllib.request
+
+          url = "http://127.0.0.1:18001/health"
+          deadline = time.time() + 60
+          while time.time() < deadline:
+              try:
+                  with urllib.request.urlopen(url, timeout=4) as resp:
+                      payload = json.loads(resp.read().decode("utf-8"))
+                      if payload.get("status") == "ok":
+                          print("health_ok")
+                          raise SystemExit(0)
+              except Exception:
+                  time.sleep(1)
+          raise SystemExit("Server did not become healthy within timeout")
+          PY
+
+      - name: Run PR Quality Gate
+        run: |
+          chmod +x scripts/run_conversation_quality_gate.sh
+          MIM_TEST_BASE_URL=http://127.0.0.1:18001 scripts/run_conversation_quality_gate.sh pr
+
+      - name: Upload Gate Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: conversation-quality-pr
+          path: |
+            runtime/reports/conversation_targeted_ab_A.json
+            runtime/reports/conversation_targeted_ab_B.json
+            runtime/reports/conversation_targeted_ab_diff.json
+            runtime/reports/conversation_targeted_gate.json
+            runtime/logs/uvicorn_ci.log
+
+  quality-gate-nightly:
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'nightly')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Runtime Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install fastapi uvicorn pydantic pydantic-settings python-dotenv sqlalchemy asyncpg SpeechRecognition
+
+      - name: Prepare Runtime Directories
+        run: mkdir -p runtime/logs runtime/reports
+
+      - name: Start API Server
+        run: |
+          nohup python -m uvicorn core.app:app --host 127.0.0.1 --port 18001 > runtime/logs/uvicorn_ci.log 2>&1 &
+
+      - name: Wait For Health
+        run: |
+          python - <<'PY'
+          import json
+          import time
+          import urllib.request
+
+          url = "http://127.0.0.1:18001/health"
+          deadline = time.time() + 60
+          while time.time() < deadline:
+              try:
+                  with urllib.request.urlopen(url, timeout=4) as resp:
+                      payload = json.loads(resp.read().decode("utf-8"))
+                      if payload.get("status") == "ok":
+                          print("health_ok")
+                          raise SystemExit(0)
+              except Exception:
+                  time.sleep(1)
+          raise SystemExit("Server did not become healthy within timeout")
+          PY
+
+      - name: Run Nightly Quality Gate
+        run: |
+          chmod +x scripts/run_conversation_quality_gate.sh
+          MIM_TEST_BASE_URL=http://127.0.0.1:18001 scripts/run_conversation_quality_gate.sh nightly
+
+      - name: Upload Gate Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: conversation-quality-nightly
+          path: |
+            runtime/reports/conversation_score_report.smoke.json
+            runtime/reports/conversation_score_report.expanded.json
+            runtime/reports/conversation_score_report.stress.json
+            runtime/reports/conversation_score_report.regression.json
+            runtime/reports/conversation_regression_diff.json
+            runtime/reports/conversation_regression_gate.json
+            runtime/logs/uvicorn_ci.log

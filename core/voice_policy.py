@@ -15,10 +15,10 @@ DEFAULT_POLICY = {
     "max_output_chars": 240,
     "allowed_output_priorities": ["low", "normal", "high"],
     "clarification_templates": {
-        "default": "Please clarify your request so I can proceed safely.",
-        "missing_target": "I need a specific target to continue. What object or location should I use?",
-        "ambiguous_command": "Your command sounds ambiguous. Please restate with explicit action and target.",
-        "low_transcript_confidence": "I did not confidently understand that. Please repeat your command clearly.",
+        "default": "I'm missing one detail: do you want me to answer a question, suggest a plan, or take an action?",
+        "missing_target": "I'm missing one detail: tell me the exact object or location, then I can continue.",
+        "ambiguous_command": "I'm missing one detail: do you want an answer, a plan, or an action?",
+        "low_transcript_confidence": "I could not confirm what you said. Choose one path: answer, plan, or action.",
         "unsafe_action_request": "I cannot execute that request safely. Please provide a safer alternative.",
     },
 }
