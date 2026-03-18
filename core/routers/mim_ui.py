@@ -76,6 +76,22 @@ def _looks_like_direct_question(text: str) -> bool:
     return prompt.startswith(question_starts)
 
 
+def _looks_like_greeting(text: str) -> bool:
+    normalized = " ".join(str(text or "").strip().lower().split())
+    if not normalized:
+      return False
+    greeting_tokens = {
+      "hello",
+      "hi",
+      "hey",
+      "yo",
+      "good morning",
+      "good afternoon",
+      "good evening",
+    }
+    return normalized in greeting_tokens
+
+
 def _is_clarifier_prompt_text(text: str) -> bool:
     normalized = " ".join(str(text or "").strip().lower().split())
     if not normalized:
@@ -97,6 +113,24 @@ def _plain_answer_from_context(
     question = str(latest_mic_transcript or "").strip()
     ql = question.lower()
     question_stub = _compact_sentence(question, max_len=72)
+    if _looks_like_greeting(question):
+      return "Hi. I can hear you and I am ready to help."
+
+    if "what exactly do you need" in ql or "what do you need" in ql:
+      return "I need one concrete request from you: ask one question or name one action."
+
+    if "objective" in ql and any(
+      token in ql for token in {"current", "active", "working", "on"}
+    ):
+      if goal_summary:
+        return _compact_sentence(
+          f"Current active objective: {goal_summary.rstrip('.')}", max_len=180
+        )
+      return "I do not have an active objective in this state yet."
+
+    if ("health" in ql or "status" in ql) and any(token in ql for token in {"what", "how", "are you", "your"}):
+      return "Current health status: healthy, online, and listening right now."
+
     if "task 75" in ql and ("what" in ql or "does" in ql):
       return "Task 75 checks whether MIM and TOD stay synchronized without drift."
 
@@ -254,6 +288,8 @@ def _build_curiosity_prompt(
     learning = _compact_sentence(learning_summary, max_len=110)
 
     if mic:
+      if _looks_like_greeting(mic):
+        return "Hi. I can hear you and I am ready to help."
       if _looks_like_direct_question(mic):
         return _plain_answer_from_context(
           latest_mic_transcript=mic,
