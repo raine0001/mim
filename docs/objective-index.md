@@ -3,7 +3,7 @@
 This registry indexes objective evidence and promotion artifacts so objective history stays queryable and operational.
 
 | Objective | Title | Status | Schema Version | Release Tag | Key Files | Readiness Report | Prod Report | Notable Capability Added |
-|---|---|---|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | 21 | Unified Input and Perception Gateway | promoted | mixed (pre-46 manifest era) | objective-21.x | core/routers/gateway.py; core/schemas.py | docs/objective-21x-21_5-promotion-readiness-report.md | docs/objective-21_6-prod-capability-bootstrap-report.md | unified_input_gateway |
 | 22 | MIM↔TOD Execution Feedback Integration | promoted_verified | see prod report | objective-22 | core/routers/gateway.py; core/models.py | docs/objective-22-promotion-readiness-report.md | docs/objective-22-prod-promotion-report.md | execution_feedback_updater |
 | 23 | Operator Control and Exception Handling | promoted_verified | see prod report | objective-23 | core/routers/operator.py | docs/objective-23-promotion-readiness-report.md | docs/objective-23-prod-promotion-report.md | operator_execution_actions |
@@ -60,7 +60,7 @@ This registry indexes objective evidence and promotion artifacts so objective hi
 | 72 | State Bus Consumers and Cross-System Subscription | promoted_verified | 2026-03-12-65 | objective-72 | core/models.py; core/state_bus_consumer_service.py; core/routers/state_bus.py; core/schemas.py; core/manifest.py | docs/objective-72-promotion-readiness-report.md | docs/objective-72-prod-promotion-report.md | state_bus_consumers_cross_system_subscription |
 | 73 | Bus-Driven Cross-System Reactions | promoted_verified | 2026-03-12-66 | objective-73 | core/state_bus_consumer_service.py; core/routers/state_bus.py; core/schemas.py; core/manifest.py | docs/objective-73-promotion-readiness-report.md | docs/objective-73-prod-promotion-report.md | bus_driven_cross_system_reactions |
 | 74 | Operator Interface and Channel Bridge | promoted_verified | 2026-03-12-67 | objective-74 | core/models.py; core/interface_service.py; core/routers/interface.py; core/schemas.py; core/manifest.py | docs/objective-74-promotion-readiness-report.md | docs/objective-74-prod-promotion-report.md | operator_interface_channel_bridge |
-| 75 | MIM→TOD Interface Hardening (First Project) | planned | 2026-03-12-68 (target) | objective-75 (target) | runtime/shared/MIM_CONTEXT_EXPORT.latest.json; runtime/shared/MIM_TOD_HANDSHAKE_PACKET.latest.json; runtime/shared/MIM_MANIFEST.latest.json; runtime/shared/MIM_TOD_ALIGNMENT_REQUEST.latest.json | n/a | n/a | mim_tod_interface_hardening |
+| 75 | MIM→TOD Interface Hardening (First Project) | promoted_verified | 2026-03-12-68 | objective-75 | runtime/shared/MIM_CONTEXT_EXPORT.latest.json; runtime/shared/MIM_TOD_HANDSHAKE_PACKET.latest.json; runtime/shared/MIM_MANIFEST.latest.json; runtime/shared/MIM_TOD_ALIGNMENT_REQUEST.latest.json | docs/objective-75-promotion-readiness-report.md | docs/objective-75-prod-promotion-report.md | mim_tod_interface_hardening |
 
 ## Notes
 

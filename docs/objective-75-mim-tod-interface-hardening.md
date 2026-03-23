@@ -1,13 +1,20 @@
 # Objective 75 — MIM→TOD Interface Hardening (First Project)
 
 Date: 2026-03-12
-Status: planned
+Status: completed
 Target Schema Version: 2026-03-12-68
 Target Release Tag: objective-75
 
 ## Summary
 
 Objective 75 defines and hardens the MIM→TOD shared interface contract as the first post-Objective-74 project. The immediate goal is to convert the current transport-success/objective-mismatch state into deterministic contract compatibility and objective alignment.
+
+Closure update: 2026-03-23
+
+- MIM shared exports, manifest truth, and handshake truth are aligned on objective `75`, schema `2026-03-12-68`, and release `objective-75`.
+- TOD canonical status now publishes manifest and handshake refresh evidence instead of alignment-only partial truth.
+- The canonical catch-up writer is aligned with the refreshed status publication path and now reports `gate_pass=true` on the real shared-state evidence.
+- MIM-side recoupling now passes under the stricter evidence rules, so the interface is closed as a verified baseline rather than a partial transport fix.
 
 ## Why This Is First
 
@@ -68,34 +75,34 @@ Out of scope:
 
 ### Phase 2 — MIM Producer Conformance
 
-4. Add automated producer conformance check for required files and key fields.
+1. Add automated producer conformance check for required files and key fields.
    - Owner: MIM backend lead
    - Output: integration test module for shared export integrity
-5. Add validation that handshake packet truth matches manifest and context export objective fields.
+2. Add validation that handshake packet truth matches manifest and context export objective fields.
    - Owner: MIM backend lead
    - Output: assertion coverage in integration tests
-6. Ensure alignment request packet generation is deterministic and timestamped.
+3. Ensure alignment request packet generation is deterministic and timestamped.
    - Owner: MIM backend lead
    - Output: script step in export/refresh workflow
 
 ### Phase 3 — TOD Consumer Conformance
 
-7. Run TOD sync against shared root and publish fresh integration status artifact.
+1. Run TOD sync against shared root and publish fresh integration status artifact.
    - Owner: TOD integration lead
    - Output: new `TOD_INTEGRATION_STATUS.latest.json`
-8. Confirm optional manifest and handshake pulls succeed when present.
+2. Confirm manifest and handshake pulls succeed and are surfaced in canonical status publication when present.
    - Owner: TOD integration lead
-   - Output: status fields `copied_manifest=true` (when present) and handshake pull success
-9. Align TOD current objective with MIM objective active.
+   - Output: status fields `copied_manifest=true`, non-empty `source_manifest` / `source_handshake_packet`, and populated handshake schema/release/objective truth
+3. Align TOD current objective with MIM objective active.
    - Owner: TOD product owner
    - Output: objective alignment status `aligned`
 
 ### Phase 4 — Promotion Gate
 
-10. Enforce pre-promotion interface gate requiring compatibility and objective alignment.
+1. Enforce pre-promotion interface gate requiring compatibility and objective alignment.
     - Owner: MIM QA/release lead
     - Output: promotion checklist update
-11. Record objective-75 readiness and production promotion evidence.
+2. Record objective-75 readiness and production promotion evidence.
     - Owner: MIM release owner
     - Output: readiness + prod promotion reports
 
@@ -111,7 +118,8 @@ Out of scope:
 
 - Verify TOD-published status reports `compatible=true`.
 - Verify `failure_reason` is empty for refresh path.
-- Verify optional file pulls do not fail when files are present.
+- Verify canonical status shows `copied_manifest=true` and non-empty source paths when shared manifest/handshake artifacts are present.
+- Verify canonical `mim_handshake` truth matches the shared handshake packet for objective/schema/release fields.
 
 ### C. Objective Alignment
 
@@ -132,6 +140,10 @@ Objective 75 is done when all conditions below are true in a fresh TOD status pu
 - `objective_alignment.status=aligned`
 - `objective_alignment.tod_current_objective` equals MIM active objective
 - refresh `failure_reason` remains empty
+- `mim_refresh.copied_manifest=true`
+- `mim_refresh.source_manifest` and `mim_refresh.source_handshake_packet` are populated
+- `mim_handshake.available=true`
+- `mim_handshake.objective_active`, `mim_handshake.schema_version`, and `mim_handshake.release_tag` match the shared MIM handshake truth
 - required artifacts are present and parseable
 - Objective 73/74 integration suites pass
 
@@ -146,4 +158,4 @@ Objective 75 is done when all conditions below are true in a fresh TOD status pu
 
 ## Immediate Next Action
 
-Request one TOD sync+publish cycle against current shared artifacts, then evaluate Objective 75 gate conditions from the resulting `TOD_INTEGRATION_STATUS.latest.json`.
+Use Objective 75 as the stable interface baseline for Objective 80 planning, with the assumptions that shared truth export is stable, canonical status publication is trustworthy, recoupling logic is proven, and catch-up status no longer fakes success.
