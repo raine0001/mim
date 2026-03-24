@@ -6,7 +6,9 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from core.execution_truth_service import summarize_execution_truth
 from core.models import ConstraintEvaluation, ExecutionJournal, WorkspaceAutonomyBoundaryProfile, WorkspaceDevelopmentPattern, WorkspaceInterruptionEvent, WorkspaceMonitoringState, WorkspacePolicyExperiment, WorkspaceProposal, WorkspaceReplanSignal
+from core.models import CapabilityExecution
 
 
 PROFILE_STATUSES = {
@@ -368,6 +370,20 @@ async def evaluate_adaptive_autonomy_boundaries(
     else:
         experiment_confidence = 0.5
 
+    execution_rows = (
+        await db.execute(
+            select(CapabilityExecution)
+            .where(CapabilityExecution.created_at >= since)
+            .order_by(CapabilityExecution.id.desc())
+            .limit(200)
+        )
+    ).scalars().all()
+    execution_truth_summary = summarize_execution_truth(
+        execution_rows,
+        managed_scope=(scope.strip() if str(scope).strip() else "global"),
+        max_age_hours=max(1, int(lookback_hours)),
+    )
+
     monitoring = (
         await db.execute(select(WorkspaceMonitoringState).order_by(WorkspaceMonitoringState.id.asc()))
     ).scalars().first()
@@ -462,6 +478,13 @@ async def evaluate_adaptive_autonomy_boundaries(
             "development_patterns": len(pattern_rows),
             "policy_experiments": experiment_total,
         },
+        "execution_truth": {
+            "execution_count": int(execution_truth_summary.get("execution_count", 0) or 0),
+            "signal_count": int(execution_truth_summary.get("deviation_signal_count", 0) or 0),
+            "signal_types": execution_truth_summary.get("signal_types", []),
+            "freshness": execution_truth_summary.get("freshness", {}),
+            "managed_scope": execution_truth_summary.get("managed_scope", "global"),
+        },
     }
 
     applied: dict = {}
@@ -501,10 +524,17 @@ async def evaluate_adaptive_autonomy_boundaries(
             "hard_ceiling": hard_ceiling_state,
             "hard_ceiling_violations": hard_ceiling_violations,
             "scope": scope,
+            "execution_truth_influence": {
+                **execution_truth_summary,
+                "review_only": True,
+            },
         },
         metadata_json={
             **(metadata_json if isinstance(metadata_json, dict) else {}),
             "objective58_adaptive_autonomy_boundaries": True,
+            "objective80_execution_truth_review": bool(
+                int(execution_truth_summary.get("deviation_signal_count", 0) or 0)
+            ),
         },
     )
     db.add(row)
@@ -541,6 +571,11 @@ async def get_autonomy_boundary_profile(*, profile_id: int, db: AsyncSession) ->
 
 
 def to_autonomy_boundary_profile_out(row: WorkspaceAutonomyBoundaryProfile) -> dict:
+    adaptation_reasoning = (
+        row.adaptation_reasoning_json
+        if isinstance(row.adaptation_reasoning_json, dict)
+        else {}
+    )
     return {
         "boundary_id": int(row.id),
         "profile_id": int(row.id),
@@ -564,7 +599,12 @@ def to_autonomy_boundary_profile_out(row: WorkspaceAutonomyBoundaryProfile) -> d
         "recommended_boundaries": row.recommended_boundaries_json if isinstance(row.recommended_boundaries_json, dict) else {},
         "applied_boundaries": row.applied_boundaries_json if isinstance(row.applied_boundaries_json, dict) else {},
         "adaptation_summary": row.adaptation_summary,
-        "adaptation_reasoning": row.adaptation_reasoning_json if isinstance(row.adaptation_reasoning_json, dict) else {},
+        "adaptation_reasoning": adaptation_reasoning,
+        "execution_truth_influence": (
+            adaptation_reasoning.get("execution_truth_influence", {})
+            if isinstance(adaptation_reasoning.get("execution_truth_influence", {}), dict)
+            else {}
+        ),
         "metadata_json": row.metadata_json if isinstance(row.metadata_json, dict) else {},
         "created_at": row.created_at,
     }

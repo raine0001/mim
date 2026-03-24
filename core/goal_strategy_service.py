@@ -4,6 +4,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.cross_domain_reasoning_service import build_cross_domain_reasoning_context, to_cross_domain_reasoning_out
+from core.execution_truth_service import execution_truth_freshness, summarize_execution_truth_signal_types
 from core.horizon_planning_service import create_horizon_plan
 from core.improvement_service import generate_improvement_proposals as generate_improvement_proposals_for_strategy
 from core.maintenance_service import run_environment_maintenance_cycle
@@ -90,6 +91,208 @@ def _operator_recommendations(strategy_type: str) -> list[str]:
     return by_type.get(strategy_type, ["Review strategic goal before downstream execution."])
 
 
+def _execution_truth_summary(*, context: dict) -> dict:
+    reasoning = (
+        context.get("reasoning", {})
+        if isinstance(context.get("reasoning", {}), dict)
+        else {}
+    )
+    summary = (
+        reasoning.get("execution_truth_influence", {})
+        if isinstance(reasoning.get("execution_truth_influence", {}), dict)
+        else {}
+    )
+    return _scoped_execution_truth_summary(context=context, summary=summary)
+
+
+def _context_managed_scopes(*, context: dict) -> list[str]:
+    metadata = (
+        context.get("metadata_json", {})
+        if isinstance(context.get("metadata_json", {}), dict)
+        else {}
+    )
+    requested_scope = str(
+        metadata.get("managed_scope", metadata.get("target_scope", ""))
+    ).strip()
+    if requested_scope:
+        return [requested_scope]
+
+    workspace = (
+        context.get("workspace_state", {})
+        if isinstance(context.get("workspace_state", {}), dict)
+        else {}
+    )
+    zones = workspace.get("zones", []) if isinstance(workspace.get("zones", []), list) else []
+    scopes: list[str] = []
+    for zone in zones:
+        if not isinstance(zone, dict):
+            continue
+        scope = str(zone.get("zone", "")).strip()
+        if scope and scope not in scopes:
+            scopes.append(scope)
+    return scopes
+
+
+def _scoped_execution_truth_summary(*, context: dict, summary: dict) -> dict:
+    if not isinstance(summary, dict):
+        return {}
+    scopes = _context_managed_scopes(context=context)
+    if not scopes:
+        return summary
+
+    recent_executions = (
+        summary.get("recent_executions", [])
+        if isinstance(summary.get("recent_executions", []), list)
+        else []
+    )
+    filtered_recent_executions = [
+        item
+        for item in recent_executions
+        if isinstance(item, dict)
+        and any(
+            str(scope_ref).strip() in scopes
+            for scope_ref in (
+                item.get("scope_refs", []) if isinstance(item.get("scope_refs", []), list) else []
+            )
+        )
+    ]
+    filtered_execution_ids = {
+        _safe_int(item.get("execution_id", 0))
+        for item in filtered_recent_executions
+        if isinstance(item, dict)
+    }
+    filtered_capabilities = {
+        str(item.get("capability_name", "")).strip()
+        for item in filtered_recent_executions
+        if isinstance(item, dict) and str(item.get("capability_name", "")).strip()
+    }
+
+    deviation_signals = (
+        summary.get("deviation_signals", [])
+        if isinstance(summary.get("deviation_signals", []), list)
+        else []
+    )
+    filtered_deviation_signals = [
+        item
+        for item in deviation_signals
+        if isinstance(item, dict)
+        and (
+            str(item.get("target_scope", "")).strip() in scopes
+            or _safe_int(item.get("execution_id", 0)) in filtered_execution_ids
+            or str(item.get("target_scope", "")).strip() in filtered_capabilities
+        )
+    ]
+
+    if not filtered_recent_executions and not filtered_deviation_signals:
+        return summary
+
+    scoped_summary = {
+        **summary,
+        "execution_count": len(filtered_recent_executions),
+        "deviation_signal_count": len(filtered_deviation_signals),
+        "deviation_signals": filtered_deviation_signals,
+        "recent_executions": filtered_recent_executions,
+        "signal_types": sorted(
+            {
+                str(item.get("signal_type", "")).strip()
+                for item in filtered_deviation_signals
+                if isinstance(item, dict) and str(item.get("signal_type", "")).strip()
+            }
+        ),
+        "managed_scope": scopes[0] if len(scopes) == 1 else ",".join(scopes),
+    }
+    scoped_summary["freshness"] = execution_truth_freshness(
+        scoped_summary,
+        decay_window_hours=24,
+    )
+    return scoped_summary
+
+
+def _execution_truth_signal_types(*, summary: dict) -> list[str]:
+    return summarize_execution_truth_signal_types(summary)
+
+
+def _execution_truth_strategy_influence(*, strategy_type: str, summary: dict) -> dict:
+    execution_count = _safe_int(summary.get("execution_count", 0))
+    signal_count = _safe_int(summary.get("deviation_signal_count", 0))
+    signal_types = _execution_truth_signal_types(summary=summary)
+    freshness = execution_truth_freshness(summary, decay_window_hours=24)
+    freshness_weight = float(freshness.get("freshness_weight", 0.0) or 0.0)
+    if execution_count <= 0 or signal_count <= 0 or not signal_types:
+        return {
+            "execution_count": execution_count,
+            "signal_count": signal_count,
+            "signal_types": signal_types,
+            "strategy_weight": 0.0,
+            "freshness": freshness,
+            "rationale": "",
+        }
+
+    per_strategy_weights = {
+        "maintain_workspace_readiness": {
+            "execution_slower_than_expected": 0.14,
+            "retry_instability_detected": 0.18,
+            "fallback_path_used": 0.16,
+            "simulation_reality_mismatch": 0.18,
+            "environment_shift_during_execution": 0.18,
+            "base_pressure": 0.12,
+        },
+        "reduce_operator_interruption_load": {
+            "execution_slower_than_expected": 0.03,
+            "retry_instability_detected": 0.04,
+            "fallback_path_used": 0.04,
+            "simulation_reality_mismatch": 0.05,
+            "environment_shift_during_execution": 0.05,
+            "base_pressure": 0.03,
+        },
+        "stabilize_uncertain_zones_before_action": {
+            "execution_slower_than_expected": 0.12,
+            "retry_instability_detected": 0.18,
+            "fallback_path_used": 0.14,
+            "simulation_reality_mismatch": 0.24,
+            "environment_shift_during_execution": 0.24,
+            "base_pressure": 0.15,
+        },
+        "prioritize_development_improvements_affecting_active_workflows": {
+            "execution_slower_than_expected": 0.08,
+            "retry_instability_detected": 0.14,
+            "fallback_path_used": 0.16,
+            "simulation_reality_mismatch": 0.2,
+            "environment_shift_during_execution": 0.16,
+            "base_pressure": 0.08,
+        },
+    }
+    weights = per_strategy_weights.get(strategy_type, {})
+    weight = float(weights.get("base_pressure", 0.05)) * _bounded(signal_count / 5.0)
+    for signal_type in signal_types:
+        weight += float(weights.get(signal_type, 0.0))
+    weight = _bounded(weight * freshness_weight)
+
+    rationale_parts: list[str] = []
+    signal_set = set(signal_types)
+    if signal_set.intersection({"retry_instability_detected", "fallback_path_used"}):
+        rationale_parts.append(
+            "Retry and fallback pressure lower confidence in aggressive execution strategies."
+        )
+    if signal_set.intersection({"simulation_reality_mismatch", "environment_shift_during_execution"}):
+        rationale_parts.append(
+            "Runtime mismatch indicates environment assumptions should be reconfirmed before committing strategy weight."
+        )
+    if "execution_slower_than_expected" in signal_set:
+        rationale_parts.append(
+            "Latency drift suggests current readiness assumptions are too optimistic."
+        )
+
+    return {
+        "execution_count": execution_count,
+        "signal_count": signal_count,
+        "signal_types": signal_types,
+        "strategy_weight": round(weight, 6),
+        "freshness": freshness,
+        "rationale": " ".join(rationale_parts).strip(),
+    }
+
+
 async def _operator_preference_weight(*, strategy_type: str, db: AsyncSession) -> float:
     rows = (
         await db.execute(
@@ -138,6 +341,11 @@ def _strategy_candidates(*, context: dict) -> list[dict]:
     external = domains["external_information"]
     development = domains["development"]
     self_improvement = domains["self_improvement"]
+    execution_truth = _execution_truth_summary(context=context)
+    execution_truth_signal_count = _safe_int(
+        execution_truth.get("deviation_signal_count", 0)
+    )
+    execution_truth_signal_types = _execution_truth_signal_types(summary=execution_truth)
 
     candidates: list[dict] = []
 
@@ -150,6 +358,11 @@ def _strategy_candidates(*, context: dict) -> list[dict]:
                 "workspace_observation_count": workspace,
                 "communication_signal_count": communication,
                 "external_signal_count": external,
+                "execution_truth_execution_count": _safe_int(
+                    execution_truth.get("execution_count", 0)
+                ),
+                "execution_truth_signal_count": execution_truth_signal_count,
+                "execution_truth_signal_types": execution_truth_signal_types,
             },
             "urgency": _bounded(0.4 + (communication / 60.0) + (workspace / 200.0)),
             "expected_impact": _bounded(0.55 + (workspace / 250.0)),
@@ -166,6 +379,11 @@ def _strategy_candidates(*, context: dict) -> list[dict]:
                 "supporting_evidence": {
                     "communication_signal_count": communication,
                     "self_improvement_backlog_count": self_improvement,
+                    "execution_truth_execution_count": _safe_int(
+                        execution_truth.get("execution_count", 0)
+                    ),
+                    "execution_truth_signal_count": execution_truth_signal_count,
+                    "execution_truth_signal_types": execution_truth_signal_types,
                 },
                 "urgency": _bounded(0.35 + (communication / 40.0)),
                 "expected_impact": _bounded(0.5 + (self_improvement / 80.0)),
@@ -182,6 +400,11 @@ def _strategy_candidates(*, context: dict) -> list[dict]:
                 "supporting_evidence": {
                     "workspace_observation_count": workspace,
                     "development_pattern_count": development,
+                    "execution_truth_execution_count": _safe_int(
+                        execution_truth.get("execution_count", 0)
+                    ),
+                    "execution_truth_signal_count": execution_truth_signal_count,
+                    "execution_truth_signal_types": execution_truth_signal_types,
                 },
                 "urgency": _bounded(0.3 + (workspace / 150.0)),
                 "expected_impact": _bounded(0.45 + (workspace / 220.0)),
@@ -198,6 +421,11 @@ def _strategy_candidates(*, context: dict) -> list[dict]:
                 "supporting_evidence": {
                     "development_pattern_count": development,
                     "self_improvement_backlog_count": self_improvement,
+                    "execution_truth_execution_count": _safe_int(
+                        execution_truth.get("execution_count", 0)
+                    ),
+                    "execution_truth_signal_count": execution_truth_signal_count,
+                    "execution_truth_signal_types": execution_truth_signal_types,
                 },
                 "urgency": _bounded(0.35 + (development / 30.0)),
                 "expected_impact": _bounded(0.5 + (self_improvement / 70.0)),
@@ -404,6 +632,7 @@ async def build_strategy_goals(
     candidates = _strategy_candidates(context=context)
     ranked_candidates: list[dict] = []
     developmental_friction = _bounded(float(domain_counts.get("development", 0)) / 8.0)
+    execution_truth_summary = _execution_truth_summary(context=context)
 
     for candidate in candidates:
         strategy_type = str(candidate.get("strategy_type", "strategy_goal"))
@@ -411,6 +640,10 @@ async def build_strategy_goals(
         expected_impact = _bounded(float(candidate.get("expected_impact", 0.5) or 0.5))
         risk = _bounded(float(candidate.get("risk", _risk_baseline(strategy_type)) or _risk_baseline(strategy_type)))
         operator_pref = await _operator_preference_weight(strategy_type=strategy_type, db=db)
+        execution_truth_influence = _execution_truth_strategy_influence(
+            strategy_type=strategy_type,
+            summary=execution_truth_summary,
+        )
 
         score = _bounded(
             (urgency * 0.25)
@@ -419,13 +652,20 @@ async def build_strategy_goals(
             + ((1.0 - risk) * 0.1)
             + (operator_pref * 0.1)
             + (developmental_friction * 0.15)
+            + (float(execution_truth_influence.get("strategy_weight", 0.0) or 0.0) * 0.15)
         )
+
+        reasoning_summary = str(candidate.get("why_formed", ""))
+        rationale = str(execution_truth_influence.get("rationale", "")).strip()
+        if rationale:
+            reasoning_summary = f"{reasoning_summary} {rationale}".strip()
 
         ranked_candidates.append(
             {
                 **candidate,
                 "priority_score": score,
                 "priority": _priority_label(score),
+                "reasoning_summary": reasoning_summary,
                 "ranking_factors": {
                     "urgency": urgency,
                     "confidence": confidence,
@@ -433,7 +673,23 @@ async def build_strategy_goals(
                     "risk": risk,
                     "operator_preference_influence": operator_pref,
                     "developmental_friction_patterns": developmental_friction,
+                    "execution_truth_execution_count": int(
+                        execution_truth_influence.get("execution_count", 0) or 0
+                    ),
+                    "execution_truth_signal_count": int(
+                        execution_truth_influence.get("signal_count", 0) or 0
+                    ),
+                    "execution_truth_signal_types": execution_truth_influence.get(
+                        "signal_types", []
+                    ),
+                    "execution_truth_strategy_weight": float(
+                        execution_truth_influence.get("strategy_weight", 0.0) or 0.0
+                    ),
+                    "execution_truth_freshness": execution_truth_influence.get(
+                        "freshness", {}
+                    ),
                 },
+                "execution_truth_influence": execution_truth_influence,
             }
         )
 
@@ -455,19 +711,46 @@ async def build_strategy_goals(
             priority_score=float(candidate.get("priority_score", 0.0) or 0.0),
             success_criteria=str(candidate.get("success_criteria", "")),
             status="proposed",
-            evidence_summary=str(candidate.get("why_formed", "")),
+            evidence_summary=str(candidate.get("reasoning_summary", "")),
             supporting_evidence_json=candidate.get("supporting_evidence", {}) if isinstance(candidate.get("supporting_evidence", {}), dict) else {},
             contributing_domains_json=domains_present,
             ranking_factors_json=candidate.get("ranking_factors", {}) if isinstance(candidate.get("ranking_factors", {}), dict) else {},
-            reasoning_summary=str(candidate.get("why_formed", "")),
+            reasoning_summary=str(candidate.get("reasoning_summary", "")),
             reasoning_json={
                 "domains_contributed": domains_present,
                 "cross_domain_links": links if isinstance(links, list) else [],
                 "origin_context_confidence": confidence,
+                "execution_truth_influence": {
+                    **(
+                        execution_truth_summary
+                        if isinstance(execution_truth_summary, dict)
+                        else {}
+                    ),
+                    "signal_types": _execution_truth_signal_types(
+                        summary=execution_truth_summary
+                    ),
+                    "strategy_weight": float(
+                        candidate.get("execution_truth_influence", {}).get(
+                            "strategy_weight", 0.0
+                        )
+                        if isinstance(candidate.get("execution_truth_influence", {}), dict)
+                        else 0.0
+                    ),
+                    "strategy_rationale": str(
+                        candidate.get("execution_truth_influence", {}).get(
+                            "rationale", ""
+                        )
+                        if isinstance(candidate.get("execution_truth_influence", {}), dict)
+                        else ""
+                    ).strip(),
+                },
             },
             metadata_json={
                 **(metadata_json if isinstance(metadata_json, dict) else {}),
                 "objective57_strategy_goal": True,
+                "objective80_execution_truth_strategy": bool(
+                    _safe_int(execution_truth_summary.get("deviation_signal_count", 0))
+                ),
             },
         )
         db.add(row)

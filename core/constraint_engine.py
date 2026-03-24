@@ -49,6 +49,27 @@ def evaluate_constraints(
     throttle_blocked = _to_bool(system_state.get("throttle_blocked", False))
     integrity_risk = _to_bool(system_state.get("integrity_risk", False))
     unlawful_action = _to_bool(policy_state.get("unlawful_action", False))
+    execution_truth_summary = (
+        workspace_state.get("execution_truth_summary", {})
+        if isinstance(workspace_state.get("execution_truth_summary", {}), dict)
+        else {}
+    )
+    execution_truth_signal_types = (
+        execution_truth_summary.get("signal_types", [])
+        if isinstance(execution_truth_summary.get("signal_types", []), list)
+        else []
+    )
+    execution_truth_signal_count = int(
+        execution_truth_summary.get("deviation_signal_count", 0) or 0
+    )
+    execution_truth_freshness = (
+        execution_truth_summary.get("freshness", {})
+        if isinstance(execution_truth_summary.get("freshness", {}), dict)
+        else {}
+    )
+    execution_truth_freshness_weight = _to_float(
+        execution_truth_freshness.get("freshness_weight", 0.0), 0.0
+    )
 
     if unlawful_action:
         hard_violations.append(
@@ -134,6 +155,38 @@ def evaluate_constraints(
             }
         )
 
+    if execution_truth_signal_count > 0 and execution_truth_freshness_weight >= 0.15:
+        if set(execution_truth_signal_types).intersection(
+            {"simulation_reality_mismatch", "environment_shift_during_execution"}
+        ):
+            soft_warnings.append(
+                {
+                    "constraint": "execution_truth_runtime_drift",
+                    "category": "runtime_truth",
+                    "severity": "high",
+                    "reason": "recent execution truth indicates runtime mismatch or environment shift",
+                    "hard": False,
+                    "remediation": "reconfirm scope state before execution",
+                }
+            )
+        elif set(execution_truth_signal_types).intersection(
+            {
+                "retry_instability_detected",
+                "fallback_path_used",
+                "execution_slower_than_expected",
+            }
+        ):
+            soft_warnings.append(
+                {
+                    "constraint": "execution_truth_runtime_instability",
+                    "category": "runtime_truth",
+                    "severity": "medium",
+                    "reason": "recent execution truth indicates retry, fallback, or latency instability",
+                    "hard": False,
+                    "remediation": "prefer lower-risk execution path or gather more runtime evidence",
+                }
+            )
+
     if hard_violations:
         decision = "blocked"
         recommended_next_step = "stop_and_escalate"
@@ -143,13 +196,27 @@ def evaluate_constraints(
         has_freshness_soft = any(item.get("constraint") == "workspace_freshness" for item in soft_warnings)
         has_confidence_soft = any(item.get("constraint") == "target_confidence_threshold" for item in soft_warnings)
         has_throttle_soft = any(item.get("constraint") == "execution_throttle" for item in soft_warnings)
+        has_execution_truth_replan = any(
+            item.get("constraint") == "execution_truth_runtime_drift"
+            for item in soft_warnings
+        )
+        has_execution_truth_instability = any(
+            item.get("constraint") == "execution_truth_runtime_instability"
+            for item in soft_warnings
+        )
 
         if has_human_soft:
             decision = "requires_confirmation"
             recommended_next_step = "request_operator_confirmation"
+        elif has_execution_truth_replan and is_physical:
+            decision = "requires_replan"
+            recommended_next_step = "reconfirm_runtime_and_replan"
         elif has_confidence_soft or has_freshness_soft:
             decision = "requires_replan"
             recommended_next_step = "reobserve_and_replan"
+        elif has_execution_truth_instability:
+            decision = "allowed_with_conditions"
+            recommended_next_step = "reduce_execution_risk"
         elif has_throttle_soft:
             decision = "allowed_with_conditions"
             recommended_next_step = "wait_for_cooldown"
@@ -170,5 +237,10 @@ def evaluate_constraints(
             "evaluated_at": datetime.now(timezone.utc).isoformat(),
             "hard_violation_count": len(hard_violations),
             "soft_warning_count": len(soft_warnings),
+            "execution_truth_influence": {
+                "signal_count": execution_truth_signal_count,
+                "signal_types": execution_truth_signal_types,
+                "freshness": execution_truth_freshness,
+            },
         },
     }

@@ -1,13 +1,14 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.decision_record_service import record_decision
 from core.environment_strategy_service import generate_environment_strategies, resolve_environment_strategy, to_environment_strategy_out
-from core.models import MemoryEntry, WorkspaceEnvironmentStrategy, WorkspaceMaintenanceAction, WorkspaceMaintenanceRun, WorkspaceObservation
+from core.execution_truth_service import derive_execution_truth_signals, execution_truth_scope_refs, summarize_execution_truth
+from core.models import CapabilityExecution, MemoryEntry, WorkspaceEnvironmentStrategy, WorkspaceMaintenanceAction, WorkspaceMaintenanceRun, WorkspaceObservation
 
 
 async def _detect_stale_zones(*, stale_after_seconds: int, db: AsyncSession) -> list[dict]:
@@ -45,6 +46,50 @@ async def _detect_stale_zones(*, stale_after_seconds: int, db: AsyncSession) -> 
     return degraded
 
 
+async def _detect_execution_truth_zone_drift(*, lookback_hours: int, db: AsyncSession) -> tuple[list[dict], dict]:
+    since = datetime.now(timezone.utc) - timedelta(hours=max(1, int(lookback_hours)))
+    rows = (
+        await db.execute(
+            select(CapabilityExecution)
+            .where(CapabilityExecution.created_at >= since)
+            .order_by(CapabilityExecution.id.desc())
+            .limit(200)
+        )
+    ).scalars().all()
+    summary = summarize_execution_truth(rows, max_age_hours=max(1, int(lookback_hours)))
+
+    signals: list[dict] = []
+    seen: set[tuple[int, str, str]] = set()
+    for row in rows:
+        truth = row.execution_truth_json if isinstance(row.execution_truth_json, dict) else {}
+        if str(truth.get("contract", "")).strip() != "execution_truth_v1":
+            continue
+        scope_refs = [item for item in sorted(execution_truth_scope_refs(row)) if item and item != "global"]
+        if not scope_refs:
+            continue
+        for signal in derive_execution_truth_signals(truth):
+            if not isinstance(signal, dict):
+                continue
+            signal_type = str(signal.get("signal_type", "")).strip()
+            if not signal_type:
+                continue
+            for scope_ref in scope_refs:
+                key = (int(getattr(row, "id", 0) or 0), scope_ref, signal_type)
+                if key in seen:
+                    continue
+                seen.add(key)
+                signals.append(
+                    {
+                        "signal_type": signal_type,
+                        "target_scope": scope_ref,
+                        "execution_id": int(getattr(row, "id", 0) or 0),
+                        "capability_name": str(getattr(row, "capability_name", "") or "").strip(),
+                        "severity": float(signal.get("severity", 0.0) or 0.0),
+                    }
+                )
+    return signals, summary
+
+
 async def run_environment_maintenance_cycle(
     *,
     actor: str,
@@ -57,10 +102,23 @@ async def run_environment_maintenance_cycle(
     db: AsyncSession,
 ) -> tuple[WorkspaceMaintenanceRun, list[WorkspaceMaintenanceAction], list[WorkspaceEnvironmentStrategy], int]:
     degraded = await _detect_stale_zones(stale_after_seconds=stale_after_seconds, db=db)
+    execution_truth_signals, execution_truth_summary = await _detect_execution_truth_zone_drift(
+        lookback_hours=24,
+        db=db,
+    )
+    degraded = sorted(
+        [*degraded, *execution_truth_signals],
+        key=lambda item: float(item.get("severity", 0.0) or 0.0),
+        reverse=True,
+    )
 
     conditions = [
         {
-            "condition_type": "stale_scans",
+            "condition_type": (
+                "stale_scans"
+                if str(item.get("signal_type", "")) == "stale_zone_detected"
+                else "execution_truth_drift"
+            ),
             "target_scope": item["target_scope"],
             "severity": item["severity"],
             "occurrence_count": 1,
@@ -95,6 +153,7 @@ async def run_environment_maintenance_cycle(
         metadata_json={
             "auto_execute": bool(auto_execute),
             "max_actions": int(max_actions),
+            "execution_truth_summary": execution_truth_summary,
             **(metadata_json if isinstance(metadata_json, dict) else {}),
         },
     )
@@ -207,6 +266,10 @@ async def run_environment_maintenance_cycle(
     run.stabilized = bool(actions) or not bool(degraded)
     run.maintenance_outcomes_json = {
         "degraded_signal_count": len(degraded),
+        "execution_truth_signal_count": int(
+            execution_truth_summary.get("deviation_signal_count", 0) or 0
+        ),
+        "execution_truth_signal_types": execution_truth_summary.get("signal_types", []),
         "strategies_created": len(strategies),
         "actions_executed": len(actions),
         "memory_entries_created": memory_entries_created,

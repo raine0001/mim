@@ -1,12 +1,18 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from core.execution_truth_service import (
+    execution_truth_freshness,
+    summarize_execution_truth,
+    summarize_execution_truth_signal_types,
+)
 from core.improvement_service import generate_improvement_proposals, list_improvement_proposals
 from core.models import (
+    CapabilityExecution,
     UserPreference,
     WorkspaceImprovementBacklog,
     WorkspaceImprovementProposal,
@@ -125,6 +131,88 @@ def _evidence_strength(*, evidence_count: int, confidence: float) -> float:
     return _bounded((count_component * 0.6) + (confidence_component * 0.4))
 
 
+def _execution_truth_priority_influence(
+    *, proposal: WorkspaceImprovementProposal, summary: dict
+) -> dict:
+    execution_count = int(summary.get("execution_count", 0) or 0)
+    signal_count = int(summary.get("deviation_signal_count", 0) or 0)
+    signal_types = summarize_execution_truth_signal_types(summary)
+    freshness = execution_truth_freshness(summary, decay_window_hours=24)
+    freshness_weight = float(freshness.get("freshness_weight", 0.0) or 0.0)
+    metadata = (
+        proposal.metadata_json if isinstance(proposal.metadata_json, dict) else {}
+    )
+    evidence = proposal.evidence_json if isinstance(proposal.evidence_json, dict) else {}
+    affected_component = str(proposal.affected_component or "").strip().lower()
+    proposal_type = str(proposal.proposal_type or "").strip().lower()
+
+    if execution_count <= 0 or signal_count <= 0 or not signal_types:
+        return {
+            "execution_count": execution_count,
+            "signal_count": signal_count,
+            "signal_types": signal_types,
+            "priority_weight": 0.0,
+            "freshness": freshness,
+            "rationale": "",
+        }
+
+    focus_multiplier = 0.1
+    if bool(metadata.get("objective80_execution_truth", False)):
+        focus_multiplier = 1.0
+    elif affected_component == "execution_truth_bridge":
+        focus_multiplier = 0.95
+    elif proposal_type == "capability_workflow_improvement":
+        focus_multiplier = 0.65
+    elif proposal_type == "policy_adjustment":
+        focus_multiplier = 0.4
+    elif affected_component.startswith("action:"):
+        focus_multiplier = 0.35
+
+    per_signal_weight = {
+        "execution_slower_than_expected": 0.08,
+        "retry_instability_detected": 0.14,
+        "fallback_path_used": 0.12,
+        "simulation_reality_mismatch": 0.18,
+        "environment_shift_during_execution": 0.18,
+    }
+    weight = 0.08 * _bounded(signal_count / 5.0)
+    for signal_type in signal_types:
+        weight += per_signal_weight.get(signal_type, 0.0)
+    weight = _bounded(weight * focus_multiplier * freshness_weight)
+
+    rationale_parts: list[str] = []
+    if bool(metadata.get("objective80_execution_truth", False)) or affected_component == "execution_truth_bridge":
+        rationale_parts.append(
+            "Execution-truth-originated runtime drift raises the priority of bounded workflow improvements."
+        )
+    if set(signal_types).intersection({"retry_instability_detected", "fallback_path_used"}):
+        rationale_parts.append(
+            "Retry and fallback pressure indicate workflow hardening should move up the backlog."
+        )
+    if set(signal_types).intersection({"simulation_reality_mismatch", "environment_shift_during_execution"}):
+        rationale_parts.append(
+            "Runtime mismatch suggests planning assumptions and bridge handling need reconfirmation."
+        )
+    evidence_signal_types = (
+        evidence.get("signal_types", [])
+        if isinstance(evidence.get("signal_types", []), list)
+        else []
+    )
+    if evidence_signal_types:
+        rationale_parts.append(
+            "Proposal evidence preserves execution-truth signal types for bounded review."
+        )
+
+    return {
+        "execution_count": execution_count,
+        "signal_count": signal_count,
+        "signal_types": signal_types,
+        "priority_weight": round(weight, 6),
+        "freshness": freshness,
+        "rationale": " ".join(rationale_parts).strip(),
+    }
+
+
 def _priority_score(
     *,
     impact_estimate: float,
@@ -132,6 +220,7 @@ def _priority_score(
     risk_score: float,
     affected_capability_count: int,
     operator_preference_weight: float,
+    execution_truth_priority_weight: float = 0.0,
 ) -> float:
     cap_factor = _bounded(float(affected_capability_count) / 5.0)
     score = (
@@ -140,6 +229,7 @@ def _priority_score(
         + ((1.0 - risk_score) * 0.2)
         + (cap_factor * 0.1)
         + (operator_preference_weight * 0.1)
+        + (_bounded(execution_truth_priority_weight) * 0.15)
     )
     return _bounded(score)
 
@@ -199,6 +289,8 @@ async def refresh_improvement_backlog(
     metadata_json: dict,
     db: AsyncSession,
 ) -> list[WorkspaceImprovementBacklog]:
+    since = datetime.now(timezone.utc) - timedelta(hours=max(1, int(lookback_hours)))
+
     await generate_improvement_proposals(
         actor=actor,
         source=source,
@@ -213,6 +305,15 @@ async def refresh_improvement_backlog(
     )
 
     proposals = await list_improvement_proposals(db=db, status="", proposal_type="", limit=500)
+    execution_rows = (
+        await db.execute(
+            select(CapabilityExecution)
+            .where(CapabilityExecution.created_at >= since)
+            .order_by(CapabilityExecution.id.desc())
+            .limit(max(25, int(max_items) * 3))
+        )
+    ).scalars().all()
+    execution_truth_summary = summarize_execution_truth(execution_rows)
 
     refreshed_rows: list[WorkspaceImprovementBacklog] = []
     for proposal in proposals:
@@ -227,12 +328,19 @@ async def refresh_improvement_backlog(
             confidence=float(proposal.confidence or 0.0),
         )
         pref_weight = await _operator_preference_weight(proposal_type=proposal.proposal_type, db=db)
+        execution_truth_influence = _execution_truth_priority_influence(
+            proposal=proposal,
+            summary=execution_truth_summary,
+        )
         priority = _priority_score(
             impact_estimate=impact_estimate,
             evidence_strength=evidence_strength,
             risk_score=risk_score,
             affected_capability_count=len(capabilities),
             operator_preference_weight=pref_weight,
+            execution_truth_priority_weight=float(
+                execution_truth_influence.get("priority_weight", 0.0) or 0.0
+            ),
         )
         decision = _governance_decision(
             priority_score=priority,
@@ -264,7 +372,8 @@ async def refresh_improvement_backlog(
         row.risk_summary = proposal.risk_summary
         row.ranking_reason = (
             f"priority={priority:.3f} from impact={impact_estimate:.3f}, evidence={evidence_strength:.3f}, "
-            f"risk_penalty={risk_score:.3f}, capabilities={len(capabilities)}, operator_pref={pref_weight:.3f}"
+            f"risk_penalty={risk_score:.3f}, capabilities={len(capabilities)}, operator_pref={pref_weight:.3f}, "
+            f"execution_truth={float(execution_truth_influence.get('priority_weight', 0.0) or 0.0):.3f}"
         )
         row.reasoning_json = {
             "impact_estimate": impact_estimate,
@@ -273,6 +382,23 @@ async def refresh_improvement_backlog(
             "risk_score": risk_score,
             "affected_capabilities": capabilities,
             "operator_preference_weight": pref_weight,
+            "execution_truth_influence": {
+                **(
+                    execution_truth_summary
+                    if isinstance(execution_truth_summary, dict)
+                    else {}
+                ),
+                "signal_types": summarize_execution_truth_signal_types(
+                    execution_truth_summary
+                ),
+                "priority_weight": float(
+                    execution_truth_influence.get("priority_weight", 0.0) or 0.0
+                ),
+                "freshness": execution_truth_influence.get("freshness", {}),
+                "priority_rationale": str(
+                    execution_truth_influence.get("rationale", "") or ""
+                ).strip(),
+            },
             "governance_policy": {
                 "auto_experiment_if": "priority_score>=0.72 and evidence_count>=2 and risk_level!=high",
                 "operator_review_if": "priority_score>=0.45 or risk_level==high",
@@ -284,6 +410,9 @@ async def refresh_improvement_backlog(
             **(row.metadata_json if isinstance(row.metadata_json, dict) else {}),
             **(metadata_json if isinstance(metadata_json, dict) else {}),
             "refreshed_at": datetime.now(timezone.utc).isoformat(),
+            "objective80_execution_truth_priority": bool(
+                int(execution_truth_summary.get("deviation_signal_count", 0) or 0)
+            ),
         }
 
         if proposal.status == "rejected":
