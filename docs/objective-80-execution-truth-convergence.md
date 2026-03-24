@@ -1,7 +1,7 @@
 # Objective 80 - Execution Truth Convergence
 
 Date: 2026-03-23
-Status: in_progress
+Status: promoted_verified
 Depends On: Objective 75
 Target Release Tag: objective-80
 Target Schema Version: 2026-03-12-68
@@ -12,6 +12,13 @@ Objective 80 makes TOD execution reality a first-class input to MIM reasoning.
 MIM remains the owner of intent, contract, and adaptation policy. TOD becomes the primary source of execution truth. The bridge carries those signals in a canonical form that MIM can trust.
 
 Objective 75 established the interface baseline. Objective 80 starts from the assumption that TOD is now ready to publish stable execution-truth signals over that recoupled path.
+
+Closure update: 2026-03-24
+
+- Objective 80 focused integration and bridge-projection validation passed across the execution-truth contract, inquiry, stewardship, strategy, improvement, constraint, and adaptation surfaces.
+- Shared runtime truth is converged on objective `80`, and the live TOD dashboard now reports `publisher_warning: none` with request and result activity on `objective-80-task-3293`.
+- Shared execution-truth bridge artifacts are fresh, alias-synchronized, and contract-valid. The current live snapshot remains empty when no fresh runtime execution-truth packet has been published, which is acceptable for this promotion slice.
+- Formal promotion evidence is recorded in `docs/objective-80-promotion-readiness-report.md` and `docs/objective-80-prod-promotion-report.md`.
 
 This objective exists to close the gap between:
 
