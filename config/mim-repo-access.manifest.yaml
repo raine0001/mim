@@ -1,0 +1,174 @@
+version: 1
+owner: raine0001
+created_at_utc: 2026-03-28T00:00:00Z
+
+mim_identity:
+  git_user_name: ""
+  git_user_email: ""
+  signing_required: false
+  signing_key_id: ""
+
+authentication:
+  mode: fine_grained_pat # options: fine_grained_pat | github_app | ssh
+  secret_source: "" # examples: env var, 1password, github actions secret, keychain
+  github_app:
+    app_id: ""
+    installation_id: ""
+    private_key_secret_ref: ""
+  pat:
+    token_secret_ref: ""
+  ssh:
+    public_key_ref: ""
+    private_key_ref: ""
+
+workspace:
+  clone_root: /home/testpilot/work
+  strategy: multi_repo # options: mono_workspace | multi_repo
+
+policy:
+  require_pr_before_merge: true
+  allow_direct_push_to_default: false
+  allow_repo_creation: false
+  allow_repo_deletion: false
+  default_branch_overrides: {}
+
+permissions_defaults:
+  metadata: read
+  contents: write
+  pull_requests: write
+  issues: write
+  actions: read
+
+repos:
+  - repo: raine0001/comm_app
+    enabled: true
+    visibility: unknown # set public/private
+    access: write # set read or write
+    default_branch: main
+    local_path: /home/testpilot/work/comm_app
+    permissions: {}
+
+  - repo: raine0001/coachMIM
+    enabled: true
+    visibility: unknown
+    access: write
+    default_branch: main
+    local_path: /home/testpilot/work/coachMIM
+    permissions: {}
+
+  - repo: raine0001/TOD
+    enabled: true
+    visibility: unknown
+    access: write
+    default_branch: main
+    local_path: /home/testpilot/work/TOD
+    permissions: {}
+
+  - repo: raine0001/mim_wall
+    enabled: true
+    visibility: unknown
+    access: write
+    default_branch: main
+    local_path: /home/testpilot/work/mim_wall
+    permissions: {}
+
+  - repo: raine0001/doach_app
+    enabled: true
+    visibility: unknown
+    access: write
+    default_branch: main
+    local_path: /home/testpilot/work/doach_app
+    permissions: {}
+
+  - repo: raine0001/mim_pulz
+    enabled: true
+    visibility: unknown
+    access: write
+    default_branch: main
+    local_path: /home/testpilot/work/mim_pulz
+    permissions: {}
+
+  - repo: raine0001/mim
+    enabled: true
+    visibility: unknown
+    access: write
+    default_branch: main
+    local_path: /home/testpilot/work/mim
+    permissions: {}
+
+  - repo: raine0001/MIMweb
+    enabled: true
+    visibility: unknown
+    access: write
+    default_branch: main
+    local_path: /home/testpilot/work/MIMweb
+    permissions: {}
+
+  - repo: raine0001/viasion_app
+    enabled: true
+    visibility: unknown
+    access: write
+    default_branch: main
+    local_path: /home/testpilot/work/viasion_app
+    permissions: {}
+
+  - repo: raine0001/mim_arm
+    enabled: true
+    visibility: unknown
+    access: write
+    default_branch: main
+    local_path: /home/testpilot/work/mim_arm
+    permissions: {}
+
+  - repo: raine0001/doach-ai-site
+    enabled: true
+    visibility: unknown
+    access: write
+    default_branch: main
+    local_path: /home/testpilot/work/doach-ai-site
+    permissions: {}
+
+  - repo: raine0001/mediapipe
+    enabled: true
+    visibility: unknown
+    access: write
+    default_branch: main
+    local_path: /home/testpilot/work/mediapipe
+    permissions: {}
+
+  - repo: raine0001/Golf-Swing-Pose-Analysis-Model-Based-on-YOLOv11-Pose
+    enabled: true
+    visibility: unknown
+    access: write
+    default_branch: main
+    local_path: /home/testpilot/work/Golf-Swing-Pose-Analysis-Model-Based-on-YOLOv11-Pose
+    permissions: {}
+
+  - repo: raine0001/AI-Basketball-Shot-Detection-Tracker
+    enabled: true
+    visibility: unknown
+    access: write
+    default_branch: main
+    local_path: /home/testpilot/work/AI-Basketball-Shot-Detection-Tracker
+    permissions: {}
+
+  - repo: raine0001/grok-1
+    enabled: true
+    visibility: unknown
+    access: write
+    default_branch: main
+    local_path: /home/testpilot/work/grok-1
+    permissions: {}
+
+  - repo: raine0001/OpenExchange
+    enabled: true
+    visibility: unknown
+    access: write
+    default_branch: main
+    local_path: /home/testpilot/work/OpenExchange
+    permissions: {}
+
+notes:
+  - "Set visibility for each repository before provisioning."
+  - "Use read-only access for any repository MIM should not modify."
+  - "For production safety, require PR review for mim_arm and mim repositories."
