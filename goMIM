@@ -2,4 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-exec "$ROOT_DIR/goMIM.cmd" "$@"
+
+# Linux/macOS launcher for the MIM desktop text-chat UI.
+export MIM_UI_URL="${MIM_UI_URL:-http://127.0.0.1:18001/mim}"
+exec "$ROOT_DIR/scripts/run_mim_desktop_shell.sh" "$@"

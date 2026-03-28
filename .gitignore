@@ -14,4 +14,11 @@ runtime/prod/backups/
 coverage/
 state.json
 runtime/**/state.json
+runtime/mim-shell-profile/
+runtime/shared/.bridge_sequence_state.json
+runtime/shared/.bridge_sequence_state.lock
+runtime/shared/.shared_trigger_state
+runtime/shared/SHARED_TRIGGER_EVENTS.latest.jsonl
+runtime/shared/TOD_TO_MIM_TRIGGER.latest.json
+runtime/shared/.tod_liveness_state
 

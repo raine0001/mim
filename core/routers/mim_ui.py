@@ -7,8 +7,51 @@ from fastapi.responses import HTMLResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from core.camera_scene import (
+    collect_fresh_camera_observations,
+    summarize_camera_observations,
+)
 from core.db import get_db
-from core.models import InputEvent, MemoryEntry, SpeechOutputAction, WorkspaceInquiryQuestion, WorkspacePerceptionSource, WorkspaceStrategyGoal
+from core.execution_recovery_service import evaluate_execution_recovery
+from core.execution_readiness_service import (
+  execution_readiness_summary,
+  load_latest_execution_readiness,
+)
+from core.models import (
+    Actor,
+    CapabilityExecution,
+    InputEvent,
+    InputEventResolution,
+    MemoryEntry,
+    SpeechOutputAction,
+    WorkspaceAutonomyBoundaryProfile,
+    WorkspaceExecutionTruthGovernanceProfile,
+    WorkspaceInquiryQuestion,
+    WorkspaceObjectMemory,
+    WorkspaceOperatorResolutionCommitment,
+    WorkspaceOperatorResolutionCommitmentMonitoringProfile,
+    WorkspaceOperatorResolutionCommitmentOutcomeProfile,
+    WorkspacePerceptionSource,
+    WorkspaceStewardshipCycle,
+    WorkspaceStewardshipState,
+    WorkspaceStrategyGoal,
+)
+from core.operator_commitment_monitoring_service import (
+    latest_commitment_monitoring_profile,
+    to_operator_resolution_commitment_monitoring_out,
+)
+from core.operator_commitment_outcome_service import (
+    latest_commitment_outcome_profile,
+    to_operator_resolution_commitment_outcome_out,
+)
+from core.operator_preference_convergence_service import (
+  latest_scope_learned_preference,
+  list_learned_preferences,
+  preference_conflicts,
+)
+from core.operator_resolution_service import choose_operator_resolution_commitment, commitment_effect_labels, commitment_snapshot
+from core.policy_conflict_resolution_service import list_workspace_policy_conflict_profiles
+from core.proposal_policy_convergence_service import list_workspace_proposal_policy_preferences
 
 router = APIRouter(tags=["mim-ui"])
 
@@ -63,15 +106,97 @@ def _tokenize(text: str) -> set[str]:
     return {token for token in cleaned.split() if token}
 
 
+def _strip_conversation_noise(text: str) -> str:
+    normalized = " ".join(str(text or "").strip().lower().split())
+    if not normalized:
+        return ""
+
+    for suffix in (
+        "please do not repeat yourself",
+        "and i am giving some extra context because i am thinking out loud",
+        "i am not totally sure",
+    ):
+        if suffix in normalized:
+            normalized = normalized.split(suffix, 1)[0].strip(" .,!?;")
+
+    changed = True
+    while changed and normalized:
+        changed = False
+        for prefix in (
+            "okay so ",
+            "okay ",
+            "just ",
+            "honestly ",
+            "quickly ",
+            "can you tell me ",
+            "do you know ",
+            "maybe ",
+            "uh ",
+            "um ",
+            "you know ",
+            "hmm ",
+        ):
+            if normalized.startswith(prefix):
+                normalized = normalized[len(prefix) :].strip(" .,!?;")
+                changed = True
+                break
+
+    return normalized.strip(" .,!?;")
+
+
+def _looks_like_low_signal_turn(text: str) -> bool:
+    normalized = _strip_conversation_noise(text)
+    if not normalized:
+        return True
+    low_signal = {
+        "uh",
+        "um",
+        "hmm",
+        "you know",
+        "maybe",
+        "maybe maybe",
+        "wait",
+        "no stop",
+    }
+    return normalized in low_signal
+
+
+def _looks_like_status_request(text: str) -> bool:
+    normalized = _strip_conversation_noise(text)
+    if not normalized:
+        return False
+    return normalized in {
+        "status",
+        "status now",
+        "one line status",
+        "health",
+        "health now",
+        "current health",
+    }
+
+
 def _looks_like_direct_question(text: str) -> bool:
-    prompt = str(text or "").strip().lower()
+    prompt = _strip_conversation_noise(text)
     if not prompt:
-      return False
+        return False
     if "?" in prompt:
-      return True
+        return True
     question_starts = (
-      "what ", "why ", "how ", "when ", "where ", "who ", "which ",
-      "does ", "do ", "can ", "could ", "is ", "are ", "will ", "would ",
+        "what ",
+        "why ",
+        "how ",
+        "when ",
+        "where ",
+        "who ",
+        "which ",
+        "does ",
+        "do ",
+        "can ",
+        "could ",
+        "is ",
+        "are ",
+        "will ",
+        "would ",
     )
     return prompt.startswith(question_starts)
 
@@ -79,15 +204,15 @@ def _looks_like_direct_question(text: str) -> bool:
 def _looks_like_greeting(text: str) -> bool:
     normalized = " ".join(str(text or "").strip().lower().split())
     if not normalized:
-      return False
+        return False
     greeting_tokens = {
-      "hello",
-      "hi",
-      "hey",
-      "yo",
-      "good morning",
-      "good afternoon",
-      "good evening",
+        "hello",
+        "hi",
+        "hey",
+        "yo",
+        "good morning",
+        "good afternoon",
+        "good evening",
     }
     return normalized in greeting_tokens
 
@@ -95,11 +220,11 @@ def _looks_like_greeting(text: str) -> bool:
 def _is_clarifier_prompt_text(text: str) -> bool:
     normalized = " ".join(str(text or "").strip().lower().split())
     if not normalized:
-      return False
+        return False
     return (
-      "missing one detail" in normalized
-      or "options: 1)" in normalized
-      or "i am still missing" in normalized
+        "missing one detail" in normalized
+        or "options: 1)" in normalized
+        or "i am still missing" in normalized
     )
 
 
@@ -109,39 +234,113 @@ def _plain_answer_from_context(
     environment_now: str,
     goal_summary: str,
     memory_summary: str,
-    ) -> str:
+) -> str:
     question = str(latest_mic_transcript or "").strip()
-    ql = question.lower()
+    ql = _strip_conversation_noise(question)
     question_stub = _compact_sentence(question, max_len=72)
     if _looks_like_greeting(question):
-      return "Hi. I can hear you and I am ready to help."
+        return "Hi. I can hear you and I am ready to help."
 
-    if "what exactly do you need" in ql or "what do you need" in ql:
-      return "I need one concrete request from you: ask one question or name one action."
+    if "annoying" in ql and "repeating" in ql:
+        return "Understood. I will keep this concise and avoid repeating myself."
+
+    if (
+        "what exactly do you need" in ql
+        or "what do you need" in ql
+        or "what do u need" in ql
+    ):
+        return (
+            "I need one concrete request from you: ask one question or name one action."
+        )
+
+    if "what can you do" in ql or "what can you help with" in ql:
+        return "I can answer a question, suggest a plan, or take an action."
+
+    if "just chatting for now" in ql or "keep this simple and conversational" in ql:
+        return "Understood. I will keep this simple and conversational."
+
+    if "upcoming tasks" in ql:
+        if goal_summary:
+            return _compact_sentence(
+                f"Upcoming task focus: {goal_summary.rstrip('.')}", max_len=180
+            )
+        return "Upcoming task focus: I am ready for the next concrete task you want to take on."
+
+    if "recap" in ql:
+        if goal_summary:
+            return _compact_sentence(
+                f"Short recap: {goal_summary.rstrip('.')}", max_len=180
+            )
+        if memory_summary:
+            return _compact_sentence(
+                f"Short recap: {memory_summary.rstrip('.')}", max_len=180
+            )
+        return "Short recap: I am online, listening, and ready for the next concrete request."
+
+    if "why that" in ql or "why that one" in ql:
+        if goal_summary:
+            because_clause = goal_summary.rstrip(".")
+            if because_clause:
+                because_clause = because_clause[0].lower() + because_clause[1:]
+            return _compact_sentence(f"Because {because_clause}.", max_len=180)
+        return "Because that is the clearest next priority in the current state."
+
+    if any(
+        phrase in ql
+        for phrase in {
+            "what should i do first",
+            "what should we do first",
+            "what should i do next",
+            "what should we do next",
+            "what should we prioritize next",
+        }
+    ):
+        if goal_summary:
+            return _compact_sentence(
+                f"First priority: {goal_summary.rstrip('.')}", max_len=180
+            )
+        return "First priority: give me one concrete request so I can help directly."
 
     if "objective" in ql and any(
-      token in ql for token in {"current", "active", "working", "on"}
+        token in ql for token in {"current", "active", "working", "on"}
     ):
-      if goal_summary:
-        return _compact_sentence(
-          f"Current active objective: {goal_summary.rstrip('.')}", max_len=180
-        )
-      return "I do not have an active objective in this state yet."
+        if goal_summary:
+            return _compact_sentence(
+                f"Current active objective: {goal_summary.rstrip('.')}", max_len=180
+            )
+        return "I do not have an active objective in this state yet."
 
-    if ("health" in ql or "status" in ql) and any(token in ql for token in {"what", "how", "are you", "your"}):
-      return "Current health status: healthy, online, and listening right now."
+    if _looks_like_status_request(question):
+        return "Current health status: healthy, online, and listening right now."
+
+    if ("health" in ql or "status" in ql) and any(
+        token in ql for token in {"what", "how", "are you", "your"}
+    ):
+        return "Current health status: healthy, online, and listening right now."
+
+    if "tod" in ql and "how" in ql:
+        if goal_summary:
+            return _compact_sentence(
+                f"TOD status now: {goal_summary.rstrip('.')}", max_len=180
+            )
+        return (
+            "TOD status now: healthy, online, and waiting on the next concrete request."
+        )
 
     if "task 75" in ql and ("what" in ql or "does" in ql):
-      return "Task 75 checks whether MIM and TOD stay synchronized without drift."
+        return "Task 75 checks whether MIM and TOD stay synchronized without drift."
 
     if goal_summary:
-      return _compact_sentence(f"{goal_summary.rstrip('.')}.", max_len=180)
+        return _compact_sentence(f"{goal_summary.rstrip('.')}.", max_len=180)
     if memory_summary:
-      return _compact_sentence(f"{memory_summary.rstrip('.')}.", max_len=180)
+        return _compact_sentence(f"{memory_summary.rstrip('.')}.", max_len=180)
     if environment_now:
-      if environment_now.startswith("camera has no clear"):
-        return f"For '{question_stub}', I do not have enough current state to answer directly yet."
-      return _compact_sentence(f"For '{question_stub}', current state is {environment_now.rstrip('.')}.", max_len=180)
+        if environment_now.startswith("camera has no clear"):
+            return f"For '{question_stub}', I do not have enough current state to answer directly yet."
+        return _compact_sentence(
+            f"For '{question_stub}', current state is {environment_now.rstrip('.')}.",
+            max_len=180,
+        )
     return f"For '{question_stub}', I do not have enough current state to answer directly yet."
 
 
@@ -152,35 +351,35 @@ def _apply_anti_drift_rewrite(
     environment_now: str,
     goal_summary: str,
     memory_summary: str,
-    ) -> str:
+) -> str:
     candidate = str(text or "").strip()
     if not candidate:
-      return ""
+        return ""
 
     lowered = candidate.lower()
     drift_openers = (
-      "what you're really asking",
-      "what you are really asking",
-      "at a high level",
-      "in broad terms",
-      "more generally",
+        "what you're really asking",
+        "what you are really asking",
+        "at a high level",
+        "in broad terms",
+        "more generally",
     )
     if lowered.startswith(drift_openers):
-      first_sentence = candidate.split(".", 1)[0].strip()
-      candidate = first_sentence if first_sentence else candidate
+        first_sentence = candidate.split(".", 1)[0].strip()
+        candidate = first_sentence if first_sentence else candidate
 
     if _looks_like_direct_question(latest_mic_transcript):
-      user_tokens = _tokenize(latest_mic_transcript)
-      reply_tokens = _tokenize(candidate)
-      overlap = len(user_tokens.intersection(reply_tokens))
-      if overlap < 2:
-        direct = _plain_answer_from_context(
-          latest_mic_transcript=latest_mic_transcript,
-          environment_now=environment_now,
-          goal_summary=goal_summary,
-          memory_summary=memory_summary,
-        )
-        return direct
+        user_tokens = _tokenize(latest_mic_transcript)
+        reply_tokens = _tokenize(candidate)
+        overlap = len(user_tokens.intersection(reply_tokens))
+        if overlap < 2:
+            direct = _plain_answer_from_context(
+                latest_mic_transcript=latest_mic_transcript,
+                environment_now=environment_now,
+                goal_summary=goal_summary,
+                memory_summary=memory_summary,
+            )
+            return direct
     return _compact_sentence(candidate, max_len=220)
 
 
@@ -236,31 +435,31 @@ def _rewrite_state_output_text(
     environment_now: str,
     memory_summary: str,
 ) -> str:
-  text = str(raw_text or "").strip()
-  if not text:
-    return ""
+    text = str(raw_text or "").strip()
+    if not text:
+        return ""
 
-  normalized = " ".join(text.lower().split())
-  if normalized in {"hello, i am mim.", "hello i am mim.", "hello i am mim"}:
-    return ""
+    normalized = " ".join(text.lower().split())
+    if normalized in {"hello, i am mim.", "hello i am mim.", "hello i am mim"}:
+        return ""
 
-  if needs_identity_prompt:
-    return text
+    if needs_identity_prompt:
+        return text
 
-  if _looks_like_identity_prompt(text):
-    if open_question_summary:
-      return f"Before I proceed, I need one decision: {open_question_summary}"
-    if goal_summary:
-      return f"I am tracking this goal: {goal_summary}. Tell me what you want me to do next."
-    return ""
+    if _looks_like_identity_prompt(text):
+        if open_question_summary:
+            return f"Before I proceed, I need one decision: {open_question_summary}"
+        if goal_summary:
+            return f"I am tracking this goal: {goal_summary}. Tell me what you want me to do next."
+        return ""
 
-  return _apply_anti_drift_rewrite(
-      text=text,
-      latest_mic_transcript=latest_mic_transcript,
-      environment_now=environment_now,
-      goal_summary=goal_summary,
-      memory_summary=memory_summary,
-  )
+    return _apply_anti_drift_rewrite(
+        text=text,
+        latest_mic_transcript=latest_mic_transcript,
+        environment_now=environment_now,
+        goal_summary=goal_summary,
+        memory_summary=memory_summary,
+    )
 
 
 def _choose_phrase(options: list[str], key: str) -> str:
@@ -288,67 +487,971 @@ def _build_curiosity_prompt(
     learning = _compact_sentence(learning_summary, max_len=110)
 
     if mic:
-      if _looks_like_greeting(mic):
-        return "Hi. I can hear you and I am ready to help."
-      if _looks_like_direct_question(mic):
-        return _plain_answer_from_context(
-          latest_mic_transcript=mic,
-          environment_now=env,
-          goal_summary=goal,
-          memory_summary=memory,
-        )
-      if clarification_budget_exhausted:
-        return f"For '{mic}', I still need one detail. Options: 1) answer, 2) plan, 3) action."
-      return (
-        f"For '{mic}', I'm missing one detail: do you want me to answer a question, suggest a plan, or take an action?"
-      )
+        if _looks_like_greeting(mic):
+            return "Hi. I can hear you and I am ready to help."
+        if _looks_like_direct_question(mic) or _looks_like_status_request(mic):
+            return _plain_answer_from_context(
+                latest_mic_transcript=mic,
+                environment_now=env,
+                goal_summary=goal,
+                memory_summary=memory,
+            )
+        if clarification_budget_exhausted:
+            if _looks_like_low_signal_turn(mic):
+                return "I am waiting for one concrete request: answer, plan, or action."
+            return f"For '{mic}', I still need one detail. Options: 1) answer, 2) plan, 3) action."
+        return f"For '{mic}', I'm missing one detail: do you want me to answer a question, suggest a plan, or take an action?"
 
     if learning:
-      return _choose_phrase(
-        [
-          f"Current preference signal: {learning}.",
-          f"Stored interaction pattern: {learning}.",
-          f"Recent preference memory: {learning}.",
-        ],
-        key=f"learn:{learning}|env:{env}",
-      )
+        return _choose_phrase(
+            [
+                f"Current preference signal: {learning}.",
+                f"Stored interaction pattern: {learning}.",
+                f"Recent preference memory: {learning}.",
+            ],
+            key=f"learn:{learning}|env:{env}",
+        )
 
     if goal and env:
-      return _choose_phrase(
-        [
-          f"Current scene: {env}. Active goal: {goal}.",
-          f"I can see {env}. I am tracking {goal}.",
-          f"Context: {env}. Goal in play: {goal}.",
-        ],
-        key=f"goal-env:{goal}|{env}",
-      )
+        return _choose_phrase(
+            [
+                f"Current scene: {env}. Active goal: {goal}.",
+                f"I can see {env}. I am tracking {goal}.",
+                f"Context: {env}. Goal in play: {goal}.",
+            ],
+            key=f"goal-env:{goal}|{env}",
+        )
 
     if goal:
-      return _choose_phrase(
-        [
-          f"I am tracking this goal: {goal}.",
-          f"Goal status: {goal}.",
-        ],
-        key=f"goal:{goal}",
-      )
+        return _choose_phrase(
+            [
+                f"I am tracking this goal: {goal}.",
+                f"Goal status: {goal}.",
+            ],
+            key=f"goal:{goal}",
+        )
 
     if memory:
-      return _choose_phrase(
-        [
-          f"From memory: {memory}.",
-          f"I remember: {memory}.",
-        ],
-        key=f"memory:{memory}",
-      )
+        return _choose_phrase(
+            [
+                f"From memory: {memory}.",
+                f"I remember: {memory}.",
+            ],
+            key=f"memory:{memory}",
+        )
 
     return _choose_phrase(
-      [
-        "I am ready. Choose one: answer a question, suggest a plan, or take an action.",
-        "I am ready. Options: answer, plan, or action.",
-        "I am available. Pick one path: answer, plan, or action.",
-      ],
-      key="fallback-curiosity",
+        [
+            "I am ready. Choose one: answer a question, suggest a plan, or take an action.",
+            "I am ready. Options: answer, plan, or action.",
+            "I am available. Pick one path: answer, plan, or action.",
+        ],
+        key="fallback-curiosity",
     )
+
+
+def _semantic_metadata_fields(metadata: dict[str, object]) -> list[str]:
+    fields = [
+        "description",
+        "purpose",
+        "owner",
+        "category",
+        "meaning",
+        "user_notes",
+    ]
+    return [field for field in fields if str(metadata.get(field) or "").strip()]
+
+
+def _extract_conversation_session_id(metadata: object) -> str:
+    if not isinstance(metadata, dict):
+        return ""
+    return str(
+        metadata.get("conversation_session_id") or metadata.get("session_id") or ""
+    ).strip()
+
+
+def _resolve_active_perception_session(
+    *,
+    camera_rows: list[WorkspacePerceptionSource],
+    mic_row: WorkspacePerceptionSource | None,
+    now: datetime,
+    fallback_session_id: str = "",
+) -> str:
+    freshest_session = ""
+    freshest_seen_at: datetime | None = None
+
+    for row in camera_rows:
+        session_id = str(row.session_id or "").strip()
+        seen_at = (
+            row.last_seen_at.astimezone(timezone.utc) if row.last_seen_at else None
+        )
+        if not session_id or seen_at is None:
+            continue
+        age_seconds = max((now - seen_at).total_seconds(), 0.0)
+        if age_seconds > 90.0:
+            continue
+        if freshest_seen_at is None or seen_at > freshest_seen_at:
+            freshest_session = session_id
+            freshest_seen_at = seen_at
+
+    if freshest_session:
+        return freshest_session
+
+    if mic_row:
+        mic_session = str(mic_row.session_id or "").strip()
+        mic_seen_at = (
+            mic_row.last_seen_at.astimezone(timezone.utc)
+            if mic_row.last_seen_at
+            else None
+        )
+        if mic_session and mic_seen_at is not None:
+            age_seconds = max((now - mic_seen_at).total_seconds(), 0.0)
+            if age_seconds <= 90.0:
+                return mic_session
+
+    return str(fallback_session_id or "").strip()
+
+
+def _object_memory_matches_active_session(
+  row: WorkspaceObjectMemory,
+  active_session_id: str,
+) -> bool:
+  if not active_session_id:
+    return True
+
+  metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
+  last_source = str(metadata.get("last_observation_source") or "").strip().lower()
+  source_metadata = (
+    metadata.get("last_observation_source_metadata")
+    if isinstance(metadata.get("last_observation_source_metadata"), dict)
+    else {}
+  )
+  source_session_id = str(
+    source_metadata.get("session_id") or metadata.get("last_session_id") or ""
+  ).strip()
+
+  if last_source == "live_camera":
+    return source_session_id == active_session_id
+  if source_session_id:
+    return source_session_id == active_session_id
+  return True
+
+
+def _object_memory_matches_label(row: WorkspaceObjectMemory, label: str) -> bool:
+    target = str(label or "").strip().lower()
+    if not target:
+        return False
+    aliases = {str(row.canonical_name or "").strip().lower()}
+    if isinstance(row.candidate_labels, list):
+        aliases.update(
+            str(item).strip().lower()
+            for item in row.candidate_labels
+            if str(item).strip()
+        )
+    metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
+    aliases.add(str(metadata.get("last_matched_label") or "").strip().lower())
+    return target in aliases
+
+
+def _build_semantic_note(metadata: dict[str, object]) -> str:
+    parts: list[str] = []
+    owner = str(metadata.get("owner") or "").strip()
+    purpose = str(metadata.get("purpose") or "").strip()
+    meaning = str(metadata.get("meaning") or "").strip()
+    expected_home_zone = str(
+        metadata.get("expected_home_zone")
+        or metadata.get("expected_zone")
+        or metadata.get("home_zone")
+        or ""
+    ).strip()
+    if owner:
+        parts.append(f"Owner: {owner}")
+    if purpose:
+        parts.append(f"Purpose: {purpose}")
+    if meaning:
+        parts.append(f"Meaning: {meaning}")
+    if expected_home_zone:
+        parts.append(f"Expected home zone: {expected_home_zone}")
+    return ". ".join(parts)
+
+
+def _camera_detail_for_label(
+    *,
+    label: str,
+    state: str,
+    metadata: dict[str, object] | None = None,
+    row: WorkspaceObjectMemory | None = None,
+    inquiry_questions: list[str] | None = None,
+) -> dict[str, object]:
+    meta = metadata if isinstance(metadata, dict) else {}
+    semantic_fields = _semantic_metadata_fields(meta)
+    expected_home_zone = str(
+        meta.get("expected_home_zone")
+        or meta.get("expected_zone")
+        or meta.get("home_zone")
+        or getattr(row, "zone", "")
+        or ""
+    ).strip()
+    detail = {
+        "state": state,
+        "semantic_fields": semantic_fields,
+        "semantic_memory": {
+            field: str(meta.get(field) or "").strip() for field in semantic_fields
+        },
+        "semantic_note": _build_semantic_note(meta),
+        "expected_home_zone": expected_home_zone,
+    }
+    if inquiry_questions:
+        detail["inquiry_questions"] = inquiry_questions
+    return detail
+
+
+def _operator_goal_snapshot(row: WorkspaceStrategyGoal | None) -> dict:
+    if row is None:
+        return {}
+    ranking = (
+        row.ranking_factors_json if isinstance(row.ranking_factors_json, dict) else {}
+    )
+    reasoning = _compact_sentence(
+        row.reasoning_summary or row.evidence_summary or row.success_criteria,
+        max_len=180,
+    )
+    return {
+        "goal_id": int(row.id),
+        "strategy_type": str(row.strategy_type or "").strip(),
+        "priority": str(row.priority or "").strip(),
+        "priority_score": round(float(row.priority_score or 0.0), 6),
+        "status": str(row.status or "").strip(),
+        "reasoning_summary": reasoning,
+        "execution_truth_governance_decision": str(
+            ranking.get("execution_truth_governance_decision") or ""
+        ).strip(),
+        "contributing_domains": (
+            row.contributing_domains_json
+            if isinstance(row.contributing_domains_json, list)
+            else []
+        )[:5],
+    }
+
+
+def _operator_inquiry_snapshot(row: WorkspaceInquiryQuestion | None) -> dict:
+    if row is None:
+        return {}
+    metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
+    policy = metadata.get("inquiry_policy", {})
+    if not isinstance(policy, dict):
+        policy = {}
+    applied_effect = (
+        row.applied_effect_json if isinstance(row.applied_effect_json, dict) else {}
+    )
+    trigger_evidence = (
+        row.trigger_evidence_json if isinstance(row.trigger_evidence_json, dict) else {}
+    )
+    return {
+        "question_id": int(row.id),
+        "status": str(row.status or "").strip(),
+        "trigger_type": str(row.trigger_type or "").strip(),
+        "managed_scope": str(trigger_evidence.get("managed_scope") or "").strip(),
+        "decision_state": str(
+            policy.get("decision_state") or applied_effect.get("decision_state") or ""
+        ).strip(),
+        "decision_reason": str(
+            policy.get("decision_reason") or policy.get("reason") or ""
+        ).strip(),
+        "suppression_reason": str(policy.get("suppression_reason") or "").strip(),
+        "waiting_decision": _compact_sentence(
+            row.waiting_decision or row.why_answer_matters or row.safe_default_if_unanswered,
+            max_len=180,
+        ),
+        "recent_answer_reused": bool(policy.get("recent_answer_reused", False)),
+        "duplicate_suppressed": bool(policy.get("duplicate_suppressed", False)),
+        "cooldown_remaining_seconds": int(
+            policy.get("cooldown_remaining_seconds", 0) or 0
+        ),
+        "state_delta_summary": (
+            applied_effect.get("state_delta_summary", [])
+            if isinstance(applied_effect.get("state_delta_summary", []), list)
+            else []
+        ),
+    }
+
+
+def _operator_governance_snapshot(
+    row: WorkspaceExecutionTruthGovernanceProfile | None,
+) -> dict:
+    if row is None:
+        return {}
+    return {
+        "governance_id": int(row.id),
+        "managed_scope": str(row.managed_scope or "").strip(),
+        "governance_state": str(row.governance_state or "").strip(),
+        "governance_decision": str(row.governance_decision or "").strip(),
+        "governance_reason": _compact_sentence(row.governance_reason, max_len=180),
+        "signal_count": int(row.signal_count or 0),
+        "execution_count": int(row.execution_count or 0),
+        "confidence": round(float(row.confidence or 0.0), 6),
+    }
+
+
+def _operator_autonomy_snapshot(
+    row: WorkspaceAutonomyBoundaryProfile | None,
+) -> dict:
+    if row is None:
+        return {}
+    reasoning = (
+        row.adaptation_reasoning_json
+        if isinstance(row.adaptation_reasoning_json, dict)
+        else {}
+    )
+    governance = (
+        reasoning.get("execution_truth_governance", {})
+        if isinstance(reasoning.get("execution_truth_governance", {}), dict)
+        else {}
+    )
+    proposal_arbitration_review = (
+      reasoning.get("proposal_arbitration_autonomy_review", {})
+      if isinstance(reasoning.get("proposal_arbitration_autonomy_review", {}), dict)
+      else {}
+    )
+    return {
+        "boundary_id": int(row.id),
+        "scope": str(row.scope or "").strip(),
+        "current_level": str(row.current_level or "").strip(),
+        "profile_status": str(row.profile_status or "").strip(),
+        "adaptation_summary": _compact_sentence(row.adaptation_summary, max_len=180),
+        "decision": str(reasoning.get("decision") or "").strip(),
+        "governance_decision": str(
+            governance.get("governance_decision") or ""
+        ).strip(),
+        "confidence": round(float(row.confidence or 0.0), 6),
+        "proposal_arbitration_review": {
+          "applied": bool(proposal_arbitration_review.get("applied", False)),
+          "review_weight": round(
+            float(proposal_arbitration_review.get("review_weight", 0.0) or 0.0),
+            6,
+          ),
+          "target_level_cap": str(
+            proposal_arbitration_review.get("target_level_cap") or ""
+          ).strip(),
+          "related_zone": str(
+            proposal_arbitration_review.get("related_zone") or ""
+          ).strip(),
+          "proposal_types": (
+            proposal_arbitration_review.get("proposal_types", [])
+            if isinstance(proposal_arbitration_review.get("proposal_types", []), list)
+            else []
+          ),
+        },
+    }
+
+
+def _operator_stewardship_snapshot(
+    state_row: WorkspaceStewardshipState | None,
+    cycle_row: WorkspaceStewardshipCycle | None,
+) -> dict:
+    if state_row is None:
+        return {}
+    cycle_metadata = (
+        cycle_row.metadata_json
+        if cycle_row and isinstance(cycle_row.metadata_json, dict)
+        else {}
+    )
+    verification = (
+        cycle_metadata.get("verification", {})
+        if isinstance(cycle_metadata.get("verification", {}), dict)
+        else {}
+    )
+    inquiry_candidates = (
+        verification.get("inquiry_candidates", [])
+        if isinstance(verification.get("inquiry_candidates", []), list)
+        else []
+    )
+    governance = (
+        verification.get("execution_truth_governance", {})
+        if isinstance(verification.get("execution_truth_governance", {}), dict)
+        else {}
+    )
+    persistent_degradation = bool(verification.get("persistent_degradation", False))
+    if inquiry_candidates:
+        followup_status = "generated"
+    elif persistent_degradation:
+        followup_status = "suppressed"
+    else:
+        followup_status = "not_needed"
+    return {
+        "stewardship_id": int(state_row.id),
+        "managed_scope": str(state_row.managed_scope or "").strip(),
+        "status": str(state_row.status or "").strip(),
+        "current_health": round(float(state_row.current_health or 0.0), 6),
+        "cycle_count": int(state_row.cycle_count or 0),
+        "last_decision_summary": _compact_sentence(
+            state_row.last_decision_summary,
+            max_len=180,
+        ),
+        "persistent_degradation": persistent_degradation,
+        "followup_status": followup_status,
+        "inquiry_candidate_count": len(inquiry_candidates),
+        "governance_decision": str(
+            governance.get("governance_decision") or ""
+        ).strip(),
+    }
+
+
+def _build_operator_reasoning_summary(
+    *,
+    goal: dict,
+    inquiry: dict,
+    governance: dict,
+    autonomy: dict,
+    stewardship: dict,
+    execution_readiness: dict,
+    execution_recovery: dict,
+    commitment: dict,
+    commitment_monitoring: dict,
+    commitment_outcome: dict,
+    learned_preferences: list[dict],
+    proposal_policy: dict,
+    conflict_resolution: dict,
+) -> str:
+    parts: list[str] = []
+    if str(goal.get("reasoning_summary") or "").strip():
+        parts.append(f"Goal: {str(goal.get('reasoning_summary') or '').strip()}")
+    if str(inquiry.get("decision_state") or "").strip():
+        trigger = str(inquiry.get("trigger_type") or "").strip().replace("_", " ")
+        decision = str(inquiry.get("decision_state") or "").strip().replace("_", " ")
+        if trigger:
+            parts.append(f"Inquiry: {decision} for {trigger}")
+        else:
+            parts.append(f"Inquiry: {decision}")
+    if str(governance.get("governance_decision") or "").strip():
+        parts.append(
+            "Governance: "
+            f"{str(governance.get('governance_decision') or '').strip().replace('_', ' ')}"
+        )
+    if str(autonomy.get("current_level") or "").strip():
+        parts.append(
+            "Autonomy: "
+            f"{str(autonomy.get('current_level') or '').strip().replace('_', ' ')}"
+        )
+    if str(stewardship.get("followup_status") or "").strip():
+        status = str(stewardship.get("followup_status") or "").strip().replace("_", " ")
+        scope = str(stewardship.get("managed_scope") or "").strip()
+        if scope:
+            parts.append(f"Stewardship: {status} on {scope}")
+        else:
+            parts.append(f"Stewardship: {status}")
+    if str(execution_readiness.get("summary") or "").strip():
+      parts.append(
+        "Readiness: "
+        f"{str(execution_readiness.get('summary') or '').strip()}"
+      )
+    if str(execution_recovery.get("summary") or "").strip():
+      parts.append(
+        "Recovery: "
+        f"{str(execution_recovery.get('summary') or '').strip()}"
+      )
+    if bool(commitment.get("active", False)):
+        decision = str(commitment.get("decision_type") or "").strip().replace("_", " ")
+        scope = str(commitment.get("managed_scope") or "").strip()
+        if decision and scope:
+            parts.append(f"Operator: {decision} on {scope}")
+        elif decision:
+            parts.append(f"Operator: {decision}")
+    if str(commitment_monitoring.get("governance_state") or "").strip():
+        state = str(commitment_monitoring.get("governance_state") or "").strip().replace("_", " ")
+        parts.append(f"Commitment monitoring: {state}")
+    if str(commitment_outcome.get("outcome_status") or "").strip():
+      status = str(commitment_outcome.get("outcome_status") or "").strip().replace("_", " ")
+      parts.append(f"Commitment outcome: {status}")
+    if learned_preferences:
+      first = learned_preferences[0] if isinstance(learned_preferences[0], dict) else {}
+      direction = str(first.get("preference_direction") or "").strip().replace("_", " ")
+      scope = str(first.get("managed_scope") or "").strip()
+      if direction and scope:
+        parts.append(f"Preference: {direction} on {scope}")
+      elif direction:
+        parts.append(f"Preference: {direction}")
+    if int(proposal_policy.get("active_policy_count", 0) or 0) > 0:
+      summary = str(proposal_policy.get("summary") or "").strip()
+      if summary:
+        parts.append(f"Proposal policy: {summary}")
+    if int(conflict_resolution.get("active_conflict_count", 0) or 0) > 0:
+      summary = str(conflict_resolution.get("summary") or "").strip()
+      if summary:
+        parts.append(f"Conflict resolution: {summary}")
+    return _compact_sentence(". ".join(part for part in parts if part), max_len=260)
+
+
+def _operator_proposal_policy_snapshot(preferences: list[dict]) -> dict:
+    items = [item for item in preferences if isinstance(item, dict)]
+    active = [
+        item
+        for item in items
+        if str(item.get("policy_state") or "").strip() in {"preferred", "suppressed", "downgraded"}
+    ]
+    first = active[0] if active else (items[0] if items else {})
+    return {
+        "active_policy_count": len(active),
+        "managed_scope": str(first.get("managed_scope") or "").strip(),
+        "policy_state": str(first.get("policy_state") or "").strip(),
+        "proposal_type": str(first.get("proposal_type") or "").strip(),
+        "convergence_confidence": round(float(first.get("convergence_confidence", 0.0) or 0.0), 6),
+        "summary": _compact_sentence(str(first.get("rationale") or ""), max_len=180),
+        "items": items[:5],
+    }
+
+
+def _operator_policy_conflict_snapshot(conflicts: list[dict]) -> dict:
+    items = [item for item in conflicts if isinstance(item, dict)]
+    active = [
+        item
+        for item in items
+        if str(item.get("conflict_state") or "").strip() in {"active_conflict", "cooldown_held"}
+    ]
+    first = active[0] if active else (items[0] if items else {})
+    winner = str(first.get("winning_policy_source") or "").strip().replace("_", " ")
+    loser_sources = first.get("losing_policy_sources", [])
+    loser = ""
+    if isinstance(loser_sources, list) and loser_sources:
+        loser = str(loser_sources[0] or "").strip().replace("_", " ")
+    summary = ""
+    if winner and loser:
+        summary = _compact_sentence(f"{winner} prevailed over {loser} in this scope.", max_len=180)
+    elif winner:
+        summary = _compact_sentence(f"{winner} is currently shaping the scoped policy posture.", max_len=180)
+    return {
+        "active_conflict_count": len(active),
+        "managed_scope": str(first.get("managed_scope") or "").strip(),
+        "winning_policy_source": str(first.get("winning_policy_source") or "").strip(),
+        "precedence_rule": str(first.get("precedence_rule") or "").strip(),
+        "conflict_state": str(first.get("conflict_state") or "").strip(),
+        "summary": summary,
+        "items": items[:5],
+    }
+
+
+def _operator_execution_readiness_snapshot(readiness: dict) -> dict:
+    if not isinstance(readiness, dict):
+        return {}
+    summary = execution_readiness_summary(readiness)
+    return {
+        **summary,
+        "signal_name": str(readiness.get("signal_name") or "").strip(),
+        "freshness_state": str(readiness.get("freshness_state") or "").strip(),
+        "valid": bool(readiness.get("valid", False)),
+        "authoritative": bool(readiness.get("authoritative", False)),
+    }
+
+
+def _operator_execution_recovery_snapshot(recovery: dict) -> dict:
+    if not isinstance(recovery, dict):
+        return {}
+    reason = _compact_sentence(str(recovery.get("recovery_reason") or ""), max_len=180)
+    decision = str(recovery.get("recovery_decision") or "").strip()
+    summary = _compact_sentence(
+        str(recovery.get("summary") or "") or (
+            f"{decision.replace('_', ' ')}: {reason}" if decision and reason else decision.replace("_", " ")
+        ),
+        max_len=180,
+    )
+    return {
+        "trace_id": str(recovery.get("trace_id") or "").strip(),
+        "execution_id": recovery.get("execution_id"),
+        "managed_scope": str(recovery.get("managed_scope") or "").strip(),
+        "execution_status": str(recovery.get("execution_status") or "").strip(),
+        "recovery_decision": decision,
+        "recommended_attempt_decision": str(recovery.get("recommended_attempt_decision") or "").strip(),
+        "recovery_reason": reason,
+        "operator_action_required": bool(recovery.get("operator_action_required", False)),
+        "recovery_allowed": bool(recovery.get("recovery_allowed", False)),
+        "resume_step_key": str(recovery.get("resume_step_key") or "").strip(),
+        "summary": summary,
+        "latest_attempt": recovery.get("latest_attempt", {}) if isinstance(recovery.get("latest_attempt", {}), dict) else {},
+        "latest_outcome": recovery.get("latest_outcome", {}) if isinstance(recovery.get("latest_outcome", {}), dict) else {},
+        "recovery_learning": recovery.get("recovery_learning", {}) if isinstance(recovery.get("recovery_learning", {}), dict) else {},
+        "why_recovery_escalated_before_retry": str(recovery.get("why_recovery_escalated_before_retry") or "").strip(),
+        "conflict_resolution": recovery.get("conflict_resolution", {}) if isinstance(recovery.get("conflict_resolution", {}), dict) else {},
+    }
+
+
+def _operator_execution_recovery_learning_snapshot(recovery: dict) -> dict:
+    if not isinstance(recovery, dict):
+        return {}
+    learning = recovery.get("recovery_learning", {}) if isinstance(recovery.get("recovery_learning", {}), dict) else {}
+    if not learning:
+        return {}
+    summary = _compact_sentence(
+        str(
+            learning.get("why_recovery_escalated_before_retry")
+            or learning.get("rationale")
+            or ""
+        ).strip(),
+        max_len=180,
+    )
+    return {
+        "managed_scope": str(learning.get("managed_scope") or recovery.get("managed_scope") or "").strip(),
+        "capability_family": str(learning.get("capability_family") or "").strip(),
+        "recovery_decision": str(learning.get("recovery_decision") or "").strip(),
+        "learning_state": str(learning.get("learning_state") or "").strip(),
+        "escalation_decision": str(learning.get("escalation_decision") or "").strip(),
+        "confidence": float(learning.get("confidence") or 0.0),
+        "sample_count": int(learning.get("sample_count") or 0),
+        "summary": summary,
+        "why_recovery_escalated_before_retry": str(
+            learning.get("why_recovery_escalated_before_retry") or ""
+        ).strip(),
+    }
+
+
+def _operator_current_recommendation(
+    *,
+    inquiry: dict,
+    governance: dict,
+    autonomy: dict,
+    stewardship: dict,
+  execution_recovery: dict,
+    commitment_monitoring: dict,
+    commitment_outcome: dict,
+  ) -> dict:
+    if str(commitment_monitoring.get("governance_decision") or "").strip() and str(
+        commitment_monitoring.get("governance_decision") or ""
+    ).strip() != "maintain_commitment":
+        return {
+            "source": "commitment_monitoring",
+            "decision": str(commitment_monitoring.get("governance_decision") or "").strip(),
+            "managed_scope": str(commitment_monitoring.get("managed_scope") or "").strip(),
+            "summary": _compact_sentence(
+                str(commitment_monitoring.get("governance_reason") or "").strip(),
+                max_len=180,
+            ),
+        }
+    if str(commitment_outcome.get("outcome_status") or "").strip() in {
+      "ineffective",
+      "harmful",
+      "abandoned",
+    }:
+      return {
+        "source": "commitment_outcome",
+        "decision": str(commitment_outcome.get("outcome_status") or "").strip(),
+        "managed_scope": str(commitment_outcome.get("managed_scope") or "").strip(),
+        "summary": _compact_sentence(
+          str(commitment_outcome.get("outcome_reason") or "").strip(),
+          max_len=180,
+        ),
+      }
+      recovery_learning = (
+        execution_recovery.get("recovery_learning", {})
+        if isinstance(execution_recovery.get("recovery_learning", {}), dict)
+        else {}
+      )
+      if str(recovery_learning.get("escalation_decision") or "").strip() and str(
+        recovery_learning.get("escalation_decision") or ""
+      ).strip() != "continue_bounded_recovery":
+        return {
+          "source": "execution_recovery_learning",
+          "decision": str(recovery_learning.get("escalation_decision") or "").strip(),
+          "managed_scope": str(recovery_learning.get("managed_scope") or "").strip(),
+          "summary": _compact_sentence(
+            str(
+              recovery_learning.get("why_recovery_escalated_before_retry")
+              or recovery_learning.get("rationale")
+              or ""
+            ).strip(),
+            max_len=180,
+          ),
+        }
+    if str(execution_recovery.get("recovery_decision") or "").strip() and (
+        bool(execution_recovery.get("operator_action_required", False))
+        or bool(execution_recovery.get("recovery_allowed", False))
+    ):
+        return {
+            "source": "execution_recovery",
+            "decision": str(execution_recovery.get("recovery_decision") or "").strip(),
+            "managed_scope": str(execution_recovery.get("managed_scope") or "").strip(),
+            "summary": _compact_sentence(
+                str(execution_recovery.get("summary") or execution_recovery.get("recovery_reason") or "").strip(),
+                max_len=180,
+            ),
+        }
+    if str(governance.get("governance_decision") or "").strip():
+        decision = str(governance.get("governance_decision") or "").strip()
+        scope = str(governance.get("managed_scope") or "").strip()
+        reason = str(governance.get("governance_reason") or "").strip()
+        summary = decision.replace("_", " ")
+        if scope:
+            summary = f"{summary} on {scope}"
+        if reason:
+            summary = _compact_sentence(f"{summary}: {reason}", max_len=180)
+        return {
+            "source": "governance",
+            "decision": decision,
+            "managed_scope": scope,
+            "summary": summary,
+        }
+    if str(stewardship.get("last_decision_summary") or "").strip():
+        decision = str(stewardship.get("followup_status") or "").strip()
+        scope = str(stewardship.get("managed_scope") or "").strip()
+        return {
+            "source": "stewardship",
+            "decision": decision,
+            "managed_scope": scope,
+            "summary": str(stewardship.get("last_decision_summary") or "").strip(),
+        }
+    if str(inquiry.get("decision_state") or "").strip():
+        return {
+            "source": "inquiry",
+            "decision": str(inquiry.get("decision_state") or "").strip(),
+            "managed_scope": str(inquiry.get("managed_scope") or "").strip(),
+            "summary": str(inquiry.get("waiting_decision") or "").strip(),
+        }
+    if str(autonomy.get("current_level") or "").strip():
+        return {
+            "source": "autonomy",
+            "decision": str(autonomy.get("current_level") or "").strip(),
+            "managed_scope": str(autonomy.get("scope") or "").strip(),
+            "summary": str(autonomy.get("adaptation_summary") or "").strip(),
+        }
+    return {}
+
+
+def _operator_resolution_commitment_snapshot(
+    row: WorkspaceOperatorResolutionCommitment | None,
+) -> dict:
+    if row is None:
+        return {}
+    snapshot = commitment_snapshot(row)
+    snapshot["reason"] = _compact_sentence(
+        str(snapshot.get("reason", "")),
+        max_len=180,
+    )
+    snapshot["effect_labels"] = commitment_effect_labels(row)
+    return snapshot
+
+
+def _operator_resolution_commitment_monitoring_snapshot(
+    row: WorkspaceOperatorResolutionCommitmentMonitoringProfile | None,
+) -> dict:
+    if row is None:
+        return {}
+    snapshot = to_operator_resolution_commitment_monitoring_out(row)
+    snapshot["governance_reason"] = _compact_sentence(
+        str(snapshot.get("governance_reason") or ""),
+        max_len=180,
+    )
+    return snapshot
+
+
+def _operator_resolution_commitment_outcome_snapshot(
+    row: WorkspaceOperatorResolutionCommitmentOutcomeProfile | None,
+) -> dict:
+    if row is None:
+        return {}
+    snapshot = to_operator_resolution_commitment_outcome_out(row)
+    snapshot["outcome_reason"] = _compact_sentence(
+        str(snapshot.get("outcome_reason") or ""),
+        max_len=180,
+    )
+    return snapshot
+
+
+def _choose_operator_resolution_commitment(
+    rows: list[WorkspaceOperatorResolutionCommitment],
+    *,
+    scope: str,
+) -> WorkspaceOperatorResolutionCommitment | None:
+    return choose_operator_resolution_commitment(rows, scope=scope)
+
+
+def _build_operator_reasoning_payload(
+    *,
+    goal_row: WorkspaceStrategyGoal | None,
+    inquiry_row: WorkspaceInquiryQuestion | None,
+    governance_row: WorkspaceExecutionTruthGovernanceProfile | None,
+    autonomy_row: WorkspaceAutonomyBoundaryProfile | None,
+    stewardship_row: WorkspaceStewardshipState | None,
+    stewardship_cycle_row: WorkspaceStewardshipCycle | None,
+    commitment_row: WorkspaceOperatorResolutionCommitment | None,
+    commitment_monitoring_row: WorkspaceOperatorResolutionCommitmentMonitoringProfile | None,
+    commitment_outcome_row: WorkspaceOperatorResolutionCommitmentOutcomeProfile | None,
+    execution_recovery: dict,
+    learned_preferences: list[dict],
+    preference_conflicts_items: list[dict],
+    proposal_policy_preferences: list[dict],
+    policy_conflict_profiles: list[dict],
+    execution_readiness: dict,
+) -> dict:
+    goal = _operator_goal_snapshot(goal_row)
+    inquiry = _operator_inquiry_snapshot(inquiry_row)
+    governance = _operator_governance_snapshot(governance_row)
+    autonomy = _operator_autonomy_snapshot(autonomy_row)
+    stewardship = _operator_stewardship_snapshot(stewardship_row, stewardship_cycle_row)
+    commitment = _operator_resolution_commitment_snapshot(commitment_row)
+    commitment_monitoring = _operator_resolution_commitment_monitoring_snapshot(
+      commitment_monitoring_row
+    )
+    commitment_outcome = _operator_resolution_commitment_outcome_snapshot(
+      commitment_outcome_row
+    )
+    proposal_policy = _operator_proposal_policy_snapshot(proposal_policy_preferences)
+    conflict_resolution = _operator_policy_conflict_snapshot(policy_conflict_profiles)
+    readiness = _operator_execution_readiness_snapshot(execution_readiness)
+    recovery = _operator_execution_recovery_snapshot(execution_recovery)
+    recovery_learning = _operator_execution_recovery_learning_snapshot(execution_recovery)
+    recommendation = _operator_current_recommendation(
+        inquiry=inquiry,
+        governance=governance,
+        autonomy=autonomy,
+        stewardship=stewardship,
+        execution_recovery=recovery,
+        commitment_monitoring=commitment_monitoring,
+        commitment_outcome=commitment_outcome,
+    )
+    return {
+        "summary": _build_operator_reasoning_summary(
+            goal=goal,
+            inquiry=inquiry,
+            governance=governance,
+            autonomy=autonomy,
+            stewardship=stewardship,
+            execution_readiness=readiness,
+            execution_recovery=recovery,
+            commitment=commitment,
+            commitment_monitoring=commitment_monitoring,
+            commitment_outcome=commitment_outcome,
+            learned_preferences=learned_preferences,
+            proposal_policy=proposal_policy,
+            conflict_resolution=conflict_resolution,
+        ),
+        "active_goal": goal,
+        "inquiry": inquiry,
+        "governance": governance,
+        "autonomy": autonomy,
+        "stewardship": stewardship,
+        "execution_readiness": readiness,
+        "execution_recovery": recovery,
+        "execution_recovery_learning": recovery_learning,
+        "current_recommendation": recommendation,
+        "resolution_commitment": commitment,
+        "commitment_monitoring": commitment_monitoring,
+        "commitment_outcome": commitment_outcome,
+        "learned_preferences": learned_preferences,
+        "preference_conflicts": preference_conflicts_items,
+        "proposal_policy": proposal_policy,
+        "conflict_resolution": conflict_resolution,
+    }
+
+
+def _scope_value(raw: object) -> str:
+    return str(raw or "").strip()
+
+
+def _choose_operator_reasoning_scope(
+    *,
+    inquiry_row: WorkspaceInquiryQuestion | None,
+    governance_row: WorkspaceExecutionTruthGovernanceProfile | None,
+    autonomy_row: WorkspaceAutonomyBoundaryProfile | None,
+    stewardship_row: WorkspaceStewardshipState | None,
+) -> str:
+    inquiry_scope = ""
+    stewardship_scope = _scope_value(getattr(stewardship_row, "managed_scope", ""))
+    governance_scope = _scope_value(getattr(governance_row, "managed_scope", ""))
+    autonomy_scope = _scope_value(getattr(autonomy_row, "scope", ""))
+    if inquiry_row is not None:
+        trigger_evidence = (
+            inquiry_row.trigger_evidence_json
+            if isinstance(inquiry_row.trigger_evidence_json, dict)
+            else {}
+        )
+        inquiry_scope = _scope_value(trigger_evidence.get("managed_scope"))
+    if inquiry_scope and inquiry_scope in {
+        stewardship_scope,
+        governance_scope,
+        autonomy_scope,
+    }:
+        return inquiry_scope
+    return (
+        stewardship_scope
+        or governance_scope
+        or inquiry_scope
+        or autonomy_scope
+    )
+
+
+def _row_matches_operator_reasoning_scope(
+    row: object,
+    scope: str,
+    *,
+    inquiry: bool = False,
+    autonomy: bool = False,
+) -> bool:
+    normalized_scope = _scope_value(scope)
+    if not normalized_scope or row is None:
+        return True
+    if inquiry:
+        trigger_evidence = (
+            row.trigger_evidence_json if isinstance(row.trigger_evidence_json, dict) else {}
+        )
+        return _scope_value(trigger_evidence.get("managed_scope")) == normalized_scope
+    if autonomy:
+        return _scope_value(getattr(row, "scope", "")) == normalized_scope
+    return _scope_value(getattr(row, "managed_scope", "")) == normalized_scope
+
+
+def _build_camera_state_prompt(
+    *,
+    camera_scene_summary: str,
+    camera_source_count: int,
+    recognized_person: str,
+    unknown_camera_label: str,
+    uncertain_camera_label: str,
+    missing_camera_label: str,
+    camera_object_details: dict[str, dict[str, object]],
+    camera_last_confidence: float,
+) -> str:
+    scene_prefix = ""
+    if camera_scene_summary:
+        if camera_source_count > 1:
+            scene_prefix = f"I can currently see {camera_scene_summary}. "
+        elif camera_last_confidence > 0.0:
+            scene_prefix = f"I can currently see {camera_scene_summary}. Primary confidence is {camera_last_confidence:.2f}. "
+        else:
+            scene_prefix = f"I can currently see {camera_scene_summary}. "
+
+    if missing_camera_label:
+        details = camera_object_details.get(missing_camera_label, {})
+        semantic_note = str(details.get("semantic_note") or "").strip()
+        note = f" {semantic_note}." if semantic_note else ""
+        return (
+            f"{scene_prefix}I cannot find {missing_camera_label} on camera right now.{note} "
+            f"Where did it go, or did it get moved?"
+        ).strip()
+
+    if uncertain_camera_label:
+        details = camera_object_details.get(uncertain_camera_label, {})
+        semantic_note = str(details.get("semantic_note") or "").strip()
+        note = f" {semantic_note}." if semantic_note else ""
+        return (
+            f"{scene_prefix}{uncertain_camera_label} seems to have moved.{note} "
+            f"Can you confirm whether that move was intentional?"
+        ).strip()
+
+    if unknown_camera_label:
+        details = camera_object_details.get(unknown_camera_label, {})
+        questions = [
+            str(item).strip()
+            for item in (details.get("inquiry_questions") or [])
+            if str(item).strip()
+        ]
+        lead = scene_prefix or f"I can currently see {unknown_camera_label} on camera. "
+        return f"{lead}I do not know what {unknown_camera_label} is yet. {' '.join(questions)}".strip()
+
+    if recognized_person:
+        if scene_prefix:
+            return f"{scene_prefix}Good to see you, {recognized_person}. I recognize you on camera.".strip()
+        return f"Good to see you, {recognized_person}. I recognize you on camera."
+
+    return ""
+
 
 @router.get("/mim", response_class=HTMLResponse)
 async def mim_ui_page() -> str:
@@ -615,6 +1718,110 @@ async def mim_ui_page() -> str:
       padding: 8px;
       min-height: 84px;
     }
+    .object-memory-panel {
+      margin-top: 14px;
+      border: 1px solid #15475e;
+      border-radius: 10px;
+      background: linear-gradient(180deg, rgba(9, 27, 39, 0.96), rgba(6, 20, 30, 0.98));
+      padding: 12px;
+    }
+    .object-memory-panel[hidden] {
+      display: none;
+    }
+    .object-memory-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: 12px;
+      margin-bottom: 8px;
+    }
+    .object-memory-title {
+      font-size: 13px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: #9de8ff;
+    }
+    .object-memory-caption {
+      font-size: 11px;
+      color: var(--muted);
+    }
+    .object-memory-list {
+      list-style: none;
+      margin: 0;
+      padding: 0;
+      display: grid;
+      gap: 8px;
+    }
+    .object-memory-item {
+      border: 1px solid #15475e;
+      border-radius: 8px;
+      background: rgba(10, 31, 45, 0.92);
+      padding: 8px 10px;
+    }
+    .object-memory-item strong {
+      display: block;
+      font-size: 13px;
+      color: var(--text);
+      margin-bottom: 3px;
+    }
+    .object-memory-meta {
+      font-size: 11px;
+      color: #9de8ff;
+    }
+    .object-memory-note {
+      margin-top: 4px;
+      font-size: 11px;
+      color: var(--muted);
+    }
+    .text-chat-panel {
+      margin-top: 14px;
+      border: 1px solid #15475e;
+      border-radius: 10px;
+      background: linear-gradient(180deg, rgba(9, 27, 39, 0.96), rgba(6, 20, 30, 0.98));
+      padding: 12px;
+    }
+    .chat-log {
+      margin-top: 8px;
+      border: 1px solid #15475e;
+      border-radius: 8px;
+      background: #091b27;
+      min-height: 130px;
+      max-height: 240px;
+      overflow-y: auto;
+      padding: 10px;
+      display: grid;
+      gap: 8px;
+    }
+    .chat-bubble {
+      border: 1px solid #1a4f68;
+      border-radius: 8px;
+      padding: 8px 10px;
+      font-size: 13px;
+      line-height: 1.35;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .chat-bubble.user {
+      background: #103047;
+      justify-self: end;
+      max-width: 88%;
+    }
+    .chat-bubble.mim {
+      background: #0a2536;
+      justify-self: start;
+      max-width: 92%;
+    }
+    .chat-controls {
+      display: grid;
+      grid-template-columns: 1fr auto auto;
+      gap: 10px;
+      margin-top: 10px;
+    }
+    @media (max-width: 720px) {
+      .chat-controls {
+        grid-template-columns: 1fr;
+      }
+    }
     @keyframes bounce {
       0%, 100% { transform: scaleY(0.22); }
       50% { transform: scaleY(1); }
@@ -718,7 +1925,7 @@ async def mim_ui_page() -> str:
   </div>
 
   <h1 id="mimIcon" class="mim-icon">MIM</h1>
-  <div id="buildTag" class="small" style="text-align:center; margin-top:-8px; margin-bottom:8px;">Build: objective-22-provider-degrade</div>
+  <div id="buildTag" class="small" style="text-align:center; margin-top:-8px; margin-bottom:8px;">Build: loading...</div>
 
   <div class=\"panel\">
     <div class=\"wave-wrap\">
@@ -741,6 +1948,38 @@ async def mim_ui_page() -> str:
       <input id=\"cameraInput\" placeholder=\"Who is in view? (e.g. unknown, person, alice)\" value=\"unknown\" />
       <button id=\"cameraBtn\">Send Camera Event</button>
     </div>
+
+    <div id=\"textChatPanel\" class=\"text-chat-panel\">
+      <div class=\"object-memory-header\">
+        <div class=\"object-memory-title\">Text Chat</div>
+        <div class=\"object-memory-caption\">Direct typed conversation</div>
+      </div>
+      <div id=\"chatLog\" class=\"chat-log\" aria-live=\"polite\" aria-label=\"Text chat history\">
+        <div class=\"chat-bubble mim\">Text chat is ready. Type a message and press Send Text.</div>
+      </div>
+      <div class=\"chat-controls\">
+        <input id=\"chatInput\" placeholder=\"Type a message to MIM\" value=\"\" />
+        <button id=\"chatSendBtn\">Send Text</button>
+        <button id=\"chatClearBtn\" type=\"button\">Clear</button>
+      </div>
+    </div>
+
+    <div id=\"objectMemoryPanel\" class=\"object-memory-panel\" hidden>
+      <div class=\"object-memory-header\">
+        <div class=\"object-memory-title\">Object Memory</div>
+        <div class=\"object-memory-caption\">Live camera continuity</div>
+      </div>
+      <ul id=\"objectMemoryList\" class=\"object-memory-list\"></ul>
+    </div>
+
+    <div id=\"systemReasoningPanel\" class=\"object-memory-panel\" hidden>
+      <div class=\"object-memory-header\">
+        <div class=\"object-memory-title\">System Reasoning</div>
+        <div class=\"object-memory-caption\">Operator-visible decision context</div>
+      </div>
+      <div id=\"systemReasoningSummary\" class=\"object-memory-note\"></div>
+      <ul id=\"systemReasoningList\" class=\"object-memory-list\"></ul>
+    </div>
   </div>
 
   <script>
@@ -754,6 +1993,11 @@ async def mim_ui_page() -> str:
     const sayInput = document.getElementById('sayInput');
     const cameraInput = document.getElementById('cameraInput');
     const listenBtn = document.getElementById('listenBtn');
+    const buildTagEl = document.getElementById('buildTag');
+    const chatLog = document.getElementById('chatLog');
+    const chatInput = document.getElementById('chatInput');
+    const chatSendBtn = document.getElementById('chatSendBtn');
+    const chatClearBtn = document.getElementById('chatClearBtn');
     const mimIcon = document.getElementById('mimIcon');
     const settingsBtn = document.getElementById('settingsBtn');
     const settingsPanel = document.getElementById('settingsPanel');
@@ -781,6 +2025,11 @@ async def mim_ui_page() -> str:
     const cameraSettingsStatus = document.getElementById('cameraSettingsStatus');
     const cameraRefreshBtn = document.getElementById('cameraRefreshBtn');
     const cameraToggleBtn = document.getElementById('cameraToggleBtn');
+    const objectMemoryPanel = document.getElementById('objectMemoryPanel');
+    const objectMemoryList = document.getElementById('objectMemoryList');
+    const systemReasoningPanel = document.getElementById('systemReasoningPanel');
+    const systemReasoningSummary = document.getElementById('systemReasoningSummary');
+    const systemReasoningList = document.getElementById('systemReasoningList');
 
     window.addEventListener('error', (event) => {
       const msg = String(event?.message || 'unknown_js_error');
@@ -793,6 +2042,75 @@ async def mim_ui_page() -> str:
     let micAutoMode = false;
     let micListening = false;
     let recognition = null;
+
+    function appendChatMessage(role, text) {
+      if (!chatLog) return;
+      const clean = String(text || '').trim();
+      if (!clean) return;
+      const item = document.createElement('div');
+      item.className = `chat-bubble ${role === 'user' ? 'user' : 'mim'}`;
+      item.textContent = clean;
+      chatLog.appendChild(item);
+      chatLog.scrollTop = chatLog.scrollHeight;
+    }
+
+    function summarizeTextResolution(result) {
+      const resolution = result && typeof result.resolution === 'object' ? result.resolution : {};
+      const prompt = String(resolution.clarification_prompt || '').trim();
+      if (prompt) {
+        return prompt;
+      }
+
+      const outcome = String(resolution.outcome || '').trim().toLowerCase();
+      if (outcome === 'auto_execute') {
+        return 'Request accepted and routed for execution.';
+      }
+      if (outcome === 'requires_confirmation') {
+        return 'I need one more specific detail before executing that request.';
+      }
+      if (outcome === 'store_only') {
+        return 'Saved. Ask one specific question or request one action when ready.';
+      }
+      if (outcome === 'blocked') {
+        return 'This request is currently blocked by safety or policy checks.';
+      }
+      return 'Message received.';
+    }
+
+    async function sendTextChat() {
+      const text = String(chatInput ? chatInput.value : '').trim();
+      if (!text) return;
+
+      appendChatMessage('user', text);
+      if (chatInput) chatInput.value = '';
+
+      try {
+        const response = await fetch('/gateway/intake/text', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            text,
+            parsed_intent: 'discussion',
+            metadata_json: {
+              source: 'mim_ui_text_chat',
+              route_preference: 'conversation_layer',
+            },
+          }),
+        });
+        if (!response.ok) {
+          appendChatMessage('mim', `Text chat request failed (${response.status}).`);
+          return;
+        }
+
+        const result = await response.json();
+        appendChatMessage('mim', summarizeTextResolution(result));
+      } catch (error) {
+        const detail = error && error.message ? String(error.message) : 'request_failed';
+        appendChatMessage('mim', `Text chat is temporarily unavailable (${detail}).`);
+      }
+      refreshState();
+    }
+
     let motionInterval = null;
     let availableCameras = [];
     let selectedCameraDeviceId = localStorage.getItem('mim_camera_device_id') || '';
@@ -1034,6 +2352,228 @@ async def mim_ui_page() -> str:
       }
 
       return snippets.join(' ').trim();
+    }
+
+    function escapeObjectMemoryHtml(value) {
+      return String(value || '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/\"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
+    function objectMemorySortRank(details = {}) {
+      if (details.recognized_person) return 0;
+      if (details.observed) return details.uncertain ? 2 : 1;
+      if (details.missing) return 3;
+      return 4;
+    }
+
+    function collectObjectMemoryEntries(conversationContext = {}) {
+      const detailsMap = (conversationContext && typeof conversationContext.camera_object_details === 'object')
+        ? conversationContext.camera_object_details
+        : {};
+      const entriesByLabel = new Map();
+
+      function upsertEntry(labelRaw, nextDetails = {}) {
+        const label = String(labelRaw || '').trim();
+        if (!label) return;
+        const current = entriesByLabel.get(label) || {
+          label,
+          observed: false,
+          uncertain: false,
+          missing: false,
+          recognized_person: false,
+          note: '',
+        };
+        const merged = { ...current, ...nextDetails, label };
+        if (!merged.note && typeof nextDetails.note === 'string') {
+          merged.note = nextDetails.note;
+        }
+        entriesByLabel.set(label, merged);
+      }
+
+      Object.entries(detailsMap).forEach(([label, rawDetails]) => {
+        const baseDetails = rawDetails && typeof rawDetails === 'object' ? rawDetails : {};
+        upsertEntry(label, {
+          observed: Boolean(baseDetails.seen_now),
+          uncertain: Boolean(baseDetails.uncertain),
+          missing: Boolean(baseDetails.missing),
+          recognized_person: Boolean(baseDetails.recognized_person),
+          note: String(baseDetails.detail || baseDetails.camera_detail || '').trim(),
+        });
+      });
+
+      const recognizedPeople = Array.isArray(conversationContext.recognized_people)
+        ? conversationContext.recognized_people
+        : [];
+      recognizedPeople.forEach((label) => {
+        upsertEntry(label, {
+          observed: true,
+          recognized_person: true,
+        });
+      });
+
+      const knownObjects = Array.isArray(conversationContext.known_camera_objects)
+        ? conversationContext.known_camera_objects
+        : [];
+      knownObjects.forEach((label) => {
+        upsertEntry(label, { observed: true });
+      });
+
+      const uncertainObjects = Array.isArray(conversationContext.uncertain_camera_objects)
+        ? conversationContext.uncertain_camera_objects
+        : [];
+      uncertainObjects.forEach((label) => {
+        upsertEntry(label, { observed: true, uncertain: true });
+      });
+
+      const missingObjects = Array.isArray(conversationContext.missing_camera_objects)
+        ? conversationContext.missing_camera_objects
+        : [];
+      missingObjects.forEach((label) => {
+        upsertEntry(label, { missing: true });
+      });
+
+      return Array.from(entriesByLabel.values())
+        .sort((left, right) => {
+          const rankDiff = objectMemorySortRank(left) - objectMemorySortRank(right);
+          if (rankDiff !== 0) return rankDiff;
+          return String(left.label || '').localeCompare(String(right.label || ''));
+        });
+    }
+
+    function renderObjectMemoryPanel(conversationContext = {}) {
+      if (!objectMemoryPanel || !objectMemoryList) return;
+
+      const entries = collectObjectMemoryEntries(conversationContext);
+      if (!entries.length) {
+        objectMemoryPanel.hidden = true;
+        objectMemoryList.innerHTML = '';
+        return;
+      }
+
+      objectMemoryPanel.hidden = false;
+      objectMemoryList.innerHTML = entries.map((entry) => {
+        const label = escapeObjectMemoryHtml(entry.label);
+        const stateBits = [];
+        if (entry.recognized_person) stateBits.push('recognized person');
+        if (entry.observed && entry.uncertain) {
+          stateBits.push('visible now, uncertain');
+        } else if (entry.observed) {
+          stateBits.push('visible now');
+        }
+        if (entry.missing) stateBits.push('missing from current view');
+        const meta = escapeObjectMemoryHtml(stateBits.join(' | ') || 'tracked in memory');
+        const note = String(entry.note || '').trim();
+        const noteHtml = note
+          ? `<div class="object-memory-note">${escapeObjectMemoryHtml(note)}</div>`
+          : '';
+        return `
+          <li class="object-memory-item">
+            <strong>${label}</strong>
+            <div class="object-memory-meta">${meta}</div>
+            ${noteHtml}
+          </li>
+        `;
+      }).join('');
+    }
+
+    function collectSystemReasoningEntries(reasoning = {}) {
+      const entries = [];
+      const goal = (reasoning && typeof reasoning.active_goal === 'object') ? reasoning.active_goal : {};
+      const inquiry = (reasoning && typeof reasoning.inquiry === 'object') ? reasoning.inquiry : {};
+      const governance = (reasoning && typeof reasoning.governance === 'object') ? reasoning.governance : {};
+      const autonomy = (reasoning && typeof reasoning.autonomy === 'object') ? reasoning.autonomy : {};
+      const stewardship = (reasoning && typeof reasoning.stewardship === 'object') ? reasoning.stewardship : {};
+
+      if (String(goal.reasoning_summary || '').trim()) {
+        entries.push({
+          title: 'Active goal',
+          meta: [goal.strategy_type, goal.priority].filter(Boolean).join(' | '),
+          note: String(goal.reasoning_summary || '').trim(),
+        });
+      }
+
+      if (String(inquiry.decision_state || inquiry.status || '').trim()) {
+        const meta = [inquiry.decision_state || inquiry.status, inquiry.trigger_type].filter(Boolean).join(' | ');
+        let note = String(inquiry.waiting_decision || inquiry.decision_reason || '').trim();
+        if (!note && String(inquiry.managed_scope || '').trim()) {
+          note = `Scope: ${String(inquiry.managed_scope || '').trim()}`;
+        }
+        entries.push({ title: 'Inquiry', meta, note });
+      }
+
+      if (String(governance.governance_decision || '').trim()) {
+        const meta = [governance.governance_decision, governance.managed_scope && `scope ${governance.managed_scope}`]
+          .filter(Boolean)
+          .join(' | ');
+        let note = String(governance.governance_reason || '').trim();
+        if (!note && Number(governance.signal_count || 0) > 0) {
+          note = `${Number(governance.signal_count || 0)} governance signals observed.`;
+        }
+        entries.push({ title: 'Governance', meta, note });
+      }
+
+      if (String(autonomy.current_level || '').trim()) {
+        const meta = [autonomy.current_level, autonomy.scope && `scope ${autonomy.scope}`]
+          .filter(Boolean)
+          .join(' | ');
+        entries.push({
+          title: 'Autonomy',
+          meta,
+          note: String(autonomy.adaptation_summary || '').trim(),
+        });
+      }
+
+      if (String(stewardship.managed_scope || stewardship.followup_status || '').trim()) {
+        const bits = [];
+        if (String(stewardship.managed_scope || '').trim()) bits.push(String(stewardship.managed_scope || '').trim());
+        if (Number(stewardship.current_health || 0) > 0) bits.push(`health ${Number(stewardship.current_health || 0).toFixed(2)}`);
+        let note = String(stewardship.last_decision_summary || '').trim();
+        if (!note && String(stewardship.followup_status || '').trim()) {
+          note = `Follow-up status: ${String(stewardship.followup_status || '').trim()}`;
+        }
+        entries.push({
+          title: 'Stewardship',
+          meta: bits.join(' | '),
+          note,
+        });
+      }
+
+      return entries;
+    }
+
+    function renderSystemReasoningPanel(reasoning = {}) {
+      if (!systemReasoningPanel || !systemReasoningSummary || !systemReasoningList) return;
+
+      const summary = String((reasoning && reasoning.summary) || '').trim();
+      const entries = collectSystemReasoningEntries(reasoning);
+      if (!summary && !entries.length) {
+        systemReasoningPanel.hidden = true;
+        systemReasoningSummary.textContent = '';
+        systemReasoningList.innerHTML = '';
+        return;
+      }
+
+      systemReasoningPanel.hidden = false;
+      systemReasoningSummary.textContent = summary;
+      systemReasoningList.innerHTML = entries.map((entry) => {
+        const title = escapeObjectMemoryHtml(entry.title);
+        const meta = escapeObjectMemoryHtml(String(entry.meta || '').trim() || 'latest reasoning');
+        const note = String(entry.note || '').trim();
+        const noteHtml = note
+          ? `<div class="object-memory-note">${escapeObjectMemoryHtml(note)}</div>`
+          : '';
+        return `
+          <li class="object-memory-item">
+            <strong>${title}</strong>
+            <div class="object-memory-meta">${meta}</div>
+            ${noteHtml}
+          </li>
+        `;
+      }).join('');
     }
 
     function isIdentityInquiryText(textRaw) {
@@ -3557,6 +5097,10 @@ async def mim_ui_page() -> str:
         markBackendReachability(true);
         const data = await res.json();
         latestUiState = data;
+        if (buildTagEl) {
+          const runtimeBuild = String(data.runtime_build || 'mim-ui');
+          buildTagEl.textContent = `Build: ${runtimeBuild}`;
+        }
         setSpeaking(Boolean(data.speaking));
         const spokeFromState = await maybeSpeakFromState(data).catch(() => false);
         maybeIssueStartupIdentityInquiry(data);
@@ -3566,6 +5110,9 @@ async def mim_ui_page() -> str:
         cameraEl.textContent = `Camera: ${cameraLabel} (confidence ${cameraConfidence})`;
         const inquiryPrompt = String(data.inquiry_prompt || '').trim();
         const conversationContext = (data && typeof data.conversation_context === 'object') ? data.conversation_context : {};
+        const operatorReasoning = (data && typeof data.operator_reasoning === 'object') ? data.operator_reasoning : {};
+        renderObjectMemoryPanel(conversationContext);
+        renderSystemReasoningPanel(operatorReasoning);
         const cameraIdentityKnown = !isUnknownOrMissingIdentity(cameraLabel);
         const shouldSuppressInquiryReplay = Date.now() < suppressBackendInquiryUntil && (Boolean(locallyAcceptedIdentity) || cameraIdentityKnown);
         if (inquiryPrompt && !shouldSuppressInquiryReplay && !spokeFromState) {
@@ -4277,9 +5824,21 @@ async def mim_ui_page() -> str:
       micUnstableCycleCount = 0;
       listenOnce();
     });
+    chatSendBtn.addEventListener('click', sendTextChat);
+    chatClearBtn.addEventListener('click', () => {
+      if (!chatLog) return;
+      chatLog.innerHTML = '';
+      appendChatMessage('mim', 'Text chat cleared. Ready for your next message.');
+    });
+    chatInput.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' && !event.shiftKey) {
+        event.preventDefault();
+        sendTextChat();
+      }
+    });
 
     updateIconGlow();
-    addMicDebug('ui-boot', 'objective-22-debug-pane');
+    addMicDebug('ui-boot', 'mim-ui-tightened-v1');
     if (micEventEl) {
       micEventEl.textContent = `Mic event: ui-boot @ ${new Date().toLocaleTimeString()}`;
     }
@@ -4326,7 +5885,9 @@ async def mim_ui_state(db: AsyncSession = Depends(get_db)) -> dict:
     speech_row = (
         (
             await db.execute(
-                select(SpeechOutputAction).order_by(SpeechOutputAction.id.desc()).limit(1)
+                select(SpeechOutputAction)
+                .order_by(SpeechOutputAction.id.desc())
+                .limit(1)
             )
         )
         .scalars()
@@ -4335,7 +5896,9 @@ async def mim_ui_state(db: AsyncSession = Depends(get_db)) -> dict:
 
     speaking = False
     if speech_row and speech_row.created_at:
-        age_seconds = (now - speech_row.created_at.astimezone(timezone.utc)).total_seconds()
+        age_seconds = (
+            now - speech_row.created_at.astimezone(timezone.utc)
+        ).total_seconds()
         speaking = age_seconds <= 8
 
     camera_row = (
@@ -4354,199 +5917,942 @@ async def mim_ui_state(db: AsyncSession = Depends(get_db)) -> dict:
     mic_row = (
         (
             await db.execute(
-            select(WorkspacePerceptionSource)
-            .where(WorkspacePerceptionSource.source_type == "microphone")
-            .order_by(WorkspacePerceptionSource.id.desc())
-            .limit(1)
+                select(WorkspacePerceptionSource)
+                .where(WorkspacePerceptionSource.source_type == "microphone")
+                .order_by(
+                    WorkspacePerceptionSource.last_seen_at.desc(),
+                    WorkspacePerceptionSource.id.desc(),
+                )
+                .limit(1)
             )
         )
         .scalars()
         .first()
     )
 
-    camera_payload = camera_row.last_event_payload_json if camera_row and isinstance(camera_row.last_event_payload_json, dict) else {}
-    label_raw = str(camera_payload.get("object_label", "")).strip()
+    camera_rows = (
+        (
+            await db.execute(
+                select(WorkspacePerceptionSource)
+                .where(WorkspacePerceptionSource.source_type == "camera")
+                .order_by(
+                    WorkspacePerceptionSource.last_seen_at.desc(),
+                    WorkspacePerceptionSource.id.desc(),
+                )
+                .limit(12)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    latest_input_event = (
+        (
+            await db.execute(
+            select(InputEvent)
+            .where(InputEvent.source.in_(["text", "voice", "ui", "api"]))
+            .order_by(InputEvent.id.desc())
+            .limit(1)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    active_perception_session_id = _resolve_active_perception_session(
+        camera_rows=camera_rows,
+        mic_row=mic_row,
+        now=now,
+        fallback_session_id=_extract_conversation_session_id(
+            latest_input_event.metadata_json if latest_input_event else {}
+        ),
+    )
+    if active_perception_session_id:
+        session_camera_rows = [
+            row
+            for row in camera_rows
+            if str(row.session_id or "").strip() == active_perception_session_id
+        ]
+        if session_camera_rows:
+            camera_rows = session_camera_rows
+
+    fresh_camera_observations = collect_fresh_camera_observations(
+        camera_rows,
+        now=now,
+        stale_seconds=90.0,
+    )
+    camera_summary = summarize_camera_observations(fresh_camera_observations)
+    label_raw = str(camera_summary.get("primary_label", "")).strip()
     label = label_raw.lower()
-    confidence = float(camera_payload.get("confidence", 0.0) or 0.0)
+    confidence = float(camera_summary.get("primary_confidence", 0.0) or 0.0)
+    camera_scene_summary = str(camera_summary.get("summary", "")).strip()
+    camera_source_count = int(camera_summary.get("source_count", 0) or 0)
+    latest_camera_seen_at = max(
+        [
+            row.last_seen_at.astimezone(timezone.utc)
+            for row in camera_rows
+            if row.last_seen_at
+        ],
+        default=None,
+    )
+    observed_zones = {
+        str(observation.get("zone") or "").strip().lower()
+        for observation in fresh_camera_observations
+        if str(observation.get("zone") or "").strip()
+    }
+
+    recent_actors = (
+        (await db.execute(select(Actor).order_by(Actor.id.desc()).limit(20)))
+        .scalars()
+        .all()
+    )
+    recent_object_memories = (
+        (
+            await db.execute(
+                select(WorkspaceObjectMemory)
+                .order_by(
+                    WorkspaceObjectMemory.last_seen_at.desc(),
+                    WorkspaceObjectMemory.id.desc(),
+                )
+                .limit(120)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if active_perception_session_id:
+        recent_object_memories = [
+            row
+            for row in recent_object_memories
+            if _object_memory_matches_active_session(
+                row,
+                active_perception_session_id,
+            )
+        ]
+
+    known_people = set(_known_people())
+    for actor in recent_actors:
+        if str(actor.role or "").strip().lower() != "user":
+            continue
+        known_people.add(str(actor.name or "").strip().lower())
+        identity_meta = (
+            actor.identity_metadata if isinstance(actor.identity_metadata, dict) else {}
+        )
+        display_name = str(identity_meta.get("display_name") or "").strip().lower()
+        if display_name:
+            known_people.add(display_name)
+        aliases = (
+            identity_meta.get("aliases", [])
+            if isinstance(identity_meta.get("aliases", []), list)
+            else []
+        )
+        for alias in aliases:
+            alias_text = str(alias or "").strip().lower()
+            if alias_text:
+                known_people.add(alias_text)
+
+    latest_goal = (
+        (
+            await db.execute(
+                select(WorkspaceStrategyGoal)
+                .order_by(WorkspaceStrategyGoal.id.desc())
+                .limit(1)
+            )
+        )
+        .scalars()
+        .first()
+    )
+
+    open_question = (
+        (
+            await db.execute(
+                select(WorkspaceInquiryQuestion)
+                .where(WorkspaceInquiryQuestion.status == "open")
+                .order_by(WorkspaceInquiryQuestion.id.desc())
+                .limit(1)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    latest_inquiry = open_question or (
+        (
+            await db.execute(
+                select(WorkspaceInquiryQuestion)
+                .order_by(WorkspaceInquiryQuestion.id.desc())
+                .limit(1)
+            )
+        )
+        .scalars()
+        .first()
+    )
+
+    latest_governance = (
+        (
+            await db.execute(
+                select(WorkspaceExecutionTruthGovernanceProfile)
+                .order_by(WorkspaceExecutionTruthGovernanceProfile.id.desc())
+                .limit(1)
+            )
+        )
+        .scalars()
+        .first()
+    )
+
+    latest_autonomy_boundary = (
+        (
+            await db.execute(
+                select(WorkspaceAutonomyBoundaryProfile)
+                .order_by(WorkspaceAutonomyBoundaryProfile.id.desc())
+                .limit(1)
+            )
+        )
+        .scalars()
+        .first()
+    )
+
+    latest_stewardship_state = (
+        (
+            await db.execute(
+                select(WorkspaceStewardshipState)
+                .order_by(WorkspaceStewardshipState.id.desc())
+                .limit(1)
+            )
+        )
+        .scalars()
+        .first()
+    )
+
+    latest_stewardship_cycle = None
+    commitment_rows = (
+      (
+        await db.execute(
+          select(WorkspaceOperatorResolutionCommitment)
+          .order_by(WorkspaceOperatorResolutionCommitment.id.desc())
+          .limit(40)
+        )
+      )
+      .scalars()
+      .all()
+    )
+    latest_resolution_commitment = _choose_operator_resolution_commitment(
+      commitment_rows,
+      scope="",
+    )
+    latest_commitment_monitoring = None
+    latest_commitment_outcome = None
+    latest_execution_recovery: dict = {}
+    learned_preferences: list[dict] = []
+    proposal_policy_preferences: list[dict] = []
+    policy_conflict_profiles: list[dict] = []
+    preference_conflict_items: list[dict] = []
+    operator_reasoning_scope = ""
+    if latest_resolution_commitment is not None:
+      latest_commitment_monitoring = await latest_commitment_monitoring_profile(
+        commitment_id=int(latest_resolution_commitment.id),
+        db=db,
+      )
+      latest_commitment_outcome = await latest_commitment_outcome_profile(
+        commitment_id=int(latest_resolution_commitment.id),
+        db=db,
+      )
+    if latest_stewardship_state is not None:
+        latest_stewardship_cycle = (
+            (
+                await db.execute(
+                    select(WorkspaceStewardshipCycle)
+                    .where(
+                        WorkspaceStewardshipCycle.stewardship_id
+                        == int(latest_stewardship_state.id)
+                    )
+                    .order_by(WorkspaceStewardshipCycle.id.desc())
+                    .limit(1)
+                )
+            )
+            .scalars()
+            .first()
+        )
+
+        operator_reasoning_scope = _choose_operator_reasoning_scope(
+            inquiry_row=latest_inquiry,
+            governance_row=latest_governance,
+            autonomy_row=latest_autonomy_boundary,
+            stewardship_row=latest_stewardship_state,
+        )
+        if operator_reasoning_scope:
+          if latest_inquiry is not None and not _row_matches_operator_reasoning_scope(
+            latest_inquiry,
+            operator_reasoning_scope,
+            inquiry=True,
+          ):
+            latest_inquiry = (
+              (
+                await db.execute(
+                  select(WorkspaceInquiryQuestion)
+                  .order_by(WorkspaceInquiryQuestion.id.desc())
+                  .limit(40)
+                )
+              )
+              .scalars()
+              .all()
+            )
+            latest_inquiry = next(
+              (
+                row
+                for row in latest_inquiry
+                if _row_matches_operator_reasoning_scope(
+                  row,
+                  operator_reasoning_scope,
+                  inquiry=True,
+                )
+              ),
+              None,
+            )
+
+          if latest_governance is not None and not _row_matches_operator_reasoning_scope(
+            latest_governance,
+            operator_reasoning_scope,
+          ):
+            latest_governance = (
+              (
+                await db.execute(
+                  select(WorkspaceExecutionTruthGovernanceProfile)
+                  .order_by(WorkspaceExecutionTruthGovernanceProfile.id.desc())
+                  .limit(40)
+                )
+              )
+              .scalars()
+              .all()
+            )
+            latest_governance = next(
+              (
+                row
+                for row in latest_governance
+                if _row_matches_operator_reasoning_scope(
+                  row,
+                  operator_reasoning_scope,
+                )
+              ),
+              None,
+            )
+
+          if latest_autonomy_boundary is not None and not _row_matches_operator_reasoning_scope(
+            latest_autonomy_boundary,
+            operator_reasoning_scope,
+            autonomy=True,
+          ):
+            latest_autonomy_boundary = (
+              (
+                await db.execute(
+                  select(WorkspaceAutonomyBoundaryProfile)
+                  .order_by(WorkspaceAutonomyBoundaryProfile.id.desc())
+                  .limit(40)
+                )
+              )
+              .scalars()
+              .all()
+            )
+            latest_autonomy_boundary = next(
+              (
+                row
+                for row in latest_autonomy_boundary
+                if _row_matches_operator_reasoning_scope(
+                  row,
+                  operator_reasoning_scope,
+                  autonomy=True,
+                )
+              ),
+              None,
+            )
+
+          if latest_stewardship_state is not None and not _row_matches_operator_reasoning_scope(
+            latest_stewardship_state,
+            operator_reasoning_scope,
+          ):
+            latest_stewardship_state = (
+              (
+                await db.execute(
+                  select(WorkspaceStewardshipState)
+                  .order_by(WorkspaceStewardshipState.id.desc())
+                  .limit(40)
+                )
+              )
+              .scalars()
+              .all()
+            )
+            latest_stewardship_state = next(
+              (
+                row
+                for row in latest_stewardship_state
+                if _row_matches_operator_reasoning_scope(
+                  row,
+                  operator_reasoning_scope,
+                )
+              ),
+              None,
+            )
+            latest_stewardship_cycle = None
+            if latest_stewardship_state is not None:
+              latest_stewardship_cycle = (
+                (
+                  await db.execute(
+                    select(WorkspaceStewardshipCycle)
+                    .where(
+                      WorkspaceStewardshipCycle.stewardship_id
+                      == int(latest_stewardship_state.id)
+                    )
+                    .order_by(WorkspaceStewardshipCycle.id.desc())
+                    .limit(1)
+                  )
+                )
+                .scalars()
+                .first()
+              )
+
+          latest_resolution_commitment = _choose_operator_resolution_commitment(
+            commitment_rows,
+            scope=operator_reasoning_scope if 'operator_reasoning_scope' in locals() else "",
+          )
+          latest_commitment_monitoring = None
+          latest_commitment_outcome = None
+          if latest_resolution_commitment is not None:
+            latest_commitment_monitoring = await latest_commitment_monitoring_profile(
+              commitment_id=int(latest_resolution_commitment.id),
+              db=db,
+            )
+            latest_commitment_outcome = await latest_commitment_outcome_profile(
+              commitment_id=int(latest_resolution_commitment.id),
+              db=db,
+            )
+
+          learned_preferences = await list_learned_preferences(
+            db=db,
+            managed_scope=operator_reasoning_scope,
+            limit=10,
+          )
+          preference_conflict_items = preference_conflicts(learned_preferences)
+          proposal_policy_preferences = await list_workspace_proposal_policy_preferences(
+            db=db,
+            related_zone=operator_reasoning_scope,
+            limit=10,
+          )
+          policy_conflict_profiles = await list_workspace_policy_conflict_profiles(
+            db=db,
+            managed_scope=operator_reasoning_scope,
+            limit=10,
+          )
+
+    if not learned_preferences:
+      fallback_scopes: list[str] = []
+      for candidate_scope in [
+        operator_reasoning_scope,
+        str(getattr(latest_commitment_outcome, "managed_scope", "") or "").strip(),
+        str(getattr(latest_autonomy_boundary, "scope", "") or "").strip(),
+        str(getattr(latest_stewardship_state, "managed_scope", "") or "").strip(),
+      ]:
+        normalized_scope = str(candidate_scope or "").strip()
+        if normalized_scope and normalized_scope not in fallback_scopes:
+          fallback_scopes.append(normalized_scope)
+      for fallback_scope in fallback_scopes:
+        learned_preferences = await list_learned_preferences(
+          db=db,
+          managed_scope=fallback_scope,
+          limit=10,
+        )
+        preference_conflict_items = preference_conflicts(learned_preferences)
+        proposal_policy_preferences = await list_workspace_proposal_policy_preferences(
+          db=db,
+          related_zone=fallback_scope,
+          limit=10,
+        )
+        policy_conflict_profiles = await list_workspace_policy_conflict_profiles(
+          db=db,
+          managed_scope=fallback_scope,
+          limit=10,
+        )
+        if learned_preferences:
+          break
+
+    if not learned_preferences and latest_resolution_commitment is not None:
+      fallback_preference = await latest_scope_learned_preference(
+        managed_scope=str(latest_resolution_commitment.managed_scope or "").strip(),
+        db=db,
+      )
+      if fallback_preference:
+        learned_preferences = [fallback_preference]
+        preference_conflict_items = preference_conflicts(learned_preferences)
+
+    recovery_execution_rows = (
+      (
+        await db.execute(
+          select(CapabilityExecution)
+          .where(CapabilityExecution.trace_id != "")
+          .order_by(CapabilityExecution.id.desc())
+          .limit(40)
+        )
+      )
+      .scalars()
+      .all()
+    )
+    latest_recovery_execution = next(
+      (
+        row
+        for row in recovery_execution_rows
+        if str(row.status or "").strip() in {"failed", "blocked", "pending_confirmation", "succeeded"}
+        and (
+          not operator_reasoning_scope
+          or str(row.managed_scope or "").strip() == operator_reasoning_scope
+        )
+      ),
+      None,
+    )
+    if latest_recovery_execution is None:
+      latest_recovery_execution = next(
+        (
+          row
+          for row in recovery_execution_rows
+          if str(row.status or "").strip() in {"failed", "blocked", "pending_confirmation", "succeeded"}
+        ),
+        None,
+      )
+    if latest_recovery_execution is not None:
+      latest_execution_recovery = await evaluate_execution_recovery(
+        trace_id=str(latest_recovery_execution.trace_id or "").strip(),
+        execution_id=int(latest_recovery_execution.id),
+        managed_scope=str(latest_recovery_execution.managed_scope or "").strip(),
+        db=db,
+      ) or {}
+
+    latest_memory = (
+        (await db.execute(select(MemoryEntry).order_by(MemoryEntry.id.desc()).limit(1)))
+        .scalars()
+        .first()
+    )
+
+    latest_interaction_learning = (
+        (
+            await db.execute(
+                select(MemoryEntry)
+                .where(MemoryEntry.memory_class == "interaction_learning")
+                .order_by(MemoryEntry.id.desc())
+                .limit(1)
+            )
+        )
+        .scalars()
+        .first()
+    )
+
+    goal_summary = ""
+    if latest_goal:
+        goal_summary = _compact_sentence(
+            latest_goal.reasoning_summary
+            or latest_goal.success_criteria
+            or latest_goal.evidence_summary
+            or latest_goal.strategy_type.replace("_", " "),
+            max_len=160,
+        )
+
+    open_question_summary = ""
+    should_surface_open_question = False
+    if open_question:
+        urgency = str(open_question.urgency or "").strip().lower()
+        priority = str(open_question.priority or "").strip().lower()
+        age_seconds = (
+            (now - open_question.created_at.astimezone(timezone.utc)).total_seconds()
+            if open_question.created_at
+            else 0.0
+        )
+        urgent_flag = urgency in {"critical", "high", "urgent"} or priority in {
+            "critical",
+            "high",
+            "urgent",
+        }
+        open_question_summary = _compact_sentence(
+            open_question.waiting_decision
+            or open_question.why_answer_matters
+            or open_question.safe_default_if_unanswered,
+            max_len=170,
+        )
+
+    memory_summary = ""
+    if latest_memory:
+        memory_summary = _compact_sentence(
+            latest_memory.summary or latest_memory.content,
+            max_len=140,
+        )
+
+    learning_summary = ""
+    if latest_interaction_learning and not _is_low_quality_learning_entry(
+        latest_interaction_learning
+    ):
+        learning_summary = _compact_sentence(
+            latest_interaction_learning.summary or latest_interaction_learning.content,
+            max_len=140,
+        )
+    recent_learning_rows = (
+        (
+            await db.execute(
+                select(MemoryEntry)
+                .where(MemoryEntry.memory_class == "interaction_learning")
+                .order_by(MemoryEntry.id.desc())
+                .limit(20)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for learning_row in recent_learning_rows:
+        meta = (
+            learning_row.metadata_json
+            if isinstance(learning_row.metadata_json, dict)
+            else {}
+        )
+        if active_perception_session_id:
+          learning_session_id = _extract_conversation_session_id(meta)
+          if (
+            learning_session_id
+            and learning_session_id != active_perception_session_id
+          ):
+            continue
+        if str(meta.get("preference_signal") or "").strip().lower() != "call_me":
+            continue
+        learned_name = str(meta.get("preference_value") or "").strip().lower()
+        if learned_name:
+            known_people.add(learned_name)
+
+    recognized_people: list[str] = []
+    observed_non_person_labels: list[str] = []
+    known_camera_objects: list[str] = []
+    uncertain_camera_objects: list[str] = []
+    missing_camera_objects: list[str] = []
+    unknown_camera_labels: list[str] = []
+    camera_object_states: dict[str, str] = {}
+    camera_object_details: dict[str, dict[str, object]] = {}
+
+    for observation in fresh_camera_observations:
+        observed_label = str(observation.get("label_raw") or "").strip()
+        if not observed_label:
+            continue
+        observed_key = observed_label.lower()
+        if observed_key in known_people:
+            recognized_people.append(observed_label)
+            continue
+        observed_non_person_labels.append(observed_label)
+
+        object_row = next(
+            (
+                row
+                for row in recent_object_memories
+                if _object_memory_matches_label(row, observed_label)
+            ),
+            None,
+        )
+        metadata = (
+            object_row.metadata_json
+            if object_row and isinstance(object_row.metadata_json, dict)
+            else {}
+        )
+        semantic_fields = _semantic_metadata_fields(metadata)
+        has_library_memory = bool(
+            object_row
+            and (
+                object_row.last_execution_id is not None
+                or semantic_fields
+                or str(metadata.get("last_observation_source") or "").strip().lower()
+                != "live_camera"
+            )
+        )
+
+        state = "novel"
+        if object_row and str(object_row.status or "").strip().lower() == "uncertain":
+            state = "uncertain"
+        elif object_row and has_library_memory:
+            state = "known"
+
+        camera_object_states[observed_label] = state
+        if state == "uncertain":
+            uncertain_camera_objects.append(observed_label)
+        elif state == "known":
+            known_camera_objects.append(observed_label)
+        else:
+            unknown_camera_labels.append(observed_label)
+
+        if state == "novel":
+            camera_object_details[observed_label] = _camera_detail_for_label(
+                label=observed_label,
+                state="novel",
+                metadata=metadata,
+                row=object_row,
+                inquiry_questions=[
+                    f"What is {observed_label}?",
+                    f"What does {observed_label} do?",
+                    "Explain more if needed.",
+                ],
+            )
+        else:
+            camera_object_details[observed_label] = _camera_detail_for_label(
+                label=observed_label,
+                state=state,
+                metadata=metadata,
+                row=object_row,
+            )
+
+    should_consider_missing_objects = bool(observed_non_person_labels) or not recognized_people
+    if should_consider_missing_objects:
+      for object_row in recent_object_memories:
+        state = str(object_row.status or "").strip().lower()
+        if state != "missing":
+          continue
+        if (
+          observed_zones
+          and str(object_row.zone or "").strip().lower() not in observed_zones
+        ):
+          continue
+        metadata = (
+          object_row.metadata_json
+          if isinstance(object_row.metadata_json, dict)
+          else {}
+        )
+        semantic_fields = _semantic_metadata_fields(metadata)
+        has_library_memory = bool(
+          object_row.last_execution_id is not None
+          or semantic_fields
+          or str(metadata.get("last_observation_source") or "").strip().lower()
+          != "live_camera"
+        )
+        if not has_library_memory:
+          continue
+        missing_label = str(object_row.canonical_name or "").strip()
+        if not missing_label or missing_label in missing_camera_objects:
+          continue
+        missing_camera_objects.append(missing_label)
+        camera_object_states[missing_label] = "missing"
+        camera_object_details[missing_label] = _camera_detail_for_label(
+          label=missing_label,
+          state="missing",
+          metadata=metadata,
+          row=object_row,
+        )
+
+    recognized_person = recognized_people[0] if recognized_people else ""
+    unknown_camera_label = unknown_camera_labels[0] if unknown_camera_labels else ""
+    uncertain_camera_label = (
+        uncertain_camera_objects[0] if uncertain_camera_objects else ""
+    )
+    missing_camera_label = missing_camera_objects[0] if missing_camera_objects else ""
 
     unknown_person = False
     if label:
         if label in {"person", "human", "unknown", "visitor"}:
             unknown_person = True
-        elif "person" in label and label not in _known_people():
+        elif "person" in label and label not in known_people:
             unknown_person = True
 
-    latest_goal = (
-      (
-        await db.execute(
-          select(WorkspaceStrategyGoal)
-          .order_by(WorkspaceStrategyGoal.id.desc())
-          .limit(1)
-        )
-      )
-      .scalars()
-      .first()
+    mic_payload = (
+        mic_row.last_event_payload_json
+        if mic_row and isinstance(mic_row.last_event_payload_json, dict)
+        else {}
     )
-
-    open_question = (
-      (
-        await db.execute(
-          select(WorkspaceInquiryQuestion)
-          .where(WorkspaceInquiryQuestion.status == "open")
-          .order_by(WorkspaceInquiryQuestion.id.desc())
-          .limit(1)
-        )
-      )
-      .scalars()
-      .first()
-    )
-
-    latest_memory = (
-      (
-        await db.execute(
-          select(MemoryEntry)
-          .order_by(MemoryEntry.id.desc())
-          .limit(1)
-        )
-      )
-      .scalars()
-      .first()
-    )
-
-    latest_interaction_learning = (
-      (
-        await db.execute(
-          select(MemoryEntry)
-          .where(MemoryEntry.memory_class == "interaction_learning")
-          .order_by(MemoryEntry.id.desc())
-          .limit(1)
-        )
-      )
-      .scalars()
-      .first()
-    )
-
-    goal_summary = ""
-    if latest_goal:
-      goal_summary = _compact_sentence(
-        latest_goal.reasoning_summary
-        or latest_goal.success_criteria
-        or latest_goal.evidence_summary
-        or latest_goal.strategy_type.replace("_", " "),
-        max_len=160,
-      )
-
-    open_question_summary = ""
-    should_surface_open_question = False
-    if open_question:
-      urgency = str(open_question.urgency or "").strip().lower()
-      priority = str(open_question.priority or "").strip().lower()
-      age_seconds = (now - open_question.created_at.astimezone(timezone.utc)).total_seconds() if open_question.created_at else 0.0
-      urgent_flag = urgency in {"critical", "high", "urgent"} or priority in {"critical", "high", "urgent"}
-      open_question_summary = _compact_sentence(
-        open_question.waiting_decision
-        or open_question.why_answer_matters
-        or open_question.safe_default_if_unanswered,
-        max_len=170,
-      )
-
-    memory_summary = ""
-    if latest_memory:
-      memory_summary = _compact_sentence(
-        latest_memory.summary or latest_memory.content,
-        max_len=140,
-      )
-
-    learning_summary = ""
-    if latest_interaction_learning and not _is_low_quality_learning_entry(latest_interaction_learning):
-      learning_summary = _compact_sentence(
-        latest_interaction_learning.summary or latest_interaction_learning.content,
-        max_len=140,
-      )
-
-    mic_payload = mic_row.last_event_payload_json if mic_row and isinstance(mic_row.last_event_payload_json, dict) else {}
     mic_confidence = float(mic_payload.get("confidence", 0.0) or 0.0)
     mic_timestamp = _parse_payload_timestamp(mic_payload.get("timestamp"))
     mic_age_seconds = _age_seconds(now, mic_timestamp)
     mic_transcript_raw = str(mic_payload.get("transcript", "")).strip()
     latest_mic_transcript = ""
     if (
-      mic_transcript_raw
-      and mic_confidence >= MIC_PROMPT_MIN_CONFIDENCE
-      and (mic_age_seconds is None or mic_age_seconds <= MIC_PROMPT_MAX_AGE_SECONDS)
+        mic_transcript_raw
+        and mic_confidence >= MIC_PROMPT_MIN_CONFIDENCE
+        and (mic_age_seconds is None or mic_age_seconds <= MIC_PROMPT_MAX_AGE_SECONDS)
     ):
-      latest_mic_transcript = _compact_sentence(mic_transcript_raw, max_len=120)
+        latest_mic_transcript = _compact_sentence(mic_transcript_raw, max_len=120)
 
-    latest_input_event = (
+    recent_input_events = (
       (
         await db.execute(
           select(InputEvent)
           .where(InputEvent.source.in_(["text", "voice", "ui", "api"]))
           .order_by(InputEvent.id.desc())
-          .limit(1)
-        )
-      )
-      .scalars()
-      .first()
-    )
-    latest_input_text = ""
-    if latest_input_event:
-      latest_input_text = _compact_sentence(str(latest_input_event.raw_input or "").strip(), max_len=120)
-
-    latest_user_input = latest_mic_transcript or latest_input_text
-
-    recent_speech_actions = (
-      (
-        await db.execute(
-          select(SpeechOutputAction)
-          .order_by(SpeechOutputAction.id.desc())
-          .limit(6)
+          .limit(12)
         )
       )
       .scalars()
       .all()
     )
-    clarification_budget_exhausted = any(
-      _is_clarifier_prompt_text(str(row.requested_text or ""))
-      for row in recent_speech_actions
+    if active_perception_session_id:
+        session_input_events = []
+        for row in recent_input_events:
+            event_session_id = _extract_conversation_session_id(row.metadata_json)
+            if event_session_id == active_perception_session_id:
+                session_input_events.append(row)
+        if session_input_events:
+            recent_input_events = session_input_events
+    latest_input_event = (
+        recent_input_events[0] if recent_input_events else latest_input_event
+    )
+    latest_input_text = ""
+    if latest_input_event:
+        latest_input_text = _compact_sentence(
+            str(latest_input_event.raw_input or "").strip(), max_len=120
+        )
+
+    repeated_ambiguous_user_input = False
+    if len(recent_input_events) >= 2:
+        latest_raw_input = str(recent_input_events[0].raw_input or "").strip()
+        previous_raw_input = str(recent_input_events[1].raw_input or "").strip()
+
+        def _is_ambiguous_turn(value: str) -> bool:
+            if not value:
+                return False
+            if (
+                _looks_like_greeting(value)
+                or _looks_like_direct_question(value)
+                or _looks_like_status_request(value)
+            ):
+                return False
+            return True
+
+        repeated_ambiguous_user_input = _is_ambiguous_turn(
+            latest_raw_input
+        ) and _is_ambiguous_turn(previous_raw_input)
+
+    latest_user_input = latest_input_text
+    if latest_mic_transcript:
+        latest_input_created_at = (
+            latest_input_event.created_at.astimezone(timezone.utc)
+            if latest_input_event and latest_input_event.created_at
+            else None
+        )
+        if latest_input_created_at is None or (
+            mic_timestamp is not None and mic_timestamp >= latest_input_created_at
+        ):
+            latest_user_input = latest_mic_transcript
+    if not latest_user_input:
+        latest_user_input = latest_mic_transcript or latest_input_text
+
+    latest_user_signal_at = None
+    if latest_input_event and latest_input_event.created_at:
+        latest_user_signal_at = latest_input_event.created_at.astimezone(timezone.utc)
+    if mic_timestamp is not None and (
+        latest_user_signal_at is None or mic_timestamp >= latest_user_signal_at
+    ):
+        latest_user_signal_at = mic_timestamp
+
+    recent_speech_actions = (
+        (
+            await db.execute(
+                select(SpeechOutputAction)
+                .order_by(SpeechOutputAction.id.desc())
+                .limit(6)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    recent_resolutions = (
+        (
+            await db.execute(
+                select(InputEventResolution)
+                .order_by(InputEventResolution.id.desc())
+                .limit(6)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    clarification_budget_exhausted = (
+        any(
+            _is_clarifier_prompt_text(str(row.requested_text or ""))
+            for row in recent_speech_actions
+        )
+        or any(
+            _is_clarifier_prompt_text(str(row.clarification_prompt or ""))
+            for row in recent_resolutions
+        )
+        or repeated_ambiguous_user_input
     )
 
     if open_question_summary and open_question:
-      urgency = str(open_question.urgency or "").strip().lower()
-      priority = str(open_question.priority or "").strip().lower()
-      age_seconds = (now - open_question.created_at.astimezone(timezone.utc)).total_seconds() if open_question.created_at else 0.0
-      critical_interrupt = urgency in {"critical", "urgent", "emergency"} or priority in {"critical", "urgent", "emergency"}
-      elevated_priority = urgency in {"high", "critical", "urgent", "emergency"} or priority in {"high", "critical", "urgent", "emergency"}
-      conversational_signal = bool(latest_mic_transcript or learning_summary)
-      should_surface_open_question = bool(
-        critical_interrupt
-        or (not conversational_signal and (elevated_priority or age_seconds <= 1200))
-      )
+        urgency = str(open_question.urgency or "").strip().lower()
+        priority = str(open_question.priority or "").strip().lower()
+        age_seconds = (
+            (now - open_question.created_at.astimezone(timezone.utc)).total_seconds()
+            if open_question.created_at
+            else 0.0
+        )
+        critical_interrupt = urgency in {
+            "critical",
+            "urgent",
+            "emergency",
+        } or priority in {"critical", "urgent", "emergency"}
+        elevated_priority = urgency in {
+            "high",
+            "critical",
+            "urgent",
+            "emergency",
+        } or priority in {"high", "critical", "urgent", "emergency"}
+        conversational_signal = bool(latest_mic_transcript or learning_summary)
+        should_surface_open_question = bool(
+            critical_interrupt
+            or (
+                not conversational_signal and (elevated_priority or age_seconds <= 1200)
+            )
+        )
 
     environment_now = ""
     if unknown_person:
-      environment_now = "there is an unidentified person in view"
+        environment_now = "there is an unidentified person in view"
+    elif camera_scene_summary:
+        environment_now = camera_scene_summary
     elif label_raw:
-      environment_now = f"{label_raw} is visible on camera with confidence {confidence:.2f}"
+        environment_now = (
+            f"{label_raw} is visible on camera with confidence {confidence:.2f}"
+        )
     else:
-      environment_now = "camera has no clear person in view"
+        environment_now = "camera has no clear person in view"
 
-    needs_identity_prompt = bool(unknown_person and not goal_summary and not (open_question_summary and should_surface_open_question))
+    needs_identity_prompt = bool(
+        unknown_person
+        and not goal_summary
+        and not (open_question_summary and should_surface_open_question)
+    )
 
     inquiry_prompt = ""
     if open_question_summary and should_surface_open_question:
-      inquiry_prompt = f"If you want me to continue this workflow, I need one decision: {open_question_summary}"
+        inquiry_prompt = f"If you want me to continue this workflow, I need one decision: {open_question_summary}"
     elif needs_identity_prompt:
-      inquiry_prompt = "I can see someone nearby. What should I call you?"
+        inquiry_prompt = "I can see someone nearby. What should I call you?"
     else:
-      inquiry_prompt = _build_curiosity_prompt(
-          environment_now=environment_now,
-          goal_summary=goal_summary,
-          memory_summary=memory_summary,
+        camera_prompt_allowed = not (
+            latest_user_signal_at is not None
+            and latest_camera_seen_at is not None
+            and latest_user_signal_at >= latest_camera_seen_at
+        )
+        if camera_prompt_allowed:
+            inquiry_prompt = _build_camera_state_prompt(
+                camera_scene_summary=camera_scene_summary,
+                camera_source_count=camera_source_count,
+                recognized_person=recognized_person,
+                unknown_camera_label=unknown_camera_label,
+                uncertain_camera_label=uncertain_camera_label,
+                missing_camera_label=missing_camera_label,
+                camera_object_details=camera_object_details,
+                camera_last_confidence=confidence,
+            )
+    if not inquiry_prompt:
+        inquiry_prompt = _build_curiosity_prompt(
+            environment_now=environment_now,
+            goal_summary=goal_summary,
+            memory_summary=memory_summary,
             latest_mic_transcript=latest_user_input,
-          learning_summary=learning_summary,
+            learning_summary=learning_summary,
             clarification_budget_exhausted=clarification_budget_exhausted,
-      )
+        )
+
+    voice_listen_hint = ""
+    mic_status = str(mic_payload.get("status") or "").strip().lower()
+    mic_mode = str(mic_payload.get("mode") or "").strip().lower()
+    if mic_status == "heartbeat_no_transcript" or "no_wake" in mic_mode:
+        if "no_wake" in mic_mode:
+            voice_listen_hint = 'Wake word required: say "MIM" before your request.'
+        else:
+            voice_listen_hint = "Listening heartbeat active. Say a request when ready."
 
     latest_output_text = _rewrite_state_output_text(
         str(speech_row.requested_text or "") if speech_row else "",
@@ -4554,27 +6860,105 @@ async def mim_ui_state(db: AsyncSession = Depends(get_db)) -> dict:
         open_question_summary=open_question_summary,
         goal_summary=goal_summary,
         latest_mic_transcript=latest_user_input,
-      environment_now=environment_now,
-      memory_summary=memory_summary,
+        environment_now=environment_now,
+        memory_summary=memory_summary,
+    )
+    operator_reasoning = _build_operator_reasoning_payload(
+        goal_row=latest_goal,
+        inquiry_row=latest_inquiry,
+        governance_row=latest_governance,
+        autonomy_row=latest_autonomy_boundary,
+        stewardship_row=latest_stewardship_state,
+        stewardship_cycle_row=latest_stewardship_cycle,
+        commitment_row=latest_resolution_commitment,
+        commitment_monitoring_row=latest_commitment_monitoring,
+        commitment_outcome_row=latest_commitment_outcome,
+        learned_preferences=learned_preferences,
+        preference_conflicts_items=preference_conflict_items,
+        proposal_policy_preferences=proposal_policy_preferences,
+        policy_conflict_profiles=policy_conflict_profiles,
+        execution_recovery=latest_execution_recovery,
+        execution_readiness=load_latest_execution_readiness(
+            action="mim_ui_state",
+            capability_name="mim_ui_state",
+            managed_scope=operator_reasoning_scope,
+            requested_executor="tod",
+            metadata_json={"managed_scope": operator_reasoning_scope},
+        ),
     )
 
     return {
         "speaking": speaking,
         "camera_last_label": label_raw,
         "camera_last_confidence": confidence,
+        "camera_scene_summary": camera_scene_summary,
+        "camera_source_count": camera_source_count,
+        "voice_listen_hint": voice_listen_hint,
+        "conversation_policy_profile": "tightened_v1",
+        "runtime_build": "mim-ui-tightened-v1",
+        "runtime_features": [
+            "voice_listen_hint",
+            "camera_scene_context",
+            "object_memory_bridge",
+            "conversation_policy_tightened",
+            "operator_reasoning_summary",
+            "operator_resolution_commitments",
+            "operator_commitment_enforcement_monitoring",
+            "operator_preference_convergence",
+            "cross_policy_conflict_resolution",
+            "execution_readiness_integration",
+        ],
         "inquiry_prompt": inquiry_prompt,
-      "conversation_context": {
-        "environment_now": environment_now,
-        "active_goal": goal_summary,
-        "open_question": open_question_summary,
-        "memory_hint": memory_summary,
-        "recent_user_input": latest_user_input,
-        "interaction_learning": learning_summary,
-        "needs_identity_prompt": needs_identity_prompt,
-      },
-      "latest_output_action_id": int(speech_row.id) if speech_row else 0,
-      "latest_output_text": latest_output_text,
-      "latest_output_allowed": bool(str(speech_row.delivery_status or "") == "queued") if speech_row else False,
+        "operator_reasoning": operator_reasoning,
+        "conversation_context": {
+            "environment_now": environment_now,
+            "active_goal": goal_summary,
+            "open_question": open_question_summary,
+            "memory_hint": memory_summary,
+            "recent_user_input": latest_user_input,
+            "interaction_learning": learning_summary,
+            "active_perception_session_id": active_perception_session_id,
+            "needs_identity_prompt": needs_identity_prompt,
+            "camera_scene_summary": camera_scene_summary,
+            "recognized_person": recognized_person,
+            "recognized_people": recognized_people,
+            "unknown_camera_label": unknown_camera_label,
+            "unknown_camera_labels": unknown_camera_labels,
+            "known_camera_objects": known_camera_objects,
+            "uncertain_camera_label": uncertain_camera_label,
+            "uncertain_camera_objects": uncertain_camera_objects,
+            "missing_camera_label": missing_camera_label,
+            "missing_camera_objects": missing_camera_objects,
+            "camera_object_states": camera_object_states,
+            "camera_object_details": camera_object_details,
+            "operator_reasoning_summary": str(operator_reasoning.get("summary") or "").strip(),
+            "operator_resolution_summary": str(
+              (
+                operator_reasoning.get("resolution_commitment", {})
+                if isinstance(operator_reasoning.get("resolution_commitment", {}), dict)
+                else {}
+              ).get("reason")
+              or ""
+            ).strip(),
+              "operator_preference_summary": str(
+                (
+                  operator_reasoning.get("learned_preferences", [])
+                  if isinstance(operator_reasoning.get("learned_preferences", []), list)
+                  else []
+                )[0].get("preference_direction")
+                if (
+                  isinstance(operator_reasoning.get("learned_preferences", []), list)
+                  and operator_reasoning.get("learned_preferences", [])
+                  and isinstance(operator_reasoning.get("learned_preferences", [])[0], dict)
+                )
+                else ""
+              ).strip(),
+        },
+        "latest_output_action_id": int(speech_row.id) if speech_row else 0,
+        "latest_output_text": latest_output_text,
+        "latest_output_allowed": bool(str(speech_row.delivery_status or "") == "queued")
+        if speech_row
+        else False,
     }
 
 
@@ -4589,46 +6973,48 @@ async def mim_ui_health(db: AsyncSession = Depends(get_db)) -> dict:
     db_ok = True
 
     try:
-      speech_row = (
-        (
-          await db.execute(
-            select(SpeechOutputAction).order_by(SpeechOutputAction.id.desc()).limit(1)
-          )
+        speech_row = (
+            (
+                await db.execute(
+                    select(SpeechOutputAction)
+                    .order_by(SpeechOutputAction.id.desc())
+                    .limit(1)
+                )
+            )
+            .scalars()
+            .first()
         )
-        .scalars()
-        .first()
-      )
 
-      camera_row = (
-        (
-          await db.execute(
-            select(WorkspacePerceptionSource)
-            .where(WorkspacePerceptionSource.source_type == "camera")
-            .order_by(WorkspacePerceptionSource.id.desc())
-            .limit(1)
-          )
+        camera_row = (
+            (
+                await db.execute(
+                    select(WorkspacePerceptionSource)
+                    .where(WorkspacePerceptionSource.source_type == "camera")
+                    .order_by(WorkspacePerceptionSource.id.desc())
+                    .limit(1)
+                )
+            )
+            .scalars()
+            .first()
         )
-        .scalars()
-        .first()
-      )
 
-      mic_row = (
-        (
-          await db.execute(
-            select(WorkspacePerceptionSource)
-            .where(WorkspacePerceptionSource.source_type == "microphone")
-            .order_by(WorkspacePerceptionSource.id.desc())
-            .limit(1)
-          )
+        mic_row = (
+            (
+                await db.execute(
+                    select(WorkspacePerceptionSource)
+                    .where(WorkspacePerceptionSource.source_type == "microphone")
+                    .order_by(WorkspacePerceptionSource.id.desc())
+                    .limit(1)
+                )
+            )
+            .scalars()
+            .first()
         )
-        .scalars()
-        .first()
-      )
     except Exception:
-      db_ok = False
-      speech_row = None
-      camera_row = None
-      mic_row = None
+        db_ok = False
+        speech_row = None
+        camera_row = None
+        mic_row = None
 
     speech_age = _age_seconds(now, speech_row.created_at if speech_row else None)
     camera_age = _age_seconds(now, camera_row.last_seen_at if camera_row else None)
@@ -4642,53 +7028,65 @@ async def mim_ui_health(db: AsyncSession = Depends(get_db)) -> dict:
     overall_status = "healthy" if overall_ok else "degraded"
 
     return {
-      "generated_at": now.isoformat().replace("+00:00", "Z"),
-      "status": overall_status,
-      "ok": overall_ok,
-      "checks": {
-        "backend": {"ok": True, "status": "healthy"},
-        "database": {
-          "ok": db_ok,
-          "status": "healthy" if db_ok else "error",
+        "generated_at": now.isoformat().replace("+00:00", "Z"),
+        "status": overall_status,
+        "ok": overall_ok,
+        "checks": {
+            "backend": {"ok": True, "status": "healthy"},
+            "database": {
+                "ok": db_ok,
+                "status": "healthy" if db_ok else "error",
+            },
+            "camera": {
+                "ok": camera_ok,
+                "status": "healthy" if camera_ok else "stale",
+                "age_seconds": camera_age,
+                "stale_threshold_seconds": camera_stale_seconds,
+                "source_health": str(camera_row.health_status or "")
+                if camera_row
+                else "",
+                "source_status": str(camera_row.status or "") if camera_row else "",
+            },
+            "microphone": {
+                "ok": mic_ok,
+                "status": "healthy" if mic_ok else "stale",
+                "age_seconds": mic_age,
+                "stale_threshold_seconds": mic_stale_seconds,
+                "source_health": str(mic_row.health_status or "") if mic_row else "",
+                "source_status": str(mic_row.status or "") if mic_row else "",
+            },
+            "speech_output": {
+                "ok": speech_ok,
+                "status": "healthy" if speech_ok else "stale",
+                "age_seconds": speech_age,
+                "stale_threshold_seconds": speech_stale_seconds,
+                "delivery_status": str(speech_row.delivery_status or "")
+                if speech_row
+                else "",
+            },
         },
-        "camera": {
-          "ok": camera_ok,
-          "status": "healthy" if camera_ok else "stale",
-          "age_seconds": camera_age,
-          "stale_threshold_seconds": camera_stale_seconds,
-          "source_health": str(camera_row.health_status or "") if camera_row else "",
-          "source_status": str(camera_row.status or "") if camera_row else "",
+        "latest": {
+            "camera": {
+                "source_id": int(camera_row.id) if camera_row else None,
+                "device_id": str(camera_row.device_id or "") if camera_row else "",
+                "last_seen_at": camera_row.last_seen_at.isoformat().replace(
+                    "+00:00", "Z"
+                )
+                if camera_row and camera_row.last_seen_at
+                else None,
+            },
+            "microphone": {
+                "source_id": int(mic_row.id) if mic_row else None,
+                "device_id": str(mic_row.device_id or "") if mic_row else "",
+                "last_seen_at": mic_row.last_seen_at.isoformat().replace("+00:00", "Z")
+                if mic_row and mic_row.last_seen_at
+                else None,
+            },
+            "speech_output": {
+                "action_id": int(speech_row.id) if speech_row else None,
+                "created_at": speech_row.created_at.isoformat().replace("+00:00", "Z")
+                if speech_row and speech_row.created_at
+                else None,
+            },
         },
-        "microphone": {
-          "ok": mic_ok,
-          "status": "healthy" if mic_ok else "stale",
-          "age_seconds": mic_age,
-          "stale_threshold_seconds": mic_stale_seconds,
-          "source_health": str(mic_row.health_status or "") if mic_row else "",
-          "source_status": str(mic_row.status or "") if mic_row else "",
-        },
-        "speech_output": {
-          "ok": speech_ok,
-          "status": "healthy" if speech_ok else "stale",
-          "age_seconds": speech_age,
-          "stale_threshold_seconds": speech_stale_seconds,
-          "delivery_status": str(speech_row.delivery_status or "") if speech_row else "",
-        },
-      },
-      "latest": {
-        "camera": {
-          "source_id": int(camera_row.id) if camera_row else None,
-          "device_id": str(camera_row.device_id or "") if camera_row else "",
-          "last_seen_at": camera_row.last_seen_at.isoformat().replace("+00:00", "Z") if camera_row and camera_row.last_seen_at else None,
-        },
-        "microphone": {
-          "source_id": int(mic_row.id) if mic_row else None,
-          "device_id": str(mic_row.device_id or "") if mic_row else "",
-          "last_seen_at": mic_row.last_seen_at.isoformat().replace("+00:00", "Z") if mic_row and mic_row.last_seen_at else None,
-        },
-        "speech_output": {
-          "action_id": int(speech_row.id) if speech_row else None,
-          "created_at": speech_row.created_at.isoformat().replace("+00:00", "Z") if speech_row and speech_row.created_at else None,
-        },
-      },
     }
