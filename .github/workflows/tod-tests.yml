@@ -20,8 +20,19 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install Contract Preflight Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install PyYAML jsonschema
+
+      - name: Run TOD↔MIM Contract Preflight
+        run: python3 scripts/run_tod_mim_contract_preflight.py
+
       - name: Run TOD reliability tests and generate summary
         run: python3 scripts/run_tod_tests.py
+
+      - name: Run Operator Incident Precedence Guard
+        run: python3 scripts/run_operator_incident_precedence_guard.py
 
       - name: Append test history and dashboard snapshot
         run: python3 scripts/append_tod_test_history.py
