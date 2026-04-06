@@ -63,6 +63,11 @@ class MimArmControlledAccessBaselineTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(mim_arm._resolve_execution_action_name(execution), "scan_pose")
 
+    def test_resolve_execution_action_name_uses_explicit_action_field(self):
+        execution = SimpleNamespace(arguments_json={"action": "capture_frame"})
+
+        self.assertEqual(mim_arm._resolve_execution_action_name(execution), "capture_frame")
+
     def test_resolve_execution_action_name_does_not_fallback_to_safe_home(self):
         execution = SimpleNamespace(arguments_json={})
 
@@ -442,8 +447,36 @@ class MimArmControlledAccessBaselineTest(unittest.IsolatedAsyncioTestCase):
                 "mim_arm.propose_capture_frame",
                 "mim_arm.execute_safe_home",
                 "mim_arm.execute_scan_pose",
+                "mim_arm.execute_capture_frame",
             },
         )
+
+    def test_control_readiness_advertises_all_bounded_live_actions(self):
+        readiness = mim_arm.build_mim_arm_control_readiness(
+            {
+                "arm_online": True,
+                "app_alive": True,
+                "source_host": "raspberrypi",
+                "host_timestamp": datetime.now(timezone.utc).isoformat(),
+                "arm_state_probe": {"available": True},
+                "serial_ready": True,
+                "tod_execution_allowed": True,
+                "motion_allowed": True,
+                "motion_block_reasons": [],
+                "estop_ok": True,
+                "estop_supported": True,
+                "source_artifacts": {
+                    "arm_status": __file__,
+                    "arm_host_state": __file__,
+                },
+            }
+        )
+
+        self.assertEqual(
+            readiness["current_authority"]["allowed_live_actions"],
+            ["safe_home", "scan_pose", "capture_frame"],
+        )
+        self.assertIn("capture_frame", readiness["recommended_next_step"])
 
     async def test_execute_safe_home_requires_confirmation_without_explicit_approval(self):
         db = _FakeDB()
@@ -517,6 +550,7 @@ class MimArmControlledAccessBaselineTest(unittest.IsolatedAsyncioTestCase):
             dispatch_decision="auto_dispatch",
             status="dispatched",
             reason="approved_for_dispatch",
+            arguments_json={"target_pose": "safe_home", "action": "safe_home"},
             feedback_json={
                 "execution_policy_gate": {"dispatch_decision": "auto_dispatch"},
                 "arm_execution": {"approval_state": "explicit_operator_approval"},
@@ -659,6 +693,65 @@ class MimArmControlledAccessBaselineTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             response["execution"]["bridge_publication"]["task_id"],
             "objective-109-task-mim-arm-scan-pose-991",
+        )
+        self.assertTrue(
+            response["execution"]["feedback_json"]["tod_bridge_publication"]["local_written"]
+        )
+
+    async def test_execute_capture_frame_explicit_approval_publishes_tod_bridge_projection(self):
+        db = _FakeDB()
+        status_surface = {
+            "arm_online": True,
+            "camera_online": True,
+            "serial_ready": True,
+            "estop_ok": True,
+            "current_pose": "scan_pose",
+            "mode": "development",
+            "tod_execution_allowed": True,
+            "motion_allowed": True,
+            "self_health": {
+                "status": "healthy",
+                "requires_confirmation": False,
+                "summary": "Self-health is healthy; bounded arm proposals remain eligible for TOD review.",
+            },
+        }
+        fake_execution = SimpleNamespace(
+            id=992,
+            capability_name="mim_arm.execute_capture_frame",
+            requested_executor="tod",
+            dispatch_decision="auto_dispatch",
+            status="dispatched",
+            reason="approved_for_dispatch",
+            feedback_json={
+                "execution_policy_gate": {"dispatch_decision": "auto_dispatch"},
+            },
+        )
+
+        with patch.object(mim_arm, "load_mim_arm_status_surface", return_value=status_surface), patch.object(
+            mim_arm.gateway_router,
+            "_create_or_update_execution_binding",
+            AsyncMock(return_value=fake_execution),
+        ), patch.object(
+            mim_arm,
+            "publish_mim_arm_execution_to_tod",
+            return_value={"task_id": "objective-110-task-mim-arm-capture-frame-992", "local_written": True},
+        ) as publish_mock:
+            response = await mim_arm.execute_capture_frame(
+                payload=mim_arm.MimArmExecuteSafeHomeRequest(
+                    actor="operator",
+                    reason="publish capture frame bridge projection",
+                    explicit_operator_approval=True,
+                    shared_workspace_active=False,
+                ),
+                db=db,
+            )
+
+        publish_mock.assert_called_once()
+        self.assertEqual(response["resolution"]["outcome"], "auto_execute")
+        self.assertEqual(response["execution"]["capability_name"], "mim_arm.execute_capture_frame")
+        self.assertEqual(
+            response["execution"]["bridge_publication"]["task_id"],
+            "objective-110-task-mim-arm-capture-frame-992",
         )
         self.assertTrue(
             response["execution"]["feedback_json"]["tod_bridge_publication"]["local_written"]
@@ -1034,3 +1127,20 @@ class MimArmControlledAccessBaselineTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(dispatch_telemetry["dispatch_status"], "published_local")
         self.assertEqual(dispatch_telemetry["completion_status"], "pending")
         self.assertEqual(per_dispatch["request_id"], expected_request_id)
+
+    def test_publish_mim_arm_execution_to_tod_requires_explicit_action_identity(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fake_execution = SimpleNamespace(
+                id=207748,
+                capability_name="mim_arm.execute_capture_frame",
+                requested_executor="tod",
+                arguments_json={},
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "explicit action identity"):
+                mim_arm.publish_mim_arm_execution_to_tod(
+                    execution=fake_execution,
+                    status={"arm_online": True},
+                    shared_root=root,
+                )

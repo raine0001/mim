@@ -29,10 +29,37 @@ DEFAULT_LOCAL_TASK_RESULT = DEFAULT_SHARED_DIR / "TOD_MIM_TASK_RESULT.latest.jso
 DEFAULT_LOCAL_HOST_STATE = DEFAULT_SHARED_DIR / "mim_arm_host_state.latest.json"
 DEFAULT_DISPATCH_TELEMETRY_ENDPOINT_TEMPLATE = "/mim/arm/dispatch-telemetry/{request_id}"
 HOST_STATE_SYNC_SCRIPT = PROJECT_ROOT / "scripts" / "sync_mim_arm_host_state.py"
+BOUNDED_LIVE_ACTIONS = ("capture_frame", "safe_home", "scan_pose")
 
 
 def _action_slug(action: str) -> str:
-    return str(action or "safe_home").strip().replace("_", "-") or "safe-home"
+    return str(action or "").strip().replace("_", "-")
+
+
+def _proof_chain_requirements(
+    *,
+    dispatch_telemetry_available: bool,
+    dispatch_telemetry_request_match: bool,
+    dispatch_telemetry_task_match: bool,
+    dispatch_telemetry_correlation_match: bool,
+    dispatch_telemetry_host_received: bool,
+    dispatch_telemetry_host_completed: bool,
+    task_ack_matched: bool,
+    task_result_matched: bool,
+    host_attribution_matched: bool,
+) -> dict[str, bool]:
+    return {
+        "dispatch_telemetry_present": bool(dispatch_telemetry_available),
+        "request_task_correlation_aligned": bool(
+            dispatch_telemetry_request_match
+            and dispatch_telemetry_task_match
+            and dispatch_telemetry_correlation_match
+        ),
+        "host_received_timestamp_present": bool(dispatch_telemetry_host_received),
+        "host_completed_timestamp_present": bool(dispatch_telemetry_host_completed),
+        "tod_ack_result_aligned": bool(task_ack_matched and task_result_matched),
+        "explicit_host_attribution_present": bool(host_attribution_matched),
+    }
 
 
 def _utcnow() -> str:
@@ -375,7 +402,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--poll-timeout-seconds", type=int, default=90)
     parser.add_argument("--poll-interval-seconds", type=float, default=2.0)
     parser.add_argument("--report-dir", default=str(DEFAULT_REPORT_DIR))
-    parser.add_argument("--action", default="safe_home")
+    parser.add_argument("--action", default="safe_home", choices=sorted(BOUNDED_LIVE_ACTIONS))
     parser.add_argument("--actor", default="operator")
     parser.add_argument("--reason", default="controlled bounded dispatch attribution verification")
     parser.add_argument("--shared-workspace-active", action="store_true")
@@ -388,6 +415,8 @@ def main() -> int:
     started_at = _utcnow()
     action_name = str(args.action or "safe_home").strip() or "safe_home"
     action_slug = _action_slug(action_name)
+    if not action_slug:
+        raise RuntimeError("A bounded action must be explicit for dispatch attribution checks.")
 
     command_status_before, command_status_before_error = _best_effort_remote_json(
         host=str(args.remote_host),
@@ -508,6 +537,18 @@ def main() -> int:
     arm_matches = _find_matches(merged_host_after, dispatch_identifier)
     before_evidence = _extract_command_evidence(merged_host_before)
     after_evidence = _extract_command_evidence(merged_host_after)
+    proof_requirements = _proof_chain_requirements(
+        dispatch_telemetry_available=bool(dispatch_telemetry) and not bool(dispatch_telemetry_error),
+        dispatch_telemetry_request_match=dispatch_telemetry_request_match,
+        dispatch_telemetry_task_match=dispatch_telemetry_task_match,
+        dispatch_telemetry_correlation_match=dispatch_telemetry_correlation_match,
+        dispatch_telemetry_host_received=dispatch_telemetry_host_received,
+        dispatch_telemetry_host_completed=dispatch_telemetry_host_completed,
+        task_ack_matched=bool(task_ack_match.get("matched")),
+        task_result_matched=bool(task_result_match.get("matched")),
+        host_attribution_matched=bool(arm_matches),
+    )
+    proof_chain_complete = bool(publication_boundary_matches and all(proof_requirements.values()))
 
     report = {
         "check_type": "mim_arm_dispatch_attribution_check",
@@ -597,6 +638,7 @@ def main() -> int:
             "dispatch_identifier": dispatch_identifier,
             "dispatch_identifier_kind": identifier_kind,
             "remote_publication_boundary_matches_dispatch_identifier": publication_boundary_matches,
+            "proof_requirements": proof_requirements,
             "remote_command_status_available": remote_status_available and not bool(command_status_after_error),
             "remote_command_status_surface_kind": remote_status_classification.get("surface_kind"),
             "remote_command_status_dispatch_identifier_expected": remote_status_classification.get("dispatch_identifier_expected_on_surface"),
@@ -621,18 +663,7 @@ def main() -> int:
             "host_explicitly_attributes_fresh_dispatch_identifier": bool(arm_matches),
             "host_after_request_id": after_evidence.get("request_id"),
             "host_after_task_id": after_evidence.get("task_id"),
-            "proof_chain_complete": bool(
-                publication_boundary_matches
-                and bool(dispatch_telemetry)
-                and dispatch_telemetry_request_match
-                and dispatch_telemetry_task_match
-                and dispatch_telemetry_correlation_match
-                and dispatch_telemetry_host_received
-                and dispatch_telemetry_host_completed
-                and bool(task_ack_match.get("matched"))
-                and bool(task_result_match.get("matched"))
-                and arm_matches
-            ),
+            "proof_chain_complete": proof_chain_complete,
         },
     }
 
@@ -641,7 +672,7 @@ def main() -> int:
     report_path = report_dir / f"mim_arm_dispatch_attribution_check.{dispatch_identifier}.json"
     report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(json.dumps({"report_path": str(report_path), "report": report}, indent=2))
-    return 0 if bool(report["summary"]["proof_chain_complete"]) else 1
+    return 0 if proof_chain_complete else 1
 
 
 if __name__ == "__main__":

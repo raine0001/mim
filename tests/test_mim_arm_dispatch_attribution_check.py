@@ -17,8 +17,8 @@ class DispatchIdentifierResolutionTests(unittest.TestCase):
     def test_action_slug_converts_underscores_to_hyphens(self) -> None:
         self.assertEqual(MODULE._action_slug("scan_pose"), "scan-pose")
 
-    def test_action_slug_defaults_when_empty(self) -> None:
-        self.assertEqual(MODULE._action_slug(""), "safe-home")
+    def test_action_slug_stays_empty_when_action_is_missing(self) -> None:
+        self.assertEqual(MODULE._action_slug(""), "")
 
     def test_prefers_bridge_task_id_when_present(self) -> None:
         id_kind, identifier = MODULE._resolve_dispatch_identifier(
@@ -207,6 +207,48 @@ class RemoteCommandStatusClassificationTests(unittest.TestCase):
         self.assertTrue(classification["supports_dispatch_consumption_proof"])
         self.assertTrue(classification["fresh_dispatch_identifier_visible"])
         self.assertTrue(classification["fresh_dispatch_identifier_consumed_on_surface"])
+
+
+class ProofChainRequirementTests(unittest.TestCase):
+    def test_proof_chain_requirements_require_shared_alignment_fields(self) -> None:
+        requirements = MODULE._proof_chain_requirements(
+            dispatch_telemetry_available=True,
+            dispatch_telemetry_request_match=True,
+            dispatch_telemetry_task_match=True,
+            dispatch_telemetry_correlation_match=True,
+            dispatch_telemetry_host_received=True,
+            dispatch_telemetry_host_completed=True,
+            task_ack_matched=True,
+            task_result_matched=True,
+            host_attribution_matched=True,
+        )
+
+        self.assertEqual(
+            requirements,
+            {
+                "dispatch_telemetry_present": True,
+                "request_task_correlation_aligned": True,
+                "host_received_timestamp_present": True,
+                "host_completed_timestamp_present": True,
+                "tod_ack_result_aligned": True,
+                "explicit_host_attribution_present": True,
+            },
+        )
+
+    def test_proof_chain_requirements_fail_when_ack_or_result_missing(self) -> None:
+        requirements = MODULE._proof_chain_requirements(
+            dispatch_telemetry_available=True,
+            dispatch_telemetry_request_match=True,
+            dispatch_telemetry_task_match=True,
+            dispatch_telemetry_correlation_match=True,
+            dispatch_telemetry_host_received=True,
+            dispatch_telemetry_host_completed=True,
+            task_ack_matched=True,
+            task_result_matched=False,
+            host_attribution_matched=True,
+        )
+
+        self.assertFalse(requirements["tod_ack_result_aligned"])
 
 
 if __name__ == "__main__":

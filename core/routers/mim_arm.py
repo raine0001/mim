@@ -46,6 +46,7 @@ BRIDGE_SEQUENCE_SCRIPT = PROJECT_ROOT / "scripts" / "bridge_packet_sequence.py"
 TOD_REMOTE_PUBLISH_SCRIPT = PROJECT_ROOT / "scripts" / "publish_tod_bridge_artifacts_remote.py"
 TOD_BRIDGE_AUDIT_SCRIPT = PROJECT_ROOT / "scripts" / "tod_bridge_audit.py"
 MIM_ARM_ENV_FILE = PROJECT_ROOT / "env" / ".env"
+BOUNDED_LIVE_ACTIONS = ("safe_home", "scan_pose", "capture_frame")
 
 MIM_ARM_CAPABILITY_DEFINITIONS = [
     {
@@ -171,7 +172,7 @@ MIM_ARM_CAPABILITY_DEFINITIONS = [
     {
         "capability_name": "mim_arm.execute_safe_home",
         "category": "manipulation",
-        "description": "Dispatch the first live governed motion to TOD: safe_home only.",
+        "description": "Dispatch a governed bounded safe_home action to TOD.",
         "requires_confirmation": True,
         "enabled": True,
         "safety_policy": {
@@ -185,7 +186,7 @@ MIM_ARM_CAPABILITY_DEFINITIONS = [
     {
         "capability_name": "mim_arm.execute_scan_pose",
         "category": "manipulation",
-        "description": "Dispatch the second bounded governed motion to TOD: scan_pose only.",
+        "description": "Dispatch a governed bounded scan_pose action to TOD.",
         "requires_confirmation": True,
         "enabled": True,
         "safety_policy": {
@@ -193,6 +194,20 @@ MIM_ARM_CAPABILITY_DEFINITIONS = [
             "mode": "operator_guarded",
             "executor": "tod",
             "allowed_targets": ["scan_pose"],
+            "operator_approval_required_for_execution": True,
+        },
+    },
+    {
+        "capability_name": "mim_arm.execute_capture_frame",
+        "category": "manipulation",
+        "description": "Dispatch a governed bounded capture_frame action to TOD.",
+        "requires_confirmation": True,
+        "enabled": True,
+        "safety_policy": {
+            "stage": "bounded_execution",
+            "mode": "operator_guarded",
+            "executor": "tod",
+            "allowed_targets": ["capture_frame"],
             "operator_approval_required_for_execution": True,
         },
     },
@@ -215,9 +230,20 @@ def _action_display_name(action_name: str) -> str:
     return str(action_name or "").strip().replace("_", " ")
 
 
+def _bounded_live_actions_phrase() -> str:
+    action_names = [str(action).strip() for action in BOUNDED_LIVE_ACTIONS if str(action).strip()]
+    if not action_names:
+        return ""
+    if len(action_names) == 1:
+        return action_names[0]
+    return f"{', '.join(action_names[:-1])}, or {action_names[-1]}"
+
+
 def _bounded_action_execution_phrase(action_name: str) -> str:
     if action_name in {"safe_home", "scan_pose"}:
         return f"Move the arm to the {action_name} pose via TOD-governed bounded execution."
+    if action_name == "capture_frame":
+        return "Capture one bounded frame via TOD-governed execution."
     return f"Execute bounded {action_name} via TOD-governed execution."
 
 
@@ -459,6 +485,8 @@ def publish_mim_arm_execution_to_tod(
     _load_mim_arm_env_defaults()
 
     action_name = _resolve_execution_action_name(execution)
+    if not action_name:
+        raise RuntimeError("Bounded MIM arm execution publish requires explicit action identity.")
     action_slug = _action_slug(action_name)
     action_display = _action_display_name(action_name)
     capability_name = str(getattr(execution, "capability_name", f"mim_arm.execute_{action_name}") or f"mim_arm.execute_{action_name}").strip()
@@ -1071,16 +1099,16 @@ def build_mim_arm_control_readiness(
         else:
             recommended_next_step = "Clear remaining controller or readiness blockers before first live bounded dispatch."
     elif status.get("estop_supported") is False:
-        recommended_next_step = "Bounded safe_home and scan_pose are available, but integrate explicit emergency-stop support before promoting beyond bounded managed access."
+        recommended_next_step = f"Bounded {_bounded_live_actions_phrase()} are available, but integrate explicit emergency-stop support before promoting beyond bounded managed access."
     else:
-        recommended_next_step = "MIM can request bounded safe_home or scan_pose execution once operator approval is supplied."
+        recommended_next_step = f"MIM can request bounded {_bounded_live_actions_phrase()} execution once operator approval is supplied."
 
     return {
         "generated_at": _utcnow(),
         "current_authority": {
             "executor": "tod",
             "operator_approval_required": True,
-            "allowed_live_actions": ["safe_home", "scan_pose"],
+            "allowed_live_actions": list(BOUNDED_LIVE_ACTIONS),
             "bounded_live_control_route_available": True,
         },
         "access": {
@@ -1789,6 +1817,19 @@ async def execute_scan_pose(
         db=db,
         action_name="scan_pose",
         capability_name="mim_arm.execute_scan_pose",
+    )
+
+
+@router.post("/executions/capture-frame")
+async def execute_capture_frame(
+    payload: MimArmExecuteSafeHomeRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, object]:
+    return await _execute_bounded_pose(
+        payload=payload,
+        db=db,
+        action_name="capture_frame",
+        capability_name="mim_arm.execute_capture_frame",
     )
 
 
