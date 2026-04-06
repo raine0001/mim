@@ -1,0 +1,452 @@
+contract_name: TOD_MIM_COMMUNICATION_CONTRACT
+contract_version: v1
+schema_version: 2026-04-02-communication-contract-v1
+generated_by: MIM
+generated_role_set:
+  - execution_side_system_builder
+  - communication_governance_architect
+  - authoritative_contract_generator
+canonicality:
+  single_contract_required: true
+  authoritative_source: MIM
+  consumer_role: TOD
+  reinterpretation_allowed: false
+  implied_behavior_allowed: false
+  ambiguous_behavior_allowed: false
+  multiple_truth_surfaces_allowed: false
+  parallel_writers_allowed: false
+contract_identity:
+  artifact_name: TOD_MIM_COMMUNICATION_CONTRACT.v1.yaml
+  human_companion_name: TOD_MIM_COMMUNICATION_CONTRACT.v1.md
+  validator_name: TOD_MIM_COMMUNICATION_CONTRACT.v1.schema.json
+  transmission_mode: atomic_single_payload
+  transmission_requirements:
+    include_contract_version: true
+    include_checksum_sha256: true
+    include_generation_timestamp: true
+    include_source_identity: true
+    require_tod_receipt_ack: true
+    require_tod_checksum_match_confirmation: true
+    require_tod_no_reinterpretation_confirmation: true
+transport_layer:
+  primary_transport:
+    transport_id: mim_server_shared_artifact_boundary
+    authority_surface: /home/testpilot/mim/runtime/shared
+    local_mirror_surface: /home/testpilot/mim/runtime/shared
+    local_mirror_authoritative: true
+    update_rule: write_latest_and_emit_trigger
+    polling_expectation_seconds: 2
+    ack_service_level_seconds: 10
+  fallback_transport:
+    transport_id: bounded_http_fallback_control
+    activation_rule: primary_transport_unavailable_or_reconciliation_blocked
+    allowed_for_execution: false
+    allowed_for_contract_distribution: true
+    purpose:
+      - heartbeat_exchange
+      - contract_distribution_receipt
+      - reconciliation_request
+      - health_probe
+  delivery_semantics:
+    request_cardinality: exactly_one_active_request_per_request_id
+    ack_cardinality: at_most_one_terminal_ack_per_request_id
+    result_cardinality: at_most_one_terminal_result_per_request_id
+    duplicate_execution_allowed: false
+    superseded_request_execution_allowed: false
+    stale_request_execution_allowed: false
+    idempotency_key: request_id
+artifact_surfaces:
+  request:
+    filename: MIM_TOD_TASK_REQUEST.latest.json
+    writer: MIM
+    readers:
+      - TOD
+    domain: execution_request
+  task_ack:
+    filename: TOD_MIM_TASK_ACK.latest.json
+    writer: TOD
+    readers:
+      - MIM
+    domain: execution_ack
+  task_result:
+    filename: TOD_MIM_TASK_RESULT.latest.json
+    writer: TOD
+    readers:
+      - MIM
+    domain: execution_result
+  mim_to_tod_trigger:
+    filename: MIM_TO_TOD_TRIGGER.latest.json
+    writer: MIM
+    readers:
+      - TOD
+    domain: trigger
+  tod_to_mim_trigger_ack:
+    filename: TOD_TO_MIM_TRIGGER_ACK.latest.json
+    writer: TOD
+    readers:
+      - MIM
+    domain: trigger_ack
+  tod_to_mim_trigger:
+    filename: TOD_TO_MIM_TRIGGER.latest.json
+    writer: TOD
+    readers:
+      - MIM
+    domain: trigger
+  mim_to_tod_trigger_ack:
+    filename: MIM_TO_TOD_TRIGGER_ACK.latest.json
+    writer: MIM
+    readers:
+      - TOD
+    domain: trigger_ack
+  mim_to_tod_ping:
+    filename: MIM_TO_TOD_PING.latest.json
+    writer: MIM
+    readers:
+      - TOD
+    domain: heartbeat
+  tod_to_mim_ping:
+    filename: TOD_TO_MIM_PING.latest.json
+    writer: TOD
+    readers:
+      - MIM
+    domain: heartbeat
+  communication_contract_receipt:
+    filename: TOD_MIM_CONTRACT_RECEIPT.latest.json
+    writer: TOD
+    readers:
+      - MIM
+    domain: contract_receipt
+single_authority_per_domain:
+  execution_request: MIM
+  execution_ack: TOD
+  execution_result: TOD
+  trigger_mim_to_tod: MIM
+  trigger_tod_to_mim: TOD
+  trigger_ack_mim_to_tod: MIM
+  trigger_ack_tod_to_mim: TOD
+  heartbeat_mim_to_tod: MIM
+  heartbeat_tod_to_mim: TOD
+  contract_definition: MIM
+  contract_receipt: TOD
+message_envelope:
+  required_fields:
+    - packet_type
+    - schema_version
+    - contract_version
+    - generated_at
+    - source_identity
+    - transport
+    - objective_id
+    - request_id
+    - correlation_id
+    - message_kind
+    - sequence
+  field_rules:
+    packet_type: non_empty_string
+    schema_version: exact_match_contract_schema_version
+    contract_version: exact_match_contract_version
+    generated_at: utc_iso8601
+    source_identity: object_with_actor_host_service_instance
+    transport: object_with_transport_id_and_surface
+    objective_id: non_empty_string
+    task_id: optional_non_empty_string_when_registry_linked
+    request_id: non_empty_string
+    correlation_id: non_empty_string
+    message_kind: enum
+    sequence: positive_integer
+message_kinds:
+  request:
+    packet_type: mim-tod-task-request-v1
+    status_values:
+      - proposed
+      - posted
+      - superseded
+      - cancelled
+    additional_required_fields:
+      - task_classification
+      - target_executor
+      - command
+      - execution_policy
+      - idempotency
+      - fallback_policy
+  ack:
+    packet_type: tod-mim-task-ack-v1
+    status_values:
+      - accepted
+      - rejected
+      - superseded_ignored
+      - stale_ignored
+    additional_required_fields:
+      - task_id
+      - ack_status
+      - acknowledged_trigger_sequence
+      - ack_reason_code
+  result:
+    packet_type: tod-mim-task-result-v1
+    status_values:
+      - succeeded
+      - failed
+      - timed_out
+      - aborted
+      - blocked
+    additional_required_fields:
+      - task_id
+      - result_status
+      - terminal
+      - execution_outcome
+      - result_reason_code
+  heartbeat:
+    packet_type: tod-mim-heartbeat-v1
+    status_values:
+      - alive
+      - degraded
+      - unavailable
+    additional_required_fields:
+      - task_id
+      - heartbeat_status
+      - responds_to
+      - freshness
+  fallback:
+    packet_type: tod-mim-fallback-activation-v1
+    status_values:
+      - proposed
+      - active
+      - cleared
+      - denied
+    additional_required_fields:
+      - task_id
+      - fallback_reason_code
+      - primary_transport_state
+      - fallback_scope
+task_classification_model:
+  task_classes:
+    - diagnostic
+    - governed_execution
+    - coordination
+    - status_sync
+    - reconciliation
+    - contract_distribution
+  execution_classes:
+    - bounded_motion
+    - bounded_macro
+    - status_probe
+    - bridge_recovery
+  classification_rules:
+    diagnostic: no physical execution side effect
+    governed_execution: physical or bounded executor dispatch allowed
+    coordination: state agreement or authority exchange only
+    status_sync: mirror or snapshot refresh only
+    reconciliation: mismatch repair or truth-surface re-alignment
+    contract_distribution: canonical contract publication and receipt only
+authority_and_decision_weighting_model:
+  invariants:
+    - hard safety and execution readiness block execution before request promotion
+    - operator approval may permit execution only when safety does not hard-block
+    - stale learned or advisory signals cannot override fresh blocking signals
+  precedence_order:
+    - explicit_operator_approval
+    - hard_safety_escalation
+    - execution_readiness_block
+    - degraded_health_confirmation
+    - benign_healthy_auto_execution
+  request_acceptance_preconditions:
+    - one_authoritative_request_surface
+    - current_request_id_not_superseded
+    - execution_readiness_policy_outcome_not_block
+    - no_active_hard_stop_override
+    - single_writer_integrity_preserved
+heartbeat_protocol:
+  ping_artifacts:
+    request_file: MIM_TO_TOD_PING.latest.json
+    response_file: TOD_TO_MIM_PING.latest.json
+  trigger_integration: true
+  poll_seconds: 3
+  stale_seconds: 45
+  cooldown_seconds: 30
+  receiver_requirements:
+    - receiver_must_write_trigger_ack
+    - receiver_must_write_heartbeat_response
+    - receiver_must_report_current_authoritative_task_id
+fallback_channel_spec:
+  activation_conditions:
+    - trigger_ack_missing_beyond_service_level
+    - authoritative_surface_unreachable
+    - checksum_mismatch_on_contract_distribution
+    - reconciliation_deadlock_detected
+  forbidden_behaviors:
+    - no_new_execution_writer
+    - no_parallel_request_surface
+    - no_schema_mutation_during_fallback
+  allowed_payloads:
+    - heartbeat
+    - reconciliation_request
+    - contract_distribution_receipt
+    - health_probe
+state_reconciliation_protocol:
+  reconciliation_triggers:
+    - request_id_mismatch_between_request_ack_result
+    - trigger_ack_not_current
+    - checksum_mismatch
+    - authoritative_task_disagreement
+  reconciliation_steps:
+    - freeze_new_execution_promotion
+    - identify_authoritative_surface
+    - compare_request_ack_result_request_ids
+    - compare_trigger_and_trigger_ack_sequences
+    - emit_reconciliation_record
+    - require_single_authoritative_task_resolution
+    - resume_only_after_consistency_pass
+  reconciliation_outcomes:
+    - reconciled
+    - blocked_requires_operator
+    - blocked_requires_listener_recovery
+    - blocked_requires_contract_retransmission
+audit_requirements:
+  mandatory_audit_fields:
+    - contract_version
+    - packet_type
+    - generated_at
+    - source_identity
+    - request_id
+    - task_id
+    - correlation_id
+    - checksum_sha256
+    - authoritative_surface
+  audit_events:
+    - request_written
+    - trigger_emitted
+    - ack_received
+    - result_received
+    - heartbeat_timeout
+    - fallback_activated
+    - reconciliation_started
+    - reconciliation_completed
+    - contract_transmitted
+    - contract_receipt_verified
+mode_system:
+  modes:
+    shadow:
+      description: primary contract written and validated without production cutover authority
+      execution_allowed: false
+      fallback_allowed: true
+    primary:
+      description: authoritative contract transport active for live coordination
+      execution_allowed: true
+      fallback_allowed: true
+    degraded:
+      description: primary active but missing service-level guarantees; execution may be blocked by policy
+      execution_allowed: conditional
+      fallback_allowed: true
+    rollback:
+      description: revert to prior validated transport posture
+      execution_allowed: false
+      fallback_allowed: true
+failure_classification_taxonomy:
+  categories:
+    writer_integrity_failure:
+      codes:
+        - multiple_latest_writers_detected
+        - local_writer_claimed_authority
+    authority_failure:
+      codes:
+        - ambiguous_authority_surface
+        - competing_authoritative_task_ids
+    transport_failure:
+      codes:
+        - trigger_ack_timeout
+        - shared_surface_unreachable
+        - fallback_unreachable
+    schema_failure:
+      codes:
+        - checksum_mismatch
+        - invalid_packet_shape
+        - contract_version_mismatch
+    state_failure:
+      codes:
+        - task_ack_request_mismatch
+        - task_result_request_mismatch
+        - trigger_sequence_mismatch
+        - stale_request_ignored
+    execution_failure:
+      codes:
+        - execution_readiness_blocked
+        - operator_confirmation_required
+        - executor_failed
+        - executor_timed_out
+self_validation_requirements:
+  required_simulations:
+    - request_ack_result_happy_path
+    - peer_unavailable
+    - retry_and_idempotency
+    - state_mismatch_and_reconciliation
+    - fallback_activation
+    - superseded_request_ignored
+  required_verifications:
+    - no_ambiguous_authority
+    - no_multiple_writers
+    - no_conflicting_flows
+    - exactly_one_ack_and_one_result_for_one_request
+    - no_duplicate_execution_under_retry
+  stop_rule:
+    if_any_verification_fails: stop_fix_revalidate_before_transmission
+TOD_IMPLEMENTATION_DIRECTIVE:
+  authoritative_instruction: TOD must implement against this contract exactly.
+  tod_must_not:
+    - redefine_message_schema
+    - create_alternate_transport_paths
+    - introduce_new_writers_for_defined_domains
+    - silently_resolve_contract_conflicts
+  tod_must:
+    - treat_this_contract_as_authoritative
+    - report_any_implementation_conflict_back_to_MIM
+    - acknowledge_receipt_with_checksum_match
+    - confirm_no_reinterpretation
+migration_plan:
+  current_state: split_file_based_transport_with_fragmented_rules
+  target_state: single_contract_governed_transport
+  phases:
+    - phase: shadow_mode
+      requirements:
+        - publish_contract_without_cutover
+        - validate_schema_against_shadow_packets
+        - verify_single_writer_integrity
+    - phase: cutover_readiness
+      requirements:
+        - ack_freshness_mutates_across_two_cycles
+        - request_ack_result_request_ids_match
+        - fallback_channel_validated
+        - contract_receipt_verified_by_TOD
+    - phase: cutover
+      requirements:
+        - make_contract_primary_for_all_defined_domains
+        - disable_parallel_writers
+        - preserve_audit_and_reconciliation_paths
+    - phase: rollback
+      requirements:
+        - revert_to_last_validated_transport_profile
+        - preserve_request_identity_and_audit_history
+cutover_conditions:
+  - single_authority_per_domain_confirmed
+  - shadow_validation_all_green
+  - TOD_contract_receipt_checksum_match_confirmed
+  - no_parallel_writer_detected
+rollback_plan:
+  trigger_conditions:
+    - contract_checksum_mismatch
+    - multiple_writers_reappear
+    - reconciliation_cannot_restore_single_truth
+    - fallback_path_invalid
+  actions:
+    - freeze_new_execution_promotion
+    - revert_to_last_validated_transport_profile
+    - emit_rollback_audit_record
+    - require_operator_review_before_recutover
+success_criteria:
+  - one_request_produces_one_ack_and_one_result
+  - no_duplicate_execution_occurs_under_retry
+  - both_systems_agree_on_objective_task_and_request_identity
+  - fallback_operates_when_primary_is_down
+  - state_mismatch_triggers_reconciliation_not_drift
+  - no_multiple_latest_writers_exist
+  - no_multiple_truth_surfaces_exist
+  - authority_is_unambiguous_for_every_defined_domain

@@ -1,0 +1,207 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mim.local/contracts/TOD_MIM_COMMUNICATION_CONTRACT.v1.schema.json",
+  "title": "TOD_MIM_COMMUNICATION_CONTRACT.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_name",
+    "contract_version",
+    "schema_version",
+    "generated_by",
+    "generated_role_set",
+    "canonicality",
+    "contract_identity",
+    "transport_layer",
+    "artifact_surfaces",
+    "single_authority_per_domain",
+    "message_envelope",
+    "message_kinds",
+    "task_classification_model",
+    "authority_and_decision_weighting_model",
+    "heartbeat_protocol",
+    "fallback_channel_spec",
+    "state_reconciliation_protocol",
+    "audit_requirements",
+    "mode_system",
+    "failure_classification_taxonomy",
+    "self_validation_requirements",
+    "TOD_IMPLEMENTATION_DIRECTIVE",
+    "migration_plan",
+    "cutover_conditions",
+    "rollback_plan",
+    "success_criteria"
+  ],
+  "properties": {
+    "contract_name": {"const": "TOD_MIM_COMMUNICATION_CONTRACT"},
+    "contract_version": {"const": "v1"},
+    "schema_version": {"type": "string", "minLength": 1},
+    "generated_by": {"const": "MIM"},
+    "generated_role_set": {
+      "type": "array",
+      "minItems": 3,
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1}
+    },
+    "canonicality": {"$ref": "#/$defs/strictObject"},
+    "contract_identity": {"$ref": "#/$defs/strictObject"},
+    "transport_layer": {"$ref": "#/$defs/strictObject"},
+    "artifact_surfaces": {
+      "type": "object",
+      "additionalProperties": {"$ref": "#/$defs/artifactSurface"},
+      "minProperties": 5
+    },
+    "single_authority_per_domain": {
+      "type": "object",
+      "additionalProperties": {"type": "string", "enum": ["MIM", "TOD"]},
+      "minProperties": 6
+    },
+    "message_envelope": {"$ref": "#/$defs/messageEnvelope"},
+    "message_kinds": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["request", "ack", "result", "heartbeat", "fallback"],
+      "properties": {
+        "request": {"$ref": "#/$defs/messageKind"},
+        "ack": {"$ref": "#/$defs/messageKind"},
+        "result": {"$ref": "#/$defs/messageKind"},
+        "heartbeat": {"$ref": "#/$defs/messageKind"},
+        "fallback": {"$ref": "#/$defs/messageKind"}
+      }
+    },
+    "task_classification_model": {"$ref": "#/$defs/strictObject"},
+    "authority_and_decision_weighting_model": {"$ref": "#/$defs/strictObject"},
+    "heartbeat_protocol": {"$ref": "#/$defs/strictObject"},
+    "fallback_channel_spec": {"$ref": "#/$defs/strictObject"},
+    "state_reconciliation_protocol": {"$ref": "#/$defs/strictObject"},
+    "audit_requirements": {"$ref": "#/$defs/strictObject"},
+    "mode_system": {"$ref": "#/$defs/strictObject"},
+    "failure_classification_taxonomy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["categories"],
+      "properties": {
+        "categories": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["codes"],
+            "properties": {
+              "codes": {
+                "type": "array",
+                "minItems": 1,
+                "items": {"type": "string", "minLength": 1}
+              }
+            }
+          }
+        }
+      }
+    },
+    "self_validation_requirements": {"$ref": "#/$defs/strictObject"},
+    "TOD_IMPLEMENTATION_DIRECTIVE": {"$ref": "#/$defs/strictObject"},
+    "migration_plan": {"$ref": "#/$defs/migrationPlan"},
+    "cutover_conditions": {"$ref": "#/$defs/nonEmptyStringArray"},
+    "rollback_plan": {"$ref": "#/$defs/strictObject"},
+    "success_criteria": {"$ref": "#/$defs/nonEmptyStringArray"}
+  },
+  "$defs": {
+    "nonEmptyStringArray": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"type": "string", "minLength": 1}
+    },
+    "strictObject": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": true
+    },
+    "artifactSurface": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["filename", "writer", "readers", "domain"],
+      "properties": {
+        "filename": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+\\.json$"},
+        "writer": {"type": "string", "enum": ["MIM", "TOD"]},
+        "readers": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "string", "enum": ["MIM", "TOD"]}
+        },
+        "domain": {"type": "string", "minLength": 1}
+      }
+    },
+    "messageEnvelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["required_fields", "field_rules"],
+      "properties": {
+        "required_fields": {
+          "type": "array",
+          "minItems": 10,
+          "items": {"type": "string", "minLength": 1},
+          "contains": {"const": "request_id"}
+        },
+        "field_rules": {
+          "type": "object",
+          "additionalProperties": {"type": "string"},
+          "required": [
+            "packet_type",
+            "schema_version",
+            "contract_version",
+            "generated_at",
+            "source_identity",
+            "transport",
+            "objective_id",
+            "request_id",
+            "correlation_id",
+            "message_kind",
+            "sequence"
+          ]
+        }
+      }
+    },
+    "messageKind": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["packet_type", "status_values", "additional_required_fields"],
+      "properties": {
+        "packet_type": {"type": "string", "minLength": 1},
+        "status_values": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "string", "minLength": 1},
+          "uniqueItems": true
+        },
+        "additional_required_fields": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "string", "minLength": 1},
+          "uniqueItems": true
+        }
+      }
+    },
+    "migrationPlan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["current_state", "target_state", "phases"],
+      "properties": {
+        "current_state": {"type": "string", "minLength": 1},
+        "target_state": {"type": "string", "minLength": 1},
+        "phases": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["phase", "requirements"],
+            "properties": {
+              "phase": {"type": "string", "minLength": 1},
+              "requirements": {"$ref": "#/$defs/nonEmptyStringArray"}
+            }
+          }
+        }
+      }
+    }
+  }
+}
