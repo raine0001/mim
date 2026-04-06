@@ -8,7 +8,33 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
 from core.db import SessionLocal, get_db
+from core.execution_readiness_service import (
+    execution_readiness_policy_effects,
+    load_latest_execution_readiness,
+)
+from core.execution_policy_gate import (
+    build_intent_key,
+    evaluate_execution_policy_gate,
+    sync_execution_control_state,
+)
+from core.execution_trace_service import infer_managed_scope
 from core.journal import write_journal
+from core.routers.self_awareness_router import health_monitor as _mim_health_monitor
+from core.proposal_arbitration_learning_service import (
+    list_workspace_proposal_arbitration_learning,
+    list_workspace_proposal_arbitration_outcomes,
+    record_workspace_proposal_arbitration_outcome,
+    to_workspace_proposal_arbitration_out,
+    workspace_proposal_arbitration_learning_bias,
+)
+from core.proposal_policy_convergence_service import (
+    converge_workspace_proposal_policy_preference,
+    list_workspace_proposal_policy_preferences,
+)
+from core.policy_conflict_resolution_service import (
+    list_workspace_policy_conflict_profiles,
+    resolve_workspace_proposal_policy_conflict,
+)
 from core.autonomy_boundary_service import (
     evaluate_adaptive_autonomy_boundaries,
     get_autonomy_boundary_profile,
@@ -17,9 +43,66 @@ from core.autonomy_boundary_service import (
 )
 from core.constraint_service import evaluate_and_record_constraints
 from core.concept_memory_service import concept_influence_for_proposal
-from core.models import CapabilityExecution, CapabilityRegistration, InputEvent, SpeechOutputAction, Task, WorkspaceActionPlan, WorkspaceAutonomousChain, WorkspaceCapabilityChain, WorkspaceInterruptionEvent, WorkspaceMonitoringState, WorkspaceObjectMemory, WorkspaceObjectRelation, WorkspaceObservation, WorkspaceProposal, WorkspaceReplanSignal, WorkspaceTargetResolution, WorkspaceZone, WorkspaceZoneRelation
-from core.preferences import DEFAULT_USER_ID, apply_learning_signal, get_user_preference_payload, get_user_preference_value
-from core.schemas import AdaptiveAutonomyBoundaryEvaluateRequest, WorkspaceActionPlanAbortRequest, WorkspaceActionPlanCreateRequest, WorkspaceActionPlanDecisionRequest, WorkspaceActionPlanExecuteRequest, WorkspaceActionPlanHandoffRequest, WorkspaceActionPlanReplanRequest, WorkspaceActionPlanSimulationRequest, WorkspaceAutonomousChainAdvanceRequest, WorkspaceAutonomousChainApprovalRequest, WorkspaceAutonomousChainCreateRequest, WorkspaceAutonomyOverrideRequest, WorkspaceCapabilityChainAdvanceRequest, WorkspaceCapabilityChainCreateRequest, WorkspaceExecutionPauseRequest, WorkspaceExecutionPredictChangeRequest, WorkspaceExecutionProposalActionRequest, WorkspaceExecutionProposalCreateRequest, WorkspaceExecutionResumeRequest, WorkspaceExecutionStopRequest, WorkspaceHumanAwareSignalUpdateRequest, WorkspaceMonitoringStartRequest, WorkspaceMonitoringStopRequest, WorkspaceProposalActionRequest, WorkspaceProposalPriorityPolicyUpdateRequest, WorkspaceTargetConfirmRequest, WorkspaceTargetResolveRequest
+from core.models import (
+    CapabilityExecution,
+    CapabilityRegistration,
+    InputEvent,
+    SpeechOutputAction,
+    Task,
+    WorkspaceActionPlan,
+    WorkspaceAutonomousChain,
+    WorkspaceCapabilityChain,
+    WorkspaceInterruptionEvent,
+    WorkspaceMonitoringState,
+    WorkspaceObjectMemory,
+    WorkspaceObjectRelation,
+    WorkspaceObservation,
+    WorkspaceProposal,
+    WorkspaceReplanSignal,
+    WorkspaceTargetResolution,
+    WorkspaceZone,
+    WorkspaceZoneRelation,
+)
+from core.preferences import (
+    DEFAULT_USER_ID,
+    apply_learning_signal,
+    get_user_preference_payload,
+    get_user_preference_value,
+)
+from core.schemas import (
+    AdaptiveAutonomyBoundaryEvaluateRequest,
+    WorkspaceActionPlanAbortRequest,
+    WorkspaceActionPlanCreateRequest,
+    WorkspaceActionPlanDecisionRequest,
+    WorkspaceActionPlanExecuteRequest,
+    WorkspaceActionPlanHandoffRequest,
+    WorkspaceActionPlanReplanRequest,
+    WorkspaceActionPlanSimulationRequest,
+    WorkspaceAutonomousChainAdvanceRequest,
+    WorkspaceAutonomousChainApprovalRequest,
+    WorkspaceAutonomousChainCreateRequest,
+    WorkspaceAutonomyOverrideRequest,
+    WorkspaceCapabilityChainAdvanceRequest,
+    WorkspaceCapabilityChainCreateRequest,
+    WorkspaceExecutionPauseRequest,
+    WorkspaceExecutionPredictChangeRequest,
+    WorkspaceExecutionProposalActionRequest,
+    WorkspaceExecutionProposalCreateRequest,
+    WorkspaceExecutionResumeRequest,
+    WorkspaceExecutionStopRequest,
+    WorkspaceHumanAwareSignalUpdateRequest,
+    WorkspaceMonitoringStartRequest,
+    WorkspaceMonitoringStopRequest,
+    WorkspaceProposalActionRequest,
+    WorkspaceProposalArbitrationLearningOut,
+    WorkspaceProposalArbitrationOutcomeOut,
+    WorkspaceProposalArbitrationOutcomeRecordRequest,
+    WorkspacePolicyConflictProfileOut,
+    WorkspaceProposalPolicyPreferenceOut,
+    WorkspaceProposalPriorityPolicyUpdateRequest,
+    WorkspaceTargetConfirmRequest,
+    WorkspaceTargetResolveRequest,
+)
 
 router = APIRouter()
 
@@ -28,12 +111,42 @@ OUTDATED_WINDOW_SECONDS = 3600
 OBJECT_STALE_WINDOW_SECONDS = 7200
 
 DEFAULT_ZONE_GRAPH: dict[str, dict[str, list[str] | int]] = {
-    "front-left": {"adjacent_to": ["front-center", "rear-left"], "left_of": ["front-center"], "in_front_of": ["rear-left"], "hazard_level": 0},
-    "front-center": {"adjacent_to": ["front-left", "front-right", "rear-center"], "left_of": ["front-right"], "right_of": ["front-left"], "in_front_of": ["rear-center"], "hazard_level": 0},
-    "front-right": {"adjacent_to": ["front-center", "rear-right"], "right_of": ["front-center"], "in_front_of": ["rear-right"], "hazard_level": 0},
-    "rear-left": {"adjacent_to": ["rear-center", "front-left"], "left_of": ["rear-center"], "behind": ["front-left"], "hazard_level": 0},
-    "rear-center": {"adjacent_to": ["rear-left", "rear-right", "front-center"], "behind": ["front-center"], "hazard_level": 0},
-    "rear-right": {"adjacent_to": ["rear-center", "front-right"], "right_of": ["rear-center"], "behind": ["front-right"], "hazard_level": 0},
+    "front-left": {
+        "adjacent_to": ["front-center", "rear-left"],
+        "left_of": ["front-center"],
+        "in_front_of": ["rear-left"],
+        "hazard_level": 0,
+    },
+    "front-center": {
+        "adjacent_to": ["front-left", "front-right", "rear-center"],
+        "left_of": ["front-right"],
+        "right_of": ["front-left"],
+        "in_front_of": ["rear-center"],
+        "hazard_level": 0,
+    },
+    "front-right": {
+        "adjacent_to": ["front-center", "rear-right"],
+        "right_of": ["front-center"],
+        "in_front_of": ["rear-right"],
+        "hazard_level": 0,
+    },
+    "rear-left": {
+        "adjacent_to": ["rear-center", "front-left"],
+        "left_of": ["rear-center"],
+        "behind": ["front-left"],
+        "hazard_level": 0,
+    },
+    "rear-center": {
+        "adjacent_to": ["rear-left", "rear-right", "front-center"],
+        "behind": ["front-center"],
+        "hazard_level": 0,
+    },
+    "rear-right": {
+        "adjacent_to": ["rear-center", "front-right"],
+        "right_of": ["rear-center"],
+        "behind": ["front-right"],
+        "hazard_level": 0,
+    },
 }
 
 SAFE_ACTION_TYPES = {
@@ -187,6 +300,63 @@ PROPOSAL_PRIORITY_DEFAULT = {
 }
 
 
+def _health_detail_phrase(health_summary: dict) -> str:
+    """Return a brief phrase listing which metrics are actively degraded."""
+    if not isinstance(health_summary, dict):
+        return ""
+    _rate_metrics = {"api_error_rate", "cache_hit_rate"}
+    _ms_metrics = {"api_latency_ms", "state_bus_lag_ms"}
+    parts: list[str] = []
+    for name, trend in (health_summary.get("trends") or {}).items():
+        if not isinstance(trend, dict) or not trend.get("degradation_detected"):
+            continue
+        val = trend.get("current_value")
+        label = name.replace("_", " ")
+        if val is None:
+            parts.append(label)
+        elif name in _rate_metrics:
+            parts.append(f"{label} {float(val):.1%}")
+        elif name in _ms_metrics:
+            parts.append(f"{label} {float(val):.0f}ms")
+        else:
+            parts.append(f"{label} {float(val):.0f}%")
+    return ", ".join(parts[:2]) if parts else ""
+
+
+def _physical_execution_health_gate() -> dict[str, object]:
+    status = "healthy"
+    health_summary: dict = {}
+    try:
+        health_summary = _mim_health_monitor.get_health_summary() or {}
+        if isinstance(health_summary, dict):
+            status = str(health_summary.get("status", "healthy")).strip().lower() or "healthy"
+    except Exception:
+        status = "healthy"
+
+    if status in {"degraded", "critical"}:
+        detail = _health_detail_phrase(health_summary)
+        detail_suffix = f" ({detail})" if detail else ""
+        return {
+            "active": True,
+            "status": status,
+            "requested_decision": "requires_confirmation",
+            "requested_status": "pending_confirmation",
+            "requested_reason": "system_health_degraded",
+            "governance_summary": (
+                f"System health is {status}{detail_suffix}; physical execution remains confirmation-gated."
+            ),
+        }
+
+    return {
+        "active": False,
+        "status": status,
+        "requested_decision": "queued_for_executor",
+        "requested_status": "dispatched",
+        "requested_reason": "workspace_action_plan_execute",
+        "governance_summary": "",
+    }
+
+
 def _default_autonomy_state() -> dict:
     return {
         "auto_execution_enabled": True,
@@ -208,7 +378,11 @@ def _default_autonomy_state() -> dict:
 
 def _autonomy_state_from_monitoring(row: WorkspaceMonitoringState) -> dict:
     metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
-    raw = metadata.get("autonomy", {}) if isinstance(metadata.get("autonomy", {}), dict) else {}
+    raw = (
+        metadata.get("autonomy", {})
+        if isinstance(metadata.get("autonomy", {}), dict)
+        else {}
+    )
     defaults = _default_autonomy_state()
     merged = {
         **defaults,
@@ -216,17 +390,29 @@ def _autonomy_state_from_monitoring(row: WorkspaceMonitoringState) -> dict:
     }
     merged["zone_action_limits"] = {
         str(key): max(1, int(value))
-        for key, value in (merged.get("zone_action_limits", {}) if isinstance(merged.get("zone_action_limits", {}), dict) else {}).items()
+        for key, value in (
+            merged.get("zone_action_limits", {})
+            if isinstance(merged.get("zone_action_limits", {}), dict)
+            else {}
+        ).items()
         if str(key).strip()
     }
     merged["capability_cooldown_seconds"] = {
         str(key).strip(): max(0, int(value))
-        for key, value in (merged.get("capability_cooldown_seconds", {}) if isinstance(merged.get("capability_cooldown_seconds", {}), dict) else {}).items()
+        for key, value in (
+            merged.get("capability_cooldown_seconds", {})
+            if isinstance(merged.get("capability_cooldown_seconds", {}), dict)
+            else {}
+        ).items()
         if str(key).strip()
     }
     merged["restricted_zones"] = [
         _normalize_zone_for_map(str(item))
-        for item in (merged.get("restricted_zones", []) if isinstance(merged.get("restricted_zones", []), list) else [])
+        for item in (
+            merged.get("restricted_zones", [])
+            if isinstance(merged.get("restricted_zones", []), list)
+            else []
+        )
         if _normalize_zone_for_map(str(item))
     ]
     return merged
@@ -262,7 +448,11 @@ def _default_human_aware_state() -> dict:
 
 def _human_aware_state_from_monitoring(row: WorkspaceMonitoringState) -> dict:
     metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
-    raw = metadata.get("human_aware", {}) if isinstance(metadata.get("human_aware", {}), dict) else {}
+    raw = (
+        metadata.get("human_aware", {})
+        if isinstance(metadata.get("human_aware", {}), dict)
+        else {}
+    )
     defaults = _default_human_aware_state()
     merged = {
         **defaults,
@@ -280,7 +470,11 @@ def _human_aware_state_from_monitoring(row: WorkspaceMonitoringState) -> dict:
         normalized
         for normalized in (
             _normalize_zone_for_map(str(item))
-            for item in (merged.get("occupied_zones", []) if isinstance(merged.get("occupied_zones", []), list) else [])
+            for item in (
+                merged.get("occupied_zones", [])
+                if isinstance(merged.get("occupied_zones", []), list)
+                else []
+            )
         )
         if normalized
     ]
@@ -288,7 +482,11 @@ def _human_aware_state_from_monitoring(row: WorkspaceMonitoringState) -> dict:
         normalized
         for normalized in (
             _normalize_zone_for_map(str(item))
-            for item in (merged.get("high_proximity_zones", []) if isinstance(merged.get("high_proximity_zones", []), list) else [])
+            for item in (
+                merged.get("high_proximity_zones", [])
+                if isinstance(merged.get("high_proximity_zones", []), list)
+                else []
+            )
         )
         if normalized
     ]
@@ -296,7 +494,9 @@ def _human_aware_state_from_monitoring(row: WorkspaceMonitoringState) -> dict:
     updated_at = _parse_iso_to_utc(last_updated_at) if last_updated_at else None
     is_stale = True
     if updated_at is not None:
-        age_seconds = max((datetime.now(timezone.utc) - updated_at).total_seconds(), 0.0)
+        age_seconds = max(
+            (datetime.now(timezone.utc) - updated_at).total_seconds(), 0.0
+        )
         is_stale = age_seconds > HUMAN_AWARE_SIGNAL_STALE_AFTER_SECONDS
     if is_stale:
         merged["human_in_workspace"] = False
@@ -309,7 +509,9 @@ def _human_aware_state_from_monitoring(row: WorkspaceMonitoringState) -> dict:
     return merged
 
 
-def _store_human_aware_state(row: WorkspaceMonitoringState, human_aware_state: dict) -> None:
+def _store_human_aware_state(
+    row: WorkspaceMonitoringState, human_aware_state: dict
+) -> None:
     metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
     row.metadata_json = {
         **metadata,
@@ -321,53 +523,94 @@ def _is_physical_capability_step(capability: str) -> bool:
     return capability in HUMAN_AWARE_PHYSICAL_CAPABILITIES
 
 
-def _human_aware_policy_for_capability_step(*, step: dict, human_aware: dict) -> tuple[str, str]:
+def _human_aware_policy_for_capability_step(
+    *, step: dict, human_aware: dict
+) -> tuple[str, str]:
     capability = str(step.get("capability", "")).strip()
     params = step.get("params", {}) if isinstance(step.get("params", {}), dict) else {}
     normalized_zone = _normalize_zone_for_map(str(params.get("zone", "")))
 
-    if bool(human_aware.get("shared_workspace_active", False)) and bool(human_aware.get("human_in_workspace", False)):
+    if bool(human_aware.get("shared_workspace_active", False)) and bool(
+        human_aware.get("human_in_workspace", False)
+    ):
         return "pause", "shared_workspace_active"
 
-    if bool(human_aware.get("human_near_motion_path", False)) and _is_physical_capability_step(capability):
+    if bool(
+        human_aware.get("human_near_motion_path", False)
+    ) and _is_physical_capability_step(capability):
         return "stop_replan", "human_near_motion_path"
 
-    occupied = set(human_aware.get("occupied_zones", []) if isinstance(human_aware.get("occupied_zones", []), list) else [])
-    if normalized_zone and normalized_zone in occupied and _is_physical_capability_step(capability):
+    occupied = set(
+        human_aware.get("occupied_zones", [])
+        if isinstance(human_aware.get("occupied_zones", []), list)
+        else []
+    )
+    if (
+        normalized_zone
+        and normalized_zone in occupied
+        and _is_physical_capability_step(capability)
+    ):
         return "pause", "occupied_zone_no_autonomous_movement"
 
-    high_proximity = set(human_aware.get("high_proximity_zones", []) if isinstance(human_aware.get("high_proximity_zones", []), list) else [])
-    if normalized_zone and normalized_zone in high_proximity and _is_physical_capability_step(capability):
+    high_proximity = set(
+        human_aware.get("high_proximity_zones", [])
+        if isinstance(human_aware.get("high_proximity_zones", []), list)
+        else []
+    )
+    if (
+        normalized_zone
+        and normalized_zone in high_proximity
+        and _is_physical_capability_step(capability)
+    ):
         return "require_operator_confirmation", "high_proximity_zone"
 
-    if bool(human_aware.get("human_near_target_zone", False)) and _is_physical_capability_step(capability):
+    if bool(
+        human_aware.get("human_near_target_zone", False)
+    ) and _is_physical_capability_step(capability):
         return "require_operator_confirmation", "human_near_target_zone"
 
-    if bool(human_aware.get("human_in_workspace", False)) and _is_physical_capability_step(capability):
+    if bool(
+        human_aware.get("human_in_workspace", False)
+    ) and _is_physical_capability_step(capability):
         return "require_operator_confirmation", "human_in_workspace_physical_action"
 
-    if bool(human_aware.get("operator_present", False)) and capability == "speech_output":
+    if (
+        bool(human_aware.get("operator_present", False))
+        and capability == "speech_output"
+    ):
         return "slow_suppress", "operator_present_speech_suppressed"
 
     return "continue", "clear"
 
 
-def _human_aware_policy_for_proposal(*, proposal: WorkspaceProposal, human_aware: dict) -> tuple[str, str]:
+def _human_aware_policy_for_proposal(
+    *, proposal: WorkspaceProposal, human_aware: dict
+) -> tuple[str, str]:
     proposal_type = str(proposal.proposal_type or "").strip()
     normalized_zone = _normalize_zone_for_map(str(proposal.related_zone or ""))
     is_physical = proposal_type in HUMAN_AWARE_PHYSICAL_PROPOSAL_TYPES
 
-    if bool(human_aware.get("shared_workspace_active", False)) and bool(human_aware.get("human_in_workspace", False)):
+    if bool(human_aware.get("shared_workspace_active", False)) and bool(
+        human_aware.get("human_in_workspace", False)
+    ):
         return "pause", "shared_workspace_active"
 
     if bool(human_aware.get("human_near_motion_path", False)) and is_physical:
         return "stop_replan", "human_near_motion_path"
 
-    occupied = set(human_aware.get("occupied_zones", []) if isinstance(human_aware.get("occupied_zones", []), list) else [])
+    occupied = set(
+        human_aware.get("occupied_zones", [])
+        if isinstance(human_aware.get("occupied_zones", []), list)
+        else []
+    )
     if normalized_zone and normalized_zone in occupied and is_physical:
         return "pause", "occupied_zone_no_autonomous_movement"
 
-    high_proximity = set(human_aware.get("high_proximity_zones", []) if isinstance(human_aware.get("high_proximity_zones", []), list) else [])
+    high_proximity = set(
+        human_aware.get("high_proximity_zones", [])
+        if isinstance(human_aware.get("high_proximity_zones", []), list)
+        else []
+    )
     if normalized_zone and normalized_zone in high_proximity and is_physical:
         return "require_operator_confirmation", "high_proximity_zone"
 
@@ -388,7 +631,9 @@ def _human_aware_inspectability_payload(*, row: WorkspaceMonitoringState) -> dic
             "human_in_workspace": bool(state.get("human_in_workspace", False)),
             "human_near_target_zone": bool(state.get("human_near_target_zone", False)),
             "human_near_motion_path": bool(state.get("human_near_motion_path", False)),
-            "shared_workspace_active": bool(state.get("shared_workspace_active", False)),
+            "shared_workspace_active": bool(
+                state.get("shared_workspace_active", False)
+            ),
             "operator_present": bool(state.get("operator_present", False)),
             "occupied_zones": state.get("occupied_zones", []),
             "high_proximity_zones": state.get("high_proximity_zones", []),
@@ -407,7 +652,11 @@ def _normalize_score(value: float) -> float:
 
 def _proposal_priority_policy_from_monitoring(row: WorkspaceMonitoringState) -> dict:
     metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
-    raw = metadata.get("proposal_priority_policy", {}) if isinstance(metadata.get("proposal_priority_policy", {}), dict) else {}
+    raw = (
+        metadata.get("proposal_priority_policy", {})
+        if isinstance(metadata.get("proposal_priority_policy", {}), dict)
+        else {}
+    )
     defaults = PROPOSAL_PRIORITY_DEFAULT
 
     policy = {
@@ -415,14 +664,22 @@ def _proposal_priority_policy_from_monitoring(row: WorkspaceMonitoringState) -> 
             key: _normalize_score(value)
             for key, value in {
                 **defaults.get("weights", {}),
-                **(raw.get("weights", {}) if isinstance(raw.get("weights", {}), dict) else {}),
+                **(
+                    raw.get("weights", {})
+                    if isinstance(raw.get("weights", {}), dict)
+                    else {}
+                ),
             }.items()
         },
         "urgency_map": {
             str(key): _normalize_score(value)
             for key, value in {
                 **defaults.get("urgency_map", {}),
-                **(raw.get("urgency_map", {}) if isinstance(raw.get("urgency_map", {}), dict) else {}),
+                **(
+                    raw.get("urgency_map", {})
+                    if isinstance(raw.get("urgency_map", {}), dict)
+                    else {}
+                ),
             }.items()
             if str(key).strip()
         },
@@ -430,36 +687,76 @@ def _proposal_priority_policy_from_monitoring(row: WorkspaceMonitoringState) -> 
             str(key): _normalize_score(value)
             for key, value in {
                 **defaults.get("zone_importance", {}),
-                **(raw.get("zone_importance", {}) if isinstance(raw.get("zone_importance", {}), dict) else {}),
+                **(
+                    raw.get("zone_importance", {})
+                    if isinstance(raw.get("zone_importance", {}), dict)
+                    else {}
+                ),
             }.items()
             if str(key).strip()
         },
         "operator_preference": {
             str(key): _normalize_score(value)
             for key, value in {
-                **(defaults.get("operator_preference", {}) if isinstance(defaults.get("operator_preference", {}), dict) else {}),
-                **(raw.get("operator_preference", {}) if isinstance(raw.get("operator_preference", {}), dict) else {}),
+                **(
+                    defaults.get("operator_preference", {})
+                    if isinstance(defaults.get("operator_preference", {}), dict)
+                    else {}
+                ),
+                **(
+                    raw.get("operator_preference", {})
+                    if isinstance(raw.get("operator_preference", {}), dict)
+                    else {}
+                ),
             }.items()
             if str(key).strip()
         },
-        "age_saturation_minutes": max(1, int(raw.get("age_saturation_minutes", defaults.get("age_saturation_minutes", 120)))),
+        "age_saturation_minutes": max(
+            1,
+            int(
+                raw.get(
+                    "age_saturation_minutes",
+                    defaults.get("age_saturation_minutes", 120),
+                )
+            ),
+        ),
         "version": PROPOSAL_PRIORITY_POLICY_VERSION,
     }
     return policy
 
 
-def _compute_workspace_proposal_priority(*, proposal: WorkspaceProposal, policy: dict, now: datetime) -> tuple[float, str, dict]:
-    urgency_map = policy.get("urgency_map", {}) if isinstance(policy.get("urgency_map", {}), dict) else {}
-    zone_importance_map = policy.get("zone_importance", {}) if isinstance(policy.get("zone_importance", {}), dict) else {}
-    operator_preference_map = policy.get("operator_preference", {}) if isinstance(policy.get("operator_preference", {}), dict) else {}
-    weights = policy.get("weights", {}) if isinstance(policy.get("weights", {}), dict) else {}
+def _compute_workspace_proposal_priority(
+    *, proposal: WorkspaceProposal, policy: dict, now: datetime
+) -> tuple[float, str, dict]:
+    urgency_map = (
+        policy.get("urgency_map", {})
+        if isinstance(policy.get("urgency_map", {}), dict)
+        else {}
+    )
+    zone_importance_map = (
+        policy.get("zone_importance", {})
+        if isinstance(policy.get("zone_importance", {}), dict)
+        else {}
+    )
+    operator_preference_map = (
+        policy.get("operator_preference", {})
+        if isinstance(policy.get("operator_preference", {}), dict)
+        else {}
+    )
+    weights = (
+        policy.get("weights", {}) if isinstance(policy.get("weights", {}), dict) else {}
+    )
 
     normalized_zone = _normalize_zone_for_map(proposal.related_zone)
     urgency = _normalize_score(float(urgency_map.get(proposal.proposal_type, 0.5)))
     confidence = _normalize_score(float(proposal.confidence))
     safety = _normalize_score(1.0 - _autonomy_risk_score(proposal.proposal_type))
-    operator_preference = _normalize_score(float(operator_preference_map.get(proposal.proposal_type, 0.5)))
-    zone_importance = _normalize_score(float(zone_importance_map.get(normalized_zone, 0.5)))
+    operator_preference = _normalize_score(
+        float(operator_preference_map.get(proposal.proposal_type, 0.5))
+    )
+    zone_importance = _normalize_score(
+        float(zone_importance_map.get(normalized_zone, 0.5))
+    )
 
     age_minutes = max(0.0, (now - proposal.created_at).total_seconds() / 60.0)
     age_saturation = max(1.0, float(policy.get("age_saturation_minutes", 120)))
@@ -482,14 +779,20 @@ def _compute_workspace_proposal_priority(*, proposal: WorkspaceProposal, policy:
 
     top = sorted(contribution.items(), key=lambda item: item[1], reverse=True)[:3]
     reason = ", ".join(f"{name}={components[name]:.2f}" for name, _ in top)
-    return round(_normalize_score(score), 4), reason, {
-        "components": components,
-        "weighted": contribution,
-        "top_signals": [name for name, _ in top],
-    }
+    return (
+        round(_normalize_score(score), 4),
+        reason,
+        {
+            "components": components,
+            "weighted": contribution,
+            "top_signals": [name for name, _ in top],
+        },
+    )
 
 
-async def _refresh_workspace_proposal_priority(*, proposal: WorkspaceProposal, db: AsyncSession) -> dict:
+async def _refresh_workspace_proposal_priority(
+    *, proposal: WorkspaceProposal, db: AsyncSession
+) -> dict:
     monitoring = await _get_or_create_monitoring_state(db)
     policy = _proposal_priority_policy_from_monitoring(monitoring)
 
@@ -504,7 +807,9 @@ async def _refresh_workspace_proposal_priority(*, proposal: WorkspaceProposal, d
         for zone_name in preferred_scan_zones:
             normalized = _normalize_zone_for_map(str(zone_name))
             if normalized:
-                zone_importance[normalized] = max(0.95, float(zone_importance.get(normalized, 0.5)))
+                zone_importance[normalized] = max(
+                    0.95, float(zone_importance.get(normalized, 0.5))
+                )
         policy["zone_importance"] = zone_importance
 
     auto_exec_tolerance_payload = await get_user_preference_payload(
@@ -525,7 +830,9 @@ async def _refresh_workspace_proposal_priority(*, proposal: WorkspaceProposal, d
     policy["operator_preference"] = operator_preference
 
     now = datetime.now(timezone.utc)
-    score, reason, breakdown = _compute_workspace_proposal_priority(proposal=proposal, policy=policy, now=now)
+    score, reason, breakdown = _compute_workspace_proposal_priority(
+        proposal=proposal, policy=policy, now=now
+    )
     concept_influence = await concept_influence_for_proposal(
         related_zone=proposal.related_zone,
         proposal_type=proposal.proposal_type,
@@ -538,16 +845,131 @@ async def _refresh_workspace_proposal_priority(*, proposal: WorkspaceProposal, d
         }
         reason = f"{reason}, concept_context" if reason else "concept_context"
 
+    proposal_arbitration_learning = await workspace_proposal_arbitration_learning_bias(
+        proposal_type=proposal.proposal_type,
+        related_zone=proposal.related_zone,
+        db=db,
+    )
+    arbitration_bias = float(
+        proposal_arbitration_learning.get("priority_bias", 0.0) or 0.0
+    )
+    if abs(arbitration_bias) >= 1e-9:
+        score = round(_normalize_score(score + arbitration_bias), 4)
+    breakdown = {
+        **(breakdown if isinstance(breakdown, dict) else {}),
+        "proposal_arbitration_learning": proposal_arbitration_learning,
+    }
+    if bool(proposal_arbitration_learning.get("applied", False)):
+        reason = f"{reason}, arbitration_learning" if reason else "arbitration_learning"
+
+    execution_readiness = load_latest_execution_readiness(
+        action=proposal.proposal_type,
+        capability_name=proposal.proposal_type,
+        managed_scope=proposal.related_zone,
+        requested_executor="tod",
+        metadata_json={
+            "proposal_id": int(proposal.id),
+            "proposal_type": proposal.proposal_type,
+            "managed_scope": proposal.related_zone,
+        },
+    )
+    readiness_effects = execution_readiness_policy_effects(
+        readiness=execution_readiness,
+        surface="proposal",
+    )
+    readiness_delta = float(readiness_effects.get("priority_delta", 0.0) or 0.0)
+    if abs(readiness_delta) >= 1e-9:
+        score = round(_normalize_score(score + readiness_delta), 4)
+    readiness_cap = readiness_effects.get("score_cap")
+    if isinstance(readiness_cap, (int, float)):
+        score = round(min(score, _normalize_score(float(readiness_cap))), 4)
+    breakdown = {
+        **(breakdown if isinstance(breakdown, dict) else {}),
+        "execution_readiness": {
+            "readiness": execution_readiness,
+            "policy_effects_json": readiness_effects,
+        },
+    }
+    if readiness_delta < 0.0 or isinstance(readiness_cap, (int, float)):
+        reason = f"{reason}, execution_readiness" if reason else "execution_readiness"
+
+    proposal_policy_convergence = await converge_workspace_proposal_policy_preference(
+        proposal_type=proposal.proposal_type,
+        related_zone=proposal.related_zone,
+        db=db,
+    )
+    policy_effects = (
+        proposal_policy_convergence.get("policy_effects_json", {})
+        if isinstance(proposal_policy_convergence.get("policy_effects_json", {}), dict)
+        else {}
+    )
+    policy_delta = float(policy_effects.get("priority_delta", 0.0) or 0.0)
+    if abs(policy_delta) >= 1e-9:
+        score = round(_normalize_score(score + policy_delta), 4)
+    score_cap = policy_effects.get("score_cap")
+    if isinstance(score_cap, (int, float)):
+        score = round(min(score, _normalize_score(float(score_cap))), 4)
+    breakdown = {
+        **(breakdown if isinstance(breakdown, dict) else {}),
+        "proposal_policy_convergence": proposal_policy_convergence,
+    }
+    if bool(proposal_policy_convergence.get("applied", False)):
+        reason = (
+            f"{reason}, proposal_policy_convergence"
+            if reason
+            else "proposal_policy_convergence"
+        )
+
+    policy_conflict_resolution = await resolve_workspace_proposal_policy_conflict(
+        proposal=proposal,
+        proposal_type=proposal.proposal_type,
+        related_zone=proposal.related_zone,
+        proposal_policy_convergence=proposal_policy_convergence,
+        db=db,
+    )
+    conflict_effects = (
+        policy_conflict_resolution.get("policy_effects_json", {})
+        if isinstance(policy_conflict_resolution.get("policy_effects_json", {}), dict)
+        else {}
+    )
+    conflict_delta = float(conflict_effects.get("priority_delta", 0.0) or 0.0)
+    if abs(conflict_delta) >= 1e-9:
+        score = round(_normalize_score(score + conflict_delta), 4)
+    conflict_cap = conflict_effects.get("score_cap")
+    if isinstance(conflict_cap, (int, float)):
+        score = round(min(score, _normalize_score(float(conflict_cap))), 4)
+    breakdown = {
+        **(breakdown if isinstance(breakdown, dict) else {}),
+        "policy_conflict_resolution": policy_conflict_resolution,
+    }
+    if str(policy_conflict_resolution.get("conflict_state") or "").strip() in {
+        "active_conflict",
+        "cooldown_held",
+    }:
+        reason = (
+            f"{reason}, policy_conflict_resolution"
+            if reason
+            else "policy_conflict_resolution"
+        )
+
     proposal.priority_score = score
     proposal.priority_reason = reason
     proposal.metadata_json = {
         **(proposal.metadata_json if isinstance(proposal.metadata_json, dict) else {}),
-        "priority_policy_version": policy.get("version", PROPOSAL_PRIORITY_POLICY_VERSION),
+        "priority_policy_version": policy.get(
+            "version", PROPOSAL_PRIORITY_POLICY_VERSION
+        ),
         "priority_breakdown": breakdown,
         "preference_context": {
-            "preferred_scan_zones": preferred_scan_zones if isinstance(preferred_scan_zones, list) else [],
+            "preferred_scan_zones": preferred_scan_zones
+            if isinstance(preferred_scan_zones, list)
+            else [],
             "auto_exec_tolerance": auto_exec_tolerance,
         },
+        "execution_readiness": execution_readiness,
+        "proposal_arbitration_learning": proposal_arbitration_learning,
+        "proposal_policy_convergence": proposal_policy_convergence,
+        "policy_conflict_resolution": policy_conflict_resolution,
     }
     return {
         "policy": policy,
@@ -558,6 +980,7 @@ async def _refresh_workspace_proposal_priority(*, proposal: WorkspaceProposal, d
 
 
 def _workspace_proposal_payload(row: WorkspaceProposal) -> dict:
+    metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
     return {
         "proposal_id": row.id,
         "proposal_type": row.proposal_type,
@@ -572,12 +995,34 @@ def _workspace_proposal_payload(row: WorkspaceProposal) -> dict:
         "related_object_id": row.related_object_id,
         "source_execution_id": row.source_execution_id,
         "trigger_json": row.trigger_json,
-        "metadata_json": row.metadata_json,
+        "metadata_json": metadata,
+        "arbitration_learning": (
+            metadata.get("proposal_arbitration_learning", {})
+            if isinstance(metadata.get("proposal_arbitration_learning", {}), dict)
+            else {}
+        ),
+        "proposal_policy_convergence": (
+            metadata.get("proposal_policy_convergence", {})
+            if isinstance(metadata.get("proposal_policy_convergence", {}), dict)
+            else {}
+        ),
+        "execution_readiness": (
+            metadata.get("execution_readiness", {})
+            if isinstance(metadata.get("execution_readiness", {}), dict)
+            else {}
+        ),
+        "policy_conflict_resolution": (
+            metadata.get("policy_conflict_resolution", {})
+            if isinstance(metadata.get("policy_conflict_resolution", {}), dict)
+            else {}
+        ),
         "created_at": row.created_at,
     }
 
 
-async def _notification_payload_for_proposal(*, db: AsyncSession, proposal: WorkspaceProposal, action: str) -> dict:
+async def _notification_payload_for_proposal(
+    *, db: AsyncSession, proposal: WorkspaceProposal, action: str
+) -> dict:
     verbosity = await get_user_preference_value(
         db=db,
         preference_type="notification_verbosity",
@@ -612,7 +1057,15 @@ async def _is_safe_zone(*, related_zone: str, db: AsyncSession) -> bool:
     if not zone_name:
         return True
     mapped = _normalize_zone_for_map(zone_name)
-    zone = (await db.execute(select(WorkspaceZone).where(WorkspaceZone.zone_name == mapped))).scalars().first()
+    zone = (
+        (
+            await db.execute(
+                select(WorkspaceZone).where(WorkspaceZone.zone_name == mapped)
+            )
+        )
+        .scalars()
+        .first()
+    )
     if not zone:
         return True
     return int(zone.hazard_level) <= 0
@@ -659,7 +1112,9 @@ def _parse_iso_to_utc(raw_value: str) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
-def _autonomy_throttle_check(*, autonomy_state: dict, zone: str, capability_name: str, now: datetime) -> tuple[bool, str, list[dict]]:
+def _autonomy_throttle_check(
+    *, autonomy_state: dict, zone: str, capability_name: str, now: datetime
+) -> tuple[bool, str, list[dict]]:
     recent_raw = autonomy_state.get("recent_auto_actions", [])
     recent_actions: list[dict] = []
     window_seconds = max(10, int(autonomy_state.get("auto_window_seconds", 60) or 60))
@@ -689,18 +1144,36 @@ def _autonomy_throttle_check(*, autonomy_state: dict, zone: str, capability_name
 
     cooldown = max(0, int(autonomy_state.get("cooldown_between_actions_seconds", 0)))
     if recent_actions:
-        latest = max((_parse_iso_to_utc(str(item.get("timestamp", ""))) for item in recent_actions), default=None)
+        latest = max(
+            (
+                _parse_iso_to_utc(str(item.get("timestamp", "")))
+                for item in recent_actions
+            ),
+            default=None,
+        )
         if latest and (now - latest).total_seconds() < cooldown:
             return False, "cooldown_between_actions", recent_actions
 
-    zone_limits = autonomy_state.get("zone_action_limits", {}) if isinstance(autonomy_state.get("zone_action_limits", {}), dict) else {}
+    zone_limits = (
+        autonomy_state.get("zone_action_limits", {})
+        if isinstance(autonomy_state.get("zone_action_limits", {}), dict)
+        else {}
+    )
     if zone.strip() and zone in zone_limits:
-        zone_count = sum(1 for item in recent_actions if str(item.get("zone", "")).strip() == zone)
+        zone_count = sum(
+            1 for item in recent_actions if str(item.get("zone", "")).strip() == zone
+        )
         if zone_count >= max(1, int(zone_limits[zone])):
             return False, "zone_based_limit", recent_actions
 
-    capability_cooldowns = autonomy_state.get("capability_cooldown_seconds", {}) if isinstance(autonomy_state.get("capability_cooldown_seconds", {}), dict) else {}
-    cooldown_for_capability = max(0, int(capability_cooldowns.get(capability_name, 0) or 0))
+    capability_cooldowns = (
+        autonomy_state.get("capability_cooldown_seconds", {})
+        if isinstance(autonomy_state.get("capability_cooldown_seconds", {}), dict)
+        else {}
+    )
+    cooldown_for_capability = max(
+        0, int(capability_cooldowns.get(capability_name, 0) or 0)
+    )
     if cooldown_for_capability > 0:
         last_for_capability: datetime | None = None
         for item in recent_actions:
@@ -711,7 +1184,10 @@ def _autonomy_throttle_check(*, autonomy_state: dict, zone: str, capability_name
                 continue
             if not last_for_capability or parsed > last_for_capability:
                 last_for_capability = parsed
-        if last_for_capability and (now - last_for_capability).total_seconds() < cooldown_for_capability:
+        if (
+            last_for_capability
+            and (now - last_for_capability).total_seconds() < cooldown_for_capability
+        ):
             return False, "capability_cooldown", recent_actions
 
     return True, "allowed", recent_actions
@@ -727,12 +1203,16 @@ async def _autonomy_has_active_interruption(*, db: AsyncSession) -> tuple[bool, 
     now = datetime.now(timezone.utc)
     stale_after_seconds = 45
     active = (
-        await db.execute(
-            select(WorkspaceInterruptionEvent)
-            .where(WorkspaceInterruptionEvent.status == "active")
-            .order_by(WorkspaceInterruptionEvent.id.desc())
+        (
+            await db.execute(
+                select(WorkspaceInterruptionEvent)
+                .where(WorkspaceInterruptionEvent.status == "active")
+                .order_by(WorkspaceInterruptionEvent.id.desc())
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     for item in active:
         if item.execution_id:
             execution = await db.get(CapabilityExecution, item.execution_id)
@@ -744,7 +1224,13 @@ async def _autonomy_has_active_interruption(*, db: AsyncSession) -> tuple[bool, 
         interruption_type = str(item.interruption_type or "").strip()
         if interruption_type in INTERRUPTION_BLOCKING_TYPES:
             return True, f"interruption:{interruption_type}"
-        if str(item.applied_outcome or "").strip() in {"paused", "stopped", "require_operator_decision", "auto_pause", "auto_stop"}:
+        if str(item.applied_outcome or "").strip() in {
+            "paused",
+            "stopped",
+            "require_operator_decision",
+            "auto_pause",
+            "auto_stop",
+        }:
             return True, f"interruption_outcome:{item.applied_outcome}"
     return False, "clear"
 
@@ -770,7 +1256,11 @@ def _is_safe_capability_registration(row: CapabilityRegistration | None) -> bool
     policy = row.safety_policy if isinstance(row.safety_policy, dict) else {}
     scope = str(policy.get("scope", "")).strip().lower()
     mode = str(policy.get("mode", "")).strip().lower()
-    return scope in {"non-actuating", "read-only", "observe-only"} or mode in {"scan-only", "observe-only", "non-actuating"}
+    return scope in {"non-actuating", "read-only", "observe-only"} or mode in {
+        "scan-only",
+        "observe-only",
+        "non-actuating",
+    }
 
 
 async def _autonomy_dispatch_scan_execution(
@@ -814,6 +1304,25 @@ async def _autonomy_dispatch_scan_execution(
     db.add(event)
     await db.flush()
 
+    managed_scope = infer_managed_scope(
+        proposal.metadata_json if isinstance(proposal.metadata_json, dict) else {},
+        {"related_zone": proposal.related_zone},
+        proposal.related_zone,
+    )
+    gate_result = await evaluate_execution_policy_gate(
+        db=db,
+        capability_name=capability_name,
+        requested_decision="auto_dispatch",
+        requested_status="dispatched",
+        requested_reason="objective41_autonomous_dispatch",
+        requested_executor="tod",
+        safety_mode="autonomous_bounded",
+        managed_scope=managed_scope,
+        actor="workspace",
+        source="workspace_autonomy_dispatch",
+        metadata_json=proposal.metadata_json if isinstance(proposal.metadata_json, dict) else {},
+    )
+
     execution = CapabilityExecution(
         input_event_id=event.id,
         resolution_id=None,
@@ -824,13 +1333,16 @@ async def _autonomy_dispatch_scan_execution(
             "proposal_type": proposal.proposal_type,
             "scan_area": proposal.related_zone or "workspace",
             "target_zone": proposal.related_zone or "workspace",
-            "trigger_json": proposal.trigger_json if isinstance(proposal.trigger_json, dict) else {},
+            "trigger_json": proposal.trigger_json
+            if isinstance(proposal.trigger_json, dict)
+            else {},
         },
         safety_mode="autonomous_bounded",
-        requested_executor="tod",
-        dispatch_decision="auto_dispatch",
-        status="dispatched",
-        reason="objective41_autonomous_dispatch",
+        requested_executor=gate_result["requested_executor"],
+        dispatch_decision=gate_result["dispatch_decision"],
+        managed_scope=gate_result["managed_scope"],
+        status=gate_result["status"],
+        reason=gate_result["reason"],
         feedback_json={
             "proposal_id": proposal.id,
             "proposal_type": proposal.proposal_type,
@@ -839,10 +1351,31 @@ async def _autonomy_dispatch_scan_execution(
                 "policy_rule_used": policy_rule_used,
             },
             "task_id": task.id,
+            "execution_policy_gate": gate_result,
         },
     )
     db.add(execution)
     await db.flush()
+
+    await sync_execution_control_state(
+        db=db,
+        execution=execution,
+        actor="workspace",
+        source="workspace_autonomy_dispatch",
+        requested_goal=f"autonomy:proposal:{proposal.id}",
+        intent_key=build_intent_key(
+            execution_source="workspace_proposal",
+            subject_id=proposal.id,
+            capability_name=capability_name,
+        ),
+        intent_type="workspace_proposal_execution",
+        context_json={
+            "proposal_id": proposal.id,
+            "proposal_type": proposal.proposal_type,
+            "related_zone": proposal.related_zone,
+        },
+        gate_result=gate_result,
+    )
 
     proposal.source_execution_id = execution.id
     return task.id, execution.id
@@ -853,23 +1386,49 @@ async def _evaluate_autonomous_execution_result(
     proposal: WorkspaceProposal,
     db: AsyncSession,
 ) -> dict:
-    metadata = proposal.metadata_json if isinstance(proposal.metadata_json, dict) else {}
+    metadata = (
+        proposal.metadata_json if isinstance(proposal.metadata_json, dict) else {}
+    )
     execution_id_raw = metadata.get("active_execution_id")
-    execution_id = int(execution_id_raw) if str(execution_id_raw).isdigit() else int(proposal.source_execution_id or 0)
+    execution_id = (
+        int(execution_id_raw)
+        if str(execution_id_raw).isdigit()
+        else int(proposal.source_execution_id or 0)
+    )
     if execution_id <= 0:
-        return {"updated": False, "result": "awaiting_execution", "execution_id": None, "memory_delta": {}}
+        return {
+            "updated": False,
+            "result": "awaiting_execution",
+            "execution_id": None,
+            "memory_delta": {},
+        }
 
     execution = await db.get(CapabilityExecution, execution_id)
     if not execution:
-        return {"updated": False, "result": "execution_missing", "execution_id": execution_id, "memory_delta": {}}
+        return {
+            "updated": False,
+            "result": "execution_missing",
+            "execution_id": execution_id,
+            "memory_delta": {},
+        }
 
     status = str(execution.status or "").strip()
-    feedback = execution.feedback_json if isinstance(execution.feedback_json, dict) else {}
+    feedback = (
+        execution.feedback_json if isinstance(execution.feedback_json, dict) else {}
+    )
     memory_delta = {
-        "workspace_observation_ids": feedback.get("workspace_observation_ids", []) if isinstance(feedback.get("workspace_observation_ids", []), list) else [],
-        "workspace_object_ids": feedback.get("workspace_object_ids", []) if isinstance(feedback.get("workspace_object_ids", []), list) else [],
-        "workspace_proposal_ids": feedback.get("workspace_proposal_ids", []) if isinstance(feedback.get("workspace_proposal_ids", []), list) else [],
-        "observation_count": len(feedback.get("observations", [])) if isinstance(feedback.get("observations", []), list) else 0,
+        "workspace_observation_ids": feedback.get("workspace_observation_ids", [])
+        if isinstance(feedback.get("workspace_observation_ids", []), list)
+        else [],
+        "workspace_object_ids": feedback.get("workspace_object_ids", [])
+        if isinstance(feedback.get("workspace_object_ids", []), list)
+        else [],
+        "workspace_proposal_ids": feedback.get("workspace_proposal_ids", [])
+        if isinstance(feedback.get("workspace_proposal_ids", []), list)
+        else [],
+        "observation_count": len(feedback.get("observations", []))
+        if isinstance(feedback.get("observations", []), list)
+        else 0,
     }
     has_memory_delta = (
         bool(memory_delta["workspace_observation_ids"])
@@ -1014,7 +1573,9 @@ async def _maybe_auto_execute_workspace_proposal(
     if policy_outcome != "auto_execute":
         return False, f"policy_{policy_outcome}"
 
-    interruption_blocked, interruption_reason = await _autonomy_has_active_interruption(db=db)
+    interruption_blocked, interruption_reason = await _autonomy_has_active_interruption(
+        db=db
+    )
     if interruption_blocked:
         return False, interruption_reason
 
@@ -1030,29 +1591,40 @@ async def _maybe_auto_execute_workspace_proposal(
         action_plan={
             "action_type": "auto_execute_proposal",
             "proposal_type": proposal.proposal_type,
-            "is_physical": proposal.proposal_type in HUMAN_AWARE_PHYSICAL_PROPOSAL_TYPES,
+            "is_physical": proposal.proposal_type
+            in HUMAN_AWARE_PHYSICAL_PROPOSAL_TYPES,
         },
         workspace_state={
             "human_in_workspace": human_aware.get("human_in_workspace", False),
             "human_near_target_zone": human_aware.get("human_near_target_zone", False),
             "human_near_motion_path": human_aware.get("human_near_motion_path", False),
-            "shared_workspace_active": human_aware.get("shared_workspace_active", False),
+            "shared_workspace_active": human_aware.get(
+                "shared_workspace_active", False
+            ),
             "target_confidence": float(proposal.confidence),
             "map_freshness_seconds": 0,
         },
         system_state={"throttle_blocked": False, "integrity_risk": False},
         policy_state={
-            "min_target_confidence": float(autonomy_state.get("auto_safe_confidence_threshold", 0.8)),
+            "min_target_confidence": float(
+                autonomy_state.get("auto_safe_confidence_threshold", 0.8)
+            ),
             "map_freshness_limit_seconds": MONITORING_DEFAULT_FRESHNESS_THRESHOLD_SECONDS,
             "unlawful_action": False,
         },
         metadata_json={"trigger_reason": trigger_reason},
         db=db,
     )
-    if constraint_result.get("decision") in {"requires_confirmation", "requires_replan", "blocked"}:
+    if constraint_result.get("decision") in {
+        "requires_confirmation",
+        "requires_replan",
+        "blocked",
+    }:
         return False, f"constraint_{constraint_result.get('decision')}:objective44"
 
-    human_outcome, human_reason = _human_aware_policy_for_proposal(proposal=proposal, human_aware=human_aware)
+    human_outcome, human_reason = _human_aware_policy_for_proposal(
+        proposal=proposal, human_aware=human_aware
+    )
     if human_outcome in {"pause", "require_operator_confirmation", "stop_replan"}:
         human_aware["last_policy_decision"] = {
             "outcome": human_outcome,
@@ -1067,7 +1639,11 @@ async def _maybe_auto_execute_workspace_proposal(
         return False, "confidence_below_threshold"
 
     normalized_zone = _normalize_zone_for_map(proposal.related_zone)
-    restricted_zones = set(autonomy_state.get("restricted_zones", [])) if isinstance(autonomy_state.get("restricted_zones", []), list) else set()
+    restricted_zones = (
+        set(autonomy_state.get("restricted_zones", []))
+        if isinstance(autonomy_state.get("restricted_zones", []), list)
+        else set()
+    )
     if normalized_zone and normalized_zone in restricted_zones:
         return False, "restricted_zone"
 
@@ -1088,8 +1664,16 @@ async def _maybe_auto_execute_workspace_proposal(
     if not capability_name:
         return False, "no_safe_capability_mapping"
     capability = (
-        await db.execute(select(CapabilityRegistration).where(CapabilityRegistration.capability_name == capability_name))
-    ).scalars().first()
+        (
+            await db.execute(
+                select(CapabilityRegistration).where(
+                    CapabilityRegistration.capability_name == capability_name
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
     if not _is_safe_capability_registration(capability):
         return False, "capability_not_safe"
 
@@ -1165,15 +1749,21 @@ async def _maybe_auto_execute_workspace_proposal(
     return True, "auto_executed"
 
 
-async def _run_autonomy_controller_step(*, db: AsyncSession, actor: str, reason: str, zone_filter: str = "") -> dict:
+async def _run_autonomy_controller_step(
+    *, db: AsyncSession, actor: str, reason: str, zone_filter: str = ""
+) -> dict:
     verification_updates: list[dict] = []
     accepted_auto_rows = (
-        await db.execute(
-            select(WorkspaceProposal)
-            .where(WorkspaceProposal.status == "accepted")
-            .order_by(WorkspaceProposal.id.asc())
+        (
+            await db.execute(
+                select(WorkspaceProposal)
+                .where(WorkspaceProposal.status == "accepted")
+                .order_by(WorkspaceProposal.id.asc())
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     for row in accepted_auto_rows:
         metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
         if not bool(metadata.get("auto_execution", False)):
@@ -1198,7 +1788,9 @@ async def _run_autonomy_controller_step(*, db: AsyncSession, actor: str, reason:
                 summary=f"Verified autonomous proposal {row.id}: {verification.get('result', 'unknown')}",
                 metadata_json={
                     "trigger_reason": reason,
-                    "policy_rule_used": metadata.get("policy_rule_used", "auto_execute"),
+                    "policy_rule_used": metadata.get(
+                        "policy_rule_used", "auto_execute"
+                    ),
                     "proposal_id": row.id,
                     "execution_id": verification.get("execution_id"),
                     "result": verification.get("result", "unknown"),
@@ -1234,12 +1826,18 @@ async def _run_autonomy_controller_step(*, db: AsyncSession, actor: str, reason:
         }
 
     pending_rows = (
-        await db.execute(
-            select(WorkspaceProposal)
-            .where(WorkspaceProposal.status == "pending")
-            .order_by(WorkspaceProposal.created_at.asc(), WorkspaceProposal.id.asc())
+        (
+            await db.execute(
+                select(WorkspaceProposal)
+                .where(WorkspaceProposal.status == "pending")
+                .order_by(
+                    WorkspaceProposal.created_at.asc(), WorkspaceProposal.id.asc()
+                )
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     if zone_filter.strip():
         token = zone_filter.strip().lower()
         pending_rows = [
@@ -1282,7 +1880,9 @@ async def _run_autonomy_controller_step(*, db: AsyncSession, actor: str, reason:
     )
 
     if executed:
-        selected_meta = selected.metadata_json if isinstance(selected.metadata_json, dict) else {}
+        selected_meta = (
+            selected.metadata_json if isinstance(selected.metadata_json, dict) else {}
+        )
         await write_journal(
             db,
             actor=actor,
@@ -1292,7 +1892,9 @@ async def _run_autonomy_controller_step(*, db: AsyncSession, actor: str, reason:
             summary=f"Autonomy controller executed proposal {selected.id}",
             metadata_json={
                 "trigger_reason": reason,
-                "policy_rule_used": selected_meta.get("policy_rule_used", "auto_execute"),
+                "policy_rule_used": selected_meta.get(
+                    "policy_rule_used", "auto_execute"
+                ),
                 "proposal_id": selected.id,
                 "execution_id": selected_meta.get("active_execution_id"),
                 "result": "dispatched",
@@ -1341,7 +1943,13 @@ def _monitoring_policy_payload(row: WorkspaceMonitoringState) -> dict:
         "freshness_threshold_seconds": int(row.freshness_threshold_seconds),
         "cooldown_seconds": int(row.cooldown_seconds),
         "max_scan_rate": int(row.max_scan_rate),
-        "priority_zones": [item for item in (row.priority_zones if isinstance(row.priority_zones, list) else []) if str(item).strip()],
+        "priority_zones": [
+            item
+            for item in (
+                row.priority_zones if isinstance(row.priority_zones, list) else []
+            )
+            if str(item).strip()
+        ],
     }
 
 
@@ -1350,14 +1958,20 @@ def _monitoring_state_payload(row: WorkspaceMonitoringState) -> dict:
     return {
         "desired_running": row.desired_running,
         "runtime_status": row.runtime_status,
-        "is_running": bool(MONITORING_RUNTIME.task and not MONITORING_RUNTIME.task.done()),
+        "is_running": bool(
+            MONITORING_RUNTIME.task and not MONITORING_RUNTIME.task.done()
+        ),
         "task_started_at": MONITORING_RUNTIME.loop_started_at,
         "policy": _monitoring_policy_payload(row),
         "last_scan_at": row.last_scan_at,
         "scan_count": row.scan_count,
         "last_scan_reason": row.last_scan_reason,
-        "last_deltas": row.last_deltas_json if isinstance(row.last_deltas_json, list) else [],
-        "last_proposal_ids": row.last_proposal_ids if isinstance(row.last_proposal_ids, list) else [],
+        "last_deltas": row.last_deltas_json
+        if isinstance(row.last_deltas_json, list)
+        else [],
+        "last_proposal_ids": row.last_proposal_ids
+        if isinstance(row.last_proposal_ids, list)
+        else [],
         "last_started_at": row.last_started_at,
         "last_stopped_at": row.last_stopped_at,
         "autonomy": {
@@ -1366,7 +1980,9 @@ def _monitoring_state_payload(row: WorkspaceMonitoringState) -> dict:
             if key != "recent_auto_actions"
         },
         "human_aware": _human_aware_inspectability_payload(row=row),
-        "metadata_json": row.metadata_json if isinstance(row.metadata_json, dict) else {},
+        "metadata_json": row.metadata_json
+        if isinstance(row.metadata_json, dict)
+        else {},
     }
 
 
@@ -1377,8 +1993,12 @@ def _to_workspace_autonomous_chain_out(row: WorkspaceAutonomousChain) -> dict:
         "status": row.status,
         "source": row.source,
         "trigger_reason": row.trigger_reason,
-        "proposal_ids": row.step_proposal_ids if isinstance(row.step_proposal_ids, list) else [],
-        "step_policy_json": row.step_policy_json if isinstance(row.step_policy_json, dict) else {},
+        "proposal_ids": row.step_proposal_ids
+        if isinstance(row.step_proposal_ids, list)
+        else [],
+        "step_policy_json": row.step_policy_json
+        if isinstance(row.step_policy_json, dict)
+        else {},
         "stop_on_failure": bool(row.stop_on_failure),
         "cooldown_seconds": int(row.cooldown_seconds),
         "requires_approval": bool(row.requires_approval),
@@ -1386,10 +2006,16 @@ def _to_workspace_autonomous_chain_out(row: WorkspaceAutonomousChain) -> dict:
         "approved_at": row.approved_at,
         "last_advanced_at": row.last_advanced_at,
         "current_step_index": row.current_step_index,
-        "completed_step_ids": row.completed_step_ids if isinstance(row.completed_step_ids, list) else [],
-        "failed_step_ids": row.failed_step_ids if isinstance(row.failed_step_ids, list) else [],
+        "completed_step_ids": row.completed_step_ids
+        if isinstance(row.completed_step_ids, list)
+        else [],
+        "failed_step_ids": row.failed_step_ids
+        if isinstance(row.failed_step_ids, list)
+        else [],
         "audit_trail": _coerced_json_list(row.audit_trail_json),
-        "metadata_json": row.metadata_json if isinstance(row.metadata_json, dict) else {},
+        "metadata_json": row.metadata_json
+        if isinstance(row.metadata_json, dict)
+        else {},
         "created_at": row.created_at,
     }
 
@@ -1398,14 +2024,36 @@ def _normalized_chain_step_policy(raw: dict | None) -> dict:
     policy = raw if isinstance(raw, dict) else {}
     terminal_statuses = [
         str(item).strip().lower()
-        for item in (policy.get("terminal_statuses", CHAIN_DEFAULT_STEP_POLICY["terminal_statuses"]) if isinstance(policy.get("terminal_statuses", CHAIN_DEFAULT_STEP_POLICY["terminal_statuses"]), list) else CHAIN_DEFAULT_STEP_POLICY["terminal_statuses"])
+        for item in (
+            policy.get(
+                "terminal_statuses", CHAIN_DEFAULT_STEP_POLICY["terminal_statuses"]
+            )
+            if isinstance(
+                policy.get(
+                    "terminal_statuses", CHAIN_DEFAULT_STEP_POLICY["terminal_statuses"]
+                ),
+                list,
+            )
+            else CHAIN_DEFAULT_STEP_POLICY["terminal_statuses"]
+        )
         if str(item).strip()
     ]
     if not terminal_statuses:
         terminal_statuses = CHAIN_DEFAULT_STEP_POLICY["terminal_statuses"]
     failure_statuses = [
         str(item).strip().lower()
-        for item in (policy.get("failure_statuses", CHAIN_DEFAULT_STEP_POLICY["failure_statuses"]) if isinstance(policy.get("failure_statuses", CHAIN_DEFAULT_STEP_POLICY["failure_statuses"]), list) else CHAIN_DEFAULT_STEP_POLICY["failure_statuses"])
+        for item in (
+            policy.get(
+                "failure_statuses", CHAIN_DEFAULT_STEP_POLICY["failure_statuses"]
+            )
+            if isinstance(
+                policy.get(
+                    "failure_statuses", CHAIN_DEFAULT_STEP_POLICY["failure_statuses"]
+                ),
+                list,
+            )
+            else CHAIN_DEFAULT_STEP_POLICY["failure_statuses"]
+        )
         if str(item).strip()
     ]
     return {
@@ -1427,47 +2075,78 @@ def _coerced_json_list(raw: object) -> list:
 
 
 def _interruption_outcome_for_type(interruption_type: str) -> str:
-    return INTERRUPTION_POLICY_OUTCOMES.get(interruption_type, "require_operator_decision")
+    return INTERRUPTION_POLICY_OUTCOMES.get(
+        interruption_type, "require_operator_decision"
+    )
 
 
 def _interruption_is_blocking(interruption_type: str) -> bool:
     return interruption_type in INTERRUPTION_BLOCKING_TYPES
 
 
-async def _find_action_plan_for_execution(*, execution_id: int, db: AsyncSession) -> WorkspaceActionPlan | None:
+async def _find_action_plan_for_execution(
+    *, execution_id: int, db: AsyncSession
+) -> WorkspaceActionPlan | None:
     return (
-        await db.execute(
-            select(WorkspaceActionPlan)
-            .where(WorkspaceActionPlan.execution_id == execution_id)
-            .order_by(WorkspaceActionPlan.id.desc())
+        (
+            await db.execute(
+                select(WorkspaceActionPlan)
+                .where(WorkspaceActionPlan.execution_id == execution_id)
+                .order_by(WorkspaceActionPlan.id.desc())
+            )
         )
-    ).scalars().first()
+        .scalars()
+        .first()
+    )
 
 
-async def _find_chains_for_execution(*, execution_id: int, db: AsyncSession) -> list[WorkspaceAutonomousChain]:
+async def _find_chains_for_execution(
+    *, execution_id: int, db: AsyncSession
+) -> list[WorkspaceAutonomousChain]:
     proposals = (
-        await db.execute(
-            select(WorkspaceProposal).where(WorkspaceProposal.source_execution_id == execution_id)
+        (
+            await db.execute(
+                select(WorkspaceProposal).where(
+                    WorkspaceProposal.source_execution_id == execution_id
+                )
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     proposal_ids = {item.id for item in proposals}
 
     chains = (await db.execute(select(WorkspaceAutonomousChain))).scalars().all()
     matched: list[WorkspaceAutonomousChain] = []
     for chain in chains:
         metadata = chain.metadata_json if isinstance(chain.metadata_json, dict) else {}
-        linked_execution_id = int(metadata.get("active_execution_id", 0)) if str(metadata.get("active_execution_id", "")).isdigit() else 0
+        linked_execution_id = (
+            int(metadata.get("active_execution_id", 0))
+            if str(metadata.get("active_execution_id", "")).isdigit()
+            else 0
+        )
         if linked_execution_id == execution_id:
             matched.append(chain)
             continue
-        step_ids = chain.step_proposal_ids if isinstance(chain.step_proposal_ids, list) else []
+        step_ids = (
+            chain.step_proposal_ids if isinstance(chain.step_proposal_ids, list) else []
+        )
         if proposal_ids and any(int(item) in proposal_ids for item in step_ids):
             matched.append(chain)
     return matched
 
 
-def _append_execution_interruption(execution: CapabilityExecution, *, event: str, actor: str, reason: str, metadata_json: dict) -> None:
-    feedback = execution.feedback_json if isinstance(execution.feedback_json, dict) else {}
+def _append_execution_interruption(
+    execution: CapabilityExecution,
+    *,
+    event: str,
+    actor: str,
+    reason: str,
+    metadata_json: dict,
+) -> None:
+    feedback = (
+        execution.feedback_json if isinstance(execution.feedback_json, dict) else {}
+    )
     interruptions = list(feedback.get("interruptions", []))
     interruptions.append(
         {
@@ -1517,7 +2196,14 @@ async def _record_interruption_event(
     return event
 
 
-def _append_chain_audit(row: WorkspaceAutonomousChain, *, actor: str, event: str, reason: str, metadata_json: dict) -> None:
+def _append_chain_audit(
+    row: WorkspaceAutonomousChain,
+    *,
+    actor: str,
+    event: str,
+    reason: str,
+    metadata_json: dict,
+) -> None:
     trail = list(_coerced_json_list(row.audit_trail_json))
     trail.append(
         {
@@ -1544,18 +2230,31 @@ def _to_workspace_capability_chain_out(row: WorkspaceCapabilityChain) -> dict:
         "policy": row.policy_json if isinstance(row.policy_json, dict) else {},
         "steps": row.steps_json if isinstance(row.steps_json, list) else [],
         "current_step_index": int(row.current_step_index),
-        "completed_step_ids": row.completed_step_ids if isinstance(row.completed_step_ids, list) else [],
-        "failed_step_ids": row.failed_step_ids if isinstance(row.failed_step_ids, list) else [],
+        "completed_step_ids": row.completed_step_ids
+        if isinstance(row.completed_step_ids, list)
+        else [],
+        "failed_step_ids": row.failed_step_ids
+        if isinstance(row.failed_step_ids, list)
+        else [],
         "stop_on_failure": bool(row.stop_on_failure),
         "escalate_on_failure": bool(row.escalate_on_failure),
         "last_advanced_at": row.last_advanced_at,
         "audit_trail": _coerced_json_list(row.audit_trail_json),
-        "metadata_json": row.metadata_json if isinstance(row.metadata_json, dict) else {},
+        "metadata_json": row.metadata_json
+        if isinstance(row.metadata_json, dict)
+        else {},
         "created_at": row.created_at,
     }
 
 
-def _append_capability_chain_audit(row: WorkspaceCapabilityChain, *, actor: str, event: str, reason: str, metadata_json: dict) -> None:
+def _append_capability_chain_audit(
+    row: WorkspaceCapabilityChain,
+    *,
+    actor: str,
+    event: str,
+    reason: str,
+    metadata_json: dict,
+) -> None:
     trail = list(_coerced_json_list(row.audit_trail_json))
     trail.append(
         {
@@ -1578,16 +2277,26 @@ def _normalized_capability_chain_steps(raw_steps: list[dict]) -> list[dict]:
         capability = str(item.get("capability", "")).strip()
         if not capability:
             continue
-        step_id = str(item.get("step_id", f"step-{index + 1}")).strip() or f"step-{index + 1}"
+        step_id = (
+            str(item.get("step_id", f"step-{index + 1}")).strip() or f"step-{index + 1}"
+        )
         depends_on_raw = item.get("depends_on", [])
-        depends_on = [str(dep).strip() for dep in depends_on_raw if str(dep).strip()] if isinstance(depends_on_raw, list) else []
+        depends_on = (
+            [str(dep).strip() for dep in depends_on_raw if str(dep).strip()]
+            if isinstance(depends_on_raw, list)
+            else []
+        )
         normalized.append(
             {
                 "step_id": step_id,
                 "capability": capability,
                 "depends_on": depends_on,
-                "params": item.get("params", {}) if isinstance(item.get("params", {}), dict) else {},
-                "verify": item.get("verify", {}) if isinstance(item.get("verify", {}), dict) else {},
+                "params": item.get("params", {})
+                if isinstance(item.get("params", {}), dict)
+                else {},
+                "verify": item.get("verify", {})
+                if isinstance(item.get("verify", {}), dict)
+                else {},
             }
         )
     return normalized
@@ -1609,7 +2318,11 @@ def _validate_capability_chain_dependencies(steps: list[dict]) -> tuple[bool, st
     seen: set[str] = set()
     for item in steps:
         step_id = str(item.get("step_id", "")).strip()
-        depends_on = item.get("depends_on", []) if isinstance(item.get("depends_on", []), list) else []
+        depends_on = (
+            item.get("depends_on", [])
+            if isinstance(item.get("depends_on", []), list)
+            else []
+        )
         for dependency in depends_on:
             if dependency not in known_step_ids:
                 return False, f"dependency '{dependency}' is not present in chain"
@@ -1621,16 +2334,24 @@ def _validate_capability_chain_dependencies(steps: list[dict]) -> tuple[bool, st
     return True, "valid"
 
 
-async def _execute_capability_chain_step(*, chain: WorkspaceCapabilityChain, step: dict, db: AsyncSession) -> tuple[bool, str, dict]:
+async def _execute_capability_chain_step(
+    *, chain: WorkspaceCapabilityChain, step: dict, db: AsyncSession
+) -> tuple[bool, str, dict]:
     capability = str(step.get("capability", "")).strip()
     params = step.get("params", {}) if isinstance(step.get("params", {}), dict) else {}
     metadata = chain.metadata_json if isinstance(chain.metadata_json, dict) else {}
-    context = metadata.get("context", {}) if isinstance(metadata.get("context", {}), dict) else {}
+    context = (
+        metadata.get("context", {})
+        if isinstance(metadata.get("context", {}), dict)
+        else {}
+    )
     verification: dict = {"capability": capability, "step_id": step.get("step_id")}
 
     if capability == "workspace_scan":
         zone = str(params.get("zone", "workspace")).strip() or "workspace"
-        label = str(params.get("label", f"scan-{chain.id}")).strip() or f"scan-{chain.id}"
+        label = (
+            str(params.get("label", f"scan-{chain.id}")).strip() or f"scan-{chain.id}"
+        )
         confidence = max(0.0, min(1.0, float(params.get("confidence", 0.9) or 0.9)))
         observation = WorkspaceObservation(
             zone=zone,
@@ -1644,15 +2365,21 @@ async def _execute_capability_chain_step(*, chain: WorkspaceCapabilityChain, ste
         await db.flush()
 
         existing_object = (
-            await db.execute(
-                select(WorkspaceObjectMemory)
-                .where(WorkspaceObjectMemory.canonical_name == label)
-                .order_by(WorkspaceObjectMemory.id.desc())
+            (
+                await db.execute(
+                    select(WorkspaceObjectMemory)
+                    .where(WorkspaceObjectMemory.canonical_name == label)
+                    .order_by(WorkspaceObjectMemory.id.desc())
+                )
             )
-        ).scalars().first()
+            .scalars()
+            .first()
+        )
         if existing_object:
             existing_object.zone = zone
-            existing_object.confidence = max(float(existing_object.confidence), confidence)
+            existing_object.confidence = max(
+                float(existing_object.confidence), confidence
+            )
             existing_object.status = "active"
             existing_object.last_seen_at = datetime.now(timezone.utc)
             object_memory_id = existing_object.id
@@ -1679,36 +2406,72 @@ async def _execute_capability_chain_step(*, chain: WorkspaceCapabilityChain, ste
             }
         )
         chain.metadata_json = {**metadata, "context": context}
-        verification.update({"observation_id": observation.id, "object_memory_id": object_memory_id, "observation_count": 1})
+        verification.update(
+            {
+                "observation_id": observation.id,
+                "object_memory_id": object_memory_id,
+                "observation_count": 1,
+            }
+        )
         return True, "scan_recorded", verification
 
     if capability == "observation_update":
-        zone = str(params.get("zone", context.get("last_scan_zone", "workspace"))).strip() or "workspace"
+        zone = (
+            str(params.get("zone", context.get("last_scan_zone", "workspace"))).strip()
+            or "workspace"
+        )
         label = str(params.get("label", context.get("last_scan_label", ""))).strip()
         stmt = select(WorkspaceObservation).where(WorkspaceObservation.zone == zone)
         if label:
             stmt = stmt.where(WorkspaceObservation.label == label)
-        rows = (await db.execute(stmt.order_by(WorkspaceObservation.id.desc()))).scalars().all()
+        rows = (
+            (await db.execute(stmt.order_by(WorkspaceObservation.id.desc())))
+            .scalars()
+            .all()
+        )
         if not rows:
-            return False, "observation_missing", {**verification, "zone": zone, "label": label}
-        verification.update({"zone": zone, "label": label, "observation_count": len(rows), "latest_observation_id": rows[0].id})
+            return (
+                False,
+                "observation_missing",
+                {**verification, "zone": zone, "label": label},
+            )
+        verification.update(
+            {
+                "zone": zone,
+                "label": label,
+                "observation_count": len(rows),
+                "latest_observation_id": rows[0].id,
+            }
+        )
         return True, "observation_verified", verification
 
     if capability == "target_resolution":
-        target_label = str(params.get("target_label", context.get("last_scan_label", ""))).strip()
-        preferred_zone = str(params.get("preferred_zone", context.get("last_scan_zone", ""))).strip()
+        target_label = str(
+            params.get("target_label", context.get("last_scan_label", ""))
+        ).strip()
+        preferred_zone = str(
+            params.get("preferred_zone", context.get("last_scan_zone", ""))
+        ).strip()
         if not target_label:
             return False, "target_label_required", verification
 
         object_row = (
-            await db.execute(
-                select(WorkspaceObjectMemory)
-                .where(WorkspaceObjectMemory.canonical_name == target_label)
-                .order_by(WorkspaceObjectMemory.last_seen_at.desc())
+            (
+                await db.execute(
+                    select(WorkspaceObjectMemory)
+                    .where(WorkspaceObjectMemory.canonical_name == target_label)
+                    .order_by(WorkspaceObjectMemory.last_seen_at.desc())
+                )
             )
-        ).scalars().first()
+            .scalars()
+            .first()
+        )
         if not object_row:
-            return False, "target_not_found", {**verification, "target_label": target_label}
+            return (
+                False,
+                "target_not_found",
+                {**verification, "target_label": target_label},
+            )
 
         resolution = WorkspaceTargetResolution(
             requested_target=target_label,
@@ -1725,13 +2488,29 @@ async def _execute_capability_chain_step(*, chain: WorkspaceCapabilityChain, ste
         )
         db.add(resolution)
         await db.flush()
-        context.update({"last_target_resolution_id": resolution.id, "last_target_label": target_label})
+        context.update(
+            {
+                "last_target_resolution_id": resolution.id,
+                "last_target_label": target_label,
+            }
+        )
         chain.metadata_json = {**metadata, "context": context}
-        verification.update({"target_resolution_id": resolution.id, "target_label": target_label, "confidence": float(object_row.confidence)})
+        verification.update(
+            {
+                "target_resolution_id": resolution.id,
+                "target_label": target_label,
+                "confidence": float(object_row.confidence),
+            }
+        )
         return True, "target_resolved", verification
 
     if capability == "speech_output":
-        message = str(params.get("message", f"Target {context.get('last_target_label', 'ready')} confirmed.")).strip()
+        message = str(
+            params.get(
+                "message",
+                f"Target {context.get('last_target_label', 'ready')} confirmed.",
+            )
+        ).strip()
         if not message:
             return False, "speech_message_required", verification
         suppress_speech = bool(params.get("human_policy_suppress", False))
@@ -1749,11 +2528,24 @@ async def _execute_capability_chain_step(*, chain: WorkspaceCapabilityChain, ste
         )
         db.add(speech)
         await db.flush()
-        verification.update({"speech_action_id": speech.id, "message": message, "suppressed": suppress_speech})
-        return True, "speech_suppressed" if suppress_speech else "speech_queued", verification
+        verification.update(
+            {
+                "speech_action_id": speech.id,
+                "message": message,
+                "suppressed": suppress_speech,
+            }
+        )
+        return (
+            True,
+            "speech_suppressed" if suppress_speech else "speech_queued",
+            verification,
+        )
 
     if capability == "rescan_zone":
-        zone = str(params.get("zone", context.get("last_scan_zone", "workspace"))).strip() or "workspace"
+        zone = (
+            str(params.get("zone", context.get("last_scan_zone", "workspace"))).strip()
+            or "workspace"
+        )
         confidence = max(0.0, min(1.0, float(params.get("confidence", 0.8) or 0.8)))
         proposal = WorkspaceProposal(
             proposal_type="rescan_zone",
@@ -1773,33 +2565,61 @@ async def _execute_capability_chain_step(*, chain: WorkspaceCapabilityChain, ste
         await _refresh_workspace_proposal_priority(proposal=proposal, db=db)
         context.update({"last_rescan_proposal_id": proposal.id, "last_scan_zone": zone})
         chain.metadata_json = {**metadata, "context": context}
-        verification.update({"proposal_id": proposal.id, "proposal_status": proposal.status, "zone": zone})
+        verification.update(
+            {
+                "proposal_id": proposal.id,
+                "proposal_status": proposal.status,
+                "zone": zone,
+            }
+        )
         return True, "rescan_proposal_created", verification
 
     if capability == "proposal_resolution":
-        proposal_id_raw = params.get("proposal_id", context.get("last_rescan_proposal_id"))
+        proposal_id_raw = params.get(
+            "proposal_id", context.get("last_rescan_proposal_id")
+        )
         proposal_id = int(proposal_id_raw) if str(proposal_id_raw).isdigit() else 0
         if proposal_id <= 0:
             return False, "proposal_id_required", verification
         proposal = await db.get(WorkspaceProposal, proposal_id)
         if not proposal:
-            return False, "proposal_not_found", {**verification, "proposal_id": proposal_id}
+            return (
+                False,
+                "proposal_not_found",
+                {**verification, "proposal_id": proposal_id},
+            )
         proposal.status = "resolved"
         proposal.metadata_json = {
-            **(proposal.metadata_json if isinstance(proposal.metadata_json, dict) else {}),
+            **(
+                proposal.metadata_json
+                if isinstance(proposal.metadata_json, dict)
+                else {}
+            ),
             "resolved_by": "objective42_chain",
             "chain_id": chain.id,
             "step_id": step.get("step_id"),
             "resolved_at": datetime.now(timezone.utc).isoformat(),
         }
-        verification.update({"proposal_id": proposal.id, "proposal_status": proposal.status})
+        verification.update(
+            {"proposal_id": proposal.id, "proposal_status": proposal.status}
+        )
         return True, "proposal_resolved", verification
 
     return False, "unsupported_capability", verification
 
 
 async def _get_or_create_monitoring_state(db: AsyncSession) -> WorkspaceMonitoringState:
-    row = (await db.execute(select(WorkspaceMonitoringState).order_by(WorkspaceMonitoringState.id.asc()))).scalars().first()
+    row = (
+        (
+            await db.execute(
+                select(WorkspaceMonitoringState).order_by(
+                    WorkspaceMonitoringState.id.asc()
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
     if row:
         return row
 
@@ -1846,7 +2666,9 @@ def _as_utc(value: datetime | None) -> datetime | None:
     return value.astimezone(timezone.utc)
 
 
-def _compute_object_deltas(*, previous_snapshot: dict, current_rows: list[WorkspaceObjectMemory]) -> list[dict]:
+def _compute_object_deltas(
+    *, previous_snapshot: dict, current_rows: list[WorkspaceObjectMemory]
+) -> list[dict]:
     deltas: list[dict] = []
     current_snapshot = _snapshot_from_objects(current_rows)
     previous_by_name: dict[str, tuple[str, dict]] = {}
@@ -1862,13 +2684,21 @@ def _compute_object_deltas(*, previous_snapshot: dict, current_rows: list[Worksp
 
     for row in current_rows:
         key = str(row.id)
-        previous = previous_snapshot.get(key, {}) if isinstance(previous_snapshot, dict) else {}
+        previous = (
+            previous_snapshot.get(key, {})
+            if isinstance(previous_snapshot, dict)
+            else {}
+        )
         if not previous:
             canonical_key = str(row.canonical_name or "").strip().lower()
             previous_alias = previous_by_name.get(canonical_key)
             if previous_alias:
                 alias_previous_id, alias_previous_payload = previous_alias
-                previous = alias_previous_payload if isinstance(alias_previous_payload, dict) else {}
+                previous = (
+                    alias_previous_payload
+                    if isinstance(alias_previous_payload, dict)
+                    else {}
+                )
                 matched_previous_ids.add(alias_previous_id)
 
         if not previous:
@@ -1898,7 +2728,10 @@ def _compute_object_deltas(*, previous_snapshot: dict, current_rows: list[Worksp
             )
 
         previous_status = str(previous.get("status", ""))
-        if row.status in {"missing", "stale"} and previous_status not in {"missing", "stale"}:
+        if row.status in {"missing", "stale"} and previous_status not in {
+            "missing",
+            "stale",
+        }:
             deltas.append(
                 {
                     "event": "object_missing",
@@ -1914,7 +2747,10 @@ def _compute_object_deltas(*, previous_snapshot: dict, current_rows: list[Worksp
             previous_confidence = float(previous.get("confidence", row.confidence))
         except (TypeError, ValueError):
             previous_confidence = float(row.confidence)
-        if abs(float(row.confidence) - previous_confidence) >= MONITORING_CONFIDENCE_DELTA_THRESHOLD:
+        if (
+            abs(float(row.confidence) - previous_confidence)
+            >= MONITORING_CONFIDENCE_DELTA_THRESHOLD
+        ):
             deltas.append(
                 {
                     "event": "confidence_changed",
@@ -1926,10 +2762,16 @@ def _compute_object_deltas(*, previous_snapshot: dict, current_rows: list[Worksp
                 }
             )
 
-    previous_ids = set(previous_snapshot.keys()) if isinstance(previous_snapshot, dict) else set()
+    previous_ids = (
+        set(previous_snapshot.keys()) if isinstance(previous_snapshot, dict) else set()
+    )
     current_ids = set(current_snapshot.keys())
     for orphan_id in sorted(previous_ids - current_ids - matched_previous_ids):
-        previous = previous_snapshot.get(orphan_id, {}) if isinstance(previous_snapshot, dict) else {}
+        previous = (
+            previous_snapshot.get(orphan_id, {})
+            if isinstance(previous_snapshot, dict)
+            else {}
+        )
         deltas.append(
             {
                 "event": "object_missing",
@@ -1955,18 +2797,24 @@ async def _create_monitoring_delta_proposal(
     related_object_id: int | None,
     trigger_json: dict,
 ) -> WorkspaceProposal | None:
-    window_start = datetime.now(timezone.utc) - timedelta(seconds=MONITORING_DEFAULT_FRESHNESS_THRESHOLD_SECONDS)
+    window_start = datetime.now(timezone.utc) - timedelta(
+        seconds=MONITORING_DEFAULT_FRESHNESS_THRESHOLD_SECONDS
+    )
     existing = (
-        await db.execute(
-            select(WorkspaceProposal)
-            .where(WorkspaceProposal.proposal_type == proposal_type)
-            .where(WorkspaceProposal.status == "pending")
-            .where(WorkspaceProposal.created_at >= window_start)
-            .where(WorkspaceProposal.related_zone == related_zone)
-            .where(WorkspaceProposal.related_object_id == related_object_id)
-            .order_by(WorkspaceProposal.id.desc())
+        (
+            await db.execute(
+                select(WorkspaceProposal)
+                .where(WorkspaceProposal.proposal_type == proposal_type)
+                .where(WorkspaceProposal.status == "pending")
+                .where(WorkspaceProposal.created_at >= window_start)
+                .where(WorkspaceProposal.related_zone == related_zone)
+                .where(WorkspaceProposal.related_object_id == related_object_id)
+                .order_by(WorkspaceProposal.id.desc())
+            )
         )
-    ).scalars().first()
+        .scalars()
+        .first()
+    )
     if existing:
         return None
 
@@ -2029,11 +2877,19 @@ def _monitoring_should_scan(
     if len(recent_scans) >= max(1, int(row.max_scan_rate)):
         return False, "max_scan_rate"
 
-    if last_scan_at and (now - last_scan_at).total_seconds() < max(0, int(row.cooldown_seconds)):
+    if last_scan_at and (now - last_scan_at).total_seconds() < max(
+        0, int(row.cooldown_seconds)
+    ):
         return False, "cooldown"
 
     if row.scan_trigger_mode == "freshness":
-        priority = {item.strip() for item in (row.priority_zones if isinstance(row.priority_zones, list) else []) if str(item).strip()}
+        priority = {
+            item.strip()
+            for item in (
+                row.priority_zones if isinstance(row.priority_zones, list) else []
+            )
+            if str(item).strip()
+        }
         threshold = max(30, int(row.freshness_threshold_seconds))
         for item in objects:
             if priority and item.zone not in priority:
@@ -2060,7 +2916,9 @@ def _monitoring_priority_zones(row: WorkspaceMonitoringState) -> list[str]:
     return zones
 
 
-async def _run_monitoring_scan_cycle(*, db: AsyncSession, row: WorkspaceMonitoringState, reason: str) -> None:
+async def _run_monitoring_scan_cycle(
+    *, db: AsyncSession, row: WorkspaceMonitoringState, reason: str
+) -> None:
     now = datetime.now(timezone.utc)
     stmt = select(WorkspaceObjectMemory).order_by(WorkspaceObjectMemory.id.asc())
     priority_zones = _monitoring_priority_zones(row)
@@ -2068,13 +2926,21 @@ async def _run_monitoring_scan_cycle(*, db: AsyncSession, row: WorkspaceMonitori
         stmt = stmt.where(WorkspaceObjectMemory.zone.in_(priority_zones))
     objects = (await db.execute(stmt)).scalars().all()
 
-    previous_snapshot = row.last_snapshot_json if isinstance(row.last_snapshot_json, dict) else {}
-    deltas = _compute_object_deltas(previous_snapshot=previous_snapshot, current_rows=objects)
+    previous_snapshot = (
+        row.last_snapshot_json if isinstance(row.last_snapshot_json, dict) else {}
+    )
+    deltas = _compute_object_deltas(
+        previous_snapshot=previous_snapshot, current_rows=objects
+    )
 
     proposal_ids: list[int] = []
     for delta in deltas:
         event = str(delta.get("event", ""))
-        object_id = int(delta.get("object_memory_id", 0)) if str(delta.get("object_memory_id", "")).isdigit() else None
+        object_id = (
+            int(delta.get("object_memory_id", 0))
+            if str(delta.get("object_memory_id", "")).isdigit()
+            else None
+        )
         related_zone = str(delta.get("to_zone") or delta.get("zone") or "").strip()
         object_name = str(delta.get("canonical_name", "object"))
         if event == "object_moved":
@@ -2108,7 +2974,11 @@ async def _run_monitoring_scan_cycle(*, db: AsyncSession, row: WorkspaceMonitori
 
     metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
     recent_scans_raw = metadata.get("recent_scans", [])
-    recent_scan_strings = [item for item in recent_scans_raw if isinstance(item, str)] if isinstance(recent_scans_raw, list) else []
+    recent_scan_strings = (
+        [item for item in recent_scans_raw if isinstance(item, str)]
+        if isinstance(recent_scans_raw, list)
+        else []
+    )
     recent_scan_strings.append(now.isoformat())
     filtered_recent: list[str] = []
     last_started_at = _as_utc(row.last_started_at)
@@ -2139,7 +3009,9 @@ async def _run_monitoring_scan_cycle(*, db: AsyncSession, row: WorkspaceMonitori
             }
         )
 
-    existing_delta_history = row.last_deltas_json if isinstance(row.last_deltas_json, list) else []
+    existing_delta_history = (
+        row.last_deltas_json if isinstance(row.last_deltas_json, list) else []
+    )
     merged_delta_history: list[dict] = []
     for item in [*existing_delta_history, *delta_with_timestamps]:
         if not isinstance(item, dict):
@@ -2147,7 +3019,11 @@ async def _run_monitoring_scan_cycle(*, db: AsyncSession, row: WorkspaceMonitori
         raw_detected_at = str(item.get("detected_at", "")).strip()
         if not raw_detected_at:
             raw_detected_at = now.isoformat()
-        candidate = raw_detected_at[:-1] + "+00:00" if raw_detected_at.endswith("Z") else raw_detected_at
+        candidate = (
+            raw_detected_at[:-1] + "+00:00"
+            if raw_detected_at.endswith("Z")
+            else raw_detected_at
+        )
         try:
             parsed = datetime.fromisoformat(candidate)
         except ValueError:
@@ -2160,7 +3036,9 @@ async def _run_monitoring_scan_cycle(*, db: AsyncSession, row: WorkspaceMonitori
             merged_delta_history.append({**item, "detected_at": parsed.isoformat()})
 
     if len(merged_delta_history) > MONITORING_DELTA_HISTORY_MAX_ITEMS:
-        merged_delta_history = merged_delta_history[-MONITORING_DELTA_HISTORY_MAX_ITEMS:]
+        merged_delta_history = merged_delta_history[
+            -MONITORING_DELTA_HISTORY_MAX_ITEMS:
+        ]
 
     row.last_scan_at = now
     row.scan_count = int(row.scan_count) + 1
@@ -2204,9 +3082,13 @@ async def _workspace_monitoring_loop() -> None:
                 objects_stmt = select(WorkspaceObjectMemory)
                 priority_zones = _monitoring_priority_zones(row)
                 if priority_zones:
-                    objects_stmt = objects_stmt.where(WorkspaceObjectMemory.zone.in_(priority_zones))
+                    objects_stmt = objects_stmt.where(
+                        WorkspaceObjectMemory.zone.in_(priority_zones)
+                    )
                 objects = (await db.execute(objects_stmt)).scalars().all()
-                should_scan, reason = _monitoring_should_scan(row=row, objects=objects, now=datetime.now(timezone.utc))
+                should_scan, reason = _monitoring_should_scan(
+                    row=row, objects=objects, now=datetime.now(timezone.utc)
+                )
                 if should_scan:
                     await _run_monitoring_scan_cycle(db=db, row=row, reason=reason)
                 else:
@@ -2304,7 +3186,11 @@ def _execution_precondition_violations(
     if not row.simulation_gate_passed:
         violations.append("simulation_gate_pass_required")
 
-    collision_risk = float((row.simulation_json or {}).get("collision_risk", 1.0)) if isinstance(row.simulation_json, dict) else 1.0
+    collision_risk = (
+        float((row.simulation_json or {}).get("collision_risk", 1.0))
+        if isinstance(row.simulation_json, dict)
+        else 1.0
+    )
     if collision_risk >= collision_risk_threshold:
         violations.append("collision_risk_threshold_exceeded")
 
@@ -2313,10 +3199,20 @@ def _execution_precondition_violations(
     return violations
 
 
-async def _ensure_execution_capability_registered(*, capability_name: str, db: AsyncSession) -> CapabilityRegistration:
+async def _ensure_execution_capability_registered(
+    *, capability_name: str, db: AsyncSession
+) -> CapabilityRegistration:
     row = (
-        await db.execute(select(CapabilityRegistration).where(CapabilityRegistration.capability_name == capability_name))
-    ).scalars().first()
+        (
+            await db.execute(
+                select(CapabilityRegistration).where(
+                    CapabilityRegistration.capability_name == capability_name
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
     safety_policy = {
         "scope": "actuating",
         "mode": "operator_guarded",
@@ -2324,7 +3220,9 @@ async def _ensure_execution_capability_registered(*, capability_name: str, db: A
     }
     if row:
         row.category = "manipulation"
-        row.description = "Execute guarded reach/approach motion from simulated workspace action plan"
+        row.description = (
+            "Execute guarded reach/approach motion from simulated workspace action plan"
+        )
         row.requires_confirmation = True
         row.enabled = True
         row.safety_policy = safety_policy
@@ -2343,7 +3241,9 @@ async def _ensure_execution_capability_registered(*, capability_name: str, db: A
     return created
 
 
-def _execution_safety_score(*, collision_risk: float, target_confidence: float) -> float:
+def _execution_safety_score(
+    *, collision_risk: float, target_confidence: float
+) -> float:
     return round(max(0.0, min(1.0, (1.0 - collision_risk) * target_confidence)), 3)
 
 
@@ -2375,18 +3275,30 @@ def _label_score(target: str, candidate: str) -> float:
 async def _adjacent_zones(zone_name: str, db: AsyncSession) -> list[str]:
     if not zone_name:
         return []
-    row = (await db.execute(select(WorkspaceZone).where(WorkspaceZone.zone_name == zone_name))).scalars().first()
+    row = (
+        (
+            await db.execute(
+                select(WorkspaceZone).where(WorkspaceZone.zone_name == zone_name)
+            )
+        )
+        .scalars()
+        .first()
+    )
     if not row:
         return []
 
     relations = (
-        await db.execute(
-            select(WorkspaceZoneRelation).where(
-                WorkspaceZoneRelation.from_zone_id == row.id,
-                WorkspaceZoneRelation.relation_type == "adjacent_to",
+        (
+            await db.execute(
+                select(WorkspaceZoneRelation).where(
+                    WorkspaceZoneRelation.from_zone_id == row.id,
+                    WorkspaceZoneRelation.relation_type == "adjacent_to",
+                )
             )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
 
     names: list[str] = []
     for relation in relations:
@@ -2476,7 +3388,10 @@ def _action_plan_policy(
         )
         return "plan_ready_for_approval", steps, "pending_approval"
 
-    if target.policy_outcome in {"target_requires_confirmation", "target_stale_reobserve"}:
+    if target.policy_outcome in {
+        "target_requires_confirmation",
+        "target_stale_reobserve",
+    }:
         steps.extend(
             [
                 {
@@ -2529,10 +3444,14 @@ def _to_workspace_action_plan_out(row: WorkspaceActionPlan) -> dict:
         "planning_outcome": row.planning_outcome,
         "status": row.status,
         "steps": row.steps_json if isinstance(row.steps_json, list) else [],
-        "motion_plan": row.motion_plan_json if isinstance(row.motion_plan_json, dict) else {},
+        "motion_plan": row.motion_plan_json
+        if isinstance(row.motion_plan_json, dict)
+        else {},
         "simulation_outcome": row.simulation_outcome,
         "simulation_status": row.simulation_status,
-        "simulation": row.simulation_json if isinstance(row.simulation_json, dict) else {},
+        "simulation": row.simulation_json
+        if isinstance(row.simulation_json, dict)
+        else {},
         "simulation_gate_passed": row.simulation_gate_passed,
         "execution_capability": row.execution_capability,
         "execution_status": row.execution_status,
@@ -2578,7 +3497,9 @@ async def _build_motion_plan(
             "required_clearance_m": 0.35,
         },
         "estimated_path": {
-            "zones": [*([adjacent[0]] if adjacent else []), mapped_zone or target_zone] if target_zone else [],
+            "zones": [*([adjacent[0]] if adjacent else []), mapped_zone or target_zone]
+            if target_zone
+            else [],
             "path_type": "safe_virtual_preview",
         },
         "collision_risk": 0.0,
@@ -2594,23 +3515,43 @@ async def _simulate_action_plan(
 ) -> tuple[dict, str, bool]:
     zone_name = row.target_zone.strip()
     mapped_zone = _normalize_zone_for_map(zone_name)
-    zone_row = (await db.execute(select(WorkspaceZone).where(WorkspaceZone.zone_name == mapped_zone))).scalars().first() if mapped_zone else None
+    zone_row = (
+        (
+            await db.execute(
+                select(WorkspaceZone).where(WorkspaceZone.zone_name == mapped_zone)
+            )
+        )
+        .scalars()
+        .first()
+        if mapped_zone
+        else None
+    )
     unknown_zone = bool(zone_name) and zone_row is None
     unsafe_zone = bool(zone_row and zone_row.hazard_level > 0)
 
-    related_object = await db.get(WorkspaceObjectMemory, target.related_object_id) if target.related_object_id else None
-    uncertain_identity = bool(related_object and related_object.status in {"uncertain", "stale", "missing"})
+    related_object = (
+        await db.get(WorkspaceObjectMemory, target.related_object_id)
+        if target.related_object_id
+        else None
+    )
+    uncertain_identity = bool(
+        related_object and related_object.status in {"uncertain", "stale", "missing"}
+    )
 
     obstacles: list[WorkspaceObjectMemory] = []
     if zone_name:
         candidates = (
-            await db.execute(
-                select(WorkspaceObjectMemory).where(
-                    WorkspaceObjectMemory.zone == zone_name,
-                    WorkspaceObjectMemory.status == "active",
+            (
+                await db.execute(
+                    select(WorkspaceObjectMemory).where(
+                        WorkspaceObjectMemory.zone == zone_name,
+                        WorkspaceObjectMemory.status == "active",
+                    )
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         for item in candidates:
             if target.related_object_id and item.id == target.related_object_id:
                 continue
@@ -2637,8 +3578,12 @@ async def _simulate_action_plan(
     collision_risk = min(1.0, base_risk)
 
     reachable = not any([unknown_zone, unsafe_zone, len(obstacles) > 0])
-    path_length = round(0.8 + (0.35 * len(obstacles)) + (0.25 if uncertain_identity else 0.0), 3)
-    confidence = round(max(0.0, min(1.0, target.confidence * (1.0 - collision_risk))), 3)
+    path_length = round(
+        0.8 + (0.35 * len(obstacles)) + (0.25 if uncertain_identity else 0.0), 3
+    )
+    confidence = round(
+        max(0.0, min(1.0, target.confidence * (1.0 - collision_risk))), 3
+    )
 
     if unknown_zone or unsafe_zone:
         outcome = "plan_blocked"
@@ -2670,13 +3615,21 @@ async def _simulate_action_plan(
         "outcome": outcome,
         "target_zone": zone_name,
         "target_zone_mapped": mapped_zone,
-        "approach_direction": (row.motion_plan_json.get("approach_vector", {}) if isinstance(row.motion_plan_json, dict) else {}).get("direction", "unknown"),
-        "clearance": (row.motion_plan_json.get("clearance_zone", {}) if isinstance(row.motion_plan_json, dict) else {}).get("required_clearance_m", 0.35),
+        "approach_direction": (
+            row.motion_plan_json.get("approach_vector", {})
+            if isinstance(row.motion_plan_json, dict)
+            else {}
+        ).get("direction", "unknown"),
+        "clearance": (
+            row.motion_plan_json.get("clearance_zone", {})
+            if isinstance(row.motion_plan_json, dict)
+            else {}
+        ).get("required_clearance_m", 0.35),
         "obstacle_warnings": [
-            *( ["unknown_zone"] if unknown_zone else [] ),
-            *( ["unsafe_zone"] if unsafe_zone else [] ),
-            *( ["uncertain_object_identity"] if uncertain_identity else [] ),
-            *( [f"obstacle:{item.canonical_name}" for item in obstacles] ),
+            *(["unknown_zone"] if unknown_zone else []),
+            *(["unsafe_zone"] if unsafe_zone else []),
+            *(["uncertain_object_identity"] if uncertain_identity else []),
+            *([f"obstacle:{item.canonical_name}" for item in obstacles]),
         ],
         "gate": {
             "collision_risk_threshold": collision_risk_threshold,
@@ -2712,7 +3665,9 @@ def _apply_lifecycle_aging(observation: WorkspaceObservation, now: datetime) -> 
     return freshness
 
 
-def _to_workspace_observation_out(observation: WorkspaceObservation, now: datetime) -> dict:
+def _to_workspace_observation_out(
+    observation: WorkspaceObservation, now: datetime
+) -> dict:
     freshness = _freshness_state(observation.last_seen_at, now)
     return {
         "observation_id": observation.id,
@@ -2720,7 +3675,9 @@ def _to_workspace_observation_out(observation: WorkspaceObservation, now: dateti
         "zone": observation.zone,
         "detected_object": observation.label,
         "confidence": observation.confidence,
-        "effective_confidence": _effective_confidence(observation.confidence, freshness),
+        "effective_confidence": _effective_confidence(
+            observation.confidence, freshness
+        ),
         "freshness_state": freshness,
         "source": observation.source,
         "related_execution_id": observation.execution_id,
@@ -2742,7 +3699,9 @@ def _to_workspace_object_out(item: WorkspaceObjectMemory, now: datetime) -> dict
     return {
         "object_memory_id": item.id,
         "canonical_name": item.canonical_name,
-        "aliases": item.candidate_labels if isinstance(item.candidate_labels, list) else [],
+        "aliases": item.candidate_labels
+        if isinstance(item.candidate_labels, list)
+        else [],
         "confidence": item.confidence,
         "effective_confidence": _effective_confidence(item.confidence, freshness),
         "zone": item.zone,
@@ -2750,8 +3709,109 @@ def _to_workspace_object_out(item: WorkspaceObjectMemory, now: datetime) -> dict
         "last_seen_at": item.last_seen_at,
         "status": item.status,
         "last_execution_id": item.last_execution_id,
-        "location_history": item.location_history if isinstance(item.location_history, list) else [],
+        "location_history": item.location_history
+        if isinstance(item.location_history, list)
+        else [],
         "metadata_json": item.metadata_json,
+    }
+
+
+def _object_library_semantic_fields(item: WorkspaceObjectMemory) -> list[str]:
+    metadata = item.metadata_json if isinstance(item.metadata_json, dict) else {}
+    semantic_keys = [
+        "description",
+        "purpose",
+        "owner",
+        "meaning",
+        "category",
+        "user_notes",
+        "explanation",
+        "expected_home_zone",
+        "expected_zone",
+        "home_zone",
+    ]
+    return [key for key in semantic_keys if str(metadata.get(key) or "").strip()]
+
+
+def _object_library_profile(item: WorkspaceObjectMemory, now: datetime) -> dict:
+    semantic_fields = _object_library_semantic_fields(item)
+    aliases = item.candidate_labels if isinstance(item.candidate_labels, list) else []
+    location_history = (
+        item.location_history if isinstance(item.location_history, list) else []
+    )
+    metadata = item.metadata_json if isinstance(item.metadata_json, dict) else {}
+    score = 0.0
+    promotion_reasons: list[str] = []
+
+    if item.status == "active":
+        score += 0.35
+        promotion_reasons.append("currently active")
+    elif item.status == "uncertain":
+        score += 0.22
+        promotion_reasons.append("recent but uncertain")
+    elif item.status == "missing":
+        score += 0.15
+        promotion_reasons.append("tracked as missing")
+
+    if semantic_fields:
+        score += min(0.36, 0.12 * len(semantic_fields))
+        promotion_reasons.append("has semantic memory")
+
+    if item.last_execution_id is not None:
+        score += 0.15
+        promotion_reasons.append("linked to execution")
+
+    observation_source = str(metadata.get("last_observation_source") or "").strip()
+    if observation_source == "live_camera":
+        score += 0.1
+        promotion_reasons.append("seen by live camera")
+    elif observation_source:
+        score += 0.05
+        promotion_reasons.append("seen by recorded observation")
+
+    if len(location_history) > 1:
+        score += 0.05
+        promotion_reasons.append("has movement history")
+
+    alias_count = len([str(item).strip() for item in aliases if str(item).strip()])
+    if alias_count > 1:
+        score += 0.05
+        promotion_reasons.append("has aliases")
+
+    if item.confidence >= 0.9:
+        score += 0.08
+    elif item.confidence >= 0.75:
+        score += 0.05
+    elif item.confidence >= 0.6:
+        score += 0.02
+
+    promoted = (
+        item.status in {"active", "uncertain", "missing"}
+        and score >= 0.45
+        and (
+            bool(semantic_fields)
+            or item.last_execution_id is not None
+            or len(location_history) > 1
+            or alias_count > 1
+        )
+    )
+    if promoted:
+        promotion_reasons.append("passes promotion threshold")
+
+    return {
+        "promoted": promoted,
+        "library_score": round(min(score, 1.0), 3),
+        "semantic_fields": semantic_fields,
+        "promotion_reasons": promotion_reasons,
+    }
+
+
+def _to_workspace_object_library_out(
+    item: WorkspaceObjectMemory, now: datetime
+) -> dict:
+    return {
+        **_to_workspace_object_out(item, now),
+        **_object_library_profile(item, now),
     }
 
 
@@ -2775,7 +3835,13 @@ async def _ensure_default_zone_map(db: AsyncSession) -> None:
 
     for zone_name, details in DEFAULT_ZONE_GRAPH.items():
         from_row = zone_rows[zone_name]
-        for relation_type in ["adjacent_to", "left_of", "right_of", "in_front_of", "behind"]:
+        for relation_type in [
+            "adjacent_to",
+            "left_of",
+            "right_of",
+            "in_front_of",
+            "behind",
+        ]:
             targets = details.get(relation_type, [])
             if not isinstance(targets, list):
                 continue
@@ -2803,7 +3869,9 @@ async def list_workspace_observations(
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     await _ensure_default_zone_map(db)
-    stmt = select(WorkspaceObservation).order_by(WorkspaceObservation.last_seen_at.desc(), WorkspaceObservation.id.desc())
+    stmt = select(WorkspaceObservation).order_by(
+        WorkspaceObservation.last_seen_at.desc(), WorkspaceObservation.id.desc()
+    )
     if zone.strip():
         stmt = stmt.where(WorkspaceObservation.zone == zone.strip())
     if not include_superseded:
@@ -2830,7 +3898,9 @@ async def list_workspace_observations(
 
 
 @router.get("/observations/{observation_id}")
-async def get_workspace_observation(observation_id: int, db: AsyncSession = Depends(get_db)) -> dict:
+async def get_workspace_observation(
+    observation_id: int, db: AsyncSession = Depends(get_db)
+) -> dict:
     observation = await db.get(WorkspaceObservation, observation_id)
     if not observation:
         raise HTTPException(status_code=404, detail="workspace observation not found")
@@ -2853,7 +3923,9 @@ async def list_workspace_objects(
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     await _ensure_default_zone_map(db)
-    stmt = select(WorkspaceObjectMemory).order_by(WorkspaceObjectMemory.last_seen_at.desc(), WorkspaceObjectMemory.id.desc())
+    stmt = select(WorkspaceObjectMemory).order_by(
+        WorkspaceObjectMemory.last_seen_at.desc(), WorkspaceObjectMemory.id.desc()
+    )
     if zone.strip():
         stmt = stmt.where(WorkspaceObjectMemory.zone == zone.strip())
 
@@ -2873,8 +3945,13 @@ async def list_workspace_objects(
             continue
 
         if wanted:
-            aliases = row.candidate_labels if isinstance(row.candidate_labels, list) else []
-            candidates = {row.canonical_name.lower(), *[str(item).lower() for item in aliases]}
+            aliases = (
+                row.candidate_labels if isinstance(row.candidate_labels, list) else []
+            )
+            candidates = {
+                row.canonical_name.lower(),
+                *[str(item).lower() for item in aliases],
+            }
             if not any(wanted in value for value in candidates):
                 continue
         filtered.append(row)
@@ -2889,8 +3966,111 @@ async def list_workspace_objects(
     }
 
 
+@router.get("/object-library")
+async def list_workspace_object_library(
+    label: str = "",
+    zone: str = "",
+    include_stale: bool = Query(default=False),
+    promoted_only: bool = Query(default=True),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    await _ensure_default_zone_map(db)
+    stmt = select(WorkspaceObjectMemory).order_by(
+        WorkspaceObjectMemory.last_seen_at.desc(), WorkspaceObjectMemory.id.desc()
+    )
+    if zone.strip():
+        stmt = stmt.where(WorkspaceObjectMemory.zone == zone.strip())
+
+    rows = (await db.execute(stmt)).scalars().all()
+    now = datetime.now(timezone.utc)
+
+    changed = False
+    wanted = label.strip().lower()
+    filtered: list[WorkspaceObjectMemory] = []
+    summary = {
+        "total_objects": 0,
+        "promoted_objects": 0,
+        "semantic_objects": 0,
+        "active_objects": 0,
+        "uncertain_objects": 0,
+        "missing_objects": 0,
+        "stale_objects": 0,
+        "execution_backed_objects": 0,
+    }
+    library_objects: list[dict] = []
+
+    for row in rows:
+        before = row.status
+        _apply_object_status_aging(row, now)
+        if before != row.status:
+            changed = True
+
+        summary["total_objects"] += 1
+        summary_key = f"{row.status}_objects"
+        if summary_key in summary:
+            summary[summary_key] += 1
+        if row.last_execution_id is not None:
+            summary["execution_backed_objects"] += 1
+
+        profile = _object_library_profile(row, now)
+        if profile["semantic_fields"]:
+            summary["semantic_objects"] += 1
+        if profile["promoted"]:
+            summary["promoted_objects"] += 1
+
+        if not include_stale and row.status == "stale":
+            continue
+
+        if promoted_only and not profile["promoted"]:
+            continue
+
+        if wanted:
+            aliases = (
+                row.candidate_labels if isinstance(row.candidate_labels, list) else []
+            )
+            candidates = {
+                row.canonical_name.lower(),
+                *[str(item).lower() for item in aliases],
+            }
+            owner = str(
+                (row.metadata_json if isinstance(row.metadata_json, dict) else {}).get(
+                    "owner"
+                )
+                or ""
+            ).lower()
+            if owner:
+                candidates.add(owner)
+                candidates.update(f"{owner} {value}" for value in list(candidates))
+            if not any(wanted in value for value in candidates):
+                continue
+
+        filtered.append(row)
+        library_objects.append(_to_workspace_object_library_out(row, now))
+
+    if changed:
+        await db.commit()
+        for row in filtered:
+            await db.refresh(row)
+
+    library_objects.sort(
+        key=lambda item: (
+            float(item.get("library_score", 0.0)),
+            str(item.get("last_seen_at", "")),
+            int(item.get("object_memory_id", 0)),
+        ),
+        reverse=True,
+    )
+
+    return {
+        "summary": summary,
+        "objects": library_objects,
+    }
+
+
 @router.get("/objects/{object_memory_id}")
-async def get_workspace_object(object_memory_id: int, db: AsyncSession = Depends(get_db)) -> dict:
+async def get_workspace_object(
+    object_memory_id: int, db: AsyncSession = Depends(get_db)
+) -> dict:
     await _ensure_default_zone_map(db)
     row = await db.get(WorkspaceObjectMemory, object_memory_id)
     if not row:
@@ -2907,22 +4087,31 @@ async def get_workspace_object(object_memory_id: int, db: AsyncSession = Depends
 
 
 @router.get("/objects/{object_memory_id}/relations")
-async def get_workspace_object_relations(object_memory_id: int, db: AsyncSession = Depends(get_db)) -> dict:
+async def get_workspace_object_relations(
+    object_memory_id: int, db: AsyncSession = Depends(get_db)
+) -> dict:
     await _ensure_default_zone_map(db)
     row = await db.get(WorkspaceObjectMemory, object_memory_id)
     if not row:
         raise HTTPException(status_code=404, detail="workspace object not found")
 
     relations = (
-        await db.execute(
-            select(WorkspaceObjectRelation)
-            .where(
-                (WorkspaceObjectRelation.subject_object_id == object_memory_id)
-                | (WorkspaceObjectRelation.object_object_id == object_memory_id)
+        (
+            await db.execute(
+                select(WorkspaceObjectRelation)
+                .where(
+                    (WorkspaceObjectRelation.subject_object_id == object_memory_id)
+                    | (WorkspaceObjectRelation.object_object_id == object_memory_id)
+                )
+                .order_by(
+                    WorkspaceObjectRelation.last_seen_at.desc(),
+                    WorkspaceObjectRelation.id.desc(),
+                )
             )
-            .order_by(WorkspaceObjectRelation.last_seen_at.desc(), WorkspaceObjectRelation.id.desc())
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
 
     related_ids: set[int] = set()
     for relation in relations:
@@ -2960,8 +4149,24 @@ async def get_workspace_object_relations(object_memory_id: int, db: AsyncSession
 @router.get("/map")
 async def get_workspace_map(db: AsyncSession = Depends(get_db)) -> dict:
     await _ensure_default_zone_map(db)
-    zones = (await db.execute(select(WorkspaceZone).order_by(WorkspaceZone.zone_name.asc()))).scalars().all()
-    relations = (await db.execute(select(WorkspaceZoneRelation).order_by(WorkspaceZoneRelation.id.asc()))).scalars().all()
+    zones = (
+        (
+            await db.execute(
+                select(WorkspaceZone).order_by(WorkspaceZone.zone_name.asc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    relations = (
+        (
+            await db.execute(
+                select(WorkspaceZoneRelation).order_by(WorkspaceZoneRelation.id.asc())
+            )
+        )
+        .scalars()
+        .all()
+    )
 
     names: dict[int, str] = {zone.id: zone.zone_name for zone in zones}
     return {
@@ -2992,7 +4197,15 @@ async def get_workspace_map(db: AsyncSession = Depends(get_db)) -> dict:
 @router.get("/map/zones")
 async def get_workspace_map_zones(db: AsyncSession = Depends(get_db)) -> dict:
     await _ensure_default_zone_map(db)
-    zones = (await db.execute(select(WorkspaceZone).order_by(WorkspaceZone.zone_name.asc()))).scalars().all()
+    zones = (
+        (
+            await db.execute(
+                select(WorkspaceZone).order_by(WorkspaceZone.zone_name.asc())
+            )
+        )
+        .scalars()
+        .all()
+    )
     return {
         "zones": [
             {
@@ -3010,7 +4223,9 @@ async def get_workspace_map_zones(db: AsyncSession = Depends(get_db)) -> dict:
 @router.get("/monitoring")
 async def get_workspace_monitoring_status(db: AsyncSession = Depends(get_db)) -> dict:
     row = await _get_or_create_monitoring_state(db)
-    if row.desired_running and not (MONITORING_RUNTIME.task and not MONITORING_RUNTIME.task.done()):
+    if row.desired_running and not (
+        MONITORING_RUNTIME.task and not MONITORING_RUNTIME.task.done()
+    ):
         _start_monitoring_runtime_if_needed()
         row.runtime_status = "running"
         await db.commit()
@@ -3033,7 +4248,9 @@ async def start_workspace_monitoring(
     row.freshness_threshold_seconds = payload.freshness_threshold_seconds
     row.cooldown_seconds = payload.cooldown_seconds
     row.max_scan_rate = payload.max_scan_rate
-    row.priority_zones = [item.strip() for item in payload.priority_zones if str(item).strip()]
+    row.priority_zones = [
+        item.strip() for item in payload.priority_zones if str(item).strip()
+    ]
     row.last_scan_at = None
     row.last_scan_reason = ""
     row.scan_count = 0
@@ -3134,13 +4351,17 @@ async def update_workspace_human_aware_signals(
     if payload.occupied_zones:
         state["occupied_zones"] = [
             normalized
-            for normalized in (_normalize_zone_for_map(item) for item in payload.occupied_zones)
+            for normalized in (
+                _normalize_zone_for_map(item) for item in payload.occupied_zones
+            )
             if normalized
         ]
     if payload.high_proximity_zones:
         state["high_proximity_zones"] = [
             normalized
-            for normalized in (_normalize_zone_for_map(item) for item in payload.high_proximity_zones)
+            for normalized in (
+                _normalize_zone_for_map(item) for item in payload.high_proximity_zones
+            )
             if normalized
         ]
 
@@ -3191,12 +4412,18 @@ async def get_workspace_autonomy_policy(db: AsyncSession = Depends(get_db)) -> d
         "proposal_policy_map": AUTONOMY_PROPOSAL_POLICY_MAP,
         "proposal_risk_scores": AUTONOMY_PROPOSAL_RISK_SCORE,
         "proposal_priority_policy": {
-            "policy_version": proposal_priority_policy.get("version", PROPOSAL_PRIORITY_POLICY_VERSION),
+            "policy_version": proposal_priority_policy.get(
+                "version", PROPOSAL_PRIORITY_POLICY_VERSION
+            ),
             "weights": proposal_priority_policy.get("weights", {}),
             "urgency_map": proposal_priority_policy.get("urgency_map", {}),
             "zone_importance": proposal_priority_policy.get("zone_importance", {}),
-            "operator_preference": proposal_priority_policy.get("operator_preference", {}),
-            "age_saturation_minutes": proposal_priority_policy.get("age_saturation_minutes", 120),
+            "operator_preference": proposal_priority_policy.get(
+                "operator_preference", {}
+            ),
+            "age_saturation_minutes": proposal_priority_policy.get(
+                "age_saturation_minutes", 120
+            ),
         },
         "autonomy": {
             key: value
@@ -3215,7 +4442,9 @@ async def run_workspace_autonomy_loop_step(
     zone_filter: str = "",
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    result = await _run_autonomy_controller_step(db=db, actor=actor, reason=reason, zone_filter=zone_filter)
+    result = await _run_autonomy_controller_step(
+        db=db, actor=actor, reason=reason, zone_filter=zone_filter
+    )
     await db.commit()
     return {
         "actor": actor,
@@ -3240,7 +4469,9 @@ async def set_workspace_autonomy_override(
     if payload.max_auto_actions_per_minute is not None:
         autonomy["max_auto_actions_per_minute"] = payload.max_auto_actions_per_minute
     if payload.cooldown_between_actions_seconds is not None:
-        autonomy["cooldown_between_actions_seconds"] = payload.cooldown_between_actions_seconds
+        autonomy["cooldown_between_actions_seconds"] = (
+            payload.cooldown_between_actions_seconds
+        )
     if payload.max_auto_tasks_per_window is not None:
         autonomy["max_auto_tasks_per_window"] = payload.max_auto_tasks_per_window
     if payload.auto_window_seconds is not None:
@@ -3264,9 +4495,13 @@ async def set_workspace_autonomy_override(
             if _normalize_zone_for_map(str(item))
         ]
     if payload.auto_safe_confidence_threshold is not None:
-        autonomy["auto_safe_confidence_threshold"] = payload.auto_safe_confidence_threshold
+        autonomy["auto_safe_confidence_threshold"] = (
+            payload.auto_safe_confidence_threshold
+        )
     if payload.auto_preferred_confidence_threshold is not None:
-        autonomy["auto_preferred_confidence_threshold"] = payload.auto_preferred_confidence_threshold
+        autonomy["auto_preferred_confidence_threshold"] = (
+            payload.auto_preferred_confidence_threshold
+        )
     if payload.low_risk_score_max is not None:
         autonomy["low_risk_score_max"] = payload.low_risk_score_max
     if payload.max_autonomy_retries is not None:
@@ -3293,7 +4528,9 @@ async def set_workspace_autonomy_override(
         or payload.low_risk_score_max is not None
         or payload.max_autonomy_retries is not None
     ):
-        await apply_learning_signal(db=db, signal="policy_override", user_id=payload.actor or DEFAULT_USER_ID)
+        await apply_learning_signal(
+            db=db, signal="policy_override", user_id=payload.actor or DEFAULT_USER_ID
+        )
 
     await write_journal(
         db,
@@ -3389,7 +4626,9 @@ async def get_workspace_adaptive_autonomy_boundary_profile(
 ) -> dict:
     row = await get_autonomy_boundary_profile(profile_id=profile_id, db=db)
     if not row:
-        raise HTTPException(status_code=404, detail="autonomy_boundary_profile_not_found")
+        raise HTTPException(
+            status_code=404, detail="autonomy_boundary_profile_not_found"
+        )
     return {
         "profile": to_autonomy_boundary_profile_out(row),
     }
@@ -3430,7 +4669,10 @@ async def create_workspace_capability_chain(
 ) -> dict:
     steps = _normalized_capability_chain_steps(payload.steps)
     if len(steps) < 2:
-        raise HTTPException(status_code=422, detail="capability chain must include at least two valid steps")
+        raise HTTPException(
+            status_code=422,
+            detail="capability chain must include at least two valid steps",
+        )
 
     allowed, policy_reason = _validate_capability_chain_policy(steps)
     if not allowed:
@@ -3442,7 +4684,9 @@ async def create_workspace_capability_chain(
 
     policy = {
         "version": CAPABILITY_CHAIN_POLICY_VERSION,
-        "allowed_combinations": [list(item) for item in sorted(SAFE_CAPABILITY_CHAIN_COMBINATIONS)],
+        "allowed_combinations": [
+            list(item) for item in sorted(SAFE_CAPABILITY_CHAIN_COMBINATIONS)
+        ],
         "combination": [steps[0].get("capability"), steps[1].get("capability")],
         **(payload.policy_json if isinstance(payload.policy_json, dict) else {}),
     }
@@ -3460,7 +4704,11 @@ async def create_workspace_capability_chain(
         stop_on_failure=payload.stop_on_failure,
         escalate_on_failure=payload.escalate_on_failure,
         audit_trail_json=[],
-        metadata_json={"created_by": payload.actor, "reason": payload.reason, **payload.metadata_json},
+        metadata_json={
+            "created_by": payload.actor,
+            "reason": payload.reason,
+            **payload.metadata_json,
+        },
     )
     db.add(row)
     await db.flush()
@@ -3470,7 +4718,10 @@ async def create_workspace_capability_chain(
         actor=payload.actor,
         event="capability_chain_created",
         reason=payload.reason,
-        metadata_json={"policy_version": CAPABILITY_CHAIN_POLICY_VERSION, "steps": steps},
+        metadata_json={
+            "policy_version": CAPABILITY_CHAIN_POLICY_VERSION,
+            "steps": steps,
+        },
     )
 
     await write_journal(
@@ -3488,18 +4739,26 @@ async def create_workspace_capability_chain(
 
 
 @router.get("/capability-chains/{chain_id}")
-async def get_workspace_capability_chain(chain_id: int, db: AsyncSession = Depends(get_db)) -> dict:
+async def get_workspace_capability_chain(
+    chain_id: int, db: AsyncSession = Depends(get_db)
+) -> dict:
     row = await db.get(WorkspaceCapabilityChain, chain_id)
     if not row:
-        raise HTTPException(status_code=404, detail="workspace capability chain not found")
+        raise HTTPException(
+            status_code=404, detail="workspace capability chain not found"
+        )
     return _to_workspace_capability_chain_out(row)
 
 
 @router.get("/capability-chains/{chain_id}/audit")
-async def get_workspace_capability_chain_audit(chain_id: int, db: AsyncSession = Depends(get_db)) -> dict:
+async def get_workspace_capability_chain_audit(
+    chain_id: int, db: AsyncSession = Depends(get_db)
+) -> dict:
     row = await db.get(WorkspaceCapabilityChain, chain_id)
     if not row:
-        raise HTTPException(status_code=404, detail="workspace capability chain not found")
+        raise HTTPException(
+            status_code=404, detail="workspace capability chain not found"
+        )
     return {
         "chain_id": row.id,
         "status": row.status,
@@ -3515,9 +4774,13 @@ async def advance_workspace_capability_chain(
 ) -> dict:
     row = await db.get(WorkspaceCapabilityChain, chain_id)
     if not row:
-        raise HTTPException(status_code=404, detail="workspace capability chain not found")
+        raise HTTPException(
+            status_code=404, detail="workspace capability chain not found"
+        )
     if row.status in {"completed", "failed", "canceled"}:
-        raise HTTPException(status_code=422, detail="workspace capability chain is terminal")
+        raise HTTPException(
+            status_code=422, detail="workspace capability chain is terminal"
+        )
 
     steps = row.steps_json if isinstance(row.steps_json, list) else []
     if row.current_step_index >= len(steps):
@@ -3526,7 +4789,11 @@ async def advance_workspace_capability_chain(
         await db.refresh(row)
         return _to_workspace_capability_chain_out(row)
 
-    step = steps[row.current_step_index] if isinstance(steps[row.current_step_index], dict) else {}
+    step = (
+        steps[row.current_step_index]
+        if isinstance(steps[row.current_step_index], dict)
+        else {}
+    )
     step_id = str(step.get("step_id", f"step-{row.current_step_index + 1}")).strip()
 
     monitoring = await _get_or_create_monitoring_state(db)
@@ -3534,18 +4801,26 @@ async def advance_workspace_capability_chain(
     _, chain_constraint_result = await evaluate_and_record_constraints(
         actor=payload.actor,
         source="objective44_capability_chain_advance",
-        goal={"goal_type": "advance_capability_chain", "chain_id": row.id, "step_id": step_id},
+        goal={
+            "goal_type": "advance_capability_chain",
+            "chain_id": row.id,
+            "step_id": step_id,
+        },
         action_plan={
             "action_type": str(step.get("capability", "")).strip(),
             "chain_id": row.id,
             "step_id": step_id,
-            "is_physical": _is_physical_capability_step(str(step.get("capability", "")).strip()),
+            "is_physical": _is_physical_capability_step(
+                str(step.get("capability", "")).strip()
+            ),
         },
         workspace_state={
             "human_in_workspace": human_aware.get("human_in_workspace", False),
             "human_near_target_zone": human_aware.get("human_near_target_zone", False),
             "human_near_motion_path": human_aware.get("human_near_motion_path", False),
-            "shared_workspace_active": human_aware.get("shared_workspace_active", False),
+            "shared_workspace_active": human_aware.get(
+                "shared_workspace_active", False
+            ),
             "target_confidence": 1.0,
             "map_freshness_seconds": 0,
         },
@@ -3566,7 +4841,11 @@ async def advance_workspace_capability_chain(
             actor=payload.actor,
             event="capability_step_blocked_constraint_engine",
             reason=f"decision={chain_decision}",
-            metadata_json={"step_id": step_id, "constraint_result": chain_constraint_result, **payload.metadata_json},
+            metadata_json={
+                "step_id": step_id,
+                "constraint_result": chain_constraint_result,
+                **payload.metadata_json,
+            },
         )
         await db.commit()
         await db.refresh(row)
@@ -3581,8 +4860,13 @@ async def advance_workspace_capability_chain(
             },
         }
 
-    human_outcome, human_reason = _human_aware_policy_for_capability_step(step=step, human_aware=human_aware)
-    if human_outcome in {"pause", "require_operator_confirmation", "stop_replan"} and not payload.force:
+    human_outcome, human_reason = _human_aware_policy_for_capability_step(
+        step=step, human_aware=human_aware
+    )
+    if (
+        human_outcome in {"pause", "require_operator_confirmation", "stop_replan"}
+        and not payload.force
+    ):
         if human_outcome == "pause":
             row.status = "paused"
             result = "paused_by_human_presence"
@@ -3593,7 +4877,9 @@ async def advance_workspace_capability_chain(
             row.status = "failed"
             result = "stopped_for_replan"
             if row.escalate_on_failure:
-                metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
+                metadata = (
+                    row.metadata_json if isinstance(row.metadata_json, dict) else {}
+                )
                 row.metadata_json = {
                     **metadata,
                     "escalation": {
@@ -3653,8 +4939,13 @@ async def advance_workspace_capability_chain(
             },
         }
 
-    if human_outcome == "slow_suppress" and str(step.get("capability", "")).strip() == "speech_output":
-        params = step.get("params", {}) if isinstance(step.get("params", {}), dict) else {}
+    if (
+        human_outcome == "slow_suppress"
+        and str(step.get("capability", "")).strip() == "speech_output"
+    ):
+        params = (
+            step.get("params", {}) if isinstance(step.get("params", {}), dict) else {}
+        )
         step["params"] = {
             **params,
             "human_policy_suppress": True,
@@ -3666,13 +4957,24 @@ async def advance_workspace_capability_chain(
         }
         _store_human_aware_state(monitoring, human_aware)
 
-    depends_on = step.get("depends_on", []) if isinstance(step.get("depends_on", []), list) else []
-    completed_step_ids = row.completed_step_ids if isinstance(row.completed_step_ids, list) else []
+    depends_on = (
+        step.get("depends_on", [])
+        if isinstance(step.get("depends_on", []), list)
+        else []
+    )
+    completed_step_ids = (
+        row.completed_step_ids if isinstance(row.completed_step_ids, list) else []
+    )
     unmet = [dep for dep in depends_on if dep not in completed_step_ids]
     if unmet and not payload.force:
-        raise HTTPException(status_code=422, detail=f"capability chain dependency unmet: {', '.join(unmet)}")
+        raise HTTPException(
+            status_code=422,
+            detail=f"capability chain dependency unmet: {', '.join(unmet)}",
+        )
 
-    success, result, verification = await _execute_capability_chain_step(chain=row, step=step, db=db)
+    success, result, verification = await _execute_capability_chain_step(
+        chain=row, step=step, db=db
+    )
     row.last_advanced_at = datetime.now(timezone.utc)
 
     if success:
@@ -3687,7 +4989,11 @@ async def advance_workspace_capability_chain(
             actor=payload.actor,
             event="capability_step_completed",
             reason=payload.reason or result,
-            metadata_json={"step_id": step_id, "verification": verification, **payload.metadata_json},
+            metadata_json={
+                "step_id": step_id,
+                "verification": verification,
+                **payload.metadata_json,
+            },
         )
     else:
         failed = row.failed_step_ids if isinstance(row.failed_step_ids, list) else []
@@ -3698,7 +5004,9 @@ async def advance_workspace_capability_chain(
             row.status = "failed"
         else:
             row.current_step_index = int(row.current_step_index) + 1
-            row.status = "completed" if row.current_step_index >= len(steps) else "active"
+            row.status = (
+                "completed" if row.current_step_index >= len(steps) else "active"
+            )
         metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
         if row.escalate_on_failure:
             row.metadata_json = {
@@ -3715,7 +5023,12 @@ async def advance_workspace_capability_chain(
             actor=payload.actor,
             event="capability_step_failed",
             reason=payload.reason or result,
-            metadata_json={"step_id": step_id, "verification": verification, "escalated": row.escalate_on_failure, **payload.metadata_json},
+            metadata_json={
+                "step_id": step_id,
+                "verification": verification,
+                "escalated": row.escalate_on_failure,
+                **payload.metadata_json,
+            },
         )
 
     await write_journal(
@@ -3755,7 +5068,9 @@ async def create_workspace_autonomous_chain(
 ) -> dict:
     proposal_ids = [int(item) for item in payload.proposal_ids if int(item) > 0]
     if not proposal_ids:
-        raise HTTPException(status_code=422, detail="proposal_ids must include at least one proposal")
+        raise HTTPException(
+            status_code=422, detail="proposal_ids must include at least one proposal"
+        )
 
     valid_ids: list[int] = []
     for proposal_id in proposal_ids:
@@ -3764,7 +5079,9 @@ async def create_workspace_autonomous_chain(
             valid_ids.append(proposal_id)
 
     if not valid_ids:
-        raise HTTPException(status_code=422, detail="no valid proposals found for chain")
+        raise HTTPException(
+            status_code=422, detail="no valid proposals found for chain"
+        )
 
     step_policy = _normalized_chain_step_policy(payload.step_policy_json)
 
@@ -3827,18 +5144,26 @@ async def create_workspace_autonomous_chain(
 
 
 @router.get("/chains/{chain_id}")
-async def get_workspace_autonomous_chain(chain_id: int, db: AsyncSession = Depends(get_db)) -> dict:
+async def get_workspace_autonomous_chain(
+    chain_id: int, db: AsyncSession = Depends(get_db)
+) -> dict:
     row = await db.get(WorkspaceAutonomousChain, chain_id)
     if not row:
-        raise HTTPException(status_code=404, detail="workspace autonomous chain not found")
+        raise HTTPException(
+            status_code=404, detail="workspace autonomous chain not found"
+        )
     return _to_workspace_autonomous_chain_out(row)
 
 
 @router.get("/chains/{chain_id}/audit")
-async def get_workspace_autonomous_chain_audit(chain_id: int, db: AsyncSession = Depends(get_db)) -> dict:
+async def get_workspace_autonomous_chain_audit(
+    chain_id: int, db: AsyncSession = Depends(get_db)
+) -> dict:
     row = await db.get(WorkspaceAutonomousChain, chain_id)
     if not row:
-        raise HTTPException(status_code=404, detail="workspace autonomous chain not found")
+        raise HTTPException(
+            status_code=404, detail="workspace autonomous chain not found"
+        )
     return {
         "chain_id": row.id,
         "status": row.status,
@@ -3854,9 +5179,14 @@ async def approve_workspace_autonomous_chain(
 ) -> dict:
     row = await db.get(WorkspaceAutonomousChain, chain_id)
     if not row:
-        raise HTTPException(status_code=404, detail="workspace autonomous chain not found")
+        raise HTTPException(
+            status_code=404, detail="workspace autonomous chain not found"
+        )
     if row.status in {"completed", "failed", "canceled"}:
-        raise HTTPException(status_code=422, detail="workspace autonomous chain is terminal and cannot be approved")
+        raise HTTPException(
+            status_code=422,
+            detail="workspace autonomous chain is terminal and cannot be approved",
+        )
 
     row.approved_by = payload.actor
     row.approved_at = datetime.now(timezone.utc)
@@ -3897,22 +5227,35 @@ async def advance_workspace_autonomous_chain(
 ) -> dict:
     row = await db.get(WorkspaceAutonomousChain, chain_id)
     if not row:
-        raise HTTPException(status_code=404, detail="workspace autonomous chain not found")
+        raise HTTPException(
+            status_code=404, detail="workspace autonomous chain not found"
+        )
     if row.status not in {"active", "pending"}:
-        raise HTTPException(status_code=422, detail="workspace autonomous chain is not advanceable")
+        raise HTTPException(
+            status_code=422, detail="workspace autonomous chain is not advanceable"
+        )
 
     if row.requires_approval and not row.approved_at:
-        raise HTTPException(status_code=422, detail="workspace autonomous chain requires approval before advance")
+        raise HTTPException(
+            status_code=422,
+            detail="workspace autonomous chain requires approval before advance",
+        )
 
     now = datetime.now(timezone.utc)
     if row.last_advanced_at and int(row.cooldown_seconds) > 0:
         elapsed = (now - row.last_advanced_at).total_seconds()
         if elapsed < int(row.cooldown_seconds):
-            raise HTTPException(status_code=429, detail="workspace autonomous chain cooldown active")
+            raise HTTPException(
+                status_code=429, detail="workspace autonomous chain cooldown active"
+            )
 
-    step_policy = _normalized_chain_step_policy(row.step_policy_json if isinstance(row.step_policy_json, dict) else {})
+    step_policy = _normalized_chain_step_policy(
+        row.step_policy_json if isinstance(row.step_policy_json, dict) else {}
+    )
 
-    proposal_ids = row.step_proposal_ids if isinstance(row.step_proposal_ids, list) else []
+    proposal_ids = (
+        row.step_proposal_ids if isinstance(row.step_proposal_ids, list) else []
+    )
     if row.current_step_index >= len(proposal_ids):
         row.status = "completed"
         row.last_advanced_at = now
@@ -3930,7 +5273,9 @@ async def advance_workspace_autonomous_chain(
     current_proposal_id = int(proposal_ids[row.current_step_index])
     proposal = await db.get(WorkspaceProposal, current_proposal_id)
     if not proposal:
-        failed = list(row.failed_step_ids) if isinstance(row.failed_step_ids, list) else []
+        failed = (
+            list(row.failed_step_ids) if isinstance(row.failed_step_ids, list) else []
+        )
         failed.append(current_proposal_id)
         row.failed_step_ids = failed
         row.status = "failed" if row.stop_on_failure else "active"
@@ -3943,7 +5288,11 @@ async def advance_workspace_autonomous_chain(
         is_terminal = proposal_status in set(step_policy.get("terminal_statuses", []))
         is_failure = proposal_status in set(step_policy.get("failure_statuses", []))
         if is_failure:
-            failed = list(row.failed_step_ids) if isinstance(row.failed_step_ids, list) else []
+            failed = (
+                list(row.failed_step_ids)
+                if isinstance(row.failed_step_ids, list)
+                else []
+            )
             failed.append(current_proposal_id)
             row.failed_step_ids = failed
             if row.stop_on_failure and not payload.force:
@@ -3955,7 +5304,11 @@ async def advance_workspace_autonomous_chain(
                 else:
                     row.status = "active"
         elif is_terminal or payload.force:
-            completed = list(row.completed_step_ids) if isinstance(row.completed_step_ids, list) else []
+            completed = (
+                list(row.completed_step_ids)
+                if isinstance(row.completed_step_ids, list)
+                else []
+            )
             completed.append(current_proposal_id)
             row.completed_step_ids = completed
             row.current_step_index = row.current_step_index + 1
@@ -3982,7 +5335,11 @@ async def advance_workspace_autonomous_chain(
     )
 
     if proposal and (proposal.status in {"accepted", "rejected"} or payload.force):
-        completed = list(row.completed_step_ids) if isinstance(row.completed_step_ids, list) else []
+        completed = (
+            list(row.completed_step_ids)
+            if isinstance(row.completed_step_ids, list)
+            else []
+        )
         if current_proposal_id not in completed:
             completed.append(current_proposal_id)
             row.completed_step_ids = completed
@@ -4030,7 +5387,9 @@ async def list_workspace_proposals(
     rows = (await db.execute(stmt)).scalars().all()[:limit]
     refresh_needed = False
     for row in rows:
-        if status.strip() == "pending" or (not status.strip() and row.status == "pending"):
+        if status.strip() == "pending" or (
+            not status.strip() and row.status == "pending"
+        ):
             await _refresh_workspace_proposal_priority(proposal=row, db=db)
             refresh_needed = True
     if refresh_needed:
@@ -4039,7 +5398,9 @@ async def list_workspace_proposals(
 
 
 @router.get("/proposals/priority-policy")
-async def get_workspace_proposal_priority_policy(db: AsyncSession = Depends(get_db)) -> dict:
+async def get_workspace_proposal_priority_policy(
+    db: AsyncSession = Depends(get_db),
+) -> dict:
     row = await _get_or_create_monitoring_state(db)
     policy = _proposal_priority_policy_from_monitoring(row)
     return {
@@ -4059,25 +5420,61 @@ async def update_workspace_proposal_priority_policy(
 ) -> dict:
     row = await _get_or_create_monitoring_state(db)
     metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
-    existing = metadata.get("proposal_priority_policy", {}) if isinstance(metadata.get("proposal_priority_policy", {}), dict) else {}
+    existing = (
+        metadata.get("proposal_priority_policy", {})
+        if isinstance(metadata.get("proposal_priority_policy", {}), dict)
+        else {}
+    )
 
     updated = {
         **existing,
         "weights": {
-            **(existing.get("weights", {}) if isinstance(existing.get("weights", {}), dict) else {}),
-            **{key: _normalize_score(value) for key, value in payload.weights.items() if str(key).strip()},
+            **(
+                existing.get("weights", {})
+                if isinstance(existing.get("weights", {}), dict)
+                else {}
+            ),
+            **{
+                key: _normalize_score(value)
+                for key, value in payload.weights.items()
+                if str(key).strip()
+            },
         },
         "urgency_map": {
-            **(existing.get("urgency_map", {}) if isinstance(existing.get("urgency_map", {}), dict) else {}),
-            **{str(key).strip(): _normalize_score(value) for key, value in payload.urgency_map.items() if str(key).strip()},
+            **(
+                existing.get("urgency_map", {})
+                if isinstance(existing.get("urgency_map", {}), dict)
+                else {}
+            ),
+            **{
+                str(key).strip(): _normalize_score(value)
+                for key, value in payload.urgency_map.items()
+                if str(key).strip()
+            },
         },
         "zone_importance": {
-            **(existing.get("zone_importance", {}) if isinstance(existing.get("zone_importance", {}), dict) else {}),
-            **{str(key).strip(): _normalize_score(value) for key, value in payload.zone_importance.items() if str(key).strip()},
+            **(
+                existing.get("zone_importance", {})
+                if isinstance(existing.get("zone_importance", {}), dict)
+                else {}
+            ),
+            **{
+                str(key).strip(): _normalize_score(value)
+                for key, value in payload.zone_importance.items()
+                if str(key).strip()
+            },
         },
         "operator_preference": {
-            **(existing.get("operator_preference", {}) if isinstance(existing.get("operator_preference", {}), dict) else {}),
-            **{str(key).strip(): _normalize_score(value) for key, value in payload.operator_preference.items() if str(key).strip()},
+            **(
+                existing.get("operator_preference", {})
+                if isinstance(existing.get("operator_preference", {}), dict)
+                else {}
+            ),
+            **{
+                str(key).strip(): _normalize_score(value)
+                for key, value in payload.operator_preference.items()
+                if str(key).strip()
+            },
         },
         "version": PROPOSAL_PRIORITY_POLICY_VERSION,
     }
@@ -4129,13 +5526,17 @@ async def get_next_workspace_proposal(
 ) -> dict:
     status_filter = status.strip() or "pending"
     rows = (
-        await db.execute(
-            select(WorkspaceProposal)
-            .where(WorkspaceProposal.status == status_filter)
-            .order_by(WorkspaceProposal.id.desc())
-            .limit(limit)
+        (
+            await db.execute(
+                select(WorkspaceProposal)
+                .where(WorkspaceProposal.status == status_filter)
+                .order_by(WorkspaceProposal.id.desc())
+                .limit(limit)
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     if not rows:
         return {"proposal": None, "selected": False, "status": status_filter}
 
@@ -4166,7 +5567,9 @@ async def get_next_workspace_proposal(
             "status_filter": status_filter,
             "priority_score": selected_row.priority_score,
             "priority_reason": selected_row.priority_reason,
-            "policy_version": selected_priority.get("policy", {}).get("version", PROPOSAL_PRIORITY_POLICY_VERSION),
+            "policy_version": selected_priority.get("policy", {}).get(
+                "version", PROPOSAL_PRIORITY_POLICY_VERSION
+            ),
             "priority_breakdown": selected_priority.get("breakdown", {}),
         },
     )
@@ -4180,14 +5583,186 @@ async def get_next_workspace_proposal(
         "selected": True,
         "status": status_filter,
         "proposal": _workspace_proposal_payload(selected_row),
-        "policy_version": selected_priority.get("policy", {}).get("version", PROPOSAL_PRIORITY_POLICY_VERSION),
+        "policy_version": selected_priority.get("policy", {}).get(
+            "version", PROPOSAL_PRIORITY_POLICY_VERSION
+        ),
         "priority_breakdown": selected_priority.get("breakdown", {}),
         "notification": notification,
     }
 
 
+@router.post("/proposals/arbitration-outcomes")
+async def record_workspace_proposal_arbitration_outcome_endpoint(
+    payload: WorkspaceProposalArbitrationOutcomeRecordRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    try:
+        row = await record_workspace_proposal_arbitration_outcome(
+            actor=payload.actor,
+            source=payload.source,
+            proposal_id=payload.proposal_id,
+            proposal_type=payload.proposal_type,
+            related_zone=payload.related_zone,
+            arbitration_decision=payload.arbitration_decision,
+            arbitration_posture=payload.arbitration_posture,
+            trust_chain_status=payload.trust_chain_status,
+            downstream_execution_outcome=payload.downstream_execution_outcome,
+            confidence=payload.confidence,
+            arbitration_reason=payload.reason,
+            conflict_context_json=payload.conflict_context_json,
+            commitment_state_json=payload.commitment_state_json,
+            metadata_json=payload.metadata_json,
+            db=db,
+        )
+    except ValueError as exc:
+        code = str(exc)
+        if code == "workspace_proposal_not_found":
+            raise HTTPException(status_code=404, detail="workspace proposal not found")
+        if code == "proposal_type_required":
+            raise HTTPException(status_code=422, detail="proposal_type_required")
+        raise
+
+    await write_journal(
+        db,
+        actor=payload.actor,
+        action="workspace_proposal_arbitration_outcome_recorded",
+        target_type="workspace_proposal_arbitration_outcome",
+        target_id=str(row.id),
+        summary=(
+            f"Recorded proposal arbitration outcome {row.id} for {row.proposal_type} "
+            f"decision={row.arbitration_decision}"
+        ),
+        metadata_json={
+            "proposal_id": row.proposal_id,
+            "proposal_type": row.proposal_type,
+            "related_zone": row.related_zone,
+            "trust_chain_status": row.trust_chain_status,
+            **payload.metadata_json,
+        },
+    )
+    await db.commit()
+    return {
+        "outcome": WorkspaceProposalArbitrationOutcomeOut(
+            **to_workspace_proposal_arbitration_out(row)
+        ).model_dump()
+    }
+
+
+@router.get("/proposals/arbitration-outcomes")
+async def list_workspace_proposal_arbitration_outcomes_endpoint(
+    proposal_type: str = Query(default=""),
+    related_zone: str = Query(default=""),
+    limit: int = Query(default=50, ge=1, le=200),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    rows = await list_workspace_proposal_arbitration_outcomes(
+        db=db,
+        proposal_type=proposal_type,
+        related_zone=related_zone,
+        limit=limit,
+    )
+    return {
+        "outcomes": [
+            WorkspaceProposalArbitrationOutcomeOut(
+                **to_workspace_proposal_arbitration_out(item)
+            ).model_dump()
+            for item in rows
+        ]
+    }
+
+
+@router.get("/proposals/arbitration-learning")
+async def list_workspace_proposal_arbitration_learning_endpoint(
+    proposal_type: str = Query(default=""),
+    related_zone: str = Query(default=""),
+    limit: int = Query(default=50, ge=1, le=200),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    if str(proposal_type or "").strip():
+        summary = await workspace_proposal_arbitration_learning_bias(
+            proposal_type=proposal_type,
+            related_zone=related_zone,
+            db=db,
+        )
+        return {
+            "learning": [
+                WorkspaceProposalArbitrationLearningOut(**summary).model_dump()
+            ]
+        }
+    payload = await list_workspace_proposal_arbitration_learning(
+        db=db,
+        related_zone=related_zone,
+        limit=limit,
+    )
+    return {
+        "learning": [
+            WorkspaceProposalArbitrationLearningOut(**item).model_dump()
+            for item in payload
+        ]
+    }
+
+
+@router.get("/proposals/policy-preferences")
+async def list_workspace_proposal_policy_preferences_endpoint(
+    proposal_type: str = Query(default=""),
+    related_zone: str = Query(default=""),
+    limit: int = Query(default=50, ge=1, le=200),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    if str(proposal_type or "").strip():
+        payload = await converge_workspace_proposal_policy_preference(
+            proposal_type=proposal_type,
+            related_zone=related_zone,
+            db=db,
+        )
+        await db.commit()
+        return {
+            "preferences": [
+                WorkspaceProposalPolicyPreferenceOut(**payload).model_dump()
+            ]
+        }
+    payload = await list_workspace_proposal_policy_preferences(
+        db=db,
+        related_zone=related_zone,
+        proposal_type=proposal_type,
+        limit=limit,
+    )
+    return {
+        "preferences": [
+            WorkspaceProposalPolicyPreferenceOut(**item).model_dump()
+            for item in payload
+        ]
+    }
+
+
+@router.get("/proposals/policy-conflicts")
+async def list_workspace_policy_conflicts_endpoint(
+    proposal_type: str = Query(default=""),
+    related_zone: str = Query(default=""),
+    conflict_state: str = Query(default=""),
+    limit: int = Query(default=50, ge=1, le=200),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    payload = await list_workspace_policy_conflict_profiles(
+        db=db,
+        managed_scope=related_zone,
+        decision_family="workspace_proposal_shaping",
+        proposal_type=proposal_type,
+        conflict_state=conflict_state,
+        limit=limit,
+    )
+    return {
+        "conflicts": [
+            WorkspacePolicyConflictProfileOut(**item).model_dump()
+            for item in payload
+        ]
+    }
+
+
 @router.get("/proposals/{proposal_id}")
-async def get_workspace_proposal(proposal_id: int, db: AsyncSession = Depends(get_db)) -> dict:
+async def get_workspace_proposal(
+    proposal_id: int, db: AsyncSession = Depends(get_db)
+) -> dict:
     row = await db.get(WorkspaceProposal, proposal_id)
     if not row:
         raise HTTPException(status_code=404, detail="workspace proposal not found")
@@ -4229,8 +5804,12 @@ async def accept_workspace_proposal(
         "linked_task_id": task.id,
         **payload.metadata_json,
     }
-    await apply_learning_signal(db=db, signal="proposal_accept", user_id=payload.actor or DEFAULT_USER_ID)
-    notification = await _notification_payload_for_proposal(db=db, proposal=proposal, action="accepted")
+    await apply_learning_signal(
+        db=db, signal="proposal_accept", user_id=payload.actor or DEFAULT_USER_ID
+    )
+    notification = await _notification_payload_for_proposal(
+        db=db, proposal=proposal, action="accepted"
+    )
 
     await write_journal(
         db,
@@ -4270,8 +5849,12 @@ async def reject_workspace_proposal(
         "reject_reason": payload.reason,
         **payload.metadata_json,
     }
-    await apply_learning_signal(db=db, signal="proposal_reject", user_id=payload.actor or DEFAULT_USER_ID)
-    notification = await _notification_payload_for_proposal(db=db, proposal=proposal, action="rejected")
+    await apply_learning_signal(
+        db=db, signal="proposal_reject", user_id=payload.actor or DEFAULT_USER_ID
+    )
+    notification = await _notification_payload_for_proposal(
+        db=db, proposal=proposal, action="rejected"
+    )
 
     await write_journal(
         db,
@@ -4292,10 +5875,22 @@ async def reject_workspace_proposal(
 
 
 @router.post("/targets/resolve")
-async def resolve_workspace_target(payload: WorkspaceTargetResolveRequest, db: AsyncSession = Depends(get_db)) -> dict:
+async def resolve_workspace_target(
+    payload: WorkspaceTargetResolveRequest, db: AsyncSession = Depends(get_db)
+) -> dict:
     await _ensure_default_zone_map(db)
 
-    rows = (await db.execute(select(WorkspaceObjectMemory).order_by(WorkspaceObjectMemory.last_seen_at.desc()))).scalars().all()
+    rows = (
+        (
+            await db.execute(
+                select(WorkspaceObjectMemory).order_by(
+                    WorkspaceObjectMemory.last_seen_at.desc()
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
     requested_zone = payload.preferred_zone.strip()
     unsafe_set = {item.strip() for item in payload.unsafe_zones if item.strip()}
     preferred_threshold_raw = await get_user_preference_value(
@@ -4303,7 +5898,9 @@ async def resolve_workspace_target(payload: WorkspaceTargetResolveRequest, db: A
         preference_type="preferred_confirmation_threshold",
         user_id=DEFAULT_USER_ID,
     )
-    preferred_confirmation_threshold = max(0.5, min(0.99, float(preferred_threshold_raw or 0.9)))
+    preferred_confirmation_threshold = max(
+        0.5, min(0.99, float(preferred_threshold_raw or 0.9))
+    )
     auto_exec_safe_tasks = bool(
         await get_user_preference_value(
             db=db,
@@ -4312,13 +5909,18 @@ async def resolve_workspace_target(payload: WorkspaceTargetResolveRequest, db: A
         )
     )
     if auto_exec_safe_tasks:
-        preferred_confirmation_threshold = max(0.5, preferred_confirmation_threshold - 0.05)
+        preferred_confirmation_threshold = max(
+            0.5, preferred_confirmation_threshold - 0.05
+        )
 
     scored: list[tuple[WorkspaceObjectMemory, float]] = []
     for row in rows:
         aliases = row.candidate_labels if isinstance(row.candidate_labels, list) else []
         candidate_labels = [row.canonical_name, *[str(item) for item in aliases]]
-        best_label_score = max((_label_score(payload.target_label, item) for item in candidate_labels), default=0.0)
+        best_label_score = max(
+            (_label_score(payload.target_label, item) for item in candidate_labels),
+            default=0.0,
+        )
         if best_label_score < 0.5:
             continue
 
@@ -4373,14 +5975,21 @@ async def resolve_workspace_target(payload: WorkspaceTargetResolveRequest, db: A
                 policy_outcome = "target_blocked_unsafe_zone"
                 status = "blocked"
                 suggested_actions = ["request operator confirmation"]
-            elif match_outcome == "exact_match" and top_row.status == "active" and top_score >= preferred_confirmation_threshold:
+            elif (
+                match_outcome == "exact_match"
+                and top_row.status == "active"
+                and top_score >= preferred_confirmation_threshold
+            ):
                 policy_outcome = "target_confirmed"
                 status = "confirmed"
                 suggested_actions = ["create proposal", "queue safely"]
             else:
                 policy_outcome = "target_requires_confirmation"
                 status = "pending_confirmation"
-                suggested_actions = ["request operator confirmation", "rescan target zone"]
+                suggested_actions = [
+                    "request operator confirmation",
+                    "rescan target zone",
+                ]
 
         trigger_json = {
             "requested_target": payload.target_label,
@@ -4403,17 +6012,26 @@ async def resolve_workspace_target(payload: WorkspaceTargetResolveRequest, db: A
         candidate_object_ids=candidate_object_ids,
         suggested_actions=suggested_actions,
         source=payload.source,
-        metadata_json={"unsafe_zones": sorted(list(unsafe_set)), "trigger": trigger_json},
+        metadata_json={
+            "unsafe_zones": sorted(list(unsafe_set)),
+            "trigger": trigger_json,
+        },
     )
     db.add(target)
     await db.flush()
 
     proposal_id: int | None = None
-    if payload.create_proposal and policy_outcome in {"target_confirmed", "target_requires_confirmation", "target_stale_reobserve"}:
+    if payload.create_proposal and policy_outcome in {
+        "target_confirmed",
+        "target_requires_confirmation",
+        "target_stale_reobserve",
+    }:
         proposal_type = (
-            "target_confirmed" if policy_outcome == "target_confirmed" else
-            "target_reobserve" if policy_outcome == "target_stale_reobserve" else
-            "target_confirmation"
+            "target_confirmed"
+            if policy_outcome == "target_confirmed"
+            else "target_reobserve"
+            if policy_outcome == "target_stale_reobserve"
+            else "target_confirmation"
         )
         proposal = await _create_workspace_proposal_for_target(
             title=f"Target resolution: {payload.target_label}",
@@ -4422,7 +6040,10 @@ async def resolve_workspace_target(payload: WorkspaceTargetResolveRequest, db: A
             confidence=confidence,
             related_zone=requested_zone,
             related_object_id=related_object_id,
-            trigger_json={"target_resolution_id": target.id, "policy_outcome": policy_outcome},
+            trigger_json={
+                "target_resolution_id": target.id,
+                "policy_outcome": policy_outcome,
+            },
             db=db,
         )
         proposal_id = proposal.id
@@ -4467,10 +6088,14 @@ async def resolve_workspace_target(payload: WorkspaceTargetResolveRequest, db: A
 
 
 @router.get("/targets/{target_resolution_id}")
-async def get_workspace_target_resolution(target_resolution_id: int, db: AsyncSession = Depends(get_db)) -> dict:
+async def get_workspace_target_resolution(
+    target_resolution_id: int, db: AsyncSession = Depends(get_db)
+) -> dict:
     row = await db.get(WorkspaceTargetResolution, target_resolution_id)
     if not row:
-        raise HTTPException(status_code=404, detail="workspace target resolution not found")
+        raise HTTPException(
+            status_code=404, detail="workspace target resolution not found"
+        )
     return {
         "target_resolution_id": row.id,
         "requested_target": row.requested_target,
@@ -4496,10 +6121,14 @@ async def confirm_workspace_target_resolution(
 ) -> dict:
     row = await db.get(WorkspaceTargetResolution, target_resolution_id)
     if not row:
-        raise HTTPException(status_code=404, detail="workspace target resolution not found")
+        raise HTTPException(
+            status_code=404, detail="workspace target resolution not found"
+        )
 
     if row.status not in {"pending_confirmation", "confirmed"}:
-        raise HTTPException(status_code=422, detail="workspace target resolution is not confirmable")
+        raise HTTPException(
+            status_code=422, detail="workspace target resolution is not confirmable"
+        )
 
     row.status = "confirmed"
     row.policy_outcome = "target_confirmed"
@@ -4533,7 +6162,10 @@ async def confirm_workspace_target_resolution(
         target_type="workspace_target",
         target_id=str(row.id),
         summary=f"Confirmed workspace target {row.id}",
-        metadata_json={"proposal_id": proposal.id, "related_object_id": row.related_object_id},
+        metadata_json={
+            "proposal_id": proposal.id,
+            "related_object_id": row.related_object_id,
+        },
     )
 
     await db.commit()
@@ -4553,9 +6185,13 @@ async def create_workspace_action_plan(
 ) -> dict:
     target = await db.get(WorkspaceTargetResolution, payload.target_resolution_id)
     if not target:
-        raise HTTPException(status_code=404, detail="workspace target resolution not found")
+        raise HTTPException(
+            status_code=404, detail="workspace target resolution not found"
+        )
 
-    planning_outcome, steps, status = _action_plan_policy(target=target, action_type=payload.action_type)
+    planning_outcome, steps, status = _action_plan_policy(
+        target=target, action_type=payload.action_type
+    )
 
     row = WorkspaceActionPlan(
         target_resolution_id=target.id,
@@ -4597,7 +6233,11 @@ async def create_workspace_action_plan(
     )
     row.motion_plan_json = {
         **base_motion_plan,
-        **(payload.motion_plan_overrides if isinstance(payload.motion_plan_overrides, dict) else {}),
+        **(
+            payload.motion_plan_overrides
+            if isinstance(payload.motion_plan_overrides, dict)
+            else {}
+        ),
     }
 
     await write_journal(
@@ -4620,7 +6260,9 @@ async def create_workspace_action_plan(
 
 
 @router.get("/action-plans/{plan_id}")
-async def get_workspace_action_plan(plan_id: int, db: AsyncSession = Depends(get_db)) -> dict:
+async def get_workspace_action_plan(
+    plan_id: int, db: AsyncSession = Depends(get_db)
+) -> dict:
     row = await db.get(WorkspaceActionPlan, plan_id)
     if not row:
         raise HTTPException(status_code=404, detail="workspace action plan not found")
@@ -4637,7 +6279,9 @@ async def approve_workspace_action_plan(
     if not row:
         raise HTTPException(status_code=404, detail="workspace action plan not found")
     if row.status in {"queued", "rejected", "blocked"}:
-        raise HTTPException(status_code=422, detail="workspace action plan cannot be approved")
+        raise HTTPException(
+            status_code=422, detail="workspace action plan cannot be approved"
+        )
 
     prior = row.status
     row.status = "approved"
@@ -4673,7 +6317,9 @@ async def reject_workspace_action_plan(
     if not row:
         raise HTTPException(status_code=404, detail="workspace action plan not found")
     if row.status in {"queued", "rejected"}:
-        raise HTTPException(status_code=422, detail="workspace action plan cannot be rejected")
+        raise HTTPException(
+            status_code=422, detail="workspace action plan cannot be rejected"
+        )
 
     prior = row.status
     row.status = "rejected"
@@ -4709,9 +6355,17 @@ async def queue_workspace_action_plan(
     if not row:
         raise HTTPException(status_code=404, detail="workspace action plan not found")
     if row.status != "approved":
-        raise HTTPException(status_code=422, detail="workspace action plan must be approved before queue")
-    if row.simulation_status == "completed" and (row.simulation_outcome != "plan_safe" or not row.simulation_gate_passed):
-        raise HTTPException(status_code=422, detail="workspace action plan simulation must pass before queue")
+        raise HTTPException(
+            status_code=422,
+            detail="workspace action plan must be approved before queue",
+        )
+    if row.simulation_status == "completed" and (
+        row.simulation_outcome != "plan_safe" or not row.simulation_gate_passed
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="workspace action plan simulation must pass before queue",
+        )
 
     task = Task(
         title=f"Execute safe workspace action: {row.action_type}",
@@ -4748,7 +6402,10 @@ async def queue_workspace_action_plan(
         target_type="workspace_action_plan",
         target_id=str(row.id),
         summary=f"Queued workspace action plan {row.id} to task {task.id}",
-        metadata_json={"task_id": task.id, "requested_executor": payload.requested_executor},
+        metadata_json={
+            "task_id": task.id,
+            "requested_executor": payload.requested_executor,
+        },
     )
 
     await db.commit()
@@ -4775,13 +6432,25 @@ async def execute_workspace_action_plan(
         raise HTTPException(status_code=404, detail="workspace action plan not found")
 
     if row.status != "approved":
-        raise HTTPException(status_code=422, detail="workspace action plan must be approved before execute")
-    if row.simulation_outcome != "plan_safe" or row.simulation_status != "completed" or not row.simulation_gate_passed:
-        raise HTTPException(status_code=422, detail="workspace action plan simulation_status must be plan_safe before execute")
+        raise HTTPException(
+            status_code=422,
+            detail="workspace action plan must be approved before execute",
+        )
+    if (
+        row.simulation_outcome != "plan_safe"
+        or row.simulation_status != "completed"
+        or not row.simulation_gate_passed
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="workspace action plan simulation_status must be plan_safe before execute",
+        )
 
     target = await db.get(WorkspaceTargetResolution, row.target_resolution_id)
     if not target:
-        raise HTTPException(status_code=404, detail="workspace target resolution not found")
+        raise HTTPException(
+            status_code=404, detail="workspace target resolution not found"
+        )
 
     monitoring = await _get_or_create_monitoring_state(db)
     human_aware = _human_aware_state_from_monitoring(monitoring)
@@ -4798,14 +6467,20 @@ async def execute_workspace_action_plan(
             "plan_id": row.id,
             "capability_name": payload.capability_name,
             "is_physical": True,
+            "managed_scope": row.target_zone or target.requested_zone or "global",
+            "zone": row.target_zone or target.requested_zone or "global",
         },
         workspace_state={
             "human_in_workspace": human_aware.get("human_in_workspace", False),
             "human_near_target_zone": human_aware.get("human_near_target_zone", False),
             "human_near_motion_path": human_aware.get("human_near_motion_path", False),
-            "shared_workspace_active": human_aware.get("shared_workspace_active", False),
+            "shared_workspace_active": human_aware.get(
+                "shared_workspace_active", False
+            ),
             "target_confidence": float(target.confidence),
             "map_freshness_seconds": 0,
+            "managed_scope": row.target_zone or target.requested_zone or "global",
+            "zone": row.target_zone or target.requested_zone or "global",
         },
         system_state={"throttle_blocked": False, "integrity_risk": False},
         policy_state={
@@ -4813,21 +6488,41 @@ async def execute_workspace_action_plan(
             "map_freshness_limit_seconds": MONITORING_DEFAULT_FRESHNESS_THRESHOLD_SECONDS,
             "unlawful_action": False,
         },
-        metadata_json={"reason": payload.reason, **payload.metadata_json},
+        metadata_json={
+            "reason": payload.reason,
+            "managed_scope": row.target_zone or target.requested_zone or "global",
+            "zone": row.target_zone or target.requested_zone or "global",
+            **payload.metadata_json,
+        },
         db=db,
     )
     decision = str(constraint_result.get("decision", "allowed"))
     if decision in {"requires_confirmation", "requires_replan", "blocked"}:
-        raise HTTPException(status_code=422, detail=f"constraint engine blocked execution: {decision}")
+        raise HTTPException(
+            status_code=422, detail=f"constraint engine blocked execution: {decision}"
+        )
 
-    predictive_freshness = await _evaluate_predictive_freshness(action_plan=row, target=target, db=db)
-    predictive_outcome = predictive_freshness.get("recommended_outcome", "continue_monitor")
+    predictive_freshness = await _evaluate_predictive_freshness(
+        action_plan=row, target=target, db=db
+    )
+    predictive_outcome = predictive_freshness.get(
+        "recommended_outcome", "continue_monitor"
+    )
     if predictive_outcome == "pause_and_resimulate":
-        raise HTTPException(status_code=422, detail="workspace action plan requires resimulation before execute")
+        raise HTTPException(
+            status_code=422,
+            detail="workspace action plan requires resimulation before execute",
+        )
     if predictive_outcome == "require_replan":
-        raise HTTPException(status_code=422, detail="workspace action plan requires replan before execute")
+        raise HTTPException(
+            status_code=422,
+            detail="workspace action plan requires replan before execute",
+        )
     if predictive_outcome == "abort_chain":
-        raise HTTPException(status_code=422, detail="workspace action plan blocked by severe predictive drift")
+        raise HTTPException(
+            status_code=422,
+            detail="workspace action plan blocked by severe predictive drift",
+        )
 
     violations = _execution_precondition_violations(
         row=row,
@@ -4836,16 +6531,29 @@ async def execute_workspace_action_plan(
         target_confidence_minimum=payload.target_confidence_minimum,
     )
     if violations:
-        raise HTTPException(status_code=422, detail=f"workspace action plan execution preconditions failed: {', '.join(violations)}")
+        raise HTTPException(
+            status_code=422,
+            detail=f"workspace action plan execution preconditions failed: {', '.join(violations)}",
+        )
 
-    collision_risk = float((row.simulation_json or {}).get("collision_risk", 1.0)) if isinstance(row.simulation_json, dict) else 1.0
+    collision_risk = (
+        float((row.simulation_json or {}).get("collision_risk", 1.0))
+        if isinstance(row.simulation_json, dict)
+        else 1.0
+    )
 
     if payload.capability_name not in EXECUTION_ALLOWED_CAPABILITIES:
-        raise HTTPException(status_code=422, detail="workspace action plan capability is not allowed")
+        raise HTTPException(
+            status_code=422, detail="workspace action plan capability is not allowed"
+        )
 
-    capability = await _ensure_execution_capability_registered(capability_name=payload.capability_name, db=db)
+    capability = await _ensure_execution_capability_registered(
+        capability_name=payload.capability_name, db=db
+    )
     if not capability.enabled:
-        raise HTTPException(status_code=422, detail="workspace action plan capability is disabled")
+        raise HTTPException(
+            status_code=422, detail="workspace action plan capability is disabled"
+        )
 
     task = Task(
         title=f"Execute workspace action plan {row.id}: {payload.capability_name}",
@@ -4879,10 +6587,44 @@ async def execute_workspace_action_plan(
     await db.flush()
 
     motion_plan = row.motion_plan_json if isinstance(row.motion_plan_json, dict) else {}
-    target_pose = motion_plan.get("target_pose", {}) if isinstance(motion_plan.get("target_pose", {}), dict) else {}
-    approach_vector = motion_plan.get("approach_vector", {}) if isinstance(motion_plan.get("approach_vector", {}), dict) else {}
-    clearance = motion_plan.get("clearance_zone", {}) if isinstance(motion_plan.get("clearance_zone", {}), dict) else {}
-    safety_score = _execution_safety_score(collision_risk=collision_risk, target_confidence=target.confidence)
+    target_pose = (
+        motion_plan.get("target_pose", {})
+        if isinstance(motion_plan.get("target_pose", {}), dict)
+        else {}
+    )
+    approach_vector = (
+        motion_plan.get("approach_vector", {})
+        if isinstance(motion_plan.get("approach_vector", {}), dict)
+        else {}
+    )
+    clearance = (
+        motion_plan.get("clearance_zone", {})
+        if isinstance(motion_plan.get("clearance_zone", {}), dict)
+        else {}
+    )
+    safety_score = _execution_safety_score(
+        collision_risk=collision_risk, target_confidence=target.confidence
+    )
+    managed_scope = infer_managed_scope(
+        row.metadata_json if isinstance(row.metadata_json, dict) else {},
+        row.execution_json if isinstance(row.execution_json, dict) else {},
+        {"target_zone": getattr(target, "zone", "")},
+    )
+    health_gate = _physical_execution_health_gate()
+    gate_result = await evaluate_execution_policy_gate(
+        db=db,
+        capability_name=payload.capability_name,
+        requested_decision=str(health_gate.get("requested_decision") or "queued_for_executor"),
+        requested_status=str(health_gate.get("requested_status") or "dispatched"),
+        requested_reason=payload.reason
+        or str(health_gate.get("requested_reason") or "workspace_action_plan_execute"),
+        requested_executor=payload.requested_executor,
+        safety_mode="operator_controlled",
+        managed_scope=managed_scope,
+        actor=payload.actor,
+        source="workspace_action_plan_execute",
+        metadata_json=payload.metadata_json,
+    )
 
     execution = CapabilityExecution(
         input_event_id=event.id,
@@ -4897,10 +6639,11 @@ async def execute_workspace_action_plan(
             "safety_score": safety_score,
         },
         safety_mode="operator_controlled",
-        requested_executor=payload.requested_executor,
-        dispatch_decision="queued_for_executor",
-        status="dispatched",
-        reason=payload.reason or "workspace_action_plan_execute",
+        requested_executor=gate_result["requested_executor"],
+        dispatch_decision=gate_result["dispatch_decision"],
+        managed_scope=gate_result["managed_scope"],
+        status=gate_result["status"],
+        reason=gate_result["reason"],
         feedback_json={
             "plan_id": row.id,
             "target_resolution_id": row.target_resolution_id,
@@ -4913,10 +6656,32 @@ async def execute_workspace_action_plan(
                 "target_confidence": target.confidence,
                 "target_confidence_minimum": payload.target_confidence_minimum,
             },
+            "health_gate": health_gate,
+            "execution_policy_gate": json.loads(json.dumps(gate_result, default=str)),
         },
     )
     db.add(execution)
     await db.flush()
+
+    control_state = await sync_execution_control_state(
+        db=db,
+        execution=execution,
+        actor=payload.actor,
+        source="workspace_action_plan_execute",
+        requested_goal=f"workspace_action_plan:{row.id}",
+        intent_key=build_intent_key(
+            execution_source="workspace_action_plan",
+            subject_id=row.id,
+            capability_name=payload.capability_name,
+        ),
+        intent_type="workspace_action_plan_execution",
+        context_json={
+            "plan_id": row.id,
+            "target_resolution_id": row.target_resolution_id,
+            "target_zone": getattr(target, "zone", ""),
+        },
+        gate_result=gate_result,
+    )
 
     row.queued_task_id = task.id
     row.execution_capability = payload.capability_name
@@ -4931,10 +6696,17 @@ async def execute_workspace_action_plan(
         "safety_score": safety_score,
         "requested_executor": payload.requested_executor,
         "execution_id": execution.id,
+        "trace_id": control_state["trace_id"],
+        "managed_scope": control_state["managed_scope"],
         "task_id": task.id,
+        "health_gate": health_gate,
     }
-    row.status = "executing"
-    row.planning_outcome = "plan_executing"
+    row.status = "executing" if str(execution.status or "") == "dispatched" else "approved"
+    row.planning_outcome = (
+        "plan_executing"
+        if str(execution.status or "") == "dispatched"
+        else "plan_waiting_health_confirmation"
+    )
     row.metadata_json = {
         **(row.metadata_json if isinstance(row.metadata_json, dict) else {}),
         "execution": {
@@ -4944,6 +6716,7 @@ async def execute_workspace_action_plan(
             "requested_executor": payload.requested_executor,
             "collision_risk_threshold": payload.collision_risk_threshold,
             "target_confidence_minimum": payload.target_confidence_minimum,
+            "health_gate": health_gate,
             **payload.metadata_json,
         },
     }
@@ -4988,7 +6761,11 @@ async def list_workspace_execution_proposals(
     limit: int = Query(default=100, ge=1, le=500),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    stmt = select(WorkspaceProposal).where(WorkspaceProposal.proposal_type == EXECUTION_PROPOSAL_TYPE).order_by(WorkspaceProposal.id.desc())
+    stmt = (
+        select(WorkspaceProposal)
+        .where(WorkspaceProposal.proposal_type == EXECUTION_PROPOSAL_TYPE)
+        .order_by(WorkspaceProposal.id.desc())
+    )
     if status.strip():
         stmt = stmt.where(WorkspaceProposal.status == status.strip())
     rows = (await db.execute(stmt)).scalars().all()[:limit]
@@ -5026,18 +6803,26 @@ async def propose_workspace_action_plan_execution(
 
     target = await db.get(WorkspaceTargetResolution, row.target_resolution_id)
     if not target:
-        raise HTTPException(status_code=404, detail="workspace target resolution not found")
+        raise HTTPException(
+            status_code=404, detail="workspace target resolution not found"
+        )
 
     pending_rows = (
-        await db.execute(
-            select(WorkspaceProposal).where(
-                WorkspaceProposal.proposal_type == EXECUTION_PROPOSAL_TYPE,
-                WorkspaceProposal.status == "pending",
+        (
+            await db.execute(
+                select(WorkspaceProposal).where(
+                    WorkspaceProposal.proposal_type == EXECUTION_PROPOSAL_TYPE,
+                    WorkspaceProposal.status == "pending",
+                )
             )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     for existing in pending_rows:
-        trigger = existing.trigger_json if isinstance(existing.trigger_json, dict) else {}
+        trigger = (
+            existing.trigger_json if isinstance(existing.trigger_json, dict) else {}
+        )
         if int(trigger.get("plan_id", 0)) == row.id:
             return {
                 "proposal_id": existing.id,
@@ -5053,7 +6838,10 @@ async def propose_workspace_action_plan_execution(
         target_confidence_minimum=EXECUTION_TARGET_CONFIDENCE_MINIMUM_DEFAULT,
     )
     if violations:
-        raise HTTPException(status_code=422, detail=f"workspace action plan cannot be proposed for execution: {', '.join(violations)}")
+        raise HTTPException(
+            status_code=422,
+            detail=f"workspace action plan cannot be proposed for execution: {', '.join(violations)}",
+        )
 
     simulation = row.simulation_json if isinstance(row.simulation_json, dict) else {}
     confidence = float(simulation.get("confidence", target.confidence))
@@ -5120,14 +6908,21 @@ async def accept_workspace_execution_proposal(
 ) -> dict:
     proposal = await db.get(WorkspaceProposal, proposal_id)
     if not proposal or proposal.proposal_type != EXECUTION_PROPOSAL_TYPE:
-        raise HTTPException(status_code=404, detail="workspace execution proposal not found")
+        raise HTTPException(
+            status_code=404, detail="workspace execution proposal not found"
+        )
     if proposal.status != "pending":
-        raise HTTPException(status_code=422, detail="workspace execution proposal is not pending")
+        raise HTTPException(
+            status_code=422, detail="workspace execution proposal is not pending"
+        )
 
     trigger = proposal.trigger_json if isinstance(proposal.trigger_json, dict) else {}
     plan_id = int(trigger.get("plan_id", 0))
     if plan_id <= 0:
-        raise HTTPException(status_code=422, detail="workspace execution proposal missing plan reference")
+        raise HTTPException(
+            status_code=422,
+            detail="workspace execution proposal missing plan reference",
+        )
 
     proposal.status = "accepted"
     proposal.metadata_json = {
@@ -5165,9 +6960,13 @@ async def reject_workspace_execution_proposal(
 ) -> dict:
     proposal = await db.get(WorkspaceProposal, proposal_id)
     if not proposal or proposal.proposal_type != EXECUTION_PROPOSAL_TYPE:
-        raise HTTPException(status_code=404, detail="workspace execution proposal not found")
+        raise HTTPException(
+            status_code=404, detail="workspace execution proposal not found"
+        )
     if proposal.status != "pending":
-        raise HTTPException(status_code=422, detail="workspace execution proposal is not pending")
+        raise HTTPException(
+            status_code=422, detail="workspace execution proposal is not pending"
+        )
 
     proposal.status = "rejected"
     proposal.metadata_json = {
@@ -5204,16 +7003,25 @@ async def abort_workspace_action_plan(
     if not row:
         raise HTTPException(status_code=404, detail="workspace action plan not found")
     if not row.execution_id:
-        raise HTTPException(status_code=422, detail="workspace action plan has no active execution")
+        raise HTTPException(
+            status_code=422, detail="workspace action plan has no active execution"
+        )
 
     execution = await db.get(CapabilityExecution, row.execution_id)
     if not execution:
         raise HTTPException(status_code=404, detail="capability execution not found")
     if execution.status in {"succeeded", "failed", "blocked"}:
-        raise HTTPException(status_code=422, detail="workspace action plan execution cannot be aborted in current state")
+        raise HTTPException(
+            status_code=422,
+            detail="workspace action plan execution cannot be aborted in current state",
+        )
 
     prior_execution_status = execution.status
-    history = list(execution.feedback_json.get("history", [])) if isinstance(execution.feedback_json, dict) else []
+    history = (
+        list(execution.feedback_json.get("history", []))
+        if isinstance(execution.feedback_json, dict)
+        else []
+    )
     history.append(
         {
             "from": prior_execution_status,
@@ -5227,7 +7035,9 @@ async def abort_workspace_action_plan(
     execution.status = "blocked"
     execution.reason = payload.reason or "execution_aborted"
     execution.feedback_json = {
-        **(execution.feedback_json if isinstance(execution.feedback_json, dict) else {}),
+        **(
+            execution.feedback_json if isinstance(execution.feedback_json, dict) else {}
+        ),
         "abort": {
             "aborted": True,
             "actor": payload.actor,
@@ -5291,11 +7101,16 @@ async def simulate_workspace_action_plan(
     if not row:
         raise HTTPException(status_code=404, detail="workspace action plan not found")
     if row.status in {"rejected", "queued"}:
-        raise HTTPException(status_code=422, detail="workspace action plan cannot be simulated in current state")
+        raise HTTPException(
+            status_code=422,
+            detail="workspace action plan cannot be simulated in current state",
+        )
 
     target = await db.get(WorkspaceTargetResolution, row.target_resolution_id)
     if not target:
-        raise HTTPException(status_code=404, detail="workspace target resolution not found")
+        raise HTTPException(
+            status_code=404, detail="workspace target resolution not found"
+        )
 
     simulation, outcome, gate_passed = await _simulate_action_plan(
         row=row,
@@ -5309,7 +7124,11 @@ async def simulate_workspace_action_plan(
             **row.motion_plan_json,
             "collision_risk": simulation.get("collision_risk", 0.0),
             "estimated_path": {
-                **(row.motion_plan_json.get("estimated_path", {}) if isinstance(row.motion_plan_json.get("estimated_path", {}), dict) else {}),
+                **(
+                    row.motion_plan_json.get("estimated_path", {})
+                    if isinstance(row.motion_plan_json.get("estimated_path", {}), dict)
+                    else {}
+                ),
                 "path_length": simulation.get("path_length", 0.0),
             },
         }
@@ -5355,7 +7174,9 @@ async def simulate_workspace_action_plan(
 
 
 @router.get("/action-plans/{plan_id}/simulation")
-async def get_workspace_action_plan_simulation(plan_id: int, db: AsyncSession = Depends(get_db)) -> dict:
+async def get_workspace_action_plan_simulation(
+    plan_id: int, db: AsyncSession = Depends(get_db)
+) -> dict:
     row = await db.get(WorkspaceActionPlan, plan_id)
     if not row:
         raise HTTPException(status_code=404, detail="workspace action plan not found")
@@ -5365,8 +7186,12 @@ async def get_workspace_action_plan_simulation(plan_id: int, db: AsyncSession = 
         "simulation_outcome": row.simulation_outcome,
         "simulation_status": row.simulation_status,
         "simulation_gate_passed": row.simulation_gate_passed,
-        "motion_plan": row.motion_plan_json if isinstance(row.motion_plan_json, dict) else {},
-        "simulation": row.simulation_json if isinstance(row.simulation_json, dict) else {},
+        "motion_plan": row.motion_plan_json
+        if isinstance(row.motion_plan_json, dict)
+        else {},
+        "simulation": row.simulation_json
+        if isinstance(row.simulation_json, dict)
+        else {},
         "created_at": row.created_at,
     }
 
@@ -5386,7 +7211,9 @@ def _to_workspace_interruption_out(row: WorkspaceInterruptionEvent) -> dict:
         "actor": row.actor,
         "resolved_by": row.resolved_by,
         "resolved_at": row.resolved_at,
-        "metadata_json": row.metadata_json if isinstance(row.metadata_json, dict) else {},
+        "metadata_json": row.metadata_json
+        if isinstance(row.metadata_json, dict)
+        else {},
         "created_at": row.created_at,
     }
 
@@ -5406,20 +7233,28 @@ def _to_workspace_replan_signal_out(row: WorkspaceReplanSignal) -> dict:
         "actor": row.actor,
         "resolved_by": row.resolved_by,
         "resolved_at": row.resolved_at,
-        "metadata_json": row.metadata_json if isinstance(row.metadata_json, dict) else {},
+        "metadata_json": row.metadata_json
+        if isinstance(row.metadata_json, dict)
+        else {},
         "created_at": row.created_at,
     }
 
 
-async def _active_replan_signals_for_execution(*, execution_id: int, db: AsyncSession) -> list[WorkspaceReplanSignal]:
+async def _active_replan_signals_for_execution(
+    *, execution_id: int, db: AsyncSession
+) -> list[WorkspaceReplanSignal]:
     return (
-        await db.execute(
-            select(WorkspaceReplanSignal)
-            .where(WorkspaceReplanSignal.execution_id == execution_id)
-            .where(WorkspaceReplanSignal.status == "active")
-            .order_by(WorkspaceReplanSignal.id.desc())
+        (
+            await db.execute(
+                select(WorkspaceReplanSignal)
+                .where(WorkspaceReplanSignal.execution_id == execution_id)
+                .where(WorkspaceReplanSignal.status == "active")
+                .order_by(WorkspaceReplanSignal.id.desc())
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
 
 
 def _merge_replan_outcomes(*, primary: str, secondary: str) -> str:
@@ -5451,52 +7286,80 @@ async def _evaluate_predictive_freshness(
     if target:
         target_zone = target.requested_zone
         if target.related_object_id:
-            related_object = await db.get(WorkspaceObjectMemory, target.related_object_id)
+            related_object = await db.get(
+                WorkspaceObjectMemory, target.related_object_id
+            )
 
     if related_object is None:
         freshness["target_memory_fresh"] = False
         reasons.append("target_memory_missing")
-        recommended_outcome = _merge_replan_outcomes(primary=recommended_outcome, secondary="require_replan")
+        recommended_outcome = _merge_replan_outcomes(
+            primary=recommended_outcome, secondary="require_replan"
+        )
         confidence = max(confidence, 0.75)
     else:
         age_seconds = max((now - related_object.last_seen_at).total_seconds(), 0.0)
         if related_object.status in {"missing", "stale"}:
             freshness["target_memory_fresh"] = False
             reasons.append("target_no_longer_valid")
-            recommended_outcome = _merge_replan_outcomes(primary=recommended_outcome, secondary="abort_chain")
+            recommended_outcome = _merge_replan_outcomes(
+                primary=recommended_outcome, secondary="abort_chain"
+            )
             confidence = max(confidence, 0.92)
             operator_confirmation_required = True
         elif related_object.status == "uncertain":
             freshness["target_memory_fresh"] = False
             reasons.append("target_identity_uncertain")
-            recommended_outcome = _merge_replan_outcomes(primary=recommended_outcome, secondary="pause_and_resimulate")
+            recommended_outcome = _merge_replan_outcomes(
+                primary=recommended_outcome, secondary="pause_and_resimulate"
+            )
             confidence = max(confidence, 0.7)
         elif age_seconds > OUTDATED_WINDOW_SECONDS:
             freshness["target_memory_fresh"] = False
             reasons.append("target_memory_stale")
-            recommended_outcome = _merge_replan_outcomes(primary=recommended_outcome, secondary="pause_and_resimulate")
+            recommended_outcome = _merge_replan_outcomes(
+                primary=recommended_outcome, secondary="pause_and_resimulate"
+            )
             confidence = max(confidence, 0.62)
 
         if target_zone and related_object.zone and related_object.zone != target_zone:
             freshness["simulation_assumptions_stable"] = False
             reasons.append("object_moved_since_plan")
-            recommended_outcome = _merge_replan_outcomes(primary=recommended_outcome, secondary="require_replan")
+            recommended_outcome = _merge_replan_outcomes(
+                primary=recommended_outcome, secondary="require_replan"
+            )
             confidence = max(confidence, 0.8)
 
-        if target and float(related_object.confidence) + 0.05 < float(target.confidence):
+        if target and float(related_object.confidence) + 0.05 < float(
+            target.confidence
+        ):
             reasons.append("confidence_drop")
-            recommended_outcome = _merge_replan_outcomes(primary=recommended_outcome, secondary="require_replan")
+            recommended_outcome = _merge_replan_outcomes(
+                primary=recommended_outcome, secondary="require_replan"
+            )
             confidence = max(confidence, 0.78)
             operator_confirmation_required = True
 
     mapped_zone = _normalize_zone_for_map(target_zone)
     if mapped_zone:
-        zone = (await db.execute(select(WorkspaceZone).where(WorkspaceZone.zone_name == mapped_zone))).scalars().first()
+        zone = (
+            (
+                await db.execute(
+                    select(WorkspaceZone).where(WorkspaceZone.zone_name == mapped_zone)
+                )
+            )
+            .scalars()
+            .first()
+        )
         if zone and int(zone.hazard_level) > 0:
             freshness["map_context_stable"] = False
             reasons.append("zone_state_changed")
-            severe_outcome = "abort_chain" if int(zone.hazard_level) >= 2 else "require_replan"
-            recommended_outcome = _merge_replan_outcomes(primary=recommended_outcome, secondary=severe_outcome)
+            severe_outcome = (
+                "abort_chain" if int(zone.hazard_level) >= 2 else "require_replan"
+            )
+            recommended_outcome = _merge_replan_outcomes(
+                primary=recommended_outcome, secondary=severe_outcome
+            )
             confidence = max(confidence, 0.8)
             operator_confirmation_required = True
 
@@ -5504,13 +7367,23 @@ async def _evaluate_predictive_freshness(
         simulation = action_plan.simulation_json
         sim_target_zone = str(simulation.get("target_zone", "")).strip()
         if not sim_target_zone and isinstance(action_plan.motion_plan_json, dict):
-            sim_target_zone = str((action_plan.motion_plan_json.get("target_pose", {}) if isinstance(action_plan.motion_plan_json.get("target_pose", {}), dict) else {}).get("zone", "")).strip()
+            sim_target_zone = str(
+                (
+                    action_plan.motion_plan_json.get("target_pose", {})
+                    if isinstance(
+                        action_plan.motion_plan_json.get("target_pose", {}), dict
+                    )
+                    else {}
+                ).get("zone", "")
+            ).strip()
 
         current_zone = related_object.zone if related_object else ""
         if sim_target_zone and current_zone and sim_target_zone != current_zone:
             freshness["simulation_assumptions_stable"] = False
             reasons.append("simulation_target_zone_drift")
-            recommended_outcome = _merge_replan_outcomes(primary=recommended_outcome, secondary="require_replan")
+            recommended_outcome = _merge_replan_outcomes(
+                primary=recommended_outcome, secondary="require_replan"
+            )
             confidence = max(confidence, 0.79)
 
         try:
@@ -5520,7 +7393,9 @@ async def _evaluate_predictive_freshness(
         if simulation_collision_risk >= SIMULATION_BLOCK_THRESHOLD_DEFAULT:
             freshness["simulation_assumptions_stable"] = False
             reasons.append("simulation_collision_risk_elevated")
-            recommended_outcome = _merge_replan_outcomes(primary=recommended_outcome, secondary="require_replan")
+            recommended_outcome = _merge_replan_outcomes(
+                primary=recommended_outcome, secondary="require_replan"
+            )
             confidence = max(confidence, 0.76)
 
     if recommended_outcome in {"require_replan", "abort_chain"}:
@@ -5546,7 +7421,9 @@ async def predict_workspace_execution_change(
     if not execution:
         raise HTTPException(status_code=404, detail="capability execution not found")
 
-    action_plan = await _find_action_plan_for_execution(execution_id=execution.id, db=db)
+    action_plan = await _find_action_plan_for_execution(
+        execution_id=execution.id, db=db
+    )
     chains = await _find_chains_for_execution(execution_id=execution.id, db=db)
 
     signal = WorkspaceReplanSignal(
@@ -5554,7 +7431,9 @@ async def predict_workspace_execution_change(
         action_plan_id=action_plan.id if action_plan else None,
         chain_id=chains[0].id if chains else None,
         signal_type=payload.signal_type,
-        predicted_outcome=REPLAN_OUTCOME_MAP.get(payload.predicted_outcome, "continue_monitor"),
+        predicted_outcome=REPLAN_OUTCOME_MAP.get(
+            payload.predicted_outcome, "continue_monitor"
+        ),
         confidence=payload.confidence,
         source=payload.source,
         status="active",
@@ -5567,7 +7446,11 @@ async def predict_workspace_execution_change(
 
     applied_hold = False
     predicted = signal.predicted_outcome
-    if predicted in {"pause_and_resimulate", "require_replan", "abort_chain"} and execution.status in {"dispatched", "accepted", "running"}:
+    if predicted in {
+        "pause_and_resimulate",
+        "require_replan",
+        "abort_chain",
+    } and execution.status in {"dispatched", "accepted", "running"}:
         execution.status = "paused"
         execution.dispatch_decision = "predictive_replan_hold"
         execution.reason = payload.reason or predicted
@@ -5583,7 +7466,11 @@ async def predict_workspace_execution_change(
             else:
                 action_plan.planning_outcome = "plan_blocked"
             action_plan.metadata_json = {
-                **(action_plan.metadata_json if isinstance(action_plan.metadata_json, dict) else {}),
+                **(
+                    action_plan.metadata_json
+                    if isinstance(action_plan.metadata_json, dict)
+                    else {}
+                ),
                 "predictive_hold": {
                     "signal_id": signal.id,
                     "predicted_outcome": predicted,
@@ -5614,7 +7501,9 @@ async def predict_workspace_execution_change(
                 },
             )
 
-    feedback = execution.feedback_json if isinstance(execution.feedback_json, dict) else {}
+    feedback = (
+        execution.feedback_json if isinstance(execution.feedback_json, dict) else {}
+    )
     predictive_signals = list(feedback.get("predictive_signals", []))
     predictive_signals.append(
         {
@@ -5623,7 +7512,9 @@ async def predict_workspace_execution_change(
             "predicted_outcome": signal.predicted_outcome,
             "confidence": signal.confidence,
             "reason": signal.reason,
-            "timestamp": signal.created_at.isoformat() if signal.created_at else datetime.now(timezone.utc).isoformat(),
+            "timestamp": signal.created_at.isoformat()
+            if signal.created_at
+            else datetime.now(timezone.utc).isoformat(),
         }
     )
     execution.feedback_json = {
@@ -5689,7 +7580,9 @@ async def list_workspace_replan_signals(
 
 
 @router.get("/replan-signals/{signal_id}")
-async def get_workspace_replan_signal(signal_id: int, db: AsyncSession = Depends(get_db)) -> dict:
+async def get_workspace_replan_signal(
+    signal_id: int, db: AsyncSession = Depends(get_db)
+) -> dict:
     row = await db.get(WorkspaceReplanSignal, signal_id)
     if not row:
         raise HTTPException(status_code=404, detail="workspace replan signal not found")
@@ -5708,29 +7601,47 @@ async def replan_workspace_action_plan(
 
     target = await db.get(WorkspaceTargetResolution, row.target_resolution_id)
     if not target:
-        raise HTTPException(status_code=404, detail="workspace target resolution not found")
+        raise HTTPException(
+            status_code=404, detail="workspace target resolution not found"
+        )
 
     signal: WorkspaceReplanSignal | None = None
     if payload.signal_id is not None:
         signal = await db.get(WorkspaceReplanSignal, payload.signal_id)
         if not signal:
-            raise HTTPException(status_code=404, detail="workspace replan signal not found")
-        if signal.action_plan_id not in {None, row.id} and signal.execution_id != row.execution_id:
-            raise HTTPException(status_code=422, detail="workspace replan signal does not belong to this plan")
+            raise HTTPException(
+                status_code=404, detail="workspace replan signal not found"
+            )
+        if (
+            signal.action_plan_id not in {None, row.id}
+            and signal.execution_id != row.execution_id
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail="workspace replan signal does not belong to this plan",
+            )
     else:
         signal = (
-            await db.execute(
-                select(WorkspaceReplanSignal)
-                .where(WorkspaceReplanSignal.action_plan_id == row.id)
-                .where(WorkspaceReplanSignal.status == "active")
-                .order_by(WorkspaceReplanSignal.id.desc())
+            (
+                await db.execute(
+                    select(WorkspaceReplanSignal)
+                    .where(WorkspaceReplanSignal.action_plan_id == row.id)
+                    .where(WorkspaceReplanSignal.status == "active")
+                    .order_by(WorkspaceReplanSignal.id.desc())
+                )
             )
-        ).scalars().first()
+            .scalars()
+            .first()
+        )
 
-    freshness = await _evaluate_predictive_freshness(action_plan=row, target=target, db=db)
+    freshness = await _evaluate_predictive_freshness(
+        action_plan=row, target=target, db=db
+    )
     selected_outcome = freshness["recommended_outcome"]
     if signal:
-        selected_outcome = _merge_replan_outcomes(primary=selected_outcome, secondary=signal.predicted_outcome)
+        selected_outcome = _merge_replan_outcomes(
+            primary=selected_outcome, secondary=signal.predicted_outcome
+        )
     if payload.force and selected_outcome == "abort_chain":
         selected_outcome = "require_replan"
 
@@ -5739,12 +7650,16 @@ async def replan_workspace_action_plan(
         "status": row.status,
         "planning_outcome": row.planning_outcome,
         "steps": row.steps_json if isinstance(row.steps_json, list) else [],
-        "motion_plan": row.motion_plan_json if isinstance(row.motion_plan_json, dict) else {},
+        "motion_plan": row.motion_plan_json
+        if isinstance(row.motion_plan_json, dict)
+        else {},
         "simulation_outcome": row.simulation_outcome,
         "simulation_status": row.simulation_status,
     }
 
-    planning_outcome, steps, _ = _action_plan_policy(target=target, action_type=row.action_type)
+    planning_outcome, steps, _ = _action_plan_policy(
+        target=target, action_type=row.action_type
+    )
     status = "pending_approval"
     operator_confirmation_required = False
     if selected_outcome == "pause_and_resimulate":
@@ -5778,7 +7693,11 @@ async def replan_workspace_action_plan(
     )
     row.motion_plan_json = {
         **base_motion_plan,
-        **(payload.motion_plan_overrides if isinstance(payload.motion_plan_overrides, dict) else {}),
+        **(
+            payload.motion_plan_overrides
+            if isinstance(payload.motion_plan_overrides, dict)
+            else {}
+        ),
     }
 
     metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
@@ -5797,7 +7716,9 @@ async def replan_workspace_action_plan(
             "status": row.status,
             "planning_outcome": row.planning_outcome,
             "steps": row.steps_json if isinstance(row.steps_json, list) else [],
-            "motion_plan": row.motion_plan_json if isinstance(row.motion_plan_json, dict) else {},
+            "motion_plan": row.motion_plan_json
+            if isinstance(row.motion_plan_json, dict)
+            else {},
         },
         "metadata_json": payload.metadata_json,
     }
@@ -5822,10 +7743,15 @@ async def replan_workspace_action_plan(
             execution.status = "paused"
             execution.dispatch_decision = "replan_required"
             execution.reason = payload.reason or selected_outcome
-            feedback = execution.feedback_json if isinstance(execution.feedback_json, dict) else {}
+            feedback = (
+                execution.feedback_json
+                if isinstance(execution.feedback_json, dict)
+                else {}
+            )
             execution.feedback_json = {
                 **feedback,
-                "replan_required": selected_outcome in {"require_replan", "abort_chain"},
+                "replan_required": selected_outcome
+                in {"require_replan", "abort_chain"},
                 "latest_replan_plan_id": row.id,
                 "latest_replan_signal_id": signal.id if signal else None,
                 "latest_replan_outcome": selected_outcome,
@@ -5897,7 +7823,9 @@ async def replan_workspace_action_plan(
 
 
 @router.get("/action-plans/{plan_id}/replan-history")
-async def get_workspace_action_plan_replan_history(plan_id: int, db: AsyncSession = Depends(get_db)) -> dict:
+async def get_workspace_action_plan_replan_history(
+    plan_id: int, db: AsyncSession = Depends(get_db)
+) -> dict:
     row = await db.get(WorkspaceActionPlan, plan_id)
     if not row:
         raise HTTPException(status_code=404, detail="workspace action plan not found")
@@ -5917,7 +7845,9 @@ async def list_workspace_interruptions(
     limit: int = Query(default=100, ge=1, le=500),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    stmt = select(WorkspaceInterruptionEvent).order_by(WorkspaceInterruptionEvent.id.desc())
+    stmt = select(WorkspaceInterruptionEvent).order_by(
+        WorkspaceInterruptionEvent.id.desc()
+    )
     if execution_id is not None:
         stmt = stmt.where(WorkspaceInterruptionEvent.execution_id == execution_id)
     if status.strip():
@@ -5930,7 +7860,9 @@ async def list_workspace_interruptions(
 
 
 @router.get("/interruptions/{interruption_id}")
-async def get_workspace_interruption(interruption_id: int, db: AsyncSession = Depends(get_db)) -> dict:
+async def get_workspace_interruption(
+    interruption_id: int, db: AsyncSession = Depends(get_db)
+) -> dict:
     row = await db.get(WorkspaceInterruptionEvent, interruption_id)
     if not row:
         raise HTTPException(status_code=404, detail="workspace interruption not found")
@@ -5947,7 +7879,9 @@ async def pause_workspace_execution(
     if not execution:
         raise HTTPException(status_code=404, detail="capability execution not found")
     if execution.status not in {"dispatched", "accepted", "running"}:
-        raise HTTPException(status_code=422, detail="execution is not in a pausable state")
+        raise HTTPException(
+            status_code=422, detail="execution is not in a pausable state"
+        )
 
     requested_outcome = _interruption_outcome_for_type(payload.interruption_type)
     prior_status = execution.status
@@ -5965,13 +7899,19 @@ async def pause_workspace_execution(
         },
     )
 
-    action_plan = await _find_action_plan_for_execution(execution_id=execution.id, db=db)
+    action_plan = await _find_action_plan_for_execution(
+        execution_id=execution.id, db=db
+    )
     if action_plan:
         action_plan.status = "paused"
         action_plan.execution_status = "paused"
         action_plan.planning_outcome = "plan_paused"
         action_plan.metadata_json = {
-            **(action_plan.metadata_json if isinstance(action_plan.metadata_json, dict) else {}),
+            **(
+                action_plan.metadata_json
+                if isinstance(action_plan.metadata_json, dict)
+                else {}
+            ),
             "interruption": {
                 "type": payload.interruption_type,
                 "actor": payload.actor,
@@ -6057,7 +7997,9 @@ async def stop_workspace_execution(
     if not execution:
         raise HTTPException(status_code=404, detail="capability execution not found")
     if execution.status in {"succeeded", "failed", "blocked"}:
-        raise HTTPException(status_code=422, detail="execution is already in a terminal state")
+        raise HTTPException(
+            status_code=422, detail="execution is already in a terminal state"
+        )
 
     requested_outcome = _interruption_outcome_for_type(payload.interruption_type)
     prior_status = execution.status
@@ -6075,7 +8017,9 @@ async def stop_workspace_execution(
         },
     )
 
-    action_plan = await _find_action_plan_for_execution(execution_id=execution.id, db=db)
+    action_plan = await _find_action_plan_for_execution(
+        execution_id=execution.id, db=db
+    )
     if action_plan:
         action_plan.status = "aborted"
         action_plan.execution_status = "stopped"
@@ -6083,7 +8027,11 @@ async def stop_workspace_execution(
         action_plan.abort_reason = execution.reason
         action_plan.planning_outcome = "plan_aborted"
         action_plan.metadata_json = {
-            **(action_plan.metadata_json if isinstance(action_plan.metadata_json, dict) else {}),
+            **(
+                action_plan.metadata_json
+                if isinstance(action_plan.metadata_json, dict)
+                else {}
+            ),
             "interruption": {
                 "type": payload.interruption_type,
                 "actor": payload.actor,
@@ -6171,42 +8119,79 @@ async def resume_workspace_execution(
     if execution.status != "paused":
         raise HTTPException(status_code=422, detail="execution is not paused")
     if not payload.safety_ack:
-        raise HTTPException(status_code=422, detail="resume requires explicit safety_ack")
+        raise HTTPException(
+            status_code=422, detail="resume requires explicit safety_ack"
+        )
 
-    action_plan = await _find_action_plan_for_execution(execution_id=execution.id, db=db)
+    action_plan = await _find_action_plan_for_execution(
+        execution_id=execution.id, db=db
+    )
     if action_plan:
-        if action_plan.simulation_outcome != "plan_safe" or action_plan.simulation_status != "completed" or not action_plan.simulation_gate_passed:
-            raise HTTPException(status_code=422, detail="resume blocked: action plan simulation is no longer safe")
+        if (
+            action_plan.simulation_outcome != "plan_safe"
+            or action_plan.simulation_status != "completed"
+            or not action_plan.simulation_gate_passed
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail="resume blocked: action plan simulation is no longer safe",
+            )
 
     unresolved_blocking = (
-        await db.execute(
-            select(WorkspaceInterruptionEvent)
-            .where(WorkspaceInterruptionEvent.execution_id == execution.id)
-            .where(WorkspaceInterruptionEvent.status == "active")
-            .order_by(WorkspaceInterruptionEvent.id.desc())
+        (
+            await db.execute(
+                select(WorkspaceInterruptionEvent)
+                .where(WorkspaceInterruptionEvent.execution_id == execution.id)
+                .where(WorkspaceInterruptionEvent.status == "active")
+                .order_by(WorkspaceInterruptionEvent.id.desc())
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     unresolved_blocking = [
-        item for item in unresolved_blocking if _interruption_is_blocking(item.interruption_type)
+        item
+        for item in unresolved_blocking
+        if _interruption_is_blocking(item.interruption_type)
     ]
 
     if unresolved_blocking and not payload.conditions_restored:
-        raise HTTPException(status_code=422, detail="resume blocked: workspace changed and conditions are not restored")
+        raise HTTPException(
+            status_code=422,
+            detail="resume blocked: workspace changed and conditions are not restored",
+        )
 
-    active_replan_signals = await _active_replan_signals_for_execution(execution_id=execution.id, db=db)
+    active_replan_signals = await _active_replan_signals_for_execution(
+        execution_id=execution.id, db=db
+    )
     highest_replan_outcome = "continue_monitor"
     for signal in active_replan_signals:
-        highest_replan_outcome = _merge_replan_outcomes(primary=highest_replan_outcome, secondary=signal.predicted_outcome)
+        highest_replan_outcome = _merge_replan_outcomes(
+            primary=highest_replan_outcome, secondary=signal.predicted_outcome
+        )
 
-    target = await db.get(WorkspaceTargetResolution, action_plan.target_resolution_id) if action_plan else None
-    predictive_freshness = await _evaluate_predictive_freshness(action_plan=action_plan, target=target, db=db)
+    target = (
+        await db.get(WorkspaceTargetResolution, action_plan.target_resolution_id)
+        if action_plan
+        else None
+    )
+    predictive_freshness = await _evaluate_predictive_freshness(
+        action_plan=action_plan, target=target, db=db
+    )
     highest_replan_outcome = _merge_replan_outcomes(
         primary=highest_replan_outcome,
         secondary=predictive_freshness.get("recommended_outcome", "continue_monitor"),
     )
 
-    if highest_replan_outcome in {"pause_and_resimulate", "require_replan", "abort_chain"} and not payload.conditions_restored:
-        raise HTTPException(status_code=422, detail=f"resume blocked: predictive drift requires {highest_replan_outcome}")
+    if (
+        highest_replan_outcome
+        in {"pause_and_resimulate", "require_replan", "abort_chain"}
+        and not payload.conditions_restored
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail=f"resume blocked: predictive drift requires {highest_replan_outcome}",
+        )
 
     monitoring = await _get_or_create_monitoring_state(db)
     human_aware = _human_aware_state_from_monitoring(monitoring)
@@ -6218,14 +8203,28 @@ async def resume_workspace_execution(
             "action_type": "resume_execution",
             "execution_id": execution.id,
             "is_physical": True,
+            "managed_scope": (
+                action_plan.target_zone if action_plan and action_plan.target_zone else (target.requested_zone if target else "global")
+            ),
+            "zone": (
+                action_plan.target_zone if action_plan and action_plan.target_zone else (target.requested_zone if target else "global")
+            ),
         },
         workspace_state={
             "human_in_workspace": human_aware.get("human_in_workspace", False),
             "human_near_target_zone": human_aware.get("human_near_target_zone", False),
             "human_near_motion_path": human_aware.get("human_near_motion_path", False),
-            "shared_workspace_active": human_aware.get("shared_workspace_active", False),
+            "shared_workspace_active": human_aware.get(
+                "shared_workspace_active", False
+            ),
             "target_confidence": float((target.confidence if target else 1.0) or 1.0),
             "map_freshness_seconds": 0,
+            "managed_scope": (
+                action_plan.target_zone if action_plan and action_plan.target_zone else (target.requested_zone if target else "global")
+            ),
+            "zone": (
+                action_plan.target_zone if action_plan and action_plan.target_zone else (target.requested_zone if target else "global")
+            ),
         },
         system_state={"throttle_blocked": False, "integrity_risk": False},
         policy_state={
@@ -6233,12 +8232,27 @@ async def resume_workspace_execution(
             "map_freshness_limit_seconds": MONITORING_DEFAULT_FRESHNESS_THRESHOLD_SECONDS,
             "unlawful_action": False,
         },
-        metadata_json={"reason": payload.reason, **payload.metadata_json},
+        metadata_json={
+            "reason": payload.reason,
+            "managed_scope": (
+                action_plan.target_zone if action_plan and action_plan.target_zone else (target.requested_zone if target else "global")
+            ),
+            "zone": (
+                action_plan.target_zone if action_plan and action_plan.target_zone else (target.requested_zone if target else "global")
+            ),
+            **payload.metadata_json,
+        },
         db=db,
     )
     resume_decision = str(resume_constraint_result.get("decision", "allowed"))
-    if resume_decision in {"requires_confirmation", "requires_replan", "blocked"} and not payload.conditions_restored:
-        raise HTTPException(status_code=422, detail=f"resume blocked by constraint engine: {resume_decision}")
+    if (
+        resume_decision in {"requires_confirmation", "requires_replan", "blocked"}
+        and not payload.conditions_restored
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail=f"resume blocked by constraint engine: {resume_decision}",
+        )
 
     resolved_ids: list[int] = []
     if payload.conditions_restored:
@@ -6262,7 +8276,11 @@ async def resume_workspace_execution(
             signal.resolved_by = payload.actor
             signal.resolved_at = datetime.now(timezone.utc)
             signal.metadata_json = {
-                **(signal.metadata_json if isinstance(signal.metadata_json, dict) else {}),
+                **(
+                    signal.metadata_json
+                    if isinstance(signal.metadata_json, dict)
+                    else {}
+                ),
                 "conditions_restored": True,
                 "restored_by": payload.actor,
                 "restored_reason": payload.reason,
@@ -6294,7 +8312,11 @@ async def resume_workspace_execution(
         action_plan.execution_status = "running"
         action_plan.planning_outcome = "plan_executing"
         action_plan.metadata_json = {
-            **(action_plan.metadata_json if isinstance(action_plan.metadata_json, dict) else {}),
+            **(
+                action_plan.metadata_json
+                if isinstance(action_plan.metadata_json, dict)
+                else {}
+            ),
             "resume": {
                 "resumed_by": payload.actor,
                 "resume_reason": payload.reason,

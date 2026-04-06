@@ -6,8 +6,10 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
+from tests.integration.runtime_target_guard import DEFAULT_BASE_URL, probe_current_source_runtime
 
-BASE_URL = os.getenv("MIM_TEST_BASE_URL", "http://127.0.0.1:8001")
+
+BASE_URL = os.getenv("MIM_TEST_BASE_URL", DEFAULT_BASE_URL)
 
 
 def post_json(path: str, payload: dict) -> tuple[int, dict]:
@@ -27,6 +29,15 @@ def post_json(path: str, payload: dict) -> tuple[int, dict]:
 
 
 class Objective80ExecutionTruthAdaptationSurfacesTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        probe_current_source_runtime(
+            suite_name="Objective 80 adaptation surfaces",
+            base_url=BASE_URL,
+            require_execution_truth_projection=True,
+        )
+
     def _register_workspace_scan(self) -> None:
         status, payload = post_json(
             "/gateway/capabilities",

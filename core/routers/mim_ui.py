@@ -1,9 +1,12 @@
+import json
 from datetime import datetime, timezone
 from hashlib import sha256
+from pathlib import Path
 import re
 
 from fastapi import APIRouter, Depends
 from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -36,6 +39,7 @@ from core.models import (
     WorkspaceStewardshipState,
     WorkspaceStrategyGoal,
 )
+from core.mim_arm_dispatch_telemetry import refresh_dispatch_telemetry_record
 from core.operator_commitment_monitoring_service import (
     latest_commitment_monitoring_profile,
     to_operator_resolution_commitment_monitoring_out,
@@ -52,11 +56,27 @@ from core.operator_preference_convergence_service import (
 from core.operator_resolution_service import choose_operator_resolution_commitment, commitment_effect_labels, commitment_snapshot
 from core.policy_conflict_resolution_service import list_workspace_policy_conflict_profiles
 from core.proposal_policy_convergence_service import list_workspace_proposal_policy_preferences
+from core.runtime_recovery_service import RuntimeRecoveryService
+from core.ui_health_service import (
+  build_mim_ui_health_snapshot,
+  build_mim_ui_health_snapshot_from_rows,
+  summarize_runtime_health,
+)
 
 router = APIRouter(tags=["mim-ui"])
+SHARED_RUNTIME_ROOT = Path("runtime/shared")
+runtime_recovery_service = RuntimeRecoveryService(SHARED_RUNTIME_ROOT)
 
 MIC_PROMPT_MIN_CONFIDENCE = 0.66
 MIC_PROMPT_MAX_AGE_SECONDS = 25.0
+
+
+class RuntimeRecoveryEventRequest(BaseModel):
+    lane: str
+    event_type: str
+    detail: str | None = None
+    next_retry_at: str | None = None
+    metadata: dict | None = None
 
 
 def _known_people() -> set[str]:
@@ -902,6 +922,7 @@ def _build_operator_reasoning_summary(
     goal: dict,
     inquiry: dict,
     governance: dict,
+    gateway_governance: dict,
     autonomy: dict,
     stewardship: dict,
     execution_readiness: dict,
@@ -912,7 +933,19 @@ def _build_operator_reasoning_summary(
     learned_preferences: list[dict],
     proposal_policy: dict,
     conflict_resolution: dict,
+    collaboration_progress: dict | None = None,
+    dispatch_telemetry: dict | None = None,
+    runtime_health: dict | None = None,
+    runtime_recovery: dict | None = None,
 ) -> str:
+    collaboration_progress = (
+      collaboration_progress if isinstance(collaboration_progress, dict) else {}
+    )
+    dispatch_telemetry = (
+      dispatch_telemetry if isinstance(dispatch_telemetry, dict) else {}
+    )
+    runtime_health = runtime_health if isinstance(runtime_health, dict) else {}
+    runtime_recovery = runtime_recovery if isinstance(runtime_recovery, dict) else {}
     parts: list[str] = []
     if str(goal.get("reasoning_summary") or "").strip():
         parts.append(f"Goal: {str(goal.get('reasoning_summary') or '').strip()}")
@@ -928,6 +961,25 @@ def _build_operator_reasoning_summary(
             "Governance: "
             f"{str(governance.get('governance_decision') or '').strip().replace('_', ' ')}"
         )
+    if str(gateway_governance.get("summary") or "").strip():
+        parts.append(
+            "Gateway governance: "
+            f"{str(gateway_governance.get('summary') or '').strip()}"
+        )
+    collaboration_summary = str(collaboration_progress.get("summary") or "").strip()
+    if collaboration_summary:
+      parts.append(f"TOD collaboration: {collaboration_summary}")
+    dispatch_summary = str(dispatch_telemetry.get("summary") or "").strip()
+    if dispatch_summary:
+      parts.append(f"Dispatch telemetry: {dispatch_summary}")
+    runtime_summary = summarize_runtime_health(runtime_health)
+    runtime_status = str(runtime_health.get("status") or "").strip()
+    if runtime_summary and runtime_status and runtime_status != "healthy":
+        parts.append(f"Runtime health: {runtime_summary}")
+    recovery_summary = str(runtime_recovery.get("summary") or "").strip()
+    recovery_status = str(runtime_recovery.get("status") or "").strip()
+    if recovery_summary and recovery_status and recovery_status != "healthy":
+      parts.append(f"Runtime recovery: {recovery_summary}")
     if str(autonomy.get("current_level") or "").strip():
         parts.append(
             "Autonomy: "
@@ -1103,16 +1155,84 @@ def _operator_execution_recovery_learning_snapshot(recovery: dict) -> dict:
     }
 
 
+def _operator_gateway_governance_snapshot(snapshot: dict) -> dict:
+    if not isinstance(snapshot, dict):
+        return {}
+    signal_codes = [
+        str(item).strip()
+        for item in (snapshot.get("signal_codes") or [])
+        if str(item).strip()
+    ]
+    return {
+        "applied_reason": str(snapshot.get("applied_reason") or "").strip(),
+        "applied_outcome": str(snapshot.get("applied_outcome") or "").strip(),
+        "primary_signal": str(snapshot.get("primary_signal") or "").strip(),
+        "system_health_status": str(snapshot.get("system_health_status") or "").strip(),
+        "summary": _compact_sentence(str(snapshot.get("summary") or "").strip(), max_len=220),
+        "signal_codes": signal_codes,
+        "signal_count": len(signal_codes),
+        "precedence_order": [
+            str(item).strip()
+            for item in (snapshot.get("precedence_order") or [])
+            if str(item).strip()
+        ],
+    }
+
+
+async def _latest_gateway_governance_snapshot(
+    *,
+    db: AsyncSession,
+    managed_scope: str,
+) -> dict:
+    normalized_scope = str(managed_scope or "").strip()
+    rows = (
+        (
+            await db.execute(
+                select(InputEventResolution)
+                .order_by(InputEventResolution.id.desc())
+                .limit(120)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for row in rows:
+        metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
+        governance = (
+            metadata.get("governance")
+            if isinstance(metadata.get("governance"), dict)
+            else {}
+        )
+        if not governance:
+            continue
+        governance_scope = str(governance.get("managed_scope") or "").strip()
+        if normalized_scope and governance_scope and governance_scope != normalized_scope:
+            continue
+        return _operator_gateway_governance_snapshot(governance)
+    return {}
+
+
 def _operator_current_recommendation(
     *,
     inquiry: dict,
     governance: dict,
     autonomy: dict,
     stewardship: dict,
-  execution_recovery: dict,
+    commitment: dict,
+    execution_recovery: dict,
     commitment_monitoring: dict,
     commitment_outcome: dict,
-  ) -> dict:
+) -> dict:
+    if bool(commitment.get("active", False)) and str(commitment.get("decision_type") or "").strip():
+        return {
+            "source": "governance",
+            "decision": str(commitment.get("decision_type") or "").strip(),
+            "managed_scope": str(commitment.get("managed_scope") or "").strip(),
+            "summary": _compact_sentence(
+                str(commitment.get("reason") or commitment.get("summary") or "").strip(),
+                max_len=180,
+            ),
+        }
     if str(commitment_monitoring.get("governance_decision") or "").strip() and str(
         commitment_monitoring.get("governance_decision") or ""
     ).strip() != "maintain_commitment":
@@ -1126,53 +1246,20 @@ def _operator_current_recommendation(
             ),
         }
     if str(commitment_outcome.get("outcome_status") or "").strip() in {
-      "ineffective",
-      "harmful",
-      "abandoned",
+        "ineffective",
+        "harmful",
+        "abandoned",
     }:
-      return {
-        "source": "commitment_outcome",
-        "decision": str(commitment_outcome.get("outcome_status") or "").strip(),
-        "managed_scope": str(commitment_outcome.get("managed_scope") or "").strip(),
-        "summary": _compact_sentence(
-          str(commitment_outcome.get("outcome_reason") or "").strip(),
-          max_len=180,
-        ),
-      }
-      recovery_learning = (
-        execution_recovery.get("recovery_learning", {})
-        if isinstance(execution_recovery.get("recovery_learning", {}), dict)
-        else {}
-      )
-      if str(recovery_learning.get("escalation_decision") or "").strip() and str(
-        recovery_learning.get("escalation_decision") or ""
-      ).strip() != "continue_bounded_recovery":
         return {
-          "source": "execution_recovery_learning",
-          "decision": str(recovery_learning.get("escalation_decision") or "").strip(),
-          "managed_scope": str(recovery_learning.get("managed_scope") or "").strip(),
-          "summary": _compact_sentence(
-            str(
-              recovery_learning.get("why_recovery_escalated_before_retry")
-              or recovery_learning.get("rationale")
-              or ""
-            ).strip(),
-            max_len=180,
-          ),
-        }
-    if str(execution_recovery.get("recovery_decision") or "").strip() and (
-        bool(execution_recovery.get("operator_action_required", False))
-        or bool(execution_recovery.get("recovery_allowed", False))
-    ):
-        return {
-            "source": "execution_recovery",
-            "decision": str(execution_recovery.get("recovery_decision") or "").strip(),
-            "managed_scope": str(execution_recovery.get("managed_scope") or "").strip(),
+            "source": "commitment_outcome",
+            "decision": str(commitment_outcome.get("outcome_status") or "").strip(),
+            "managed_scope": str(commitment_outcome.get("managed_scope") or "").strip(),
             "summary": _compact_sentence(
-                str(execution_recovery.get("summary") or execution_recovery.get("recovery_reason") or "").strip(),
+                str(commitment_outcome.get("outcome_reason") or "").strip(),
                 max_len=180,
             ),
         }
+
     if str(governance.get("governance_decision") or "").strip():
         decision = str(governance.get("governance_decision") or "").strip()
         scope = str(governance.get("managed_scope") or "").strip()
@@ -1187,6 +1274,41 @@ def _operator_current_recommendation(
             "decision": decision,
             "managed_scope": scope,
             "summary": summary,
+        }
+
+    recovery_learning = (
+        execution_recovery.get("recovery_learning", {})
+        if isinstance(execution_recovery.get("recovery_learning", {}), dict)
+        else {}
+    )
+    if str(recovery_learning.get("escalation_decision") or "").strip() and str(
+        recovery_learning.get("escalation_decision") or ""
+    ).strip() != "continue_bounded_recovery":
+        return {
+            "source": "execution_recovery_learning",
+            "decision": str(recovery_learning.get("escalation_decision") or "").strip(),
+            "managed_scope": str(recovery_learning.get("managed_scope") or "").strip(),
+            "summary": _compact_sentence(
+                str(
+                    recovery_learning.get("why_recovery_escalated_before_retry")
+                    or recovery_learning.get("rationale")
+                    or ""
+                ).strip(),
+                max_len=180,
+            ),
+        }
+    if str(execution_recovery.get("recovery_decision") or "").strip() and (
+        bool(execution_recovery.get("operator_action_required", False))
+        or bool(execution_recovery.get("recovery_allowed", False))
+    ):
+        return {
+            "source": "execution_recovery",
+            "decision": str(execution_recovery.get("recovery_decision") or "").strip(),
+            "managed_scope": str(execution_recovery.get("managed_scope") or "").strip(),
+            "summary": _compact_sentence(
+                str(execution_recovery.get("summary") or execution_recovery.get("recovery_reason") or "").strip(),
+                max_len=180,
+            ),
         }
     if str(stewardship.get("last_decision_summary") or "").strip():
         decision = str(stewardship.get("followup_status") or "").strip()
@@ -1254,6 +1376,170 @@ def _operator_resolution_commitment_outcome_snapshot(
     return snapshot
 
 
+def _load_json_artifact(path: Path) -> dict:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _resolve_execution_identity(payload: dict) -> dict:
+  task_id = str(payload.get("task_id") or payload.get("registry_task_id") or "").strip()
+  request_id = str(payload.get("request_id") or payload.get("bridge_request_id") or "").strip()
+  execution_id = str(payload.get("execution_id") or "").strip()
+  id_kind = str(payload.get("id_kind") or payload.get("execution_id_kind") or "").strip()
+  if not execution_id:
+    if id_kind == "bridge_request_id":
+      execution_id = request_id or task_id
+    elif id_kind == "mim_task_registry_id":
+      execution_id = task_id or request_id
+    else:
+      execution_id = request_id or task_id
+  if not id_kind:
+    if request_id and execution_id == request_id:
+      id_kind = "bridge_request_id"
+    elif task_id and execution_id == task_id:
+      id_kind = "mim_task_registry_id"
+  execution_lane = str(payload.get("execution_lane") or "").strip()
+  if not execution_lane:
+    execution_lane = (
+      "tod_bridge_request"
+      if id_kind == "bridge_request_id"
+      else ("mim_task_registry" if id_kind == "mim_task_registry_id" else "")
+    )
+  if id_kind == "bridge_request_id":
+    execution_id_label = f"bridge request {execution_id}" if execution_id else ""
+  elif id_kind == "mim_task_registry_id":
+    execution_id_label = f"task {execution_id}" if execution_id else ""
+  else:
+    execution_id_label = execution_id
+  return {
+    "execution_id": execution_id,
+    "id_kind": id_kind,
+    "execution_lane": execution_lane,
+    "execution_id_label": execution_id_label,
+    "task_id": task_id,
+    "request_id": request_id,
+  }
+
+
+def _operator_collaboration_progress_snapshot(
+    shared_root: Path = SHARED_RUNTIME_ROOT,
+) -> dict:
+  payload = _load_json_artifact(shared_root / "MIM_TOD_COLLAB_PROGRESS.latest.json")
+  if not payload:
+    return {}
+
+  identity = _resolve_execution_identity(payload)
+
+  workstreams_raw = payload.get("workstreams")
+  workstreams = [
+    item for item in workstreams_raw if isinstance(item, dict)
+  ] if isinstance(workstreams_raw, list) else []
+  first = workstreams[0] if workstreams else {}
+  active = next(
+    (
+      item
+      for item in workstreams
+      if str(item.get("tod_status") or "").strip().endswith("recovery_in_progress")
+      or "recovery" in str(item.get("name") or "").strip().lower()
+    ),
+    first,
+  )
+  name = str(active.get("name") or "").strip().replace("_", " ")
+  mim_status = str(active.get("mim_status") or "").strip().replace("_", " ")
+  tod_status = str(active.get("tod_status") or "").strip().replace("_", " ")
+  observation = _compact_sentence(
+    str(active.get("latest_observation") or ""),
+    max_len=180,
+  )
+  summary_parts = []
+  if identity["execution_id_label"]:
+    summary_parts.append(identity["execution_id_label"])
+  if name:
+    summary_parts.append(name)
+  if tod_status:
+    summary_parts.append(tod_status)
+  elif mim_status:
+    summary_parts.append(mim_status)
+  summary = _compact_sentence(" | ".join(summary_parts), max_len=180)
+  return {
+    **identity,
+    "generated_at": str(payload.get("generated_at") or "").strip(),
+    "type": str(payload.get("type") or "").strip(),
+    "summary": summary,
+    "active_workstream": {
+      "name": str(active.get("name") or "").strip(),
+      "mim_status": str(active.get("mim_status") or "").strip(),
+      "tod_status": str(active.get("tod_status") or "").strip(),
+      "latest_observation": observation,
+    },
+    "workstreams": [
+      {
+        "id": int(item.get("id") or 0),
+        "name": str(item.get("name") or "").strip(),
+        "mim_status": str(item.get("mim_status") or "").strip(),
+        "tod_status": str(item.get("tod_status") or "").strip(),
+        "latest_observation": _compact_sentence(
+          str(item.get("latest_observation") or ""),
+          max_len=180,
+        ),
+      }
+      for item in workstreams[:5]
+    ],
+  }
+
+
+def _operator_dispatch_telemetry_snapshot(
+    shared_root: Path = SHARED_RUNTIME_ROOT,
+) -> dict:
+  payload = refresh_dispatch_telemetry_record(shared_root)
+  if not payload:
+    return {}
+
+  evidence_sources = payload.get("evidence_sources")
+  evidence_items = [item for item in evidence_sources if isinstance(item, dict)] if isinstance(evidence_sources, list) else []
+  evidence_kinds = [
+    str(item.get("kind") or "").strip()
+    for item in evidence_items
+    if str(item.get("kind") or "").strip()
+  ]
+  command_name = str(payload.get("command_name") or "").strip()
+  request_id = str(payload.get("request_id") or "").strip()
+  dispatch_status = str(payload.get("dispatch_status") or "").strip().replace("_", " ")
+  completion_status = str(payload.get("completion_status") or "").strip().replace("_", " ")
+  summary_parts = []
+  if command_name:
+    summary_parts.append(command_name)
+  if request_id:
+    summary_parts.append(request_id)
+  if dispatch_status:
+    summary_parts.append(f"dispatch {dispatch_status}")
+  if completion_status and completion_status != "pending":
+    summary_parts.append(f"completion {completion_status}")
+  if evidence_kinds:
+    summary_parts.append(f"evidence via {', '.join(evidence_kinds[:4])}")
+
+  return {
+    "request_id": request_id,
+    "task_id": str(payload.get("task_id") or "").strip(),
+    "correlation_id": str(payload.get("correlation_id") or "").strip(),
+    "execution_id": payload.get("execution_id"),
+    "execution_lane": str(payload.get("execution_lane") or "").strip(),
+    "command_name": command_name,
+    "dispatch_timestamp": str(payload.get("dispatch_timestamp") or "").strip(),
+    "host_received_timestamp": str(payload.get("host_received_timestamp") or "").strip(),
+    "host_completed_timestamp": str(payload.get("host_completed_timestamp") or "").strip(),
+    "dispatch_status": str(payload.get("dispatch_status") or "").strip(),
+    "completion_status": str(payload.get("completion_status") or "").strip(),
+    "result_reason": str(payload.get("result_reason") or "").strip(),
+    "record_path": str(payload.get("record_path") or "").strip(),
+    "evidence_source_kinds": evidence_kinds,
+    "summary": "; ".join(summary_parts),
+  }
+
+
 def _choose_operator_resolution_commitment(
     rows: list[WorkspaceOperatorResolutionCommitment],
     *,
@@ -1273,12 +1559,17 @@ def _build_operator_reasoning_payload(
     commitment_row: WorkspaceOperatorResolutionCommitment | None,
     commitment_monitoring_row: WorkspaceOperatorResolutionCommitmentMonitoringProfile | None,
     commitment_outcome_row: WorkspaceOperatorResolutionCommitmentOutcomeProfile | None,
+    gateway_governance_snapshot: dict,
     execution_recovery: dict,
     learned_preferences: list[dict],
     preference_conflicts_items: list[dict],
     proposal_policy_preferences: list[dict],
     policy_conflict_profiles: list[dict],
     execution_readiness: dict,
+    collaboration_progress: dict,
+    dispatch_telemetry: dict,
+    runtime_health: dict,
+    runtime_recovery: dict,
 ) -> dict:
     goal = _operator_goal_snapshot(goal_row)
     inquiry = _operator_inquiry_snapshot(inquiry_row)
@@ -1292,6 +1583,9 @@ def _build_operator_reasoning_payload(
     commitment_outcome = _operator_resolution_commitment_outcome_snapshot(
       commitment_outcome_row
     )
+    gateway_governance = _operator_gateway_governance_snapshot(
+        gateway_governance_snapshot
+    )
     proposal_policy = _operator_proposal_policy_snapshot(proposal_policy_preferences)
     conflict_resolution = _operator_policy_conflict_snapshot(policy_conflict_profiles)
     readiness = _operator_execution_readiness_snapshot(execution_readiness)
@@ -1302,6 +1596,7 @@ def _build_operator_reasoning_payload(
         governance=governance,
         autonomy=autonomy,
         stewardship=stewardship,
+      commitment=commitment,
         execution_recovery=recovery,
         commitment_monitoring=commitment_monitoring,
         commitment_outcome=commitment_outcome,
@@ -1311,6 +1606,7 @@ def _build_operator_reasoning_payload(
             goal=goal,
             inquiry=inquiry,
             governance=governance,
+            gateway_governance=gateway_governance,
             autonomy=autonomy,
             stewardship=stewardship,
             execution_readiness=readiness,
@@ -1321,10 +1617,15 @@ def _build_operator_reasoning_payload(
             learned_preferences=learned_preferences,
             proposal_policy=proposal_policy,
             conflict_resolution=conflict_resolution,
+            collaboration_progress=collaboration_progress,
+            dispatch_telemetry=dispatch_telemetry,
+            runtime_health=runtime_health,
+            runtime_recovery=runtime_recovery,
         ),
         "active_goal": goal,
         "inquiry": inquiry,
         "governance": governance,
+        "gateway_governance": gateway_governance,
         "autonomy": autonomy,
         "stewardship": stewardship,
         "execution_readiness": readiness,
@@ -1338,6 +1639,10 @@ def _build_operator_reasoning_payload(
         "preference_conflicts": preference_conflicts_items,
         "proposal_policy": proposal_policy,
         "conflict_resolution": conflict_resolution,
+        "collaboration_progress": collaboration_progress,
+        "dispatch_telemetry": dispatch_telemetry,
+        "runtime_health": runtime_health,
+        "runtime_recovery": runtime_recovery,
     }
 
 
@@ -2120,6 +2425,10 @@ async def mim_ui_page() -> str:
     let cameraWatcherCtx = null;
     let cameraLastFrame = null;
     let cameraLastSentAt = 0;
+    let cameraLastHeartbeatAt = 0;
+    let cameraWatcherStartedAt = 0;
+    let cameraLastFrameSeenAt = 0;
+    let cameraLastHealthyFrameAt = 0;
     let lastSpokenOutputId = Number(localStorage.getItem('mim_last_spoken_output_id') || 0);
     let availableVoices = [];
     let availableMics = [];
@@ -2171,6 +2480,7 @@ async def mim_ui_page() -> str:
     let micFallbackInterval = null;
     let micLastSpeechEventAt = 0;
     let micLastResultAt = 0;
+    let cameraRecoveryInFlight = false;
     let voiceRecoveryInterval = null;
     let voiceRecoveryAttempts = 0;
     const MIC_FLAP_WINDOW_MS = 12000;
@@ -2189,6 +2499,9 @@ async def mim_ui_page() -> str:
     const MIC_POST_TTS_SUPPRESS_MS = 1100;
     const MIC_ECHO_MATCH_WINDOW_MS = 20000;
     const MIC_ECHO_MIN_SIGNATURE_LEN = 6;
+    const RUNTIME_HEALTH_RECOVERY_COOLDOWN_MS = 15000;
+    const CAMERA_FRAME_STARVED_MS = 3500;
+    const CAMERA_HEARTBEAT_MS = 8000;
     const STATE_POLL_SPEAK_ENABLED = false;
     const WAKE_WORD_REQUIRED_FOR_LIVE_REPLY = true;
     const LOW_VALUE_CLARIFY_COOLDOWN_MS = 15000;
@@ -2250,6 +2563,14 @@ async def mim_ui_page() -> str:
     let lastSpokenPhraseAt = 0;
     let refreshInFlight = false;
     let refreshPending = false;
+    const runtimeHealthRecoveryCooldownUntil = {
+      camera: 0,
+      microphone: 0,
+    };
+    const runtimeRecoveryPending = {
+      camera: null,
+      microphone: null,
+    };
 
     const SERVER_TTS_VOICES = [
       { value: 'en-US-EmmaMultilingualNeural', label: 'Emma (en-US, multilingual)' },
@@ -2485,6 +2806,7 @@ async def mim_ui_page() -> str:
       const goal = (reasoning && typeof reasoning.active_goal === 'object') ? reasoning.active_goal : {};
       const inquiry = (reasoning && typeof reasoning.inquiry === 'object') ? reasoning.inquiry : {};
       const governance = (reasoning && typeof reasoning.governance === 'object') ? reasoning.governance : {};
+      const gatewayGovernance = (reasoning && typeof reasoning.gateway_governance === 'object') ? reasoning.gateway_governance : {};
       const autonomy = (reasoning && typeof reasoning.autonomy === 'object') ? reasoning.autonomy : {};
       const stewardship = (reasoning && typeof reasoning.stewardship === 'object') ? reasoning.stewardship : {};
 
@@ -2516,6 +2838,17 @@ async def mim_ui_page() -> str:
         entries.push({ title: 'Governance', meta, note });
       }
 
+      if (String(gatewayGovernance.primary_signal || gatewayGovernance.summary || '').trim()) {
+        const signalCount = Number(gatewayGovernance.signal_count || 0);
+        const meta = [
+          gatewayGovernance.primary_signal,
+          gatewayGovernance.system_health_status,
+          signalCount > 1 ? `${signalCount} active signals` : '',
+        ].filter(Boolean).join(' | ');
+        const note = String(gatewayGovernance.summary || '').trim();
+        entries.push({ title: 'Gateway governance', meta, note });
+      }
+
       if (String(autonomy.current_level || '').trim()) {
         const meta = [autonomy.current_level, autonomy.scope && `scope ${autonomy.scope}`]
           .filter(Boolean)
@@ -2539,6 +2872,47 @@ async def mim_ui_page() -> str:
           title: 'Stewardship',
           meta: bits.join(' | '),
           note,
+        });
+      }
+
+      const collaboration = (reasoning && typeof reasoning.collaboration_progress === 'object') ? reasoning.collaboration_progress : {};
+      if (String(collaboration.summary || '').trim()) {
+        const activeWorkstream = (collaboration.active_workstream && typeof collaboration.active_workstream === 'object')
+          ? collaboration.active_workstream
+          : {};
+        const meta = [
+          collaboration.execution_id_label || collaboration.execution_id,
+          collaboration.execution_lane && String(collaboration.execution_lane || '').trim().replaceAll('_', ' '),
+          activeWorkstream.name && String(activeWorkstream.name || '').trim().replaceAll('_', ' '),
+          activeWorkstream.tod_status && String(activeWorkstream.tod_status || '').trim().replaceAll('_', ' '),
+        ].filter(Boolean).join(' | ');
+        let note = String(activeWorkstream.latest_observation || '').trim();
+        if (!note) {
+          note = String(collaboration.summary || '').trim();
+        }
+        entries.push({
+          title: 'TOD collaboration',
+          meta,
+          note,
+        });
+      }
+
+      const runtimeRecovery = (reasoning && typeof reasoning.runtime_recovery === 'object') ? reasoning.runtime_recovery : {};
+      if (String(runtimeRecovery.summary || '').trim()) {
+        const recoveryLanes = (runtimeRecovery.lanes && typeof runtimeRecovery.lanes === 'object')
+          ? Object.values(runtimeRecovery.lanes)
+          : [];
+        const unstableCount = recoveryLanes.filter((item) => item && item.unstable).length;
+        const cooldownCount = recoveryLanes.filter((item) => item && item.cooldown_active).length;
+        const meta = [
+          runtimeRecovery.status,
+          unstableCount > 0 ? `${unstableCount} unstable lane${unstableCount === 1 ? '' : 's'}` : '',
+          cooldownCount > 0 ? `${cooldownCount} cooldown active` : '',
+        ].filter(Boolean).join(' | ');
+        entries.push({
+          title: 'Runtime recovery',
+          meta,
+          note: String(runtimeRecovery.summary || '').trim(),
         });
       }
 
@@ -2574,6 +2948,23 @@ async def mim_ui_page() -> str:
           </li>
         `;
       }).join('');
+    }
+
+    async function postRuntimeRecoveryEvent(lane, eventType, detail = '', nextRetryAt = null, metadata = {}) {
+      try {
+        await fetch('/mim/ui/runtime-recovery-events', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            lane,
+            event_type: eventType,
+            detail,
+            next_retry_at: nextRetryAt,
+            metadata: metadata && typeof metadata === 'object' ? metadata : {},
+          }),
+        });
+      } catch (_) {
+      }
     }
 
     function isIdentityInquiryText(textRaw) {
@@ -3772,6 +4163,212 @@ async def mim_ui_page() -> str:
       }
       if (!micAutoMode) {
         statusEl.textContent = 'Listening paused.';
+      }
+    }
+
+    function runtimeLaneSnapshot(data, laneName) {
+      const operatorReasoning = (data && typeof data.operator_reasoning === 'object') ? data.operator_reasoning : {};
+      const runtimeHealth = (operatorReasoning && typeof operatorReasoning.runtime_health === 'object')
+        ? operatorReasoning.runtime_health
+        : {};
+      const checks = (runtimeHealth && typeof runtimeHealth.checks === 'object')
+        ? runtimeHealth.checks
+        : {};
+      return (checks && typeof checks[laneName] === 'object') ? checks[laneName] : {};
+    }
+
+    function isoFromMillis(value) {
+      const millis = Number(value || 0);
+      if (!Number.isFinite(millis) || millis <= 0) {
+        return null;
+      }
+      return new Date(millis).toISOString();
+    }
+
+    function isCameraWatcherRunning() {
+      return Boolean(
+        motionInterval
+        && cameraStream
+        && cameraStream.active
+        && cameraWatcherVideo
+        && cameraWatcherVideo.readyState >= 2
+      );
+    }
+
+    function buildCameraRecoveryMetadata(extra = {}) {
+      return {
+        watcher_running: isCameraWatcherRunning(),
+        watcher_started_at: isoFromMillis(cameraWatcherStartedAt),
+        last_frame_seen_at: isoFromMillis(cameraLastFrameSeenAt),
+        last_healthy_frame_at: isoFromMillis(cameraLastHealthyFrameAt),
+        ...extra,
+      };
+    }
+
+    function classifyCameraRetryReason(cameraLane, now) {
+      const staleThresholdMs = Math.max(5000, Number(cameraLane.stale_threshold_seconds || 30) * 1000);
+      const watcherRunning = isCameraWatcherRunning();
+      const lastFrameAgeMs = cameraLastFrameSeenAt ? Math.max(0, now - cameraLastFrameSeenAt) : null;
+      const lastHealthyFrameAgeMs = cameraLastHealthyFrameAt ? Math.max(0, now - cameraLastHealthyFrameAt) : null;
+
+      if (!watcherRunning) {
+        return {
+          category: 'watcher_not_running',
+          detail: 'Camera retry triggered because the watcher was not running.',
+          healthReportDisagreement: false,
+        };
+      }
+
+      if (lastFrameAgeMs === null || lastFrameAgeMs > CAMERA_FRAME_STARVED_MS) {
+        return {
+          category: 'no_frames',
+          detail: 'Camera retry triggered because no recent frames were observed from the watcher.',
+          healthReportDisagreement: false,
+        };
+      }
+
+      if (lastHealthyFrameAgeMs !== null && lastHealthyFrameAgeMs < staleThresholdMs) {
+        return {
+          category: 'health_report_disagreement',
+          detail: 'Backend reported camera stale even though a recent healthy frame was observed locally.',
+          healthReportDisagreement: true,
+        };
+      }
+
+      return {
+        category: 'stale_frames',
+        detail: 'Camera frames continued locally, but no recent frame kept the backend lane healthy.',
+        healthReportDisagreement: false,
+      };
+    }
+
+    async function maybeRecoverRuntimeHealth(data) {
+      const now = Date.now();
+
+      const microphoneLane = runtimeLaneSnapshot(data, 'microphone');
+      const microphoneStatus = String(microphoneLane.status || '').trim().toLowerCase();
+      if (runtimeRecoveryPending.microphone && microphoneStatus === 'healthy') {
+        await postRuntimeRecoveryEvent(
+          'microphone',
+          'recovery_succeeded',
+          'Microphone lane returned healthy after backend stale signal.',
+          runtimeRecoveryPending.microphone.nextRetryAt || null,
+          { status: microphoneStatus },
+        );
+        runtimeRecoveryPending.microphone = null;
+      }
+      if (
+        microphoneStatus === 'stale'
+        && micAutoMode
+        && !micRecoveryMode
+        && !micRestartPending
+        && now >= Number(runtimeHealthRecoveryCooldownUntil.microphone || 0)
+      ) {
+        runtimeHealthRecoveryCooldownUntil.microphone = now + RUNTIME_HEALTH_RECOVERY_COOLDOWN_MS;
+        const nextRetryAt = new Date(runtimeHealthRecoveryCooldownUntil.microphone).toISOString();
+        runtimeRecoveryPending.microphone = {
+          startedAt: new Date(now).toISOString(),
+          nextRetryAt,
+        };
+        await postRuntimeRecoveryEvent(
+          'microphone',
+          'stale_detected',
+          String(microphoneLane.detail || microphoneLane.summary || 'Microphone lane reported stale.').trim(),
+          nextRetryAt,
+          { status: microphoneStatus },
+        );
+        await postRuntimeRecoveryEvent(
+          'microphone',
+          'recovery_attempted',
+          'Client entered microphone recovery after backend stale signal.',
+          nextRetryAt,
+          { status: microphoneStatus },
+        );
+        addMicDebug('runtime-health', 'backend reported stale microphone lane; entering recovery');
+        enterMicRecovery('runtime-health-stale');
+      }
+
+      const cameraLane = runtimeLaneSnapshot(data, 'camera');
+      const cameraStatus = String(cameraLane.status || '').trim().toLowerCase();
+      if (runtimeRecoveryPending.camera && cameraStatus === 'healthy') {
+        const firstHealthyAt = runtimeRecoveryPending.camera.firstHealthyAt || new Date(now).toISOString();
+        runtimeRecoveryPending.camera.firstHealthyAt = firstHealthyAt;
+        await postRuntimeRecoveryEvent(
+          'camera',
+          'healthy_observed',
+          'Camera lane returned healthy after backend stale signal.',
+          runtimeRecoveryPending.camera.nextRetryAt || null,
+          buildCameraRecoveryMetadata({
+            status: cameraStatus,
+            first_healthy_at: firstHealthyAt,
+            recovery_attempted_at: runtimeRecoveryPending.camera.startedAt || null,
+            retry_reason: runtimeRecoveryPending.camera.retryReason || null,
+            retry_reason_detail: runtimeRecoveryPending.camera.retryReasonDetail || null,
+          }),
+        );
+        runtimeRecoveryPending.camera = null;
+      }
+      const cameraCanRecover = Boolean(healthState.cameraOk || (cameraStream && cameraStream.active));
+      if (
+        cameraStatus === 'stale'
+        && cameraCanRecover
+        && !cameraRecoveryInFlight
+        && now >= Number(runtimeHealthRecoveryCooldownUntil.camera || 0)
+      ) {
+        runtimeHealthRecoveryCooldownUntil.camera = now + RUNTIME_HEALTH_RECOVERY_COOLDOWN_MS;
+        const nextRetryAt = new Date(runtimeHealthRecoveryCooldownUntil.camera).toISOString();
+        const retryReason = classifyCameraRetryReason(cameraLane, now);
+        runtimeRecoveryPending.camera = {
+          startedAt: new Date(now).toISOString(),
+          nextRetryAt,
+          retryReason: retryReason.category,
+          retryReasonDetail: retryReason.detail,
+        };
+        await postRuntimeRecoveryEvent(
+          'camera',
+          'stale_detected',
+          String(cameraLane.detail || cameraLane.summary || 'Camera lane reported stale.').trim(),
+          nextRetryAt,
+          buildCameraRecoveryMetadata({
+            status: cameraStatus,
+            backend_age_seconds: Number(cameraLane.age_seconds || 0),
+            retry_reason: retryReason.category,
+            retry_reason_detail: retryReason.detail,
+            health_report_disagreement: retryReason.healthReportDisagreement,
+          }),
+        );
+        await postRuntimeRecoveryEvent(
+          'camera',
+          'recovery_attempted',
+          'Client restarted camera watcher after backend stale signal.',
+          nextRetryAt,
+          buildCameraRecoveryMetadata({
+            status: cameraStatus,
+            recovery_attempted_at: runtimeRecoveryPending.camera.startedAt,
+            retry_reason: retryReason.category,
+            retry_reason_detail: retryReason.detail,
+            health_report_disagreement: retryReason.healthReportDisagreement,
+          }),
+        );
+        cameraRecoveryInFlight = true;
+        cameraSettingsStatus.textContent = 'Camera runtime stale. Restarting watcher...';
+        try {
+          await startCameraWatcher();
+          await postRuntimeRecoveryEvent(
+            'camera',
+            'recovery_succeeded',
+            'Camera watcher restarted successfully.',
+            nextRetryAt,
+            buildCameraRecoveryMetadata({
+              status: 'healthy',
+              recovery_attempted_at: runtimeRecoveryPending.camera.startedAt,
+              retry_reason: runtimeRecoveryPending.camera.retryReason || null,
+              retry_reason_detail: runtimeRecoveryPending.camera.retryReasonDetail || null,
+            }),
+          );
+        } finally {
+          cameraRecoveryInFlight = false;
+        }
       }
     }
 
@@ -5113,6 +5710,7 @@ async def mim_ui_page() -> str:
         const operatorReasoning = (data && typeof data.operator_reasoning === 'object') ? data.operator_reasoning : {};
         renderObjectMemoryPanel(conversationContext);
         renderSystemReasoningPanel(operatorReasoning);
+        await maybeRecoverRuntimeHealth(data);
         const cameraIdentityKnown = !isUnknownOrMissingIdentity(cameraLabel);
         const shouldSuppressInquiryReplay = Date.now() < suppressBackendInquiryUntil && (Boolean(locallyAcceptedIdentity) || cameraIdentityKnown);
         if (inquiryPrompt && !shouldSuppressInquiryReplay && !spokeFromState) {
@@ -5268,6 +5866,16 @@ async def mim_ui_page() -> str:
           micLastSpeechEventAt = Date.now();
           healthState.micOk = true;
           micLastErrorCode = '';
+          if (runtimeRecoveryPending.microphone && micRecoveryReason === 'runtime-health-stale') {
+            void postRuntimeRecoveryEvent(
+              'microphone',
+              'recovery_succeeded',
+              'Microphone recognition recovered after backend stale signal.',
+              runtimeRecoveryPending.microphone.nextRetryAt || null,
+              { status: 'healthy' },
+            );
+            runtimeRecoveryPending.microphone = null;
+          }
           statusEl.textContent = 'Always listening...';
           updateIconGlow();
         };
@@ -5440,6 +6048,15 @@ async def mim_ui_page() -> str:
           addMicDebug('recognition:onerror', `code=${errorCode} message=${errorMessage || '-'} autoMode=${micAutoMode} listening=${micListening}`);
           micLastErrorCode = errorCode;
           const isHardError = hardMicErrors.has(errorCode);
+          if (runtimeRecoveryPending.microphone && errorCode !== 'aborted') {
+            void postRuntimeRecoveryEvent(
+              'microphone',
+              'recovery_failed',
+              `Microphone recovery hit ${detail}.`,
+              runtimeRecoveryPending.microphone.nextRetryAt || null,
+              { error_code: errorCode },
+            );
+          }
 
           if (isHardError) {
             micHardErrorStreak += 1;
@@ -5496,6 +6113,15 @@ async def mim_ui_page() -> str:
           if (micShortRunStreak >= MIC_SHORT_RUN_LIMIT && micAutoMode) {
             micUnstableCycleCount += 1;
             micShortRunStreak = 0;
+            if (runtimeRecoveryPending.microphone) {
+              void postRuntimeRecoveryEvent(
+                'microphone',
+                'recovery_failed',
+                'Microphone recovery entered short-run flap protection.',
+                runtimeRecoveryPending.microphone.nextRetryAt || null,
+                { unstable_cycle_count: micUnstableCycleCount },
+              );
+            }
             enterMicRecovery('short-run-flap');
             return;
           }
@@ -5622,6 +6248,10 @@ async def mim_ui_page() -> str:
       cameraWatcherCtx = null;
       cameraLastFrame = null;
       cameraLastSentAt = 0;
+      cameraLastHeartbeatAt = 0;
+      cameraWatcherStartedAt = 0;
+      cameraLastFrameSeenAt = 0;
+      cameraLastHealthyFrameAt = 0;
 
       if (cameraPreview) {
         cameraPreview.srcObject = null;
@@ -5662,6 +6292,7 @@ async def mim_ui_page() -> str:
         cameraWatcherVideo.muted = true;
         cameraWatcherVideo.playsInline = true;
         await cameraWatcherVideo.play();
+        cameraWatcherStartedAt = Date.now();
 
         cameraPreview.srcObject = cameraStream;
         try {
@@ -5689,11 +6320,34 @@ async def mim_ui_page() -> str:
               metadata_json: { source: 'mim_ui_sketch', mode: 'always_watching' },
             }),
           });
+          cameraLastHealthyFrameAt = Date.now();
+          cameraLastHeartbeatAt = cameraLastHealthyFrameAt;
+          refreshState();
+        };
+
+        const postCameraHeartbeat = async () => {
+          await fetch('/gateway/perception/camera/events', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              device_id: 'mim-ui-camera',
+              source_type: 'camera',
+              session_id: 'mim-ui-session',
+              is_remote: false,
+              observations: [],
+              min_interval_seconds: 0,
+              duplicate_window_seconds: 1,
+              metadata_json: { source: 'mim_ui_sketch', mode: 'always_watching_heartbeat' },
+            }),
+          });
+          cameraLastHealthyFrameAt = Date.now();
+          cameraLastHeartbeatAt = cameraLastHealthyFrameAt;
           refreshState();
         };
 
         motionInterval = setInterval(async () => {
           if (!cameraWatcherCtx || !cameraWatcherVideo || cameraWatcherVideo.readyState < 2) return;
+          cameraLastFrameSeenAt = Date.now();
           cameraWatcherCtx.drawImage(cameraWatcherVideo, 0, 0, width, height);
           const frame = cameraWatcherCtx.getImageData(0, 0, width, height).data;
 
@@ -5717,6 +6371,12 @@ async def mim_ui_page() -> str:
             cameraLastSentAt = now;
             cameraEl.textContent = `Camera: activity detected (${normalized.toFixed(2)})`;
             await postCameraActivity(normalized);
+            return;
+          }
+
+          if (now - cameraLastHeartbeatAt >= CAMERA_HEARTBEAT_MS) {
+            cameraEl.textContent = 'Camera: watcher alive (heartbeat)';
+            await postCameraHeartbeat();
           }
         }, 900);
 
@@ -5729,6 +6389,21 @@ async def mim_ui_page() -> str:
         updateCameraSettingsUi();
         updateIconGlow();
       } catch (_) {
+        if (runtimeRecoveryPending.camera) {
+          await postRuntimeRecoveryEvent(
+            'camera',
+            'recovery_failed',
+            'Camera watcher restart failed.',
+            runtimeRecoveryPending.camera.nextRetryAt || null,
+            buildCameraRecoveryMetadata({
+              status: 'error',
+              recovery_attempted_at: runtimeRecoveryPending.camera.startedAt || null,
+              retry_reason: runtimeRecoveryPending.camera.retryReason || 'watcher_not_running',
+              retry_reason_detail: runtimeRecoveryPending.camera.retryReasonDetail || 'Camera watcher restart failed before sustained healthy frames returned.',
+            }),
+          );
+          runtimeRecoveryPending.camera = null;
+        }
         stopCameraWatcher();
         cameraEl.textContent = 'Camera permission denied or unavailable';
         cameraSettingsStatus.textContent = 'Unable to start camera. Check permission and selected device.';
@@ -5920,7 +6595,7 @@ async def mim_ui_state(db: AsyncSession = Depends(get_db)) -> dict:
                 select(WorkspacePerceptionSource)
                 .where(WorkspacePerceptionSource.source_type == "microphone")
                 .order_by(
-                    WorkspacePerceptionSource.last_seen_at.desc(),
+            WorkspacePerceptionSource.last_seen_at.desc().nullslast(),
                     WorkspacePerceptionSource.id.desc(),
                 )
                 .limit(1)
@@ -5936,7 +6611,7 @@ async def mim_ui_state(db: AsyncSession = Depends(get_db)) -> dict:
                 select(WorkspacePerceptionSource)
                 .where(WorkspacePerceptionSource.source_type == "camera")
                 .order_by(
-                    WorkspacePerceptionSource.last_seen_at.desc(),
+                WorkspacePerceptionSource.last_seen_at.desc().nullslast(),
                     WorkspacePerceptionSource.id.desc(),
                 )
                 .limit(12)
@@ -6863,6 +7538,21 @@ async def mim_ui_state(db: AsyncSession = Depends(get_db)) -> dict:
         environment_now=environment_now,
         memory_summary=memory_summary,
     )
+    gateway_governance_snapshot = await _latest_gateway_governance_snapshot(
+      db=db,
+      managed_scope=operator_reasoning_scope,
+    )
+    runtime_health = build_mim_ui_health_snapshot_from_rows(
+        now=now,
+        speech_row=speech_row,
+        camera_row=camera_row,
+        mic_row=mic_row,
+        db_ok=True,
+    )
+    collaboration_progress = _operator_collaboration_progress_snapshot()
+    dispatch_telemetry = _operator_dispatch_telemetry_snapshot()
+    runtime_recovery = runtime_recovery_service.get_summary()
+
     operator_reasoning = _build_operator_reasoning_payload(
         goal_row=latest_goal,
         inquiry_row=latest_inquiry,
@@ -6873,6 +7563,7 @@ async def mim_ui_state(db: AsyncSession = Depends(get_db)) -> dict:
         commitment_row=latest_resolution_commitment,
         commitment_monitoring_row=latest_commitment_monitoring,
         commitment_outcome_row=latest_commitment_outcome,
+      gateway_governance_snapshot=gateway_governance_snapshot,
         learned_preferences=learned_preferences,
         preference_conflicts_items=preference_conflict_items,
         proposal_policy_preferences=proposal_policy_preferences,
@@ -6885,6 +7576,10 @@ async def mim_ui_state(db: AsyncSession = Depends(get_db)) -> dict:
             requested_executor="tod",
             metadata_json={"managed_scope": operator_reasoning_scope},
         ),
+        collaboration_progress=collaboration_progress,
+        dispatch_telemetry=dispatch_telemetry,
+        runtime_health=runtime_health,
+        runtime_recovery=runtime_recovery,
     )
 
     return {
@@ -6907,9 +7602,13 @@ async def mim_ui_state(db: AsyncSession = Depends(get_db)) -> dict:
             "operator_preference_convergence",
             "cross_policy_conflict_resolution",
             "execution_readiness_integration",
+            "tod_collaboration_progress",
+            "mim_arm_dispatch_telemetry",
+            "runtime_health_visibility",
         ],
         "inquiry_prompt": inquiry_prompt,
         "operator_reasoning": operator_reasoning,
+          "mim_arm_dispatch_telemetry": dispatch_telemetry,
         "conversation_context": {
             "environment_now": environment_now,
             "active_goal": goal_summary,
@@ -6932,6 +7631,37 @@ async def mim_ui_state(db: AsyncSession = Depends(get_db)) -> dict:
             "camera_object_states": camera_object_states,
             "camera_object_details": camera_object_details,
             "operator_reasoning_summary": str(operator_reasoning.get("summary") or "").strip(),
+            "runtime_health_summary": str(operator_reasoning.get("runtime_health", {}).get("summary") or "").strip()
+            if isinstance(operator_reasoning.get("runtime_health", {}), dict)
+            else "",
+            "runtime_recovery_summary": str(operator_reasoning.get("runtime_recovery", {}).get("summary") or "").strip()
+            if isinstance(operator_reasoning.get("runtime_recovery", {}), dict)
+            else "",
+            "tod_collaboration_summary": str(
+                operator_reasoning.get("collaboration_progress", {}).get("summary") or ""
+            ).strip()
+            if isinstance(operator_reasoning.get("collaboration_progress", {}), dict)
+            else "",
+            "tod_collaboration_execution_id": str(
+              operator_reasoning.get("collaboration_progress", {}).get("execution_id") or ""
+            ).strip()
+            if isinstance(operator_reasoning.get("collaboration_progress", {}), dict)
+            else "",
+            "tod_collaboration_id_kind": str(
+              operator_reasoning.get("collaboration_progress", {}).get("id_kind") or ""
+            ).strip()
+            if isinstance(operator_reasoning.get("collaboration_progress", {}), dict)
+            else "",
+            "tod_collaboration_task_id": str(
+                operator_reasoning.get("collaboration_progress", {}).get("task_id") or ""
+            ).strip()
+            if isinstance(operator_reasoning.get("collaboration_progress", {}), dict)
+            else "",
+            "tod_collaboration_request_id": str(
+              operator_reasoning.get("collaboration_progress", {}).get("request_id") or ""
+            ).strip()
+            if isinstance(operator_reasoning.get("collaboration_progress", {}), dict)
+            else "",
             "operator_resolution_summary": str(
               (
                 operator_reasoning.get("resolution_commitment", {})
@@ -6962,131 +7692,27 @@ async def mim_ui_state(db: AsyncSession = Depends(get_db)) -> dict:
     }
 
 
+@router.get("/mim/ui/runtime-recovery")
+async def get_runtime_recovery_summary() -> dict:
+  return runtime_recovery_service.get_summary()
+
+
+@router.post("/mim/ui/runtime-recovery-events")
+async def record_runtime_recovery_event(request: RuntimeRecoveryEventRequest) -> dict:
+  event = runtime_recovery_service.record_event(
+    lane=request.lane,
+    event_type=request.event_type,
+    detail=str(request.detail or "").strip(),
+    next_retry_at=str(request.next_retry_at or "").strip() or None,
+    metadata=request.metadata if isinstance(request.metadata, dict) else {},
+  )
+  return {
+    "status": "recorded",
+    "event": event,
+    "summary": runtime_recovery_service.get_summary(),
+  }
+
+
 @router.get("/mim/ui/health")
 async def mim_ui_health(db: AsyncSession = Depends(get_db)) -> dict:
-    now = datetime.now(timezone.utc)
-
-    camera_stale_seconds = 30.0
-    mic_stale_seconds = 30.0
-    speech_stale_seconds = 90.0
-
-    db_ok = True
-
-    try:
-        speech_row = (
-            (
-                await db.execute(
-                    select(SpeechOutputAction)
-                    .order_by(SpeechOutputAction.id.desc())
-                    .limit(1)
-                )
-            )
-            .scalars()
-            .first()
-        )
-
-        camera_row = (
-            (
-                await db.execute(
-                    select(WorkspacePerceptionSource)
-                    .where(WorkspacePerceptionSource.source_type == "camera")
-                    .order_by(WorkspacePerceptionSource.id.desc())
-                    .limit(1)
-                )
-            )
-            .scalars()
-            .first()
-        )
-
-        mic_row = (
-            (
-                await db.execute(
-                    select(WorkspacePerceptionSource)
-                    .where(WorkspacePerceptionSource.source_type == "microphone")
-                    .order_by(WorkspacePerceptionSource.id.desc())
-                    .limit(1)
-                )
-            )
-            .scalars()
-            .first()
-        )
-    except Exception:
-        db_ok = False
-        speech_row = None
-        camera_row = None
-        mic_row = None
-
-    speech_age = _age_seconds(now, speech_row.created_at if speech_row else None)
-    camera_age = _age_seconds(now, camera_row.last_seen_at if camera_row else None)
-    mic_age = _age_seconds(now, mic_row.last_seen_at if mic_row else None)
-
-    speech_ok = (speech_age is None) or (speech_age <= speech_stale_seconds)
-    camera_ok = (camera_age is not None) and (camera_age <= camera_stale_seconds)
-    mic_ok = (mic_age is not None) and (mic_age <= mic_stale_seconds)
-
-    overall_ok = bool(db_ok and camera_ok and mic_ok and speech_ok)
-    overall_status = "healthy" if overall_ok else "degraded"
-
-    return {
-        "generated_at": now.isoformat().replace("+00:00", "Z"),
-        "status": overall_status,
-        "ok": overall_ok,
-        "checks": {
-            "backend": {"ok": True, "status": "healthy"},
-            "database": {
-                "ok": db_ok,
-                "status": "healthy" if db_ok else "error",
-            },
-            "camera": {
-                "ok": camera_ok,
-                "status": "healthy" if camera_ok else "stale",
-                "age_seconds": camera_age,
-                "stale_threshold_seconds": camera_stale_seconds,
-                "source_health": str(camera_row.health_status or "")
-                if camera_row
-                else "",
-                "source_status": str(camera_row.status or "") if camera_row else "",
-            },
-            "microphone": {
-                "ok": mic_ok,
-                "status": "healthy" if mic_ok else "stale",
-                "age_seconds": mic_age,
-                "stale_threshold_seconds": mic_stale_seconds,
-                "source_health": str(mic_row.health_status or "") if mic_row else "",
-                "source_status": str(mic_row.status or "") if mic_row else "",
-            },
-            "speech_output": {
-                "ok": speech_ok,
-                "status": "healthy" if speech_ok else "stale",
-                "age_seconds": speech_age,
-                "stale_threshold_seconds": speech_stale_seconds,
-                "delivery_status": str(speech_row.delivery_status or "")
-                if speech_row
-                else "",
-            },
-        },
-        "latest": {
-            "camera": {
-                "source_id": int(camera_row.id) if camera_row else None,
-                "device_id": str(camera_row.device_id or "") if camera_row else "",
-                "last_seen_at": camera_row.last_seen_at.isoformat().replace(
-                    "+00:00", "Z"
-                )
-                if camera_row and camera_row.last_seen_at
-                else None,
-            },
-            "microphone": {
-                "source_id": int(mic_row.id) if mic_row else None,
-                "device_id": str(mic_row.device_id or "") if mic_row else "",
-                "last_seen_at": mic_row.last_seen_at.isoformat().replace("+00:00", "Z")
-                if mic_row and mic_row.last_seen_at
-                else None,
-            },
-            "speech_output": {
-                "action_id": int(speech_row.id) if speech_row else None,
-                "created_at": speech_row.created_at.isoformat().replace("+00:00", "Z")
-                if speech_row and speech_row.created_at
-                else None,
-            },
-        },
-    }
+  return await build_mim_ui_health_snapshot(db=db)

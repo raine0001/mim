@@ -5,12 +5,14 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from core.execution_truth_governance_service import latest_execution_truth_governance_snapshot
 from core.execution_truth_service import (
     execution_truth_freshness,
     summarize_execution_truth,
     summarize_execution_truth_signal_types,
 )
 from core.improvement_service import generate_improvement_proposals, list_improvement_proposals
+from core.operator_commitment_outcome_service import latest_scope_commitment_outcome_profile
 from core.models import (
     CapabilityExecution,
     UserPreference,
@@ -87,6 +89,56 @@ def _affected_capabilities_for_component(affected_component: str) -> list[str]:
     if component.startswith("workspace_autonomy_policy"):
         return ["autonomous_task_execution_policies", "closed_loop_autonomous_task_execution"]
     return ["self_improvement_proposal_engine"]
+
+
+def _operator_resolution_outcome_priority_influence(
+    *,
+    proposal: WorkspaceImprovementProposal,
+    outcome: object | None,
+) -> dict:
+    if outcome is None:
+        return {"priority_weight": 0.0, "rationale": "", "outcome_status": ""}
+
+    learning = (
+        outcome.learning_signals_json
+        if isinstance(getattr(outcome, "learning_signals_json", {}), dict)
+        else {}
+    )
+    outcome_status = str(getattr(outcome, "outcome_status", "") or "").strip()
+    decision_type = str(getattr(outcome, "decision_type", "") or "").strip()
+    weight = float(learning.get("backlog_priority_delta", 0.0) or 0.0)
+    proposal_type = str(proposal.proposal_type or "").strip()
+    affected_component = str(proposal.affected_component or "").strip().lower()
+
+    if outcome_status in {"ineffective", "harmful", "abandoned"}:
+        if proposal_type in {
+            "capability_workflow_improvement",
+            "priority_rule_refinement",
+            "policy_rule_refinement",
+            "soft_constraint_weight_adjustment",
+        }:
+            weight += 0.08
+        if decision_type in {"require_additional_evidence", "defer_action"} and (
+            "constraint" in affected_component or "action:" in affected_component
+        ):
+            weight += 0.05
+    elif outcome_status == "satisfied":
+        weight -= 0.03
+
+    weight = max(-0.2, min(0.2, weight))
+    if abs(weight) < 1e-9:
+        return {"priority_weight": 0.0, "rationale": "", "outcome_status": outcome_status}
+
+    direction = "raised" if weight > 0 else "lowered"
+    rationale = (
+        f"Recent commitment outcome {outcome_status or 'unknown'} {direction} backlog priority"
+        f" after {decision_type or 'operator guidance'} in this scope."
+    )
+    return {
+        "priority_weight": round(weight, 6),
+        "rationale": rationale,
+        "outcome_status": outcome_status,
+    }
 
 
 async def _operator_preference_weight(*, proposal_type: str, db: AsyncSession) -> float:
@@ -213,6 +265,44 @@ def _execution_truth_priority_influence(
     }
 
 
+def _execution_truth_governance_priority_influence(
+    *, proposal: WorkspaceImprovementProposal, governance: dict
+) -> dict:
+    decision = str(governance.get("governance_decision", "monitor_only") or "monitor_only").strip()
+    downstream_actions = (
+        governance.get("downstream_actions", {})
+        if isinstance(governance.get("downstream_actions", {}), dict)
+        else {}
+    )
+    base_delta = _bounded(float(downstream_actions.get("improvement_priority_delta", 0.0) or 0.0))
+    if decision == "monitor_only" or base_delta <= 0.0:
+        return {
+            "priority_weight": 0.0,
+            "preferred_backlog_decision": "",
+            "rationale": "",
+        }
+
+    affected_component = str(proposal.affected_component or "").strip().lower()
+    proposal_type = str(proposal.proposal_type or "").strip().lower()
+    multiplier = 0.6
+    if affected_component == "execution_truth_bridge":
+        multiplier = 1.0
+    elif proposal_type == "capability_workflow_improvement":
+        multiplier = 0.9
+    elif proposal_type in {"policy_adjustment", "priority_rule_refinement"}:
+        multiplier = 0.8
+    elif affected_component.startswith("action:"):
+        multiplier = 0.75
+
+    return {
+        "priority_weight": round(_bounded(base_delta * multiplier), 6),
+        "preferred_backlog_decision": str(
+            downstream_actions.get("preferred_backlog_decision", "") or ""
+        ).strip(),
+        "rationale": str(governance.get("governance_reason", "") or "").strip(),
+    }
+
+
 def _priority_score(
     *,
     impact_estimate: float,
@@ -314,6 +404,20 @@ async def refresh_improvement_backlog(
         )
     ).scalars().all()
     execution_truth_summary = summarize_execution_truth(execution_rows)
+    managed_scope = str(
+        (metadata_json if isinstance(metadata_json, dict) else {}).get(
+            "managed_scope", "global"
+        )
+        or "global"
+    ).strip() or "global"
+    execution_truth_governance = await latest_execution_truth_governance_snapshot(
+        managed_scope=managed_scope,
+        db=db,
+    )
+    operator_resolution_outcome = await latest_scope_commitment_outcome_profile(
+        managed_scope=managed_scope,
+        db=db,
+    )
 
     refreshed_rows: list[WorkspaceImprovementBacklog] = []
     for proposal in proposals:
@@ -332,6 +436,14 @@ async def refresh_improvement_backlog(
             proposal=proposal,
             summary=execution_truth_summary,
         )
+        governance_influence = _execution_truth_governance_priority_influence(
+            proposal=proposal,
+            governance=execution_truth_governance,
+        )
+        operator_resolution_outcome_influence = _operator_resolution_outcome_priority_influence(
+            proposal=proposal,
+            outcome=operator_resolution_outcome,
+        )
         priority = _priority_score(
             impact_estimate=impact_estimate,
             evidence_strength=evidence_strength,
@@ -340,6 +452,13 @@ async def refresh_improvement_backlog(
             operator_preference_weight=pref_weight,
             execution_truth_priority_weight=float(
                 execution_truth_influence.get("priority_weight", 0.0) or 0.0
+            )
+            + float(
+                governance_influence.get("priority_weight", 0.0) or 0.0
+            )
+            + float(
+                operator_resolution_outcome_influence.get("priority_weight", 0.0)
+                or 0.0
             ),
         )
         decision = _governance_decision(
@@ -347,6 +466,13 @@ async def refresh_improvement_backlog(
             evidence_count=evidence_count,
             risk_score=risk_score,
         )
+        preferred_decision = str(
+            governance_influence.get("preferred_backlog_decision", "") or ""
+        ).strip()
+        if preferred_decision == "auto_experiment" and decision != "reject_improvement" and risk_score < 0.85:
+            decision = "auto_experiment"
+        elif preferred_decision == "request_operator_review" and decision == "defer_improvement":
+            decision = "request_operator_review"
 
         row = await _existing_backlog_for_proposal(proposal_id=proposal_id, db=db)
         if not row:
@@ -373,7 +499,9 @@ async def refresh_improvement_backlog(
         row.ranking_reason = (
             f"priority={priority:.3f} from impact={impact_estimate:.3f}, evidence={evidence_strength:.3f}, "
             f"risk_penalty={risk_score:.3f}, capabilities={len(capabilities)}, operator_pref={pref_weight:.3f}, "
-            f"execution_truth={float(execution_truth_influence.get('priority_weight', 0.0) or 0.0):.3f}"
+            f"execution_truth={float(execution_truth_influence.get('priority_weight', 0.0) or 0.0):.3f}, "
+            f"execution_truth_governance={float(governance_influence.get('priority_weight', 0.0) or 0.0):.3f}, "
+            f"operator_resolution_outcome={float(operator_resolution_outcome_influence.get('priority_weight', 0.0) or 0.0):.3f}"
         )
         row.reasoning_json = {
             "impact_estimate": impact_estimate,
@@ -399,6 +527,32 @@ async def refresh_improvement_backlog(
                     execution_truth_influence.get("rationale", "") or ""
                 ).strip(),
             },
+            "execution_truth_governance": {
+                **(
+                    execution_truth_governance
+                    if isinstance(execution_truth_governance, dict)
+                    else {}
+                ),
+                "priority_weight": float(
+                    governance_influence.get("priority_weight", 0.0) or 0.0
+                ),
+                "preferred_backlog_decision": str(
+                    governance_influence.get("preferred_backlog_decision", "") or ""
+                ),
+                "priority_rationale": str(
+                    governance_influence.get("rationale", "") or ""
+                ).strip(),
+            },
+            "operator_resolution_outcome": {
+                **(
+                    operator_resolution_outcome_influence
+                    if isinstance(operator_resolution_outcome_influence, dict)
+                    else {}
+                ),
+                "priority_rationale": str(
+                    operator_resolution_outcome_influence.get("rationale", "") or ""
+                ).strip(),
+            },
             "governance_policy": {
                 "auto_experiment_if": "priority_score>=0.72 and evidence_count>=2 and risk_level!=high",
                 "operator_review_if": "priority_score>=0.45 or risk_level==high",
@@ -412,6 +566,9 @@ async def refresh_improvement_backlog(
             "refreshed_at": datetime.now(timezone.utc).isoformat(),
             "objective80_execution_truth_priority": bool(
                 int(execution_truth_summary.get("deviation_signal_count", 0) or 0)
+            ),
+            "objective81_execution_truth_governance": str(
+                execution_truth_governance.get("governance_decision", "monitor_only")
             ),
         }
 

@@ -5,8 +5,10 @@ import urllib.request
 import unittest
 from uuid import uuid4
 
+from tests.integration.runtime_target_guard import DEFAULT_BASE_URL, probe_current_source_runtime
 
-BASE_URL = os.getenv("MIM_TEST_BASE_URL", "http://127.0.0.1:8001")
+
+BASE_URL = os.getenv("MIM_TEST_BASE_URL", DEFAULT_BASE_URL)
 
 
 def post_json(path: str, payload: dict) -> tuple[int, dict]:
@@ -36,6 +38,15 @@ def get_json(path: str) -> tuple[int, dict | list]:
 
 
 class Objective80ExecutionTruthInquiryHookTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        probe_current_source_runtime(
+            suite_name="Objective 80 inquiry hook",
+            base_url=BASE_URL,
+            require_execution_truth_projection=True,
+        )
+
     def test_execution_truth_generates_inquiry_and_bounded_improvement_proposal(
         self,
     ) -> None:

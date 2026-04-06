@@ -7,8 +7,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.decision_record_service import record_decision
 from core.environment_strategy_service import generate_environment_strategies, resolve_environment_strategy, to_environment_strategy_out
+from core.execution_truth_governance_service import latest_execution_truth_governance_snapshot
 from core.execution_truth_service import derive_execution_truth_signals, execution_truth_scope_refs, summarize_execution_truth
 from core.models import CapabilityExecution, MemoryEntry, WorkspaceEnvironmentStrategy, WorkspaceMaintenanceAction, WorkspaceMaintenanceRun, WorkspaceObservation
+from core.operator_resolution_service import commitment_downstream_effects, commitment_snapshot, latest_active_operator_resolution_commitment
 
 
 async def _detect_stale_zones(*, stale_after_seconds: int, db: AsyncSession) -> list[dict]:
@@ -106,6 +108,41 @@ async def run_environment_maintenance_cycle(
         lookback_hours=24,
         db=db,
     )
+    managed_scope = str(
+        (metadata_json if isinstance(metadata_json, dict) else {}).get(
+            "managed_scope", "global"
+        )
+        or "global"
+    ).strip() or "global"
+    execution_truth_governance = await latest_execution_truth_governance_snapshot(
+        managed_scope=managed_scope,
+        db=db,
+    )
+    operator_resolution_commitment = await latest_active_operator_resolution_commitment(
+        scope=managed_scope,
+        db=db,
+    )
+    operator_resolution_effects = commitment_downstream_effects(
+        operator_resolution_commitment
+    )
+    governance_actions = (
+        execution_truth_governance.get("downstream_actions", {})
+        if isinstance(execution_truth_governance.get("downstream_actions", {}), dict)
+        else {}
+    )
+    governance_auto_execute_allowed = bool(
+        governance_actions.get("maintenance_auto_execute_allowed", True)
+    )
+    commitment_blocks_auto = str(
+        operator_resolution_effects.get("maintenance_mode", "") or ""
+    ).strip() == "deferred"
+    if not commitment_blocks_auto and operator_resolution_commitment is not None:
+        if str(operator_resolution_commitment.decision_type or "").strip() in {
+            "defer_action",
+            "require_additional_evidence",
+        }:
+            commitment_blocks_auto = True
+    effective_auto_execute = bool(auto_execute) and governance_auto_execute_allowed and not commitment_blocks_auto
     degraded = sorted(
         [*degraded, *execution_truth_signals],
         key=lambda item: float(item.get("severity", 0.0) or 0.0),
@@ -151,9 +188,14 @@ async def run_environment_maintenance_cycle(
         maintenance_outcomes_json={},
         stabilized=False,
         metadata_json={
-            "auto_execute": bool(auto_execute),
+            "auto_execute": bool(effective_auto_execute),
+            "requested_auto_execute": bool(auto_execute),
             "max_actions": int(max_actions),
             "execution_truth_summary": execution_truth_summary,
+            "execution_truth_governance": execution_truth_governance,
+            "operator_resolution_commitment": commitment_snapshot(
+                operator_resolution_commitment
+            ),
             **(metadata_json if isinstance(metadata_json, dict) else {}),
         },
     )
@@ -163,7 +205,7 @@ async def run_environment_maintenance_cycle(
     actions: list[WorkspaceMaintenanceAction] = []
     memory_entries_created = 0
 
-    if auto_execute:
+    if effective_auto_execute:
         now = datetime.now(timezone.utc)
         for strategy in strategies[: max(1, int(max_actions))]:
             zone = str(strategy.target_scope or "workspace").strip() or "workspace"
@@ -270,6 +312,14 @@ async def run_environment_maintenance_cycle(
             execution_truth_summary.get("deviation_signal_count", 0) or 0
         ),
         "execution_truth_signal_types": execution_truth_summary.get("signal_types", []),
+        "execution_truth_governance_decision": str(
+            execution_truth_governance.get("governance_decision", "monitor_only")
+        ),
+        "governance_auto_execute_blocked": bool(auto_execute) and not bool(effective_auto_execute),
+        "operator_resolution_commitment": commitment_snapshot(
+            operator_resolution_commitment
+        ),
+        "operator_resolution_blocked_auto_execution": bool(commitment_blocks_auto),
         "strategies_created": len(strategies),
         "actions_executed": len(actions),
         "memory_entries_created": memory_entries_created,

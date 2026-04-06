@@ -4,10 +4,18 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.cross_domain_reasoning_service import build_cross_domain_reasoning_context, to_cross_domain_reasoning_out
+from core.execution_truth_governance_service import latest_execution_truth_governance_snapshot
 from core.execution_truth_service import execution_truth_freshness, summarize_execution_truth_signal_types
 from core.horizon_planning_service import create_horizon_plan
 from core.improvement_service import generate_improvement_proposals as generate_improvement_proposals_for_strategy
 from core.maintenance_service import run_environment_maintenance_cycle
+from core.operator_commitment_outcome_service import latest_scope_commitment_outcome_profile
+from core.operator_preference_convergence_service import (
+    learned_preference_strategy_influence,
+    latest_scope_learned_preference,
+)
+from core.proposal_arbitration_learning_service import workspace_proposal_arbitration_family_influence
+from core.operator_resolution_service import commitment_downstream_effects, commitment_snapshot, latest_active_operator_resolution_commitment
 from datetime import datetime, timedelta, timezone
 
 from core.models import UserPreference, WorkspaceStrategyGoal, WorkspaceStrategyGoalReview
@@ -89,6 +97,184 @@ def _operator_recommendations(strategy_type: str) -> list[str]:
         ],
     }
     return by_type.get(strategy_type, ["Review strategic goal before downstream execution."])
+
+
+def _strategy_related_proposal_types(strategy_type: str) -> list[str]:
+    mapping = {
+        "maintain_workspace_readiness": [
+            "rescan_zone",
+            "verify_moved_object",
+            "confirm_target_ready",
+            "monitor_recheck_workspace",
+            "monitor_search_adjacent_zone",
+            "target_confirmed",
+        ],
+        "stabilize_uncertain_zones_before_action": [
+            "rescan_zone",
+            "verify_moved_object",
+            "confirm_target_ready",
+            "monitor_search_adjacent_zone",
+        ],
+    }
+    proposal_types = mapping.get(str(strategy_type or "").strip(), [])
+    return [item for item in proposal_types if str(item).strip()]
+
+
+async def _proposal_arbitration_strategy_influence(
+    *,
+    strategy_type: str,
+    related_zone: str,
+    db: AsyncSession,
+) -> dict:
+    proposal_types = _strategy_related_proposal_types(strategy_type)
+    influence = await workspace_proposal_arbitration_family_influence(
+        proposal_types=proposal_types,
+        related_zone=related_zone,
+        db=db,
+        max_abs_bias=0.12,
+    )
+    if not proposal_types or not isinstance(influence, dict):
+        return {
+            "strategy_weight": 0.0,
+            "rationale": "",
+            "related_zone": str(related_zone or "").strip() or "global",
+            "proposal_types": [],
+            "sample_count": 0,
+            "learning": [],
+            "applied": False,
+        }
+    learning_rows = influence.get("learning", []) if isinstance(influence.get("learning", []), list) else []
+    sample_count = int(influence.get("sample_count", 0) or 0)
+    strategy_weight = float(influence.get("aggregate_priority_bias", 0.0) or 0.0)
+    applied = sample_count >= 2 and abs(strategy_weight) >= 0.01
+    if abs(strategy_weight) < 1e-9:
+        return {
+            "strategy_weight": 0.0,
+            "rationale": "",
+            "related_zone": str(related_zone or "").strip() or "global",
+            "proposal_types": proposal_types,
+            "sample_count": sample_count,
+            "learning": learning_rows,
+            "applied": False,
+        }
+
+    direction = "boosted" if strategy_weight > 0 else "downweighted"
+    rationale = (
+        f"Proposal arbitration outcomes {direction} this strategy in zone "
+        f"{str(related_zone or '').strip() or 'global'} across {sample_count} related proposal outcomes."
+    )
+    return {
+        "strategy_weight": round(strategy_weight, 6),
+        "rationale": rationale,
+        "related_zone": str(influence.get("related_zone", related_zone) or "").strip() or "global",
+        "proposal_types": influence.get("proposal_types", proposal_types),
+        "sample_count": sample_count,
+        "learning": learning_rows,
+        "applied": applied,
+    }
+
+
+def _operator_resolution_strategy_influence(
+    *,
+    strategy_type: str,
+    commitment: object | None,
+) -> dict:
+    if commitment is None:
+        return {"strategy_weight": 0.0, "rationale": "", "decision_type": ""}
+
+    effects = commitment_downstream_effects(commitment)
+    decision_type = str(getattr(commitment, "decision_type", "") or "").strip()
+    mode = str(effects.get("strategy_priority_mode", "") or "").strip()
+    delta = float(effects.get("strategy_priority_delta", 0.0) or 0.0)
+    weight = delta
+
+    if decision_type in {"require_additional_evidence", "defer_action"}:
+        if strategy_type in {"stabilize_uncertain_zones_before_action", "maintain_workspace_readiness"}:
+            weight += 0.12
+        else:
+            weight -= 0.04
+
+    if mode == "prefer_stabilization":
+        if strategy_type in {"stabilize_uncertain_zones_before_action", "maintain_workspace_readiness"}:
+            weight += 0.1
+        else:
+            weight -= 0.03
+    elif mode == "defer_noncritical":
+        if strategy_type in {"stabilize_uncertain_zones_before_action", "maintain_workspace_readiness"}:
+            weight += 0.04
+        else:
+            weight -= 0.08
+
+    weight = max(-0.2, min(0.2, weight))
+    if abs(weight) < 1e-9:
+        return {"strategy_weight": 0.0, "rationale": "", "decision_type": decision_type}
+
+    direction = "boosted" if weight > 0 else "downweighted"
+    rationale = f"Operator resolution commitment {decision_type or 'active'} {direction} this strategy for the managed scope."
+    return {
+        "strategy_weight": round(weight, 6),
+        "rationale": rationale,
+        "decision_type": decision_type,
+    }
+
+
+def _operator_resolution_outcome_strategy_influence(
+    *,
+    strategy_type: str,
+    outcome: object | None,
+) -> dict:
+    if outcome is None:
+        return {
+            "strategy_weight": 0.0,
+            "rationale": "",
+            "outcome_status": "",
+            "decision_type": "",
+        }
+
+    learning = (
+        outcome.learning_signals_json
+        if isinstance(getattr(outcome, "learning_signals_json", {}), dict)
+        else {}
+    )
+    outcome_status = str(getattr(outcome, "outcome_status", "") or "").strip()
+    decision_type = str(getattr(outcome, "decision_type", "") or "").strip()
+    weight = float(learning.get("strategy_priority_delta", 0.0) or 0.0)
+
+    if outcome_status in {"ineffective", "harmful", "abandoned"}:
+        if strategy_type in {
+            "stabilize_uncertain_zones_before_action",
+            "maintain_workspace_readiness",
+        } and decision_type in {"require_additional_evidence", "defer_action"}:
+            weight -= 0.06
+        if strategy_type == "prioritize_development_improvements_affecting_active_workflows":
+            weight += 0.1
+    elif outcome_status == "satisfied":
+        if strategy_type in {
+            "stabilize_uncertain_zones_before_action",
+            "maintain_workspace_readiness",
+        } and decision_type in {"require_additional_evidence", "defer_action"}:
+            weight += 0.05
+
+    weight = max(-0.2, min(0.2, weight))
+    if abs(weight) < 1e-9:
+        return {
+            "strategy_weight": 0.0,
+            "rationale": "",
+            "outcome_status": outcome_status,
+            "decision_type": decision_type,
+        }
+
+    direction = "boosted" if weight > 0 else "downweighted"
+    rationale = (
+        f"Recent commitment outcome {outcome_status or 'unknown'} {direction} this strategy"
+        f" after {decision_type or 'operator guidance'} in the managed scope."
+    )
+    return {
+        "strategy_weight": round(weight, 6),
+        "rationale": rationale,
+        "outcome_status": outcome_status,
+        "decision_type": decision_type,
+    }
 
 
 def _execution_truth_summary(*, context: dict) -> dict:
@@ -290,6 +476,36 @@ def _execution_truth_strategy_influence(*, strategy_type: str, summary: dict) ->
         "strategy_weight": round(weight, 6),
         "freshness": freshness,
         "rationale": " ".join(rationale_parts).strip(),
+    }
+
+
+def _execution_truth_governance_strategy_influence(*, strategy_type: str, governance: dict) -> dict:
+    decision = str(governance.get("governance_decision", "monitor_only") or "monitor_only").strip()
+    downstream_actions = (
+        governance.get("downstream_actions", {})
+        if isinstance(governance.get("downstream_actions", {}), dict)
+        else {}
+    )
+    base_delta = _bounded(float(downstream_actions.get("strategy_weight_delta", 0.0) or 0.0))
+    if decision == "monitor_only" or base_delta <= 0.0:
+        return {
+            "governance_decision": decision,
+            "strategy_weight": 0.0,
+            "rationale": "",
+        }
+
+    per_strategy_multiplier = {
+        "maintain_workspace_readiness": 1.0,
+        "stabilize_uncertain_zones_before_action": 1.0,
+        "prioritize_development_improvements_affecting_active_workflows": 0.9,
+        "reduce_operator_interruption_load": 0.55,
+    }
+    weight = _bounded(base_delta * float(per_strategy_multiplier.get(strategy_type, 0.7)))
+    rationale = str(governance.get("governance_reason", "") or "").strip()
+    return {
+        "governance_decision": decision,
+        "strategy_weight": round(weight, 6),
+        "rationale": rationale,
     }
 
 
@@ -633,6 +849,25 @@ async def build_strategy_goals(
     ranked_candidates: list[dict] = []
     developmental_friction = _bounded(float(domain_counts.get("development", 0)) / 8.0)
     execution_truth_summary = _execution_truth_summary(context=context)
+    managed_scopes = _context_managed_scopes(context=context)
+    governance_scope = managed_scopes[0] if managed_scopes else "global"
+    execution_truth_governance = await latest_execution_truth_governance_snapshot(
+        managed_scope=governance_scope,
+        db=db,
+    )
+    operator_resolution_commitment = await latest_active_operator_resolution_commitment(
+        scope=governance_scope,
+        db=db,
+    )
+    operator_resolution_outcome = await latest_scope_commitment_outcome_profile(
+        managed_scope=governance_scope,
+        db=db,
+    )
+    learned_operator_preference = await latest_scope_learned_preference(
+        managed_scope=governance_scope,
+        db=db,
+        operator_commitment=operator_resolution_commitment,
+    )
 
     for candidate in candidates:
         strategy_type = str(candidate.get("strategy_type", "strategy_goal"))
@@ -644,6 +879,27 @@ async def build_strategy_goals(
             strategy_type=strategy_type,
             summary=execution_truth_summary,
         )
+        governance_influence = _execution_truth_governance_strategy_influence(
+            strategy_type=strategy_type,
+            governance=execution_truth_governance,
+        )
+        operator_resolution_influence = _operator_resolution_strategy_influence(
+            strategy_type=strategy_type,
+            commitment=operator_resolution_commitment,
+        )
+        operator_resolution_outcome_influence = _operator_resolution_outcome_strategy_influence(
+            strategy_type=strategy_type,
+            outcome=operator_resolution_outcome,
+        )
+        learned_preference_influence = learned_preference_strategy_influence(
+            strategy_type=strategy_type,
+            preference=learned_operator_preference,
+        )
+        proposal_arbitration_influence = await _proposal_arbitration_strategy_influence(
+            strategy_type=strategy_type,
+            related_zone=governance_scope,
+            db=db,
+        )
 
         score = _bounded(
             (urgency * 0.25)
@@ -653,12 +909,38 @@ async def build_strategy_goals(
             + (operator_pref * 0.1)
             + (developmental_friction * 0.15)
             + (float(execution_truth_influence.get("strategy_weight", 0.0) or 0.0) * 0.15)
+            + (float(governance_influence.get("strategy_weight", 0.0) or 0.0) * 0.15)
+            + float(operator_resolution_influence.get("strategy_weight", 0.0) or 0.0)
+            + float(operator_resolution_outcome_influence.get("strategy_weight", 0.0) or 0.0)
+            + float(learned_preference_influence.get("strategy_weight", 0.0) or 0.0)
+            + float(proposal_arbitration_influence.get("strategy_weight", 0.0) or 0.0)
         )
 
         reasoning_summary = str(candidate.get("why_formed", ""))
         rationale = str(execution_truth_influence.get("rationale", "")).strip()
         if rationale:
             reasoning_summary = f"{reasoning_summary} {rationale}".strip()
+        governance_rationale = str(governance_influence.get("rationale", "")).strip()
+        if governance_rationale:
+            reasoning_summary = f"{reasoning_summary} {governance_rationale}".strip()
+        operator_rationale = str(operator_resolution_influence.get("rationale", "")).strip()
+        if operator_rationale:
+            reasoning_summary = f"{reasoning_summary} {operator_rationale}".strip()
+        operator_outcome_rationale = str(
+            operator_resolution_outcome_influence.get("rationale", "")
+        ).strip()
+        if operator_outcome_rationale:
+            reasoning_summary = f"{reasoning_summary} {operator_outcome_rationale}".strip()
+        learned_preference_rationale = str(
+            learned_preference_influence.get("rationale", "")
+        ).strip()
+        if learned_preference_rationale:
+            reasoning_summary = f"{reasoning_summary} {learned_preference_rationale}".strip()
+        proposal_arbitration_rationale = str(
+            proposal_arbitration_influence.get("rationale", "")
+        ).strip()
+        if proposal_arbitration_rationale:
+            reasoning_summary = f"{reasoning_summary} {proposal_arbitration_rationale}".strip()
 
         ranked_candidates.append(
             {
@@ -688,8 +970,51 @@ async def build_strategy_goals(
                     "execution_truth_freshness": execution_truth_influence.get(
                         "freshness", {}
                     ),
+                    "execution_truth_governance_decision": str(
+                        governance_influence.get("governance_decision", "monitor_only")
+                    ),
+                    "execution_truth_governance_weight": float(
+                        governance_influence.get("strategy_weight", 0.0) or 0.0
+                    ),
+                    "operator_resolution_strategy_weight": float(
+                        operator_resolution_influence.get("strategy_weight", 0.0) or 0.0
+                    ),
+                    "operator_resolution_decision_type": str(
+                        operator_resolution_influence.get("decision_type", "") or ""
+                    ),
+                    "operator_resolution_outcome_weight": float(
+                        operator_resolution_outcome_influence.get("strategy_weight", 0.0)
+                        or 0.0
+                    ),
+                    "operator_resolution_outcome_status": str(
+                        operator_resolution_outcome_influence.get("outcome_status", "")
+                        or ""
+                    ),
+                    "operator_learned_preference_weight": float(
+                        learned_preference_influence.get("strategy_weight", 0.0) or 0.0
+                    ),
+                    "operator_learned_preference_key": str(
+                        learned_preference_influence.get("preference_key", "") or ""
+                    ),
+                    "proposal_arbitration_strategy_weight": float(
+                        proposal_arbitration_influence.get("strategy_weight", 0.0) or 0.0
+                    ),
+                    "proposal_arbitration_sample_count": int(
+                        proposal_arbitration_influence.get("sample_count", 0) or 0
+                    ),
+                    "proposal_arbitration_related_zone": str(
+                        proposal_arbitration_influence.get("related_zone", "") or ""
+                    ),
+                    "proposal_arbitration_proposal_types": proposal_arbitration_influence.get(
+                        "proposal_types", []
+                    ),
                 },
                 "execution_truth_influence": execution_truth_influence,
+                "execution_truth_governance": execution_truth_governance,
+                "operator_resolution_influence": operator_resolution_influence,
+                "operator_resolution_outcome_influence": operator_resolution_outcome_influence,
+                "operator_learned_preference_influence": learned_preference_influence,
+                "proposal_arbitration_influence": proposal_arbitration_influence,
             }
         )
 
@@ -744,6 +1069,38 @@ async def build_strategy_goals(
                         else ""
                     ).strip(),
                 },
+                "execution_truth_governance": (
+                    candidate.get("execution_truth_governance", {})
+                    if isinstance(candidate.get("execution_truth_governance", {}), dict)
+                    else {}
+                ),
+                "operator_resolution_commitment": commitment_snapshot(
+                    operator_resolution_commitment
+                ),
+                "operator_resolution_influence": (
+                    candidate.get("operator_resolution_influence", {})
+                    if isinstance(candidate.get("operator_resolution_influence", {}), dict)
+                    else {}
+                ),
+                "operator_resolution_outcome": (
+                    candidate.get("operator_resolution_outcome_influence", {})
+                    if isinstance(
+                        candidate.get("operator_resolution_outcome_influence", {}), dict
+                    )
+                    else {}
+                ),
+                "operator_learned_preference": (
+                    candidate.get("operator_learned_preference_influence", {})
+                    if isinstance(
+                        candidate.get("operator_learned_preference_influence", {}), dict
+                    )
+                    else {}
+                ),
+                "proposal_arbitration_learning": (
+                    candidate.get("proposal_arbitration_influence", {})
+                    if isinstance(candidate.get("proposal_arbitration_influence", {}), dict)
+                    else {}
+                ),
             },
             metadata_json={
                 **(metadata_json if isinstance(metadata_json, dict) else {}),
@@ -996,6 +1353,12 @@ def to_strategy_goal_out(row: WorkspaceStrategyGoal) -> dict:
         "ranking_factors": row.ranking_factors_json if isinstance(row.ranking_factors_json, dict) else {},
         "reasoning_summary": row.reasoning_summary,
         "reasoning": row.reasoning_json if isinstance(row.reasoning_json, dict) else {},
+        "operator_learned_preference_influence": (
+            row.reasoning_json.get("operator_learned_preference", {})
+            if isinstance(row.reasoning_json, dict)
+            and isinstance(row.reasoning_json.get("operator_learned_preference", {}), dict)
+            else {}
+        ),
         "linked_horizon_plan_ids": row.linked_horizon_plan_ids_json if isinstance(row.linked_horizon_plan_ids_json, list) else [],
         "linked_improvement_proposal_ids": row.linked_improvement_proposal_ids_json if isinstance(row.linked_improvement_proposal_ids_json, list) else [],
         "linked_maintenance_run_ids": row.linked_maintenance_run_ids_json if isinstance(row.linked_maintenance_run_ids_json, list) else [],

@@ -7,7 +7,9 @@ from core.db import Base
 
 
 class TimestampMixin:
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
 
 
 class Objective(Base, TimestampMixin):
@@ -26,7 +28,9 @@ class Task(Base, TimestampMixin):
     __tablename__ = "tasks"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    objective_id: Mapped[int | None] = mapped_column(ForeignKey("objectives.id", ondelete="SET NULL"))
+    objective_id: Mapped[int | None] = mapped_column(
+        ForeignKey("objectives.id", ondelete="SET NULL")
+    )
     title: Mapped[str] = mapped_column(String(200), index=True)
     details: Mapped[str] = mapped_column(Text, default="")
     dependencies: Mapped[list[int]] = mapped_column(JSON, default=list)
@@ -68,7 +72,9 @@ class ExecutionJournal(Base, TimestampMixin):
     action: Mapped[str] = mapped_column(String(200))
     target_type: Mapped[str] = mapped_column(String(80), default="system")
     target_id: Mapped[str] = mapped_column(String(120), default="")
-    idempotency_key: Mapped[str | None] = mapped_column(String(120), unique=True, nullable=True)
+    idempotency_key: Mapped[str | None] = mapped_column(
+        String(120), unique=True, nullable=True
+    )
     result: Mapped[str] = mapped_column(Text)
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
 
@@ -87,8 +93,12 @@ class MemoryLink(Base, TimestampMixin):
     __tablename__ = "memory_links"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    source_memory_id: Mapped[int] = mapped_column(ForeignKey("memory_entries.id", ondelete="CASCADE"))
-    target_memory_id: Mapped[int] = mapped_column(ForeignKey("memory_entries.id", ondelete="CASCADE"))
+    source_memory_id: Mapped[int] = mapped_column(
+        ForeignKey("memory_entries.id", ondelete="CASCADE")
+    )
+    target_memory_id: Mapped[int] = mapped_column(
+        ForeignKey("memory_entries.id", ondelete="CASCADE")
+    )
     relation: Mapped[str] = mapped_column(String(80), default="related")
 
 
@@ -101,7 +111,9 @@ class UserPreference(Base, TimestampMixin):
     value: Mapped[object] = mapped_column(JSON, default=dict)
     confidence: Mapped[float] = mapped_column(default=0.0)
     source: Mapped[str] = mapped_column(String(80), default="manual")
-    last_updated: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+    last_updated: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
 
 
 class Tool(Base, TimestampMixin):
@@ -130,7 +142,9 @@ class Service(Base, TimestampMixin):
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(120), unique=True)
     status: Mapped[str] = mapped_column(String(40), default="starting")
-    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    heartbeat_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     dependency_map: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
@@ -160,7 +174,9 @@ class RoutingExecutionMetric(Base, TimestampMixin):
     selected_engine: Mapped[str] = mapped_column(String(120), index=True)
     fallback_engine: Mapped[str] = mapped_column(String(120), default="")
     fallback_used: Mapped[bool] = mapped_column(default=False)
-    routing_source: Mapped[str] = mapped_column(String(120), default="tod.invoke-engine")
+    routing_source: Mapped[str] = mapped_column(
+        String(120), default="tod.invoke-engine"
+    )
     routing_confidence: Mapped[float] = mapped_column(default=0.0)
     policy_version: Mapped[str] = mapped_column(String(80), default="routing-policy-v1")
     engine_version: Mapped[str] = mapped_column(String(120), default="unknown")
@@ -193,8 +209,12 @@ class Goal(Base, TimestampMixin):
     __tablename__ = "goals"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    objective_id: Mapped[int | None] = mapped_column(ForeignKey("objectives.id", ondelete="SET NULL"), nullable=True)
-    task_id: Mapped[int | None] = mapped_column(ForeignKey("tasks.id", ondelete="SET NULL"), nullable=True)
+    objective_id: Mapped[int | None] = mapped_column(
+        ForeignKey("objectives.id", ondelete="SET NULL"), nullable=True
+    )
+    task_id: Mapped[int | None] = mapped_column(
+        ForeignKey("tasks.id", ondelete="SET NULL"), nullable=True
+    )
     goal_type: Mapped[str] = mapped_column(String(80), default="task_execution")
     goal_description: Mapped[str] = mapped_column(Text)
     requested_by: Mapped[str] = mapped_column(String(120), default="tod")
@@ -206,7 +226,9 @@ class Action(Base):
     __tablename__ = "actions"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    goal_id: Mapped[int] = mapped_column(ForeignKey("goals.id", ondelete="CASCADE"), index=True)
+    goal_id: Mapped[int] = mapped_column(
+        ForeignKey("goals.id", ondelete="CASCADE"), index=True
+    )
     engine: Mapped[str] = mapped_column(String(120), default="unknown")
     action_type: Mapped[str] = mapped_column(String(120), default="execute")
     input_ref: Mapped[str] = mapped_column(Text, default="")
@@ -221,8 +243,12 @@ class Action(Base):
     replacement_action_id: Mapped[int | None] = mapped_column(nullable=True)
     recovery_classification: Mapped[str] = mapped_column(String(40), default="")
     chain_event: Mapped[str] = mapped_column(String(40), default="")
-    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     status: Mapped[str] = mapped_column(String(40), default="started")
 
 
@@ -230,35 +256,51 @@ class GoalPlan(Base):
     __tablename__ = "goal_plans"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    goal_id: Mapped[int] = mapped_column(ForeignKey("goals.id", ondelete="CASCADE"), unique=True, index=True)
+    goal_id: Mapped[int] = mapped_column(
+        ForeignKey("goals.id", ondelete="CASCADE"), unique=True, index=True
+    )
     ordered_action_ids: Mapped[list[int]] = mapped_column(JSON, default=list)
     current_step_index: Mapped[int] = mapped_column(default=0)
     derived_status: Mapped[str] = mapped_column(String(40), default="unknown")
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
 
 
 class StateSnapshot(Base):
     __tablename__ = "state_snapshots"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    goal_id: Mapped[int] = mapped_column(ForeignKey("goals.id", ondelete="CASCADE"), index=True)
-    action_id: Mapped[int] = mapped_column(ForeignKey("actions.id", ondelete="CASCADE"), index=True)
+    goal_id: Mapped[int] = mapped_column(
+        ForeignKey("goals.id", ondelete="CASCADE"), index=True
+    )
+    action_id: Mapped[int] = mapped_column(
+        ForeignKey("actions.id", ondelete="CASCADE"), index=True
+    )
     snapshot_phase: Mapped[str] = mapped_column(String(20), index=True)
     state_type: Mapped[str] = mapped_column(String(80), default="json")
     state_payload: Mapped[dict] = mapped_column(JSON, default=dict)
-    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    captured_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
 
 
 class ValidationResult(Base):
     __tablename__ = "validation_results"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    goal_id: Mapped[int] = mapped_column(ForeignKey("goals.id", ondelete="CASCADE"), index=True)
-    action_id: Mapped[int] = mapped_column(ForeignKey("actions.id", ondelete="CASCADE"), index=True)
+    goal_id: Mapped[int] = mapped_column(
+        ForeignKey("goals.id", ondelete="CASCADE"), index=True
+    )
+    action_id: Mapped[int] = mapped_column(
+        ForeignKey("actions.id", ondelete="CASCADE"), index=True
+    )
     validation_method: Mapped[str] = mapped_column(String(120), default="hint")
     validation_status: Mapped[str] = mapped_column(String(40), default="unknown")
     validation_details: Mapped[dict] = mapped_column(JSON, default=dict)
-    validated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    validated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
 
 
 class InputEvent(Base, TimestampMixin):
@@ -280,19 +322,27 @@ class InputEventResolution(Base, TimestampMixin):
     __tablename__ = "input_event_resolutions"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    input_event_id: Mapped[int] = mapped_column(ForeignKey("input_events.id", ondelete="CASCADE"), unique=True, index=True)
+    input_event_id: Mapped[int] = mapped_column(
+        ForeignKey("input_events.id", ondelete="CASCADE"), unique=True, index=True
+    )
     internal_intent: Mapped[str] = mapped_column(String(80), index=True)
     confidence_tier: Mapped[str] = mapped_column(String(20), default="unknown")
     outcome: Mapped[str] = mapped_column(String(40), default="requires_confirmation")
-    resolution_status: Mapped[str] = mapped_column(String(40), default="requires_confirmation")
-    safety_decision: Mapped[str] = mapped_column(String(40), default="requires_confirmation")
+    resolution_status: Mapped[str] = mapped_column(
+        String(40), default="requires_confirmation"
+    )
+    safety_decision: Mapped[str] = mapped_column(
+        String(40), default="requires_confirmation"
+    )
     reason: Mapped[str] = mapped_column(Text, default="")
     clarification_prompt: Mapped[str] = mapped_column(Text, default="")
     escalation_reasons: Mapped[list[str]] = mapped_column(JSON, default=list)
     capability_name: Mapped[str] = mapped_column(String(120), default="")
     capability_registered: Mapped[bool] = mapped_column(default=False)
     capability_enabled: Mapped[bool] = mapped_column(default=False)
-    goal_id: Mapped[int | None] = mapped_column(ForeignKey("goals.id", ondelete="SET NULL"), nullable=True)
+    goal_id: Mapped[int | None] = mapped_column(
+        ForeignKey("goals.id", ondelete="SET NULL"), nullable=True
+    )
     proposed_goal_description: Mapped[str] = mapped_column(Text, default="")
     proposed_actions: Mapped[list[dict]] = mapped_column(JSON, default=list)
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
@@ -327,32 +377,253 @@ class CapabilityExecution(Base, TimestampMixin):
     __tablename__ = "capability_executions"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    input_event_id: Mapped[int] = mapped_column(ForeignKey("input_events.id", ondelete="CASCADE"), index=True)
-    resolution_id: Mapped[int | None] = mapped_column(ForeignKey("input_event_resolutions.id", ondelete="SET NULL"), nullable=True)
-    goal_id: Mapped[int | None] = mapped_column(ForeignKey("goals.id", ondelete="SET NULL"), nullable=True)
+    input_event_id: Mapped[int] = mapped_column(
+        ForeignKey("input_events.id", ondelete="CASCADE"), index=True
+    )
+    resolution_id: Mapped[int | None] = mapped_column(
+        ForeignKey("input_event_resolutions.id", ondelete="SET NULL"), nullable=True
+    )
+    goal_id: Mapped[int | None] = mapped_column(
+        ForeignKey("goals.id", ondelete="SET NULL"), nullable=True
+    )
     capability_name: Mapped[str] = mapped_column(String(120), index=True)
     arguments_json: Mapped[dict] = mapped_column(JSON, default=dict)
     safety_mode: Mapped[str] = mapped_column(String(40), default="standard")
     requested_executor: Mapped[str] = mapped_column(String(120), default="tod")
-    dispatch_decision: Mapped[str] = mapped_column(String(40), default="requires_confirmation")
+    dispatch_decision: Mapped[str] = mapped_column(
+        String(40), default="requires_confirmation"
+    )
+    trace_id: Mapped[str] = mapped_column(String(120), default="", index=True)
+    managed_scope: Mapped[str] = mapped_column(String(120), default="global", index=True)
     status: Mapped[str] = mapped_column(String(40), default="pending")
     reason: Mapped[str] = mapped_column(Text, default="")
     feedback_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    execution_truth_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class ExecutionTrace(Base, TimestampMixin):
+    __tablename__ = "execution_traces"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    trace_id: Mapped[str] = mapped_column(String(120), unique=True, index=True)
+    source: Mapped[str] = mapped_column(String(80), default="execution_control")
+    actor: Mapped[str] = mapped_column(String(120), default="system")
+    managed_scope: Mapped[str] = mapped_column(String(120), default="global", index=True)
+    capability_name: Mapped[str] = mapped_column(String(120), default="")
+    lifecycle_status: Mapped[str] = mapped_column(String(40), default="active")
+    current_stage: Mapped[str] = mapped_column(String(80), default="created")
+    root_execution_id: Mapped[int | None] = mapped_column(
+        ForeignKey("capability_executions.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    root_intent_id: Mapped[int | None] = mapped_column(nullable=True, index=True)
+    causality_graph_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class ExecutionTraceEvent(Base, TimestampMixin):
+    __tablename__ = "execution_trace_events"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    trace_id: Mapped[str] = mapped_column(String(120), index=True)
+    execution_id: Mapped[int | None] = mapped_column(
+        ForeignKey("capability_executions.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    intent_id: Mapped[int | None] = mapped_column(nullable=True, index=True)
+    event_type: Mapped[str] = mapped_column(String(80), index=True)
+    event_stage: Mapped[str] = mapped_column(String(80), default="")
+    causality_role: Mapped[str] = mapped_column(String(80), default="effect")
+    summary: Mapped[str] = mapped_column(Text, default="")
+    payload_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class ExecutionIntent(Base, TimestampMixin):
+    __tablename__ = "execution_intents"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    trace_id: Mapped[str] = mapped_column(String(120), index=True)
+    source: Mapped[str] = mapped_column(String(80), default="execution_control")
+    actor: Mapped[str] = mapped_column(String(120), default="system")
+    managed_scope: Mapped[str] = mapped_column(String(120), default="global", index=True)
+    intent_key: Mapped[str] = mapped_column(String(160), index=True)
+    lifecycle_status: Mapped[str] = mapped_column(String(40), default="active")
+    intent_type: Mapped[str] = mapped_column(String(80), default="execution_request")
+    requested_goal: Mapped[str] = mapped_column(Text, default="")
+    capability_name: Mapped[str] = mapped_column(String(120), default="")
+    arguments_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    context_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    last_execution_id: Mapped[int | None] = mapped_column(
+        ForeignKey("capability_executions.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    resumption_count: Mapped[int] = mapped_column(default=0)
+    archived_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+
+class ExecutionTaskOrchestration(Base, TimestampMixin):
+    __tablename__ = "execution_task_orchestrations"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    trace_id: Mapped[str] = mapped_column(String(120), index=True)
+    intent_id: Mapped[int | None] = mapped_column(nullable=True, index=True)
+    execution_id: Mapped[int | None] = mapped_column(
+        ForeignKey("capability_executions.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    source: Mapped[str] = mapped_column(String(80), default="execution_control")
+    actor: Mapped[str] = mapped_column(String(120), default="system")
+    managed_scope: Mapped[str] = mapped_column(String(120), default="global", index=True)
+    orchestration_status: Mapped[str] = mapped_column(String(40), default="active")
+    current_step_key: Mapped[str] = mapped_column(String(80), default="created")
+    step_state_json: Mapped[list[dict]] = mapped_column(JSON, default=list)
+    checkpoint_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    retry_count: Mapped[int] = mapped_column(default=0)
+    rollback_state_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class ExecutionOverride(Base, TimestampMixin):
+    __tablename__ = "execution_overrides"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    trace_id: Mapped[str] = mapped_column(String(120), default="", index=True)
+    execution_id: Mapped[int | None] = mapped_column(
+        ForeignKey("capability_executions.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    source: Mapped[str] = mapped_column(String(80), default="operator")
+    actor: Mapped[str] = mapped_column(String(120), default="operator")
+    managed_scope: Mapped[str] = mapped_column(String(120), default="global", index=True)
+    override_type: Mapped[str] = mapped_column(String(80), index=True)
+    reason: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(40), default="active", index=True)
+    priority: Mapped[str] = mapped_column(String(40), default="operator")
+    scope_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class ExecutionStabilityProfile(Base, TimestampMixin):
+    __tablename__ = "execution_stability_profiles"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    trace_id: Mapped[str] = mapped_column(String(120), default="", index=True)
+    source: Mapped[str] = mapped_column(String(80), default="execution_control")
+    actor: Mapped[str] = mapped_column(String(120), default="system")
+    managed_scope: Mapped[str] = mapped_column(String(120), default="global", index=True)
+    status: Mapped[str] = mapped_column(String(40), default="stable", index=True)
+    mitigation_state: Mapped[str] = mapped_column(String(80), default="monitor_only")
+    drift_score: Mapped[float] = mapped_column(default=0.0)
+    oscillation_score: Mapped[float] = mapped_column(default=0.0)
+    degradation_score: Mapped[float] = mapped_column(default=0.0)
+    metrics_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    triggers_json: Mapped[list[dict]] = mapped_column(JSON, default=list)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class ExecutionRecoveryAttempt(Base, TimestampMixin):
+    __tablename__ = "execution_recovery_attempts"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    trace_id: Mapped[str] = mapped_column(String(120), default="", index=True)
+    execution_id: Mapped[int | None] = mapped_column(
+        ForeignKey("capability_executions.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    source: Mapped[str] = mapped_column(String(80), default="execution_control")
+    actor: Mapped[str] = mapped_column(String(120), default="system")
+    managed_scope: Mapped[str] = mapped_column(String(120), default="global", index=True)
+    recovery_decision: Mapped[str] = mapped_column(String(80), default="")
+    recovery_reason: Mapped[str] = mapped_column(Text, default="")
+    attempt_number: Mapped[int] = mapped_column(default=1)
+    resume_step_key: Mapped[str] = mapped_column(String(120), default="")
+    status: Mapped[str] = mapped_column(String(40), default="pending", index=True)
+    result_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class ExecutionRecoveryOutcome(Base, TimestampMixin):
+    __tablename__ = "execution_recovery_outcomes"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    attempt_id: Mapped[int | None] = mapped_column(
+        ForeignKey("execution_recovery_attempts.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    trace_id: Mapped[str] = mapped_column(String(120), default="", index=True)
+    execution_id: Mapped[int | None] = mapped_column(
+        ForeignKey("capability_executions.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    source: Mapped[str] = mapped_column(String(80), default="execution_control")
+    actor: Mapped[str] = mapped_column(String(120), default="system")
+    managed_scope: Mapped[str] = mapped_column(String(120), default="global", index=True)
+    outcome_status: Mapped[str] = mapped_column(String(80), default="", index=True)
+    outcome_reason: Mapped[str] = mapped_column(Text, default="")
+    learning_bias_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    outcome_score: Mapped[float] = mapped_column(default=0.0)
+    result_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class ExecutionRecoveryLearningProfile(Base, TimestampMixin):
+    __tablename__ = "execution_recovery_learning_profiles"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    managed_scope: Mapped[str] = mapped_column(String(120), default="global", index=True)
+    capability_family: Mapped[str] = mapped_column(String(120), default="general", index=True)
+    capability_name: Mapped[str] = mapped_column(String(120), default="", index=True)
+    recovery_decision: Mapped[str] = mapped_column(String(80), default="", index=True)
+    learning_state: Mapped[str] = mapped_column(String(80), default="monitor_only", index=True)
+    escalation_decision: Mapped[str] = mapped_column(String(80), default="continue_bounded_recovery", index=True)
+    rationale: Mapped[str] = mapped_column(Text, default="")
+    confidence: Mapped[float] = mapped_column(default=0.0)
+    sample_count: Mapped[int] = mapped_column(default=0)
+    recovered_count: Mapped[int] = mapped_column(default=0)
+    failed_again_count: Mapped[int] = mapped_column(default=0)
+    operator_required_count: Mapped[int] = mapped_column(default=0)
+    success_rate: Mapped[float] = mapped_column(default=0.0)
+    evidence_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    policy_effects_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
 class WorkspaceObservation(Base, TimestampMixin):
     __tablename__ = "workspace_observations"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+    observed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
     zone: Mapped[str] = mapped_column(String(120), index=True)
     label: Mapped[str] = mapped_column(String(160), index=True)
     confidence: Mapped[float] = mapped_column(default=0.0)
     source: Mapped[str] = mapped_column(String(40), default="vision")
-    execution_id: Mapped[int | None] = mapped_column(ForeignKey("capability_executions.id", ondelete="SET NULL"), nullable=True, index=True)
-    lifecycle_status: Mapped[str] = mapped_column(String(40), default="active", index=True)
-    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+    execution_id: Mapped[int | None] = mapped_column(
+        ForeignKey("capability_executions.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    lifecycle_status: Mapped[str] = mapped_column(
+        String(40), default="active", index=True
+    )
+    first_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
     observation_count: Mapped[int] = mapped_column(default=1)
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
 
@@ -366,9 +637,17 @@ class WorkspaceObjectMemory(Base, TimestampMixin):
     confidence: Mapped[float] = mapped_column(default=0.0)
     zone: Mapped[str] = mapped_column(String(120), index=True)
     status: Mapped[str] = mapped_column(String(40), default="active", index=True)
-    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
-    last_execution_id: Mapped[int | None] = mapped_column(ForeignKey("capability_executions.id", ondelete="SET NULL"), nullable=True, index=True)
+    first_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+    last_execution_id: Mapped[int | None] = mapped_column(
+        ForeignKey("capability_executions.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     location_history: Mapped[list[dict]] = mapped_column(JSON, default=list)
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
 
@@ -387,8 +666,12 @@ class WorkspaceZoneRelation(Base, TimestampMixin):
     __tablename__ = "workspace_zone_relations"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    from_zone_id: Mapped[int] = mapped_column(ForeignKey("workspace_zones.id", ondelete="CASCADE"), index=True)
-    to_zone_id: Mapped[int] = mapped_column(ForeignKey("workspace_zones.id", ondelete="CASCADE"), index=True)
+    from_zone_id: Mapped[int] = mapped_column(
+        ForeignKey("workspace_zones.id", ondelete="CASCADE"), index=True
+    )
+    to_zone_id: Mapped[int] = mapped_column(
+        ForeignKey("workspace_zones.id", ondelete="CASCADE"), index=True
+    )
     relation_type: Mapped[str] = mapped_column(String(60), index=True)
     confidence: Mapped[float] = mapped_column(default=1.0)
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
@@ -398,13 +681,25 @@ class WorkspaceObjectRelation(Base, TimestampMixin):
     __tablename__ = "workspace_object_relations"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    subject_object_id: Mapped[int] = mapped_column(ForeignKey("workspace_object_memories.id", ondelete="CASCADE"), index=True)
-    object_object_id: Mapped[int] = mapped_column(ForeignKey("workspace_object_memories.id", ondelete="CASCADE"), index=True)
+    subject_object_id: Mapped[int] = mapped_column(
+        ForeignKey("workspace_object_memories.id", ondelete="CASCADE"), index=True
+    )
+    object_object_id: Mapped[int] = mapped_column(
+        ForeignKey("workspace_object_memories.id", ondelete="CASCADE"), index=True
+    )
     relation_type: Mapped[str] = mapped_column(String(60), default="near", index=True)
-    relation_status: Mapped[str] = mapped_column(String(40), default="active", index=True)
+    relation_status: Mapped[str] = mapped_column(
+        String(40), default="active", index=True
+    )
     confidence: Mapped[float] = mapped_column(default=0.0)
-    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
-    source_execution_id: Mapped[int | None] = mapped_column(ForeignKey("capability_executions.id", ondelete="SET NULL"), nullable=True, index=True)
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+    source_execution_id: Mapped[int | None] = mapped_column(
+        ForeignKey("capability_executions.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
@@ -421,9 +716,124 @@ class WorkspaceProposal(Base, TimestampMixin):
     priority_reason: Mapped[str] = mapped_column(Text, default="")
     source: Mapped[str] = mapped_column(String(80), default="workspace_state")
     related_zone: Mapped[str] = mapped_column(String(120), default="", index=True)
-    related_object_id: Mapped[int | None] = mapped_column(ForeignKey("workspace_object_memories.id", ondelete="SET NULL"), nullable=True, index=True)
-    source_execution_id: Mapped[int | None] = mapped_column(ForeignKey("capability_executions.id", ondelete="SET NULL"), nullable=True, index=True)
+    related_object_id: Mapped[int | None] = mapped_column(
+        ForeignKey("workspace_object_memories.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    source_execution_id: Mapped[int | None] = mapped_column(
+        ForeignKey("capability_executions.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     trigger_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class WorkspaceProposalArbitrationOutcome(Base, TimestampMixin):
+    __tablename__ = "workspace_proposal_arbitration_outcomes"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    source: Mapped[str] = mapped_column(String(80), default="objective88_2", index=True)
+    actor: Mapped[str] = mapped_column(String(120), default="tod")
+    proposal_id: Mapped[int | None] = mapped_column(
+        ForeignKey("workspace_proposals.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    proposal_type: Mapped[str] = mapped_column(String(120), default="", index=True)
+    related_zone: Mapped[str] = mapped_column(String(120), default="global", index=True)
+    arbitration_decision: Mapped[str] = mapped_column(String(40), default="won", index=True)
+    arbitration_posture: Mapped[str] = mapped_column(String(40), default="isolate", index=True)
+    trust_chain_status: Mapped[str] = mapped_column(String(40), default="verified", index=True)
+    downstream_execution_outcome: Mapped[str] = mapped_column(String(40), default="", index=True)
+    outcome_score: Mapped[float] = mapped_column(default=0.0)
+    confidence: Mapped[float] = mapped_column(default=0.0)
+    arbitration_reason: Mapped[str] = mapped_column(Text, default="")
+    conflict_context_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    commitment_state_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class WorkspaceProposalPolicyPreferenceProfile(Base, TimestampMixin):
+    __tablename__ = "workspace_proposal_policy_preference_profiles"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    managed_scope: Mapped[str] = mapped_column(String(120), default="global", index=True)
+    proposal_family: Mapped[str] = mapped_column(String(120), default="general", index=True)
+    proposal_type: Mapped[str] = mapped_column(String(120), default="", index=True)
+    policy_state: Mapped[str] = mapped_column(String(40), default="advisory", index=True)
+    preference_direction: Mapped[str] = mapped_column(String(40), default="monitor", index=True)
+    convergence_confidence: Mapped[float] = mapped_column(default=0.0)
+    sample_count: Mapped[int] = mapped_column(default=0)
+    win_count: Mapped[int] = mapped_column(default=0)
+    loss_count: Mapped[int] = mapped_column(default=0)
+    merge_count: Mapped[int] = mapped_column(default=0)
+    suppression_threshold_met: Mapped[bool] = mapped_column(default=False)
+    policy_effects_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    evidence_summary_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class WorkspacePolicyConflictProfile(Base, TimestampMixin):
+    __tablename__ = "workspace_policy_conflict_profiles"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    source: Mapped[str] = mapped_column(String(80), default="objective90", index=True)
+    actor: Mapped[str] = mapped_column(String(120), default="workspace")
+    managed_scope: Mapped[str] = mapped_column(String(120), default="global", index=True)
+    decision_family: Mapped[str] = mapped_column(
+        String(120), default="workspace_proposal_shaping", index=True
+    )
+    proposal_type: Mapped[str] = mapped_column(String(120), default="", index=True)
+    conflict_state: Mapped[str] = mapped_column(String(40), default="advisory", index=True)
+    winning_policy_source: Mapped[str] = mapped_column(String(80), default="", index=True)
+    losing_policy_sources_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    precedence_rule: Mapped[str] = mapped_column(String(120), default="")
+    conflict_confidence: Mapped[float] = mapped_column(default=0.0)
+    oscillation_count: Mapped[int] = mapped_column(default=0)
+    cooldown_until: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    resolution_reason_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    evidence_summary_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    candidate_policies_json: Mapped[list[dict]] = mapped_column(JSON, default=list)
+    policy_effects_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class WorkspacePolicyConflictResolutionEvent(Base, TimestampMixin):
+    __tablename__ = "workspace_policy_conflict_resolution_events"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    source: Mapped[str] = mapped_column(String(80), default="objective90", index=True)
+    actor: Mapped[str] = mapped_column(String(120), default="workspace")
+    profile_id: Mapped[int | None] = mapped_column(
+        ForeignKey("workspace_policy_conflict_profiles.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    proposal_id: Mapped[int | None] = mapped_column(
+        ForeignKey("workspace_proposals.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    managed_scope: Mapped[str] = mapped_column(String(120), default="global", index=True)
+    decision_family: Mapped[str] = mapped_column(
+        String(120), default="workspace_proposal_shaping", index=True
+    )
+    proposal_type: Mapped[str] = mapped_column(String(120), default="", index=True)
+    event_type: Mapped[str] = mapped_column(String(80), default="resolved", index=True)
+    winning_policy_source: Mapped[str] = mapped_column(String(80), default="", index=True)
+    losing_policy_sources_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    precedence_rule: Mapped[str] = mapped_column(String(120), default="")
+    conflict_state: Mapped[str] = mapped_column(String(40), default="advisory", index=True)
+    conflict_confidence: Mapped[float] = mapped_column(default=0.0)
+    oscillation_count: Mapped[int] = mapped_column(default=0)
+    resolution_reason_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    evidence_summary_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    candidate_policies_json: Mapped[list[dict]] = mapped_column(JSON, default=list)
+    policy_effects_json: Mapped[dict] = mapped_column(JSON, default=dict)
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
@@ -433,11 +843,19 @@ class WorkspaceTargetResolution(Base, TimestampMixin):
     id: Mapped[int] = mapped_column(primary_key=True)
     requested_target: Mapped[str] = mapped_column(String(160), index=True)
     requested_zone: Mapped[str] = mapped_column(String(120), default="", index=True)
-    match_outcome: Mapped[str] = mapped_column(String(40), default="no_match", index=True)
-    policy_outcome: Mapped[str] = mapped_column(String(60), default="target_not_found", index=True)
+    match_outcome: Mapped[str] = mapped_column(
+        String(40), default="no_match", index=True
+    )
+    policy_outcome: Mapped[str] = mapped_column(
+        String(60), default="target_not_found", index=True
+    )
     status: Mapped[str] = mapped_column(String(40), default="pending", index=True)
     confidence: Mapped[float] = mapped_column(default=0.0)
-    related_object_id: Mapped[int | None] = mapped_column(ForeignKey("workspace_object_memories.id", ondelete="SET NULL"), nullable=True, index=True)
+    related_object_id: Mapped[int | None] = mapped_column(
+        ForeignKey("workspace_object_memories.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     candidate_object_ids: Mapped[list[int]] = mapped_column(JSON, default=list)
     suggested_actions: Mapped[list[str]] = mapped_column(JSON, default=list)
     source: Mapped[str] = mapped_column(String(80), default="api")
@@ -448,26 +866,46 @@ class WorkspaceActionPlan(Base, TimestampMixin):
     __tablename__ = "workspace_action_plans"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    target_resolution_id: Mapped[int] = mapped_column(ForeignKey("workspace_target_resolutions.id", ondelete="CASCADE"), index=True)
+    target_resolution_id: Mapped[int] = mapped_column(
+        ForeignKey("workspace_target_resolutions.id", ondelete="CASCADE"), index=True
+    )
     target_label: Mapped[str] = mapped_column(String(160), index=True)
     target_zone: Mapped[str] = mapped_column(String(120), default="", index=True)
     action_type: Mapped[str] = mapped_column(String(80), index=True)
     safety_mode: Mapped[str] = mapped_column(String(60), default="operator_controlled")
-    planning_outcome: Mapped[str] = mapped_column(String(80), default="plan_requires_review", index=True)
-    status: Mapped[str] = mapped_column(String(40), default="pending_approval", index=True)
+    planning_outcome: Mapped[str] = mapped_column(
+        String(80), default="plan_requires_review", index=True
+    )
+    status: Mapped[str] = mapped_column(
+        String(40), default="pending_approval", index=True
+    )
     steps_json: Mapped[list[dict]] = mapped_column(JSON, default=list)
     motion_plan_json: Mapped[dict] = mapped_column(JSON, default=dict)
-    simulation_outcome: Mapped[str] = mapped_column(String(80), default="not_run", index=True)
-    simulation_status: Mapped[str] = mapped_column(String(40), default="not_run", index=True)
+    simulation_outcome: Mapped[str] = mapped_column(
+        String(80), default="not_run", index=True
+    )
+    simulation_status: Mapped[str] = mapped_column(
+        String(40), default="not_run", index=True
+    )
     simulation_json: Mapped[dict] = mapped_column(JSON, default=dict)
     simulation_gate_passed: Mapped[bool] = mapped_column(default=False)
     execution_capability: Mapped[str] = mapped_column(String(120), default="")
-    execution_status: Mapped[str] = mapped_column(String(40), default="not_started", index=True)
-    execution_id: Mapped[int | None] = mapped_column(ForeignKey("capability_executions.id", ondelete="SET NULL"), nullable=True, index=True)
+    execution_status: Mapped[str] = mapped_column(
+        String(40), default="not_started", index=True
+    )
+    execution_id: Mapped[int | None] = mapped_column(
+        ForeignKey("capability_executions.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     execution_json: Mapped[dict] = mapped_column(JSON, default=dict)
-    abort_status: Mapped[str] = mapped_column(String(40), default="not_aborted", index=True)
+    abort_status: Mapped[str] = mapped_column(
+        String(40), default="not_aborted", index=True
+    )
     abort_reason: Mapped[str] = mapped_column(Text, default="")
-    queued_task_id: Mapped[int | None] = mapped_column(ForeignKey("tasks.id", ondelete="SET NULL"), nullable=True, index=True)
+    queued_task_id: Mapped[int | None] = mapped_column(
+        ForeignKey("tasks.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     source: Mapped[str] = mapped_column(String(80), default="api")
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
 
@@ -477,21 +915,29 @@ class WorkspaceMonitoringState(Base, TimestampMixin):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     desired_running: Mapped[bool] = mapped_column(default=False)
-    runtime_status: Mapped[str] = mapped_column(String(40), default="stopped", index=True)
+    runtime_status: Mapped[str] = mapped_column(
+        String(40), default="stopped", index=True
+    )
     scan_trigger_mode: Mapped[str] = mapped_column(String(40), default="interval")
     interval_seconds: Mapped[int] = mapped_column(default=30)
     freshness_threshold_seconds: Mapped[int] = mapped_column(default=900)
     cooldown_seconds: Mapped[int] = mapped_column(default=10)
     max_scan_rate: Mapped[int] = mapped_column(default=6)
     priority_zones: Mapped[list[str]] = mapped_column(JSON, default=list)
-    last_scan_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    last_scan_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
     scan_count: Mapped[int] = mapped_column(default=0)
     last_scan_reason: Mapped[str] = mapped_column(String(120), default="")
     last_deltas_json: Mapped[list[dict]] = mapped_column(JSON, default=list)
     last_proposal_ids: Mapped[list[int]] = mapped_column(JSON, default=list)
     last_snapshot_json: Mapped[dict] = mapped_column(JSON, default=dict)
-    last_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    last_stopped_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_stopped_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
@@ -504,9 +950,15 @@ class WorkspacePerceptionSource(Base, TimestampMixin):
     session_id: Mapped[str] = mapped_column(String(120), default="", index=True)
     is_remote: Mapped[bool] = mapped_column(default=False)
     status: Mapped[str] = mapped_column(String(40), default="active", index=True)
-    health_status: Mapped[str] = mapped_column(String(40), default="healthy", index=True)
-    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
-    last_accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    health_status: Mapped[str] = mapped_column(
+        String(40), default="healthy", index=True
+    )
+    last_seen_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    last_accepted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     last_event_fingerprint: Mapped[str] = mapped_column(String(120), default="")
     last_event_payload_json: Mapped[dict] = mapped_column(JSON, default=dict)
     accepted_count: Mapped[int] = mapped_column(default=0)
@@ -527,11 +979,27 @@ class WorkspaceInquiryQuestion(Base, TimestampMixin):
     actor: Mapped[str] = mapped_column(String(120), default="workspace")
     status: Mapped[str] = mapped_column(String(40), default="open", index=True)
     dedupe_key: Mapped[str] = mapped_column(String(220), default="", index=True)
-    trigger_type: Mapped[str] = mapped_column(String(120), default="unknown_trigger", index=True)
-    uncertainty_type: Mapped[str] = mapped_column(String(120), default="unknown_uncertainty", index=True)
-    origin_strategy_goal_id: Mapped[int | None] = mapped_column(ForeignKey("workspace_strategy_goals.id", ondelete="SET NULL"), nullable=True, index=True)
-    origin_strategy_id: Mapped[int | None] = mapped_column(ForeignKey("workspace_environment_strategies.id", ondelete="SET NULL"), nullable=True, index=True)
-    origin_plan_id: Mapped[int | None] = mapped_column(ForeignKey("workspace_horizon_plans.id", ondelete="SET NULL"), nullable=True, index=True)
+    trigger_type: Mapped[str] = mapped_column(
+        String(120), default="unknown_trigger", index=True
+    )
+    uncertainty_type: Mapped[str] = mapped_column(
+        String(120), default="unknown_uncertainty", index=True
+    )
+    origin_strategy_goal_id: Mapped[int | None] = mapped_column(
+        ForeignKey("workspace_strategy_goals.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    origin_strategy_id: Mapped[int | None] = mapped_column(
+        ForeignKey("workspace_environment_strategies.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    origin_plan_id: Mapped[int | None] = mapped_column(
+        ForeignKey("workspace_horizon_plans.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     why_answer_matters: Mapped[str] = mapped_column(Text, default="")
     waiting_decision: Mapped[str] = mapped_column(Text, default="")
     no_answer_behavior: Mapped[str] = mapped_column(Text, default="")
@@ -544,7 +1012,9 @@ class WorkspaceInquiryQuestion(Base, TimestampMixin):
     answer_json: Mapped[dict] = mapped_column(JSON, default=dict)
     applied_effect_json: Mapped[dict] = mapped_column(JSON, default=dict)
     answered_by: Mapped[str] = mapped_column(String(120), default="")
-    answered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    answered_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
@@ -552,7 +1022,9 @@ class WorkspaceAutonomousChain(Base, TimestampMixin):
     __tablename__ = "workspace_autonomous_chains"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    chain_type: Mapped[str] = mapped_column(String(80), default="proposal_sequence", index=True)
+    chain_type: Mapped[str] = mapped_column(
+        String(80), default="proposal_sequence", index=True
+    )
     status: Mapped[str] = mapped_column(String(40), default="pending", index=True)
     source: Mapped[str] = mapped_column(String(80), default="objective36")
     trigger_reason: Mapped[str] = mapped_column(Text, default="")
@@ -562,8 +1034,12 @@ class WorkspaceAutonomousChain(Base, TimestampMixin):
     cooldown_seconds: Mapped[int] = mapped_column(default=0)
     requires_approval: Mapped[bool] = mapped_column(default=True)
     approved_by: Mapped[str] = mapped_column(String(120), default="")
-    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    last_advanced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    approved_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_advanced_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     current_step_index: Mapped[int] = mapped_column(default=0)
     completed_step_ids: Mapped[list[int]] = mapped_column(JSON, default=list)
     failed_step_ids: Mapped[list[int]] = mapped_column(JSON, default=list)
@@ -576,7 +1052,9 @@ class WorkspaceCapabilityChain(Base, TimestampMixin):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     chain_name: Mapped[str] = mapped_column(String(160), index=True)
-    chain_type: Mapped[str] = mapped_column(String(80), default="safe_capability_chain", index=True)
+    chain_type: Mapped[str] = mapped_column(
+        String(80), default="safe_capability_chain", index=True
+    )
     status: Mapped[str] = mapped_column(String(40), default="pending", index=True)
     source: Mapped[str] = mapped_column(String(80), default="objective42")
     policy_json: Mapped[dict] = mapped_column(JSON, default=dict)
@@ -586,7 +1064,9 @@ class WorkspaceCapabilityChain(Base, TimestampMixin):
     failed_step_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
     stop_on_failure: Mapped[bool] = mapped_column(default=True)
     escalate_on_failure: Mapped[bool] = mapped_column(default=True)
-    last_advanced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_advanced_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     audit_trail_json: Mapped[list[dict]] = mapped_column(JSON, default=list)
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
 
@@ -595,18 +1075,36 @@ class WorkspaceInterruptionEvent(Base, TimestampMixin):
     __tablename__ = "workspace_interruption_events"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    execution_id: Mapped[int | None] = mapped_column(ForeignKey("capability_executions.id", ondelete="SET NULL"), nullable=True, index=True)
-    action_plan_id: Mapped[int | None] = mapped_column(ForeignKey("workspace_action_plans.id", ondelete="SET NULL"), nullable=True, index=True)
-    chain_id: Mapped[int | None] = mapped_column(ForeignKey("workspace_autonomous_chains.id", ondelete="SET NULL"), nullable=True, index=True)
+    execution_id: Mapped[int | None] = mapped_column(
+        ForeignKey("capability_executions.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    action_plan_id: Mapped[int | None] = mapped_column(
+        ForeignKey("workspace_action_plans.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    chain_id: Mapped[int | None] = mapped_column(
+        ForeignKey("workspace_autonomous_chains.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     interruption_type: Mapped[str] = mapped_column(String(80), index=True)
     source: Mapped[str] = mapped_column(String(80), default="operator")
-    requested_outcome: Mapped[str] = mapped_column(String(40), default="require_operator_decision")
-    applied_outcome: Mapped[str] = mapped_column(String(40), default="require_operator_decision")
+    requested_outcome: Mapped[str] = mapped_column(
+        String(40), default="require_operator_decision"
+    )
+    applied_outcome: Mapped[str] = mapped_column(
+        String(40), default="require_operator_decision"
+    )
     status: Mapped[str] = mapped_column(String(40), default="active", index=True)
     reason: Mapped[str] = mapped_column(Text, default="")
     actor: Mapped[str] = mapped_column(String(120), default="workspace")
     resolved_by: Mapped[str] = mapped_column(String(120), default="")
-    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    resolved_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
@@ -614,18 +1112,34 @@ class WorkspaceReplanSignal(Base, TimestampMixin):
     __tablename__ = "workspace_replan_signals"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    execution_id: Mapped[int | None] = mapped_column(ForeignKey("capability_executions.id", ondelete="SET NULL"), nullable=True, index=True)
-    action_plan_id: Mapped[int | None] = mapped_column(ForeignKey("workspace_action_plans.id", ondelete="SET NULL"), nullable=True, index=True)
-    chain_id: Mapped[int | None] = mapped_column(ForeignKey("workspace_autonomous_chains.id", ondelete="SET NULL"), nullable=True, index=True)
+    execution_id: Mapped[int | None] = mapped_column(
+        ForeignKey("capability_executions.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    action_plan_id: Mapped[int | None] = mapped_column(
+        ForeignKey("workspace_action_plans.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    chain_id: Mapped[int | None] = mapped_column(
+        ForeignKey("workspace_autonomous_chains.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     signal_type: Mapped[str] = mapped_column(String(80), index=True)
-    predicted_outcome: Mapped[str] = mapped_column(String(60), default="continue_monitor", index=True)
+    predicted_outcome: Mapped[str] = mapped_column(
+        String(60), default="continue_monitor", index=True
+    )
     confidence: Mapped[float] = mapped_column(default=0.0)
     source: Mapped[str] = mapped_column(String(80), default="predictive_monitor")
     status: Mapped[str] = mapped_column(String(40), default="active", index=True)
     reason: Mapped[str] = mapped_column(Text, default="")
     actor: Mapped[str] = mapped_column(String(120), default="workspace")
     resolved_by: Mapped[str] = mapped_column(String(120), default="")
-    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    resolved_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
@@ -645,9 +1159,13 @@ class ConstraintEvaluation(Base, TimestampMixin):
     warnings_json: Mapped[list[dict]] = mapped_column(JSON, default=list)
     recommended_next_step: Mapped[str] = mapped_column(String(120), default="execute")
     confidence: Mapped[float] = mapped_column(default=0.0)
-    outcome_result: Mapped[str] = mapped_column(String(40), default="unknown", index=True)
+    outcome_result: Mapped[str] = mapped_column(
+        String(40), default="unknown", index=True
+    )
     outcome_quality: Mapped[float] = mapped_column(default=0.0)
-    outcome_recorded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    outcome_recorded_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     explanation_json: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
@@ -658,7 +1176,9 @@ class ConstraintAdjustmentProposal(Base, TimestampMixin):
     source: Mapped[str] = mapped_column(String(80), default="objective45", index=True)
     actor: Mapped[str] = mapped_column(String(120), default="workspace")
     constraint_key: Mapped[str] = mapped_column(String(120), index=True)
-    proposal_type: Mapped[str] = mapped_column(String(80), default="soft_weight_adjustment")
+    proposal_type: Mapped[str] = mapped_column(
+        String(80), default="soft_weight_adjustment"
+    )
     current_value: Mapped[str | None] = mapped_column(String(120), nullable=True)
     proposed_value: Mapped[str | None] = mapped_column(String(120), nullable=True)
     sample_size: Mapped[int] = mapped_column(default=0)
@@ -679,7 +1199,9 @@ class WorkspaceHorizonPlan(Base, TimestampMixin):
     planning_horizon_minutes: Mapped[int] = mapped_column(default=60)
     ranked_goals_json: Mapped[list[dict]] = mapped_column(JSON, default=list)
     staged_action_graph_json: Mapped[list[dict]] = mapped_column(JSON, default=list)
-    expected_future_constraints_json: Mapped[list[dict]] = mapped_column(JSON, default=list)
+    expected_future_constraints_json: Mapped[list[dict]] = mapped_column(
+        JSON, default=list
+    )
     scoring_context_json: Mapped[dict] = mapped_column(JSON, default=dict)
     explanation_json: Mapped[dict] = mapped_column(JSON, default=dict)
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
@@ -689,7 +1211,9 @@ class WorkspaceHorizonCheckpoint(Base, TimestampMixin):
     __tablename__ = "workspace_horizon_checkpoints"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    plan_id: Mapped[int] = mapped_column(ForeignKey("workspace_horizon_plans.id", ondelete="CASCADE"), index=True)
+    plan_id: Mapped[int] = mapped_column(
+        ForeignKey("workspace_horizon_plans.id", ondelete="CASCADE"), index=True
+    )
     checkpoint_key: Mapped[str] = mapped_column(String(120), index=True)
     sequence_index: Mapped[int] = mapped_column(default=1)
     checkpoint_type: Mapped[str] = mapped_column(String(80), default="goal_step")
@@ -705,7 +1229,9 @@ class WorkspaceHorizonReplanEvent(Base, TimestampMixin):
     __tablename__ = "workspace_horizon_replan_events"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    plan_id: Mapped[int] = mapped_column(ForeignKey("workspace_horizon_plans.id", ondelete="CASCADE"), index=True)
+    plan_id: Mapped[int] = mapped_column(
+        ForeignKey("workspace_horizon_plans.id", ondelete="CASCADE"), index=True
+    )
     actor: Mapped[str] = mapped_column(String(120), default="workspace")
     reason: Mapped[str] = mapped_column(Text, default="")
     drift_type: Mapped[str] = mapped_column(String(120), default="", index=True)
@@ -720,12 +1246,18 @@ class WorkspaceEnvironmentStrategy(Base, TimestampMixin):
     id: Mapped[int] = mapped_column(primary_key=True)
     source: Mapped[str] = mapped_column(String(80), default="objective47", index=True)
     strategy_type: Mapped[str] = mapped_column(String(120), index=True)
-    target_scope: Mapped[str] = mapped_column(String(160), default="workspace", index=True)
+    target_scope: Mapped[str] = mapped_column(
+        String(160), default="workspace", index=True
+    )
     priority: Mapped[str] = mapped_column(String(40), default="normal", index=True)
-    current_status: Mapped[str] = mapped_column(String(40), default="active", index=True)
+    current_status: Mapped[str] = mapped_column(
+        String(40), default="active", index=True
+    )
     success_criteria: Mapped[str] = mapped_column(Text, default="")
     contributing_goal_keys_json: Mapped[list[str]] = mapped_column(JSON, default=list)
-    contributing_checkpoint_keys_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    contributing_checkpoint_keys_json: Mapped[list[str]] = mapped_column(
+        JSON, default=list
+    )
     status_reason: Mapped[str] = mapped_column(Text, default="")
     evidence_json: Mapped[dict] = mapped_column(JSON, default=dict)
     influence_weight: Mapped[float] = mapped_column(default=0.5)
@@ -765,7 +1297,9 @@ class WorkspaceImprovementProposal(Base, TimestampMixin):
     affected_component: Mapped[str] = mapped_column(String(160), default="", index=True)
     suggested_change: Mapped[str] = mapped_column(Text, default="")
     confidence: Mapped[float] = mapped_column(default=0.0)
-    safety_class: Mapped[str] = mapped_column(String(40), default="bounded_review", index=True)
+    safety_class: Mapped[str] = mapped_column(
+        String(40), default="bounded_review", index=True
+    )
     risk_summary: Mapped[str] = mapped_column(Text, default="")
     test_recommendation: Mapped[str] = mapped_column(Text, default="")
     status: Mapped[str] = mapped_column(String(40), default="proposed", index=True)
@@ -777,9 +1311,15 @@ class WorkspaceImprovementArtifact(Base, TimestampMixin):
     __tablename__ = "workspace_improvement_artifacts"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    proposal_id: Mapped[int] = mapped_column(ForeignKey("workspace_improvement_proposals.id", ondelete="CASCADE"), index=True)
-    artifact_type: Mapped[str] = mapped_column(String(80), default="policy_change_candidate", index=True)
-    status: Mapped[str] = mapped_column(String(40), default="pending_review", index=True)
+    proposal_id: Mapped[int] = mapped_column(
+        ForeignKey("workspace_improvement_proposals.id", ondelete="CASCADE"), index=True
+    )
+    artifact_type: Mapped[str] = mapped_column(
+        String(80), default="policy_change_candidate", index=True
+    )
+    status: Mapped[str] = mapped_column(
+        String(40), default="pending_review", index=True
+    )
     candidate_payload_json: Mapped[dict] = mapped_column(JSON, default=dict)
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
 
@@ -803,10 +1343,20 @@ class WorkspaceMaintenanceAction(Base, TimestampMixin):
     __tablename__ = "workspace_maintenance_actions"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    run_id: Mapped[int] = mapped_column(ForeignKey("workspace_maintenance_runs.id", ondelete="CASCADE"), index=True)
-    strategy_id: Mapped[int | None] = mapped_column(ForeignKey("workspace_environment_strategies.id", ondelete="SET NULL"), nullable=True, index=True)
-    action_type: Mapped[str] = mapped_column(String(120), default="auto_execute_rescan", index=True)
-    target_scope: Mapped[str] = mapped_column(String(160), default="workspace", index=True)
+    run_id: Mapped[int] = mapped_column(
+        ForeignKey("workspace_maintenance_runs.id", ondelete="CASCADE"), index=True
+    )
+    strategy_id: Mapped[int | None] = mapped_column(
+        ForeignKey("workspace_environment_strategies.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    action_type: Mapped[str] = mapped_column(
+        String(120), default="auto_execute_rescan", index=True
+    )
+    target_scope: Mapped[str] = mapped_column(
+        String(160), default="workspace", index=True
+    )
     safety_mode: Mapped[str] = mapped_column(String(60), default="scan_only")
     status: Mapped[str] = mapped_column(String(40), default="succeeded", index=True)
     reason: Mapped[str] = mapped_column(Text, default="")
@@ -819,14 +1369,22 @@ class WorkspacePolicyExperiment(Base, TimestampMixin):
     id: Mapped[int] = mapped_column(primary_key=True)
     source: Mapped[str] = mapped_column(String(80), default="objective51", index=True)
     actor: Mapped[str] = mapped_column(String(120), default="workspace")
-    proposal_id: Mapped[int | None] = mapped_column(ForeignKey("workspace_improvement_proposals.id", ondelete="SET NULL"), nullable=True, index=True)
-    experiment_type: Mapped[str] = mapped_column(String(120), default="soft_constraint_sandbox", index=True)
+    proposal_id: Mapped[int | None] = mapped_column(
+        ForeignKey("workspace_improvement_proposals.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    experiment_type: Mapped[str] = mapped_column(
+        String(120), default="soft_constraint_sandbox", index=True
+    )
     sandbox_mode: Mapped[str] = mapped_column(String(80), default="shadow_evaluation")
     status: Mapped[str] = mapped_column(String(40), default="completed", index=True)
     baseline_metrics_json: Mapped[dict] = mapped_column(JSON, default=dict)
     experimental_metrics_json: Mapped[dict] = mapped_column(JSON, default=dict)
     comparison_json: Mapped[dict] = mapped_column(JSON, default=dict)
-    recommendation: Mapped[str] = mapped_column(String(40), default="revise", index=True)
+    recommendation: Mapped[str] = mapped_column(
+        String(40), default="revise", index=True
+    )
     recommendation_reason: Mapped[str] = mapped_column(Text, default="")
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
 
@@ -848,7 +1406,9 @@ class WorkspaceConceptMemory(Base, TimestampMixin):
     evidence_summary: Mapped[str] = mapped_column(Text, default="")
     status: Mapped[str] = mapped_column(String(40), default="active", index=True)
     acknowledged_by: Mapped[str] = mapped_column(String(120), default="")
-    acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    acknowledged_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
@@ -862,8 +1422,12 @@ class WorkspaceDevelopmentPattern(Base, TimestampMixin):
     evidence_count: Mapped[int] = mapped_column(default=0)
     confidence: Mapped[float] = mapped_column(default=0.0)
     affected_component: Mapped[str] = mapped_column(String(200), default="", index=True)
-    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+    first_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
     evidence_summary: Mapped[str] = mapped_column(Text, default="")
     status: Mapped[str] = mapped_column(String(40), default="active", index=True)
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
@@ -875,9 +1439,15 @@ class WorkspaceImprovementRecommendation(Base, TimestampMixin):
     id: Mapped[int] = mapped_column(primary_key=True)
     source: Mapped[str] = mapped_column(String(80), default="objective54", index=True)
     actor: Mapped[str] = mapped_column(String(120), default="workspace")
-    proposal_id: Mapped[int] = mapped_column(ForeignKey("workspace_improvement_proposals.id", ondelete="CASCADE"), index=True)
-    experiment_id: Mapped[int] = mapped_column(ForeignKey("workspace_policy_experiments.id", ondelete="CASCADE"), index=True)
-    recommendation_type: Mapped[str] = mapped_column(String(40), default="revise", index=True)
+    proposal_id: Mapped[int] = mapped_column(
+        ForeignKey("workspace_improvement_proposals.id", ondelete="CASCADE"), index=True
+    )
+    experiment_id: Mapped[int] = mapped_column(
+        ForeignKey("workspace_policy_experiments.id", ondelete="CASCADE"), index=True
+    )
+    recommendation_type: Mapped[str] = mapped_column(
+        String(40), default="revise", index=True
+    )
     recommendation_summary: Mapped[str] = mapped_column(Text, default="")
     baseline_metrics_json: Mapped[dict] = mapped_column(JSON, default=dict)
     experimental_metrics_json: Mapped[dict] = mapped_column(JSON, default=dict)
@@ -885,7 +1455,9 @@ class WorkspaceImprovementRecommendation(Base, TimestampMixin):
     status: Mapped[str] = mapped_column(String(40), default="proposed", index=True)
     review_reason: Mapped[str] = mapped_column(Text, default="")
     reviewed_by: Mapped[str] = mapped_column(String(120), default="")
-    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    reviewed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
@@ -895,8 +1467,14 @@ class WorkspaceImprovementBacklog(Base, TimestampMixin):
     id: Mapped[int] = mapped_column(primary_key=True)
     source: Mapped[str] = mapped_column(String(80), default="objective55", index=True)
     actor: Mapped[str] = mapped_column(String(120), default="workspace")
-    proposal_id: Mapped[int] = mapped_column(ForeignKey("workspace_improvement_proposals.id", ondelete="CASCADE"), index=True)
-    recommendation_id: Mapped[int | None] = mapped_column(ForeignKey("workspace_improvement_recommendations.id", ondelete="SET NULL"), nullable=True, index=True)
+    proposal_id: Mapped[int] = mapped_column(
+        ForeignKey("workspace_improvement_proposals.id", ondelete="CASCADE"), index=True
+    )
+    recommendation_id: Mapped[int | None] = mapped_column(
+        ForeignKey("workspace_improvement_recommendations.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     priority_score: Mapped[float] = mapped_column(default=0.0, index=True)
     impact_estimate: Mapped[float] = mapped_column(default=0.0)
     evidence_strength: Mapped[float] = mapped_column(default=0.0)
@@ -906,7 +1484,9 @@ class WorkspaceImprovementBacklog(Base, TimestampMixin):
     operator_preference_weight: Mapped[float] = mapped_column(default=0.5)
     proposal_type: Mapped[str] = mapped_column(String(120), default="", index=True)
     evidence_count: Mapped[int] = mapped_column(default=0)
-    governance_decision: Mapped[str] = mapped_column(String(60), default="request_operator_review", index=True)
+    governance_decision: Mapped[str] = mapped_column(
+        String(60), default="request_operator_review", index=True
+    )
     ranking_reason: Mapped[str] = mapped_column(Text, default="")
     evidence_summary: Mapped[str] = mapped_column(Text, default="")
     risk_summary: Mapped[str] = mapped_column(Text, default="")
@@ -941,12 +1521,22 @@ class WorkspaceTaskOrchestration(Base, TimestampMixin):
     source: Mapped[str] = mapped_column(String(80), default="objective63", index=True)
     actor: Mapped[str] = mapped_column(String(120), default="workspace")
     status: Mapped[str] = mapped_column(String(40), default="active", index=True)
-    orchestration_type: Mapped[str] = mapped_column(String(120), default="cross_domain_task_orchestration", index=True)
-    origin_context_id: Mapped[int | None] = mapped_column(ForeignKey("workspace_cross_domain_reasoning_contexts.id", ondelete="SET NULL"), nullable=True, index=True)
+    orchestration_type: Mapped[str] = mapped_column(
+        String(120), default="cross_domain_task_orchestration", index=True
+    )
+    origin_context_id: Mapped[int | None] = mapped_column(
+        ForeignKey("workspace_cross_domain_reasoning_contexts.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     lookback_hours: Mapped[int] = mapped_column(default=24)
     priority_score: Mapped[float] = mapped_column(default=0.0, index=True)
-    priority_label: Mapped[str] = mapped_column(String(40), default="normal", index=True)
-    collaboration_mode: Mapped[str] = mapped_column(String(40), default="autonomous", index=True)
+    priority_label: Mapped[str] = mapped_column(
+        String(40), default="normal", index=True
+    )
+    collaboration_mode: Mapped[str] = mapped_column(
+        String(40), default="autonomous", index=True
+    )
     human_context_modifiers_json: Mapped[dict] = mapped_column(JSON, default=dict)
     collaboration_reasoning_json: Mapped[dict] = mapped_column(JSON, default=dict)
     contributing_domains_json: Mapped[list[str]] = mapped_column(JSON, default=list)
@@ -955,8 +1545,12 @@ class WorkspaceTaskOrchestration(Base, TimestampMixin):
     reasoning_json: Mapped[dict] = mapped_column(JSON, default=dict)
     linked_goal_ids_json: Mapped[list[int]] = mapped_column(JSON, default=list)
     linked_horizon_plan_ids_json: Mapped[list[int]] = mapped_column(JSON, default=list)
-    linked_improvement_proposal_ids_json: Mapped[list[int]] = mapped_column(JSON, default=list)
-    linked_inquiry_question_ids_json: Mapped[list[int]] = mapped_column(JSON, default=list)
+    linked_improvement_proposal_ids_json: Mapped[list[int]] = mapped_column(
+        JSON, default=list
+    )
+    linked_inquiry_question_ids_json: Mapped[list[int]] = mapped_column(
+        JSON, default=list
+    )
     downstream_artifacts_json: Mapped[list[dict]] = mapped_column(JSON, default=list)
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
 
@@ -968,12 +1562,30 @@ class WorkspaceCollaborationNegotiation(Base, TimestampMixin):
     source: Mapped[str] = mapped_column(String(80), default="objective65", index=True)
     actor: Mapped[str] = mapped_column(String(120), default="workspace")
     status: Mapped[str] = mapped_column(String(40), default="open", index=True)
-    resolution_status: Mapped[str] = mapped_column(String(40), default="pending", index=True)
-    origin_orchestration_id: Mapped[int | None] = mapped_column(ForeignKey("workspace_task_orchestrations.id", ondelete="SET NULL"), nullable=True, index=True)
-    origin_context_id: Mapped[int | None] = mapped_column(ForeignKey("workspace_cross_domain_reasoning_contexts.id", ondelete="SET NULL"), nullable=True, index=True)
-    origin_goal_id: Mapped[int | None] = mapped_column(ForeignKey("goals.id", ondelete="SET NULL"), nullable=True, index=True)
-    origin_horizon_plan_id: Mapped[int | None] = mapped_column(ForeignKey("workspace_horizon_plans.id", ondelete="SET NULL"), nullable=True, index=True)
-    trigger_type: Mapped[str] = mapped_column(String(120), default="human_context_conflict", index=True)
+    resolution_status: Mapped[str] = mapped_column(
+        String(40), default="pending", index=True
+    )
+    origin_orchestration_id: Mapped[int | None] = mapped_column(
+        ForeignKey("workspace_task_orchestrations.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    origin_context_id: Mapped[int | None] = mapped_column(
+        ForeignKey("workspace_cross_domain_reasoning_contexts.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    origin_goal_id: Mapped[int | None] = mapped_column(
+        ForeignKey("goals.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    origin_horizon_plan_id: Mapped[int | None] = mapped_column(
+        ForeignKey("workspace_horizon_plans.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    trigger_type: Mapped[str] = mapped_column(
+        String(120), default="human_context_conflict", index=True
+    )
     trigger_reason: Mapped[str] = mapped_column(Text, default="")
     requested_decision: Mapped[str] = mapped_column(Text, default="")
     options_presented_json: Mapped[list[dict]] = mapped_column(JSON, default=list)
@@ -984,7 +1596,9 @@ class WorkspaceCollaborationNegotiation(Base, TimestampMixin):
     explainability_json: Mapped[dict] = mapped_column(JSON, default=dict)
     applied_effect_json: Mapped[dict] = mapped_column(JSON, default=dict)
     resolved_by: Mapped[str] = mapped_column(String(120), default="")
-    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    resolved_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
@@ -994,7 +1608,9 @@ class WorkspaceCollaborationPattern(Base, TimestampMixin):
     id: Mapped[int] = mapped_column(primary_key=True)
     source: Mapped[str] = mapped_column(String(80), default="objective69", index=True)
     actor: Mapped[str] = mapped_column(String(120), default="workspace")
-    pattern_type: Mapped[str] = mapped_column(String(120), default="contextual_collaboration_preference", index=True)
+    pattern_type: Mapped[str] = mapped_column(
+        String(120), default="contextual_collaboration_preference", index=True
+    )
     context_signature: Mapped[str] = mapped_column(String(320), index=True)
     evidence_count: Mapped[int] = mapped_column(default=0)
     confidence: Mapped[float] = mapped_column(default=0.0)
@@ -1005,8 +1621,12 @@ class WorkspaceCollaborationPattern(Base, TimestampMixin):
     explainability_json: Mapped[dict] = mapped_column(JSON, default=dict)
     influence_profile_json: Mapped[dict] = mapped_column(JSON, default=dict)
     acknowledged_by: Mapped[str] = mapped_column(String(120), default="")
-    acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    last_observed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    acknowledged_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_observed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
@@ -1016,9 +1636,13 @@ class WorkspaceCollaborationProfile(Base, TimestampMixin):
     id: Mapped[int] = mapped_column(primary_key=True)
     source: Mapped[str] = mapped_column(String(80), default="objective70", index=True)
     actor: Mapped[str] = mapped_column(String(120), default="workspace")
-    profile_type: Mapped[str] = mapped_column(String(120), default="contextual_collaboration_strategy", index=True)
+    profile_type: Mapped[str] = mapped_column(
+        String(120), default="contextual_collaboration_strategy", index=True
+    )
     context_scope: Mapped[str] = mapped_column(String(320), index=True)
-    dominant_collaboration_mode: Mapped[str] = mapped_column(String(40), default="autonomous", index=True)
+    dominant_collaboration_mode: Mapped[str] = mapped_column(
+        String(40), default="autonomous", index=True
+    )
     supporting_pattern_ids_json: Mapped[list[int]] = mapped_column(JSON, default=list)
     evidence_count: Mapped[int] = mapped_column(default=0)
     confidence: Mapped[float] = mapped_column(default=0.0)
@@ -1027,7 +1651,9 @@ class WorkspaceCollaborationProfile(Base, TimestampMixin):
     evidence_summary: Mapped[str] = mapped_column(Text, default="")
     explainability_json: Mapped[dict] = mapped_column(JSON, default=dict)
     influence_profile_json: Mapped[dict] = mapped_column(JSON, default=dict)
-    last_observed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    last_observed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
@@ -1041,7 +1667,9 @@ class WorkspaceStateBusEvent(Base, TimestampMixin):
     event_type: Mapped[str] = mapped_column(String(160), index=True)
     stream_key: Mapped[str] = mapped_column(String(240), index=True)
     sequence_id: Mapped[int] = mapped_column(default=1)
-    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
     payload_json: Mapped[dict] = mapped_column(JSON, default=dict)
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
 
@@ -1055,12 +1683,21 @@ class WorkspaceStateBusSnapshot(Base, TimestampMixin):
     snapshot_scope: Mapped[str] = mapped_column(String(240), unique=True, index=True)
     state_version: Mapped[int] = mapped_column(default=1)
     state_payload_json: Mapped[dict] = mapped_column(JSON, default=dict)
-    last_event_id: Mapped[int | None] = mapped_column(ForeignKey("workspace_state_bus_events.id", ondelete="SET NULL"), nullable=True, index=True)
+    last_event_id: Mapped[int | None] = mapped_column(
+        ForeignKey("workspace_state_bus_events.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     last_event_sequence: Mapped[int] = mapped_column(default=0)
     last_event_domain: Mapped[str] = mapped_column(String(120), default="")
     last_event_type: Mapped[str] = mapped_column(String(160), default="")
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), index=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        index=True,
+    )
 
 
 class WorkspaceStateBusConsumer(Base, TimestampMixin):
@@ -1073,17 +1710,30 @@ class WorkspaceStateBusConsumer(Base, TimestampMixin):
     status: Mapped[str] = mapped_column(String(40), default="active", index=True)
     subscription_json: Mapped[dict] = mapped_column(JSON, default=dict)
     cursor_event_id: Mapped[int] = mapped_column(default=0, index=True)
-    cursor_occurred_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    cursor_occurred_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     processed_event_ids_json: Mapped[list[int]] = mapped_column(JSON, default=list)
     poll_count: Mapped[int] = mapped_column(default=0)
     ack_count: Mapped[int] = mapped_column(default=0)
     lag_count: Mapped[int] = mapped_column(default=0)
     replay_from_snapshot_scope: Mapped[str] = mapped_column(String(240), default="")
-    last_polled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    last_acked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    last_replayed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_polled_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_acked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_replayed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), index=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        index=True,
+    )
 
 
 class WorkspaceStrategyGoal(Base, TimestampMixin):
@@ -1093,7 +1743,11 @@ class WorkspaceStrategyGoal(Base, TimestampMixin):
     source: Mapped[str] = mapped_column(String(80), default="objective57", index=True)
     actor: Mapped[str] = mapped_column(String(120), default="workspace")
     strategy_type: Mapped[str] = mapped_column(String(120), index=True)
-    origin_context_id: Mapped[int | None] = mapped_column(ForeignKey("workspace_cross_domain_reasoning_contexts.id", ondelete="SET NULL"), nullable=True, index=True)
+    origin_context_id: Mapped[int | None] = mapped_column(
+        ForeignKey("workspace_cross_domain_reasoning_contexts.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     priority: Mapped[str] = mapped_column(String(40), default="normal", index=True)
     priority_score: Mapped[float] = mapped_column(default=0.0, index=True)
     success_criteria: Mapped[str] = mapped_column(Text, default="")
@@ -1105,15 +1759,25 @@ class WorkspaceStrategyGoal(Base, TimestampMixin):
     reasoning_summary: Mapped[str] = mapped_column(Text, default="")
     reasoning_json: Mapped[dict] = mapped_column(JSON, default=dict)
     linked_horizon_plan_ids_json: Mapped[list[int]] = mapped_column(JSON, default=list)
-    linked_improvement_proposal_ids_json: Mapped[list[int]] = mapped_column(JSON, default=list)
-    linked_maintenance_run_ids_json: Mapped[list[int]] = mapped_column(JSON, default=list)
+    linked_improvement_proposal_ids_json: Mapped[list[int]] = mapped_column(
+        JSON, default=list
+    )
+    linked_maintenance_run_ids_json: Mapped[list[int]] = mapped_column(
+        JSON, default=list
+    )
     operator_recommendations_json: Mapped[list[str]] = mapped_column(JSON, default=list)
-    persistence_state: Mapped[str] = mapped_column(String(40), default="session", index=True)
-    review_status: Mapped[str] = mapped_column(String(40), default="unreviewed", index=True)
+    persistence_state: Mapped[str] = mapped_column(
+        String(40), default="session", index=True
+    )
+    review_status: Mapped[str] = mapped_column(
+        String(40), default="unreviewed", index=True
+    )
     persistence_confidence: Mapped[float] = mapped_column(default=0.0)
     surviving_sessions: Mapped[int] = mapped_column(default=0)
     carry_forward_count: Mapped[int] = mapped_column(default=0)
-    last_reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_reviewed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     review_notes: Mapped[str] = mapped_column(Text, default="")
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
 
@@ -1122,13 +1786,124 @@ class WorkspaceStrategyGoalReview(Base, TimestampMixin):
     __tablename__ = "workspace_strategy_goal_reviews"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    strategy_goal_id: Mapped[int] = mapped_column(ForeignKey("workspace_strategy_goals.id", ondelete="CASCADE"), index=True)
+    strategy_goal_id: Mapped[int] = mapped_column(
+        ForeignKey("workspace_strategy_goals.id", ondelete="CASCADE"), index=True
+    )
     actor: Mapped[str] = mapped_column(String(120), default="operator")
-    decision: Mapped[str] = mapped_column(String(40), default="carry_forward", index=True)
+    decision: Mapped[str] = mapped_column(
+        String(40), default="carry_forward", index=True
+    )
     reason: Mapped[str] = mapped_column(Text, default="")
-    resulting_persistence_state: Mapped[str] = mapped_column(String(40), default="session", index=True)
-    resulting_review_status: Mapped[str] = mapped_column(String(40), default="unreviewed", index=True)
+    resulting_persistence_state: Mapped[str] = mapped_column(
+        String(40), default="session", index=True
+    )
+    resulting_review_status: Mapped[str] = mapped_column(
+        String(40), default="unreviewed", index=True
+    )
     evidence_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class WorkspaceOperatorResolutionCommitment(Base, TimestampMixin):
+    __tablename__ = "workspace_operator_resolution_commitments"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    source: Mapped[str] = mapped_column(String(80), default="objective85", index=True)
+    created_by: Mapped[str] = mapped_column(String(120), default="operator", index=True)
+    managed_scope: Mapped[str] = mapped_column(String(120), default="global", index=True)
+    commitment_family: Mapped[str] = mapped_column(String(80), default="general", index=True)
+    decision_type: Mapped[str] = mapped_column(String(80), default="approve_current_path", index=True)
+    status: Mapped[str] = mapped_column(String(40), default="active", index=True)
+    reason: Mapped[str] = mapped_column(Text, default="")
+    recommendation_snapshot_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    authority_level: Mapped[str] = mapped_column(String(60), default="governance_override", index=True)
+    confidence: Mapped[float] = mapped_column(default=0.0)
+    provenance_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    superseded_by_commitment_id: Mapped[int | None] = mapped_column(
+        ForeignKey("workspace_operator_resolution_commitments.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    downstream_effects_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class WorkspaceOperatorResolutionCommitmentMonitoringProfile(Base, TimestampMixin):
+    __tablename__ = "workspace_operator_resolution_commitment_monitoring_profiles"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    source: Mapped[str] = mapped_column(String(80), default="objective86", index=True)
+    actor: Mapped[str] = mapped_column(String(120), default="workspace")
+    commitment_id: Mapped[int] = mapped_column(
+        ForeignKey("workspace_operator_resolution_commitments.id", ondelete="CASCADE"),
+        index=True,
+    )
+    managed_scope: Mapped[str] = mapped_column(String(120), default="global", index=True)
+    status: Mapped[str] = mapped_column(String(40), default="evaluated", index=True)
+    commitment_status: Mapped[str] = mapped_column(String(40), default="active", index=True)
+    monitoring_window_hours: Mapped[int] = mapped_column(default=24)
+    evidence_count: Mapped[int] = mapped_column(default=0)
+    stewardship_cycle_count: Mapped[int] = mapped_column(default=0)
+    maintenance_run_count: Mapped[int] = mapped_column(default=0)
+    inquiry_question_count: Mapped[int] = mapped_column(default=0)
+    blocked_auto_execution_count: Mapped[int] = mapped_column(default=0)
+    allowed_auto_execution_count: Mapped[int] = mapped_column(default=0)
+    potential_violation_count: Mapped[int] = mapped_column(default=0)
+    drift_score: Mapped[float] = mapped_column(default=0.0)
+    compliance_score: Mapped[float] = mapped_column(default=0.0)
+    health_score: Mapped[float] = mapped_column(default=0.0)
+    governance_state: Mapped[str] = mapped_column(String(40), default="stable", index=True)
+    governance_decision: Mapped[str] = mapped_column(
+        String(80), default="maintain_commitment", index=True
+    )
+    governance_reason: Mapped[str] = mapped_column(Text, default="")
+    trigger_counts_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    trigger_evidence_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    recommended_actions_json: Mapped[list[dict]] = mapped_column(JSON, default=list)
+    reasoning_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class WorkspaceOperatorResolutionCommitmentOutcomeProfile(Base, TimestampMixin):
+    __tablename__ = "workspace_operator_resolution_commitment_outcome_profiles"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    source: Mapped[str] = mapped_column(String(80), default="objective87", index=True)
+    actor: Mapped[str] = mapped_column(String(120), default="workspace")
+    commitment_id: Mapped[int] = mapped_column(
+        ForeignKey("workspace_operator_resolution_commitments.id", ondelete="CASCADE"),
+        index=True,
+    )
+    managed_scope: Mapped[str] = mapped_column(String(120), default="global", index=True)
+    commitment_family: Mapped[str] = mapped_column(String(80), default="general", index=True)
+    decision_type: Mapped[str] = mapped_column(
+        String(80), default="approve_current_path", index=True
+    )
+    status: Mapped[str] = mapped_column(String(40), default="evaluated", index=True)
+    commitment_status: Mapped[str] = mapped_column(String(40), default="active", index=True)
+    outcome_status: Mapped[str] = mapped_column(String(40), default="unknown", index=True)
+    outcome_reason: Mapped[str] = mapped_column(Text, default="")
+    evaluation_window_hours: Mapped[int] = mapped_column(default=24)
+    evidence_count: Mapped[int] = mapped_column(default=0)
+    monitoring_profile_count: Mapped[int] = mapped_column(default=0)
+    stewardship_cycle_count: Mapped[int] = mapped_column(default=0)
+    maintenance_run_count: Mapped[int] = mapped_column(default=0)
+    inquiry_question_count: Mapped[int] = mapped_column(default=0)
+    execution_count: Mapped[int] = mapped_column(default=0)
+    retry_count: Mapped[int] = mapped_column(default=0)
+    blocked_auto_execution_count: Mapped[int] = mapped_column(default=0)
+    allowed_auto_execution_count: Mapped[int] = mapped_column(default=0)
+    potential_violation_count: Mapped[int] = mapped_column(default=0)
+    governance_conflict_count: Mapped[int] = mapped_column(default=0)
+    effectiveness_score: Mapped[float] = mapped_column(default=0.0)
+    stability_score: Mapped[float] = mapped_column(default=0.0)
+    retry_pressure_score: Mapped[float] = mapped_column(default=0.0)
+    learning_confidence: Mapped[float] = mapped_column(default=0.0)
+    learning_signals_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    pattern_summary_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    recommended_actions_json: Mapped[list[dict]] = mapped_column(JSON, default=list)
+    reasoning_json: Mapped[dict] = mapped_column(JSON, default=dict)
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
@@ -1139,11 +1914,17 @@ class WorkspaceAutonomyBoundaryProfile(Base, TimestampMixin):
     scope: Mapped[str] = mapped_column(String(120), default="global", index=True)
     source: Mapped[str] = mapped_column(String(80), default="objective58", index=True)
     actor: Mapped[str] = mapped_column(String(120), default="workspace")
-    profile_status: Mapped[str] = mapped_column(String(40), default="evaluated", index=True)
-    current_level: Mapped[str] = mapped_column(String(40), default="operator_required", index=True)
+    profile_status: Mapped[str] = mapped_column(
+        String(40), default="evaluated", index=True
+    )
+    current_level: Mapped[str] = mapped_column(
+        String(40), default="operator_required", index=True
+    )
     confidence: Mapped[float] = mapped_column(default=0.0)
     evidence_inputs_json: Mapped[dict] = mapped_column(JSON, default=dict)
-    last_adjusted: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_adjusted: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     adjustment_reason: Mapped[str] = mapped_column(Text, default="")
     lookback_hours: Mapped[int] = mapped_column(default=24)
     sample_count: Mapped[int] = mapped_column(default=0)
@@ -1160,6 +1941,56 @@ class WorkspaceAutonomyBoundaryProfile(Base, TimestampMixin):
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
+class WorkspaceExecutionTruthGovernanceProfile(Base, TimestampMixin):
+    __tablename__ = "workspace_execution_truth_governance_profiles"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    source: Mapped[str] = mapped_column(String(80), default="objective81", index=True)
+    actor: Mapped[str] = mapped_column(String(120), default="workspace")
+    managed_scope: Mapped[str] = mapped_column(
+        String(120), default="global", index=True
+    )
+    status: Mapped[str] = mapped_column(String(40), default="active", index=True)
+    lookback_hours: Mapped[int] = mapped_column(default=24)
+    execution_count: Mapped[int] = mapped_column(default=0)
+    signal_count: Mapped[int] = mapped_column(default=0)
+    confidence: Mapped[float] = mapped_column(default=0.0)
+    governance_state: Mapped[str] = mapped_column(
+        String(40), default="stable", index=True
+    )
+    governance_decision: Mapped[str] = mapped_column(
+        String(60), default="monitor_only", index=True
+    )
+    governance_reason: Mapped[str] = mapped_column(Text, default="")
+    trigger_counts_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    trigger_evidence_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    downstream_actions_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    reasoning_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    execution_truth_summary_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class WorkspaceDesiredEnvironmentState(Base, TimestampMixin):
+    __tablename__ = "workspace_desired_environment_states"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    source: Mapped[str] = mapped_column(String(80), default="objective60", index=True)
+    actor: Mapped[str] = mapped_column(String(120), default="workspace")
+    status: Mapped[str] = mapped_column(String(40), default="active", index=True)
+    scope_type: Mapped[str] = mapped_column(String(40), default="workspace", index=True)
+    scope_ref: Mapped[str] = mapped_column(String(120), default="global", index=True)
+    target_conditions_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    priority_score: Mapped[float] = mapped_column(default=0.5)
+    origin_strategy_goal_id: Mapped[int | None] = mapped_column(
+        ForeignKey("workspace_strategy_goals.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    strategy_link_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_from: Mapped[str] = mapped_column(String(120), default="stewardship_cycle")
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
 class WorkspaceStewardshipState(Base, TimestampMixin):
     __tablename__ = "workspace_stewardship_states"
 
@@ -1167,17 +1998,36 @@ class WorkspaceStewardshipState(Base, TimestampMixin):
     source: Mapped[str] = mapped_column(String(80), default="objective60", index=True)
     actor: Mapped[str] = mapped_column(String(120), default="workspace")
     status: Mapped[str] = mapped_column(String(40), default="active", index=True)
+    linked_desired_state_id: Mapped[int | None] = mapped_column(
+        ForeignKey("workspace_desired_environment_states.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     target_environment_state_json: Mapped[dict] = mapped_column(JSON, default=dict)
-    managed_scope: Mapped[str] = mapped_column(String(120), default="global", index=True)
-    maintenance_priority: Mapped[str] = mapped_column(String(40), default="normal", index=True)
+    managed_scope: Mapped[str] = mapped_column(
+        String(120), default="global", index=True
+    )
+    maintenance_priority: Mapped[str] = mapped_column(
+        String(40), default="normal", index=True
+    )
     current_health: Mapped[float] = mapped_column(default=0.0)
-    last_cycle_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    next_cycle_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    last_cycle_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    next_cycle_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
     cycle_count: Mapped[int] = mapped_column(default=0)
     linked_strategy_goal_ids_json: Mapped[list[int]] = mapped_column(JSON, default=list)
-    linked_maintenance_run_ids_json: Mapped[list[int]] = mapped_column(JSON, default=list)
+    linked_maintenance_run_ids_json: Mapped[list[int]] = mapped_column(
+        JSON, default=list
+    )
     linked_strategy_types_json: Mapped[list[str]] = mapped_column(JSON, default=list)
-    linked_autonomy_boundary_id: Mapped[int | None] = mapped_column(ForeignKey("workspace_autonomy_boundary_profiles.id", ondelete="SET NULL"), nullable=True, index=True)
+    linked_autonomy_boundary_id: Mapped[int | None] = mapped_column(
+        ForeignKey("workspace_autonomy_boundary_profiles.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     last_decision_summary: Mapped[str] = mapped_column(Text, default="")
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
 
@@ -1186,7 +2036,9 @@ class WorkspaceStewardshipCycle(Base, TimestampMixin):
     __tablename__ = "workspace_stewardship_cycles"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    stewardship_id: Mapped[int] = mapped_column(ForeignKey("workspace_stewardship_states.id", ondelete="CASCADE"), index=True)
+    stewardship_id: Mapped[int] = mapped_column(
+        ForeignKey("workspace_stewardship_states.id", ondelete="CASCADE"), index=True
+    )
     source: Mapped[str] = mapped_column(String(80), default="objective60", index=True)
     actor: Mapped[str] = mapped_column(String(120), default="workspace")
     pre_health: Mapped[float] = mapped_column(default=0.0)
@@ -1196,7 +2048,11 @@ class WorkspaceStewardshipCycle(Base, TimestampMixin):
     selected_actions_json: Mapped[list[dict]] = mapped_column(JSON, default=list)
     decision_json: Mapped[dict] = mapped_column(JSON, default=dict)
     integration_evidence_json: Mapped[dict] = mapped_column(JSON, default=dict)
-    maintenance_run_id: Mapped[int | None] = mapped_column(ForeignKey("workspace_maintenance_runs.id", ondelete="SET NULL"), nullable=True, index=True)
+    maintenance_run_id: Mapped[int | None] = mapped_column(
+        ForeignKey("workspace_maintenance_runs.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     improved: Mapped[bool] = mapped_column(default=False)
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
 
@@ -1210,18 +2066,29 @@ class WorkspaceInterfaceSession(Base, TimestampMixin):
     session_key: Mapped[str] = mapped_column(String(180), unique=True, index=True)
     channel: Mapped[str] = mapped_column(String(40), default="text", index=True)
     status: Mapped[str] = mapped_column(String(40), default="active", index=True)
-    last_input_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    last_output_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_input_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_output_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     context_json: Mapped[dict] = mapped_column(JSON, default=dict)
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), index=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        index=True,
+    )
 
 
 class WorkspaceInterfaceMessage(Base, TimestampMixin):
     __tablename__ = "workspace_interface_messages"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    session_id: Mapped[int] = mapped_column(ForeignKey("workspace_interface_sessions.id", ondelete="CASCADE"), index=True)
+    session_id: Mapped[int] = mapped_column(
+        ForeignKey("workspace_interface_sessions.id", ondelete="CASCADE"), index=True
+    )
     source: Mapped[str] = mapped_column(String(80), default="objective74", index=True)
     actor: Mapped[str] = mapped_column(String(120), default="workspace")
     direction: Mapped[str] = mapped_column(String(20), default="inbound", index=True)
@@ -1230,7 +2097,9 @@ class WorkspaceInterfaceMessage(Base, TimestampMixin):
     parsed_intent: Mapped[str] = mapped_column(String(120), default="")
     confidence: Mapped[float] = mapped_column(default=0.0)
     requires_approval: Mapped[bool] = mapped_column(default=False)
-    delivery_status: Mapped[str] = mapped_column(String(40), default="accepted", index=True)
+    delivery_status: Mapped[str] = mapped_column(
+        String(40), default="accepted", index=True
+    )
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
@@ -1238,10 +2107,167 @@ class WorkspaceInterfaceApproval(Base, TimestampMixin):
     __tablename__ = "workspace_interface_approvals"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    session_id: Mapped[int] = mapped_column(ForeignKey("workspace_interface_sessions.id", ondelete="CASCADE"), index=True)
-    message_id: Mapped[int | None] = mapped_column(ForeignKey("workspace_interface_messages.id", ondelete="SET NULL"), nullable=True, index=True)
+    session_id: Mapped[int] = mapped_column(
+        ForeignKey("workspace_interface_sessions.id", ondelete="CASCADE"), index=True
+    )
+    message_id: Mapped[int | None] = mapped_column(
+        ForeignKey("workspace_interface_messages.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     source: Mapped[str] = mapped_column(String(80), default="objective74", index=True)
     actor: Mapped[str] = mapped_column(String(120), default="operator")
     decision: Mapped[str] = mapped_column(String(40), default="approved", index=True)
     reason: Mapped[str] = mapped_column(Text, default="")
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class AutomationWebSession(Base, TimestampMixin):
+    __tablename__ = "automation_web_sessions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    session_key: Mapped[str] = mapped_column(String(160), unique=True, index=True)
+    carrier_id: Mapped[str] = mapped_column(String(120), default="", index=True)
+    status: Mapped[str] = mapped_column(String(40), default="active", index=True)
+    simulation_mode: Mapped[bool] = mapped_column(default=True, index=True)
+    current_url: Mapped[str] = mapped_column(Text, default="")
+    last_page_title: Mapped[str] = mapped_column(String(300), default="")
+    storage_state_path: Mapped[str] = mapped_column(Text, default="")
+    last_state_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        index=True,
+    )
+
+
+class AutomationAuthChallenge(Base, TimestampMixin):
+    __tablename__ = "automation_auth_challenges"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    challenge_key: Mapped[str] = mapped_column(String(160), unique=True, index=True)
+    session_id: Mapped[int | None] = mapped_column(
+        ForeignKey("automation_web_sessions.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    carrier_id: Mapped[str] = mapped_column(String(120), default="", index=True)
+    status: Mapped[str] = mapped_column(String(40), default="open", index=True)
+    challenge_type: Mapped[str] = mapped_column(String(80), default="mfa")
+    channel: Mapped[str] = mapped_column(String(80), default="email")
+    prompt: Mapped[str] = mapped_column(Text, default="")
+    resolved_code: Mapped[str] = mapped_column(String(40), default="")
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    resolved_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
+class AutomationPlaybook(Base, TimestampMixin):
+    __tablename__ = "automation_playbooks"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    carrier_id: Mapped[str] = mapped_column(String(120), unique=True, index=True)
+    enabled: Mapped[bool] = mapped_column(default=True, index=True)
+    version: Mapped[int] = mapped_column(default=1)
+    login_method: Mapped[str] = mapped_column(String(120), default="username_password")
+    navigation_steps_json: Mapped[list[dict]] = mapped_column(JSON, default=list)
+    report_location_logic: Mapped[dict] = mapped_column(JSON, default=dict)
+    parsing_rules_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    recovery_rules_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        index=True,
+    )
+
+
+class AutomationExecutionRun(Base, TimestampMixin):
+    __tablename__ = "automation_execution_runs"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    run_key: Mapped[str] = mapped_column(String(160), unique=True, index=True)
+    status: Mapped[str] = mapped_column(String(40), default="pending", index=True)
+    triggered_by: Mapped[str] = mapped_column(String(120), default="operator")
+    summary_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        index=True,
+    )
+
+
+class AutomationCarrierRunStatus(Base, TimestampMixin):
+    __tablename__ = "automation_carrier_run_statuses"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    run_id: Mapped[int] = mapped_column(
+        ForeignKey("automation_execution_runs.id", ondelete="CASCADE"), index=True
+    )
+    carrier_id: Mapped[str] = mapped_column(String(120), index=True)
+    status: Mapped[str] = mapped_column(String(40), default="pending", index=True)
+    retries: Mapped[int] = mapped_column(default=0)
+    requires_human_action: Mapped[bool] = mapped_column(default=False)
+    last_error: Mapped[str] = mapped_column(Text, default="")
+    last_step_index: Mapped[int] = mapped_column(default=-1)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        index=True,
+    )
+
+
+class AutomationFileArtifact(Base, TimestampMixin):
+    __tablename__ = "automation_file_artifacts"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    run_id: Mapped[int | None] = mapped_column(
+        ForeignKey("automation_execution_runs.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    session_id: Mapped[int | None] = mapped_column(
+        ForeignKey("automation_web_sessions.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    carrier_id: Mapped[str] = mapped_column(String(120), default="", index=True)
+    status: Mapped[str] = mapped_column(String(40), default="detected", index=True)
+    file_name: Mapped[str] = mapped_column(String(260), default="")
+    file_path: Mapped[str] = mapped_column(Text, default="")
+    mime_type: Mapped[str] = mapped_column(String(120), default="")
+    source_url: Mapped[str] = mapped_column(Text, default="")
+    size_bytes: Mapped[int] = mapped_column(default=0)
+    file_sha256: Mapped[str] = mapped_column(String(80), default="")
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class AutomationEmailMessage(Base, TimestampMixin):
+    __tablename__ = "automation_email_messages"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    message_key: Mapped[str] = mapped_column(String(180), unique=True, index=True)
+    source: Mapped[str] = mapped_column(String(40), default="imap", index=True)
+    sender: Mapped[str] = mapped_column(String(320), default="")
+    recipient: Mapped[str] = mapped_column(String(320), default="")
+    subject: Mapped[str] = mapped_column(Text, default="")
+    body_text: Mapped[str] = mapped_column(Text, default="")
+    received_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    extracted_codes_json: Mapped[list[str]] = mapped_column(JSON, default=list)
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)

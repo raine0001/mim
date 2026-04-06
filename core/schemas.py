@@ -546,7 +546,7 @@ class LiveMicAdapterRequest(BaseModel):
     source_type: str = "microphone"
     session_id: str = ""
     is_remote: bool = False
-    transcript: str = Field(min_length=1)
+    transcript: str = ""
     confidence: float = Field(default=0.7, ge=0.0, le=1.0)
     timestamp: datetime | None = None
     min_interval_seconds: int = Field(default=1, ge=0, le=30)
@@ -640,10 +640,42 @@ class CapabilityExecutionOut(BaseModel):
     safety_mode: str
     requested_executor: str
     dispatch_decision: str
+    trace_id: str = ""
+    managed_scope: str = "global"
     status: str
     reason: str
     feedback_json: dict
+    execution_truth: dict = Field(default_factory=dict)
     created_at: datetime
+
+
+class ExecutionTruthV1(BaseModel):
+    execution_id: int | None = Field(default=None, ge=1)
+    capability_name: str = ""
+    expected_duration_ms: int | None = Field(default=None, ge=0)
+    actual_duration_ms: int | None = Field(default=None, ge=0)
+    duration_delta_ratio: float | None = None
+    retry_count: int = Field(default=0, ge=0)
+    fallback_used: bool = False
+    runtime_outcome: str = ""
+    environment_shift_detected: bool = False
+    simulation_match_status: Literal[
+        "matched", "partial_match", "mismatch", "unknown"
+    ] = "unknown"
+    truth_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    published_at: datetime
+
+    @field_validator("capability_name", "runtime_outcome")
+    @classmethod
+    def strip_string_fields(cls, value: str) -> str:
+        return value.strip()
+
+    @field_validator("duration_delta_ratio")
+    @classmethod
+    def validate_duration_delta_ratio(cls, value: float | None) -> float | None:
+        if value is None:
+            return None
+        return float(value)
 
 
 class ExecutionFeedbackUpdateRequest(BaseModel):
@@ -651,6 +683,7 @@ class ExecutionFeedbackUpdateRequest(BaseModel):
     reason: str = ""
     runtime_outcome: str = ""
     recovery_state: str = ""
+    execution_truth: ExecutionTruthV1 | None = None
     correlation_json: dict = Field(default_factory=dict)
     feedback_json: dict = Field(default_factory=dict)
     actor: str = "executor"
@@ -661,6 +694,7 @@ class ExecutionFeedbackOut(BaseModel):
     status: str
     reason: str
     feedback_json: dict
+    execution_truth: dict = Field(default_factory=dict)
 
 
 class CapabilityExecutionHandoffOut(BaseModel):
@@ -680,6 +714,400 @@ class OperatorExecutionActionRequest(BaseModel):
     actor: str = "operator"
     reason: str = ""
     metadata_json: dict = Field(default_factory=dict)
+
+
+class ExecutionOverrideRequest(BaseModel):
+    actor: str = "operator"
+    managed_scope: str = "global"
+    override_type: Literal["hard_stop", "pause", "redirect"]
+    reason: str = ""
+    execution_id: int | None = Field(default=None, ge=1)
+    trace_id: str = ""
+    priority: str = "operator"
+    metadata_json: dict = Field(default_factory=dict)
+
+    @field_validator("managed_scope", "override_type", "priority")
+    @classmethod
+    def strip_override_fields(cls, value: str) -> str:
+        return value.strip()
+
+
+class ExecutionStabilityEvaluateRequest(BaseModel):
+    actor: str = "system"
+    source: str = "execution_control"
+    managed_scope: str = Field(default="global", min_length=1, max_length=120)
+    trace_id: str = ""
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class ExecutionRecoveryEvaluateRequest(BaseModel):
+    actor: str = "system"
+    source: str = "execution_control"
+    trace_id: str = ""
+    execution_id: int | None = Field(default=None, ge=1)
+    managed_scope: str = ""
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class ExecutionRecoveryAttemptRequest(BaseModel):
+    actor: str = "system"
+    source: str = "execution_control"
+    trace_id: str = ""
+    execution_id: int | None = Field(default=None, ge=1)
+    managed_scope: str = ""
+    requested_decision: str = ""
+    reason: str = ""
+    operator_ack: bool = False
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class ExecutionRecoveryOutcomeEvaluateRequest(BaseModel):
+    actor: str = "system"
+    source: str = "execution_control"
+    trace_id: str = ""
+    execution_id: int | None = Field(default=None, ge=1)
+    managed_scope: str = ""
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class ExecutionRecoveryLearningResetRequest(BaseModel):
+    actor: str = "operator"
+    managed_scope: str = Field(default="global", min_length=1, max_length=120)
+    reason: str = ""
+    capability_family: str = ""
+    recovery_decision: str = ""
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class ExecutionRecoveryLearningOut(BaseModel):
+    recovery_learning_profile_id: int
+    managed_scope: str
+    capability_family: str
+    capability_name: str
+    recovery_decision: str
+    learning_state: str
+    escalation_decision: str
+    rationale: str
+    why_recovery_escalated_before_retry: str
+    confidence: float
+    sample_count: int
+    recovered_count: int
+    failed_again_count: int
+    operator_required_count: int
+    success_rate: float
+    evidence_json: dict
+    policy_effects_json: dict
+    metadata_json: dict
+    created_at: datetime
+
+
+class ExecutionRecoveryDecisionOut(BaseModel):
+    trace_id: str
+    execution_id: int | None
+    managed_scope: str
+    execution_status: str
+    dispatch_decision: str
+    recovery_decision: str
+    recommended_attempt_decision: str
+    recovery_reason: str
+    operator_action_required: bool
+    recovery_allowed: bool
+    resume_step_key: str
+    attempt_number: int
+    retry_pressure: int
+    mitigation_state: str
+    active_override_types: list[str]
+    latest_attempt: dict = Field(default_factory=dict)
+    latest_outcome: dict = Field(default_factory=dict)
+    recovery_learning: dict = Field(default_factory=dict)
+    why_recovery_escalated_before_retry: str = ""
+    conflict_resolution: dict = Field(default_factory=dict)
+    checkpoint_json: dict = Field(default_factory=dict)
+
+
+class ExecutionTraceEventOut(BaseModel):
+    trace_event_id: int
+    trace_id: str
+    execution_id: int | None
+    intent_id: int | None
+    event_type: str
+    event_stage: str
+    causality_role: str
+    summary: str
+    payload_json: dict
+    created_at: datetime
+
+
+class ExecutionIntentOut(BaseModel):
+    intent_id: int
+    trace_id: str
+    managed_scope: str
+    intent_key: str
+    lifecycle_status: str
+    intent_type: str
+    requested_goal: str
+    capability_name: str
+    arguments_json: dict
+    context_json: dict
+    last_execution_id: int | None
+    resumption_count: int
+    archived_at: datetime | None
+    created_at: datetime
+
+
+class ExecutionTaskOrchestrationOut(BaseModel):
+    orchestration_id: int
+    trace_id: str
+    intent_id: int | None
+    execution_id: int | None
+    managed_scope: str
+    orchestration_status: str
+    current_step_key: str
+    step_state_json: list[dict]
+    checkpoint_json: dict
+    retry_count: int
+    rollback_state_json: dict
+    metadata_json: dict
+    created_at: datetime
+
+
+class ExecutionOverrideOut(BaseModel):
+    override_id: int
+    trace_id: str
+    execution_id: int | None
+    managed_scope: str
+    override_type: str
+    reason: str
+    status: str
+    priority: str
+    scope_json: dict
+    metadata_json: dict
+    created_at: datetime
+
+
+class ExecutionStabilityOut(BaseModel):
+    stability_id: int
+    trace_id: str
+    managed_scope: str
+    status: str
+    mitigation_state: str
+    drift_score: float
+    oscillation_score: float
+    degradation_score: float
+    metrics_json: dict
+    triggers_json: list[dict]
+    metadata_json: dict
+    created_at: datetime
+
+
+class ExecutionRecoveryAttemptOut(BaseModel):
+    recovery_attempt_id: int
+    trace_id: str
+    execution_id: int | None
+    managed_scope: str
+    recovery_decision: str
+    recovery_reason: str
+    attempt_number: int
+    resume_step_key: str
+    source: str
+    actor: str
+    status: str
+    result_json: dict
+    metadata_json: dict
+    created_at: datetime
+
+
+class ExecutionRecoveryOutcomeOut(BaseModel):
+    recovery_outcome_id: int
+    attempt_id: int | None
+    trace_id: str
+    execution_id: int | None
+    managed_scope: str
+    outcome_status: str
+    outcome_reason: str
+    learning_bias_json: dict
+    outcome_score: float
+    result_json: dict
+    metadata_json: dict
+    created_at: datetime
+
+
+class ExecutionTraceOut(BaseModel):
+    trace_id: str
+    managed_scope: str
+    capability_name: str
+    lifecycle_status: str
+    current_stage: str
+    root_execution_id: int | None
+    root_intent_id: int | None
+    causality_graph_json: dict
+    metadata_json: dict
+    created_at: datetime
+    events: list[ExecutionTraceEventOut] = Field(default_factory=list)
+    intent: ExecutionIntentOut | None = None
+    orchestration: ExecutionTaskOrchestrationOut | None = None
+    stability: ExecutionStabilityOut | None = None
+
+
+class OperatorResolutionCommitmentCreateRequest(BaseModel):
+    actor: str = "operator"
+    managed_scope: str = Field(min_length=1, max_length=120)
+    decision_type: str = Field(min_length=1, max_length=80)
+    reason: str = ""
+    recommendation_snapshot_json: dict = Field(default_factory=dict)
+    commitment_family: str = ""
+    authority_level: str = "governance_override"
+    confidence: float = Field(default=0.8, ge=0.0, le=1.0)
+    expires_at: datetime | None = None
+    duration_seconds: int | None = Field(default=None, ge=1, le=604800)
+    provenance_json: dict = Field(default_factory=dict)
+    downstream_effects_json: dict = Field(default_factory=dict)
+    metadata_json: dict = Field(default_factory=dict)
+
+    @field_validator("managed_scope", "decision_type", "authority_level")
+    @classmethod
+    def require_non_blank_commitment_fields(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("must be non-empty")
+        return cleaned
+
+
+class OperatorResolutionCommitmentOut(BaseModel):
+    commitment_id: int
+    source: str
+    created_by: str
+    managed_scope: str
+    commitment_family: str
+    decision_type: str
+    status: str
+    reason: str
+    recommendation_snapshot_json: dict
+    authority_level: str
+    confidence: float
+    provenance_json: dict
+    expires_at: datetime | None = None
+    superseded_by_commitment_id: int | None = None
+    downstream_effects_json: dict
+    metadata_json: dict
+    created_at: datetime
+    active: bool
+    expired: bool
+
+
+class OperatorResolutionCommitmentMonitoringEvaluateRequest(BaseModel):
+    actor: str = "workspace"
+    source: str = "objective86"
+    lookback_hours: int = Field(default=168, ge=1, le=720)
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class OperatorResolutionCommitmentMonitoringOut(BaseModel):
+    monitoring_id: int
+    source: str
+    actor: str
+    commitment_id: int
+    managed_scope: str
+    status: str
+    commitment_status: str
+    monitoring_window_hours: int
+    evidence_count: int
+    stewardship_cycle_count: int
+    maintenance_run_count: int
+    inquiry_question_count: int
+    blocked_auto_execution_count: int
+    allowed_auto_execution_count: int
+    potential_violation_count: int
+    drift_score: float
+    compliance_score: float
+    health_score: float
+    governance_state: str
+    governance_decision: str
+    governance_reason: str
+    trigger_counts: dict
+    trigger_evidence: dict
+    recommended_actions: list[dict]
+    reasoning: dict
+    metadata_json: dict
+    created_at: datetime
+
+
+class OperatorResolutionCommitmentOutcomeEvaluateRequest(BaseModel):
+    actor: str = "workspace"
+    source: str = "objective87"
+    lookback_hours: int = Field(default=168, ge=1, le=720)
+    target_status: str = ""
+    metadata_json: dict = Field(default_factory=dict)
+
+    @field_validator("target_status")
+    @classmethod
+    def normalize_commitment_outcome_target_status(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        allowed = {
+            "",
+            "satisfied",
+            "abandoned",
+            "ineffective",
+            "harmful",
+            "superseded",
+        }
+        if normalized not in allowed:
+            raise ValueError("unsupported commitment outcome target status")
+        return normalized
+
+
+class OperatorResolutionCommitmentResolveRequest(BaseModel):
+    actor: str = "operator"
+    source: str = "objective87"
+    target_status: str = Field(min_length=1, max_length=40)
+    reason: str = ""
+    lookback_hours: int = Field(default=168, ge=1, le=720)
+    metadata_json: dict = Field(default_factory=dict)
+
+    @field_validator("target_status")
+    @classmethod
+    def require_terminal_commitment_status(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        allowed = {"satisfied", "abandoned", "ineffective", "harmful", "superseded"}
+        if normalized not in allowed:
+            raise ValueError("target_status must be a terminal commitment outcome")
+        return normalized
+
+
+class OperatorResolutionCommitmentOutcomeOut(BaseModel):
+    outcome_id: int
+    source: str
+    actor: str
+    commitment_id: int
+    managed_scope: str
+    commitment_family: str
+    decision_type: str
+    status: str
+    commitment_status: str
+    outcome_status: str
+    outcome_reason: str
+    evaluation_window_hours: int
+    evidence_count: int
+    monitoring_profile_count: int
+    stewardship_cycle_count: int
+    maintenance_run_count: int
+    inquiry_question_count: int
+    execution_count: int
+    retry_count: int
+    blocked_auto_execution_count: int
+    allowed_auto_execution_count: int
+    potential_violation_count: int
+    governance_conflict_count: int
+    effectiveness_score: float
+    stability_score: float
+    retry_pressure_score: float
+    learning_confidence: float
+    learning_signals: dict
+    pattern_summary: dict
+    recommended_actions: list[dict]
+    reasoning: dict
+    metadata_json: dict
+    created_at: datetime
 
 
 class WorkspaceObservationOut(BaseModel):
@@ -720,10 +1148,136 @@ class WorkspaceObjectMemoryListOut(BaseModel):
     objects: list[WorkspaceObjectMemoryOut]
 
 
+class WorkspaceObjectLibrarySummaryOut(BaseModel):
+    total_objects: int
+    promoted_objects: int
+    semantic_objects: int
+    active_objects: int
+    uncertain_objects: int
+    missing_objects: int
+    stale_objects: int
+    execution_backed_objects: int
+
+
+class WorkspaceObjectLibraryEntryOut(WorkspaceObjectMemoryOut):
+    promoted: bool
+    library_score: float
+    semantic_fields: list[str]
+    promotion_reasons: list[str]
+
+
+class WorkspaceObjectLibraryListOut(BaseModel):
+    summary: WorkspaceObjectLibrarySummaryOut
+    objects: list[WorkspaceObjectLibraryEntryOut]
+
+
 class WorkspaceProposalActionRequest(BaseModel):
     actor: str = "operator"
     reason: str = ""
     metadata_json: dict = Field(default_factory=dict)
+
+
+class WorkspaceProposalArbitrationOutcomeRecordRequest(BaseModel):
+    actor: str = "tod"
+    source: str = "objective88_2"
+    proposal_id: int | None = Field(default=None, ge=1)
+    proposal_type: str = ""
+    related_zone: str = ""
+    arbitration_decision: Literal[
+        "won", "lost", "merged", "isolated", "suppressed", "superseded"
+    ] = "won"
+    arbitration_posture: str = "isolate"
+    trust_chain_status: str = "verified"
+    downstream_execution_outcome: str = ""
+    confidence: float = Field(default=0.8, ge=0.0, le=1.0)
+    reason: str = ""
+    conflict_context_json: dict = Field(default_factory=dict)
+    commitment_state_json: dict = Field(default_factory=dict)
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class WorkspaceProposalArbitrationOutcomeOut(BaseModel):
+    outcome_id: int
+    source: str
+    actor: str
+    proposal_id: int | None = None
+    proposal_type: str
+    related_zone: str
+    arbitration_decision: str
+    arbitration_posture: str
+    trust_chain_status: str
+    downstream_execution_outcome: str
+    outcome_score: float
+    confidence: float
+    arbitration_reason: str
+    conflict_context_json: dict
+    commitment_state_json: dict
+    metadata_json: dict
+    created_at: datetime
+
+
+class WorkspaceProposalArbitrationLearningOut(BaseModel):
+    proposal_type: str
+    related_zone: str
+    sample_count: int
+    win_count: int
+    loss_count: int
+    merged_count: int
+    isolated_count: int
+    weighted_success_rate: float
+    confidence: float
+    priority_bias: float
+    suppression_recommended: bool
+    learned_posture: str
+    reasoning: str
+    recent_outcomes: list[dict]
+    applied: bool
+
+
+class WorkspaceProposalPolicyPreferenceOut(BaseModel):
+    profile_id: int | None = None
+    managed_scope: str
+    proposal_family: str
+    proposal_type: str
+    policy_state: str
+    preference_direction: str
+    convergence_confidence: float
+    sample_count: int
+    win_count: int
+    loss_count: int
+    merge_count: int
+    weighted_success_rate: float
+    recent_success_rate: float
+    contradictory_recent_signal: bool = False
+    stale_signal: bool = False
+    suppression_threshold_met: bool = False
+    policy_effects_json: dict
+    evidence_summary_json: dict
+    metadata_json: dict
+    rationale: str
+    applied: bool = False
+    updated_at: datetime | None = None
+
+
+class WorkspacePolicyConflictProfileOut(BaseModel):
+    profile_id: int
+    managed_scope: str
+    decision_family: str
+    proposal_type: str
+    conflict_state: str
+    winning_policy_source: str
+    losing_policy_sources: list[str]
+    precedence_rule: str
+    conflict_confidence: float
+    oscillation_count: int
+    cooldown_until: datetime | None = None
+    cooldown_active: bool = False
+    resolution_reason_json: dict
+    evidence_summary_json: dict
+    candidate_policies_json: list[dict]
+    policy_effects_json: dict
+    metadata_json: dict
+    updated_at: datetime | None = None
 
 
 class UserPreferenceUpsertRequest(BaseModel):
@@ -742,6 +1296,46 @@ class UserPreferenceOut(BaseModel):
     source: str
     last_updated: datetime | None = None
     is_default: bool = False
+
+
+class OperatorLearnedPreferenceConvergeRequest(BaseModel):
+    actor: str = "workspace"
+    source: str = "objective88"
+    managed_scope: str = ""
+    decision_type: str = ""
+    commitment_family: str = ""
+    lookback_hours: int = Field(default=720, ge=1, le=2160)
+    min_evidence: int = Field(default=3, ge=1, le=20)
+
+
+class OperatorLearnedPreferenceOut(BaseModel):
+    preference_key: str
+    managed_scope: str
+    preference_family: str
+    decision_type: str
+    preference_status: str
+    preference_direction: str
+    strength_score: float
+    confidence_score: float
+    evidence_count: int
+    success_count: int
+    failure_count: int
+    override_count: int
+    conflict_state: str
+    winning_rule: str
+    policy_effects_json: dict
+    evidence_summary_json: dict
+    metadata_json: dict
+    source: str
+    last_updated: datetime | None = None
+    age_hours: float = 0.0
+    freshness_score: float = 0.0
+    normalized_strength_score: float = 0.0
+    effective_strength_score: float = 0.0
+    arbitration_scope: str = ""
+    arbitration_state: str = ""
+    precedence_rule: str = ""
+    arbitration_reasoning_json: dict = Field(default_factory=dict)
 
 
 class WorkspaceProposalPriorityPolicyUpdateRequest(BaseModel):
@@ -883,7 +1477,9 @@ class WorkspaceAutonomyOverrideRequest(BaseModel):
     zone_action_limits: dict[str, int] = Field(default_factory=dict)
     restricted_zones: list[str] = Field(default_factory=list)
     auto_safe_confidence_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
-    auto_preferred_confidence_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+    auto_preferred_confidence_threshold: float | None = Field(
+        default=None, ge=0.0, le=1.0
+    )
     low_risk_score_max: float | None = Field(default=None, ge=0.0, le=1.0)
     max_autonomy_retries: int | None = Field(default=None, ge=0, le=5)
     reset_auto_history: bool = False
@@ -1039,7 +1635,9 @@ class EnvironmentStrategyCondition(BaseModel):
 class EnvironmentStrategyGenerateRequest(BaseModel):
     actor: str = "workspace"
     source: str = "objective47"
-    observed_conditions: list[EnvironmentStrategyCondition] = Field(default_factory=list)
+    observed_conditions: list[EnvironmentStrategyCondition] = Field(
+        default_factory=list
+    )
     min_severity: float = Field(default=0.4, ge=0.0, le=1.0)
     max_strategies: int = Field(default=5, ge=1, le=25)
     metadata_json: dict = Field(default_factory=dict)
@@ -1234,7 +1832,9 @@ class CrossDomainTaskOrchestrationBuildRequest(BaseModel):
     min_context_confidence: float = Field(default=0.5, ge=0.0, le=1.0)
     min_domains_required: int = Field(default=2, ge=1, le=10)
     dependency_resolution_policy: Literal["ask", "defer", "replan", "escalate"] = "ask"
-    collaboration_mode_preference: Literal["auto", "autonomous", "assistive", "confirmation-first", "deferential"] = "auto"
+    collaboration_mode_preference: Literal[
+        "auto", "autonomous", "assistive", "confirmation-first", "deferential"
+    ] = "auto"
     task_kind: Literal["mixed", "physical", "informational"] = "mixed"
     action_risk_level: Literal["low", "medium", "high"] = "medium"
     communication_urgency_override: float | None = Field(default=None, ge=0.0, le=1.0)
@@ -1408,7 +2008,9 @@ class CollaborationProfileRecomputeRequest(BaseModel):
 class StateBusEventCreateRequest(BaseModel):
     actor: str = "workspace"
     source: str = "objective71"
-    event_domain: Literal["tod.runtime", "mim.perception", "mim.strategy", "mim.improvement", "mim.assist"] = "mim.strategy"
+    event_domain: Literal[
+        "tod.runtime", "mim.perception", "mim.strategy", "mim.improvement", "mim.assist"
+    ] = "mim.strategy"
     event_type: str = "state.updated"
     stream_key: str = "global"
     occurred_at: str = ""
@@ -1458,7 +2060,15 @@ class StateBusConsumerRegisterRequest(BaseModel):
     actor: str = "workspace"
     source: str = "objective72"
     status: Literal["active", "paused", "disabled"] = "active"
-    subscription_domains: list[Literal["tod.runtime", "mim.perception", "mim.strategy", "mim.improvement", "mim.assist"]] = Field(default_factory=list)
+    subscription_domains: list[
+        Literal[
+            "tod.runtime",
+            "mim.perception",
+            "mim.strategy",
+            "mim.improvement",
+            "mim.assist",
+        ]
+    ] = Field(default_factory=list)
     subscription_event_types: list[str] = Field(default_factory=list)
     subscription_sources: list[str] = Field(default_factory=list)
     subscription_stream_keys: list[str] = Field(default_factory=list)
@@ -1660,6 +2270,36 @@ class AdaptiveAutonomyBoundaryProfileOut(BaseModel):
     created_at: datetime
 
 
+class ExecutionTruthGovernanceEvaluateRequest(BaseModel):
+    actor: str = "workspace"
+    source: str = "objective81"
+    managed_scope: str = "global"
+    lookback_hours: int = Field(default=24, ge=1, le=720)
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class ExecutionTruthGovernanceOut(BaseModel):
+    governance_id: int
+    source: str
+    actor: str
+    managed_scope: str
+    status: str
+    lookback_hours: int
+    execution_count: int
+    signal_count: int
+    confidence: float
+    governance_state: str
+    governance_decision: str
+    governance_reason: str
+    trigger_counts: dict
+    trigger_evidence: dict
+    downstream_actions: dict
+    reasoning: dict
+    execution_truth_summary: dict
+    metadata_json: dict
+    created_at: datetime
+
+
 class ImprovementRecommendationOut(BaseModel):
     recommendation_id: int
     source: str
@@ -1731,7 +2371,18 @@ class StewardshipCycleRequest(BaseModel):
     max_actions: int = Field(default=5, ge=1, le=50)
     auto_execute: bool = True
     force_degraded: bool = False
+    target_environment_state: dict = Field(default_factory=dict)
     metadata_json: dict = Field(default_factory=dict)
+
+
+class DesiredEnvironmentStateOut(BaseModel):
+    desired_state_id: int | None = None
+    scope: str = "workspace"
+    scope_ref: str = "global"
+    target_conditions: dict = Field(default_factory=dict)
+    priority: float = 0.0
+    strategy_link: dict = Field(default_factory=dict)
+    created_from: str = ""
 
 
 class StewardshipOut(BaseModel):
@@ -1739,6 +2390,8 @@ class StewardshipOut(BaseModel):
     source: str
     actor: str
     status: str
+    linked_desired_state_id: int | None
+    desired_state: DesiredEnvironmentStateOut
     target_environment_state: dict
     managed_scope: str
     maintenance_priority: str
@@ -1751,6 +2404,7 @@ class StewardshipOut(BaseModel):
     linked_strategy_types: list[str]
     linked_autonomy_boundary_id: int | None
     last_decision_summary: str
+    current_metrics: dict
     metadata_json: dict
     created_at: datetime
 
@@ -1767,6 +2421,8 @@ class StewardshipCycleOut(BaseModel):
     selected_actions: list[dict]
     decision: dict
     integration_evidence: dict
+    assessment: dict
+    verification: dict
     maintenance_run_id: int | None
     improved: bool
     metadata_json: dict
@@ -1813,6 +2469,14 @@ class InquiryQuestionOut(BaseModel):
     answered_by: str
     answered_at: datetime | None
     metadata_json: dict
+    decision_state: str = ""
+    decision_reason: str = ""
+    policy_evidence_score: float = 0.0
+    cooldown_active: bool = False
+    cooldown_remaining_seconds: int = 0
+    duplicate_suppressed: bool = False
+    recent_answer_reused: bool = False
+    allowed_answer_effects: list[str] = Field(default_factory=list)
     created_at: datetime
 
 
@@ -1913,4 +2577,186 @@ class WorkspaceActionPlanReplanRequest(BaseModel):
     signal_id: int | None = Field(default=None, ge=1)
     force: bool = False
     motion_plan_overrides: dict = Field(default_factory=dict)
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class AutomationWebSessionCreateRequest(BaseModel):
+    carrier_id: str = ""
+    session_key: str = ""
+    start_url: str = ""
+    simulation_mode: bool | None = None
+    headless: bool | None = None
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class AutomationWebNavigateRequest(BaseModel):
+    url: str = Field(min_length=1)
+    wait_for: str = "domcontentloaded"
+    timeout_seconds: int = Field(default=20, ge=1, le=180)
+
+
+class AutomationWebActionRequest(BaseModel):
+    action: Literal["click", "type", "wait_for", "press", "select", "detect"]
+    selector: str = ""
+    text: str = ""
+    key: str = ""
+    value: str = ""
+    timeout_seconds: int = Field(default=20, ge=1, le=180)
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class AutomationAuthResolveRequest(BaseModel):
+    session_id: int | None = None
+    carrier_id: str = ""
+    username: str = ""
+    password: str = ""
+    mfa_code: str = ""
+    pause_if_mfa_detected: bool = True
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class AutomationAuthChallengeActionRequest(BaseModel):
+    actor: str = "operator"
+    mfa_code: str = ""
+    reason: str = ""
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class AutomationNavigationExecuteRequest(BaseModel):
+    session_id: int
+    carrier_id: str = ""
+    steps: list[dict] = Field(default_factory=list)
+    stop_on_failure: bool = True
+    start_step_index: int = Field(default=0, ge=0)
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class AutomationFileDetectRequest(BaseModel):
+    session_id: int | None = None
+    run_id: int | None = None
+    carrier_id: str = ""
+    selector: str = ""
+    expected_name_pattern: str = ""
+    source_url: str = ""
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class AutomationFileDownloadRequest(BaseModel):
+    session_id: int | None = None
+    run_id: int | None = None
+    artifact_id: int | None = None
+    carrier_id: str = ""
+    url: str = ""
+    file_name: str = ""
+    content_base64: str = ""
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class AutomationPlaybookUpsertRequest(BaseModel):
+    carrier_id: str = Field(min_length=1)
+    enabled: bool = True
+    login_method: str = "username_password"
+    navigation_steps: list[dict] = Field(default_factory=list)
+    report_location_logic: dict = Field(default_factory=dict)
+    parsing_rules: dict = Field(default_factory=dict)
+    recovery_rules: dict = Field(default_factory=dict)
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class AutomationPlaybookRefineRequest(BaseModel):
+    actor: str = "operator"
+    patch: dict = Field(default_factory=dict)
+    reason: str = ""
+
+
+class AutomationRecoveryEvaluateRequest(BaseModel):
+    carrier_id: str = ""
+    run_id: int | None = None
+    failure_type: str = ""
+    detail: str = ""
+    retries_attempted: int = Field(default=0, ge=0, le=20)
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class AutomationRecoveryRetryRequest(BaseModel):
+    run_id: int | None = None
+    carrier_id: str = ""
+    strategy: str = "auto"
+    reason: str = ""
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class AutomationEmailPollRequest(BaseModel):
+    source: Literal["imap", "simulation"] = "imap"
+    mailbox: str = "INBOX"
+    limit: int = Field(default=20, ge=1, le=200)
+    subject_contains: str = ""
+    sender_contains: str = ""
+    simulation_messages: list[dict] = Field(default_factory=list)
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class AutomationEmailExtractMfaRequest(BaseModel):
+    carrier_id: str = ""
+    challenge_key: str = ""
+    lookback_minutes: int = Field(default=15, ge=1, le=1440)
+    sender_contains: str = ""
+    subject_contains: str = ""
+
+
+class AutomationCalendarGoogleAuthUrlRequest(BaseModel):
+    state: str = ""
+    scopes: list[str] = Field(
+        default_factory=lambda: ["https://www.googleapis.com/auth/calendar.events"]
+    )
+    prompt: str = "consent"
+    access_type: Literal["online", "offline"] = "offline"
+    include_granted_scopes: bool = True
+
+
+class AutomationCalendarGoogleExchangeCodeRequest(BaseModel):
+    code: str = Field(min_length=1)
+    redirect_uri: str = ""
+    code_verifier: str = ""
+
+
+class AutomationCalendarReminderCreateRequest(BaseModel):
+    source: Literal["google", "simulation"] = "simulation"
+    title: str = Field(min_length=1, max_length=200)
+    description: str = ""
+    start_at: datetime
+    end_at: datetime | None = None
+    timezone: str = ""
+    calendar_id: str = "primary"
+    reminder_minutes: list[int] = Field(default_factory=lambda: [30])
+    attendees: list[str] = Field(default_factory=list)
+    access_token: str = ""
+    refresh_token: str = ""
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class AutomationRunCreateRequest(BaseModel):
+    run_key: str = ""
+    triggered_by: str = "operator"
+    carriers: list[str] = Field(default_factory=list)
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class AutomationRunCarrierStatusUpdateRequest(BaseModel):
+    carrier_id: str = Field(min_length=1)
+    status: str = Field(min_length=1)
+    retries: int = Field(default=0, ge=0, le=50)
+    requires_human_action: bool = False
+    last_error: str = ""
+    last_step_index: int = -1
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class AutomationReconciliationEvaluateRequest(BaseModel):
+    carrier_id: str = ""
+    current_totals: dict = Field(default_factory=dict)
+    previous_totals: dict = Field(default_factory=dict)
+    expected_carriers: list[str] = Field(default_factory=list)
+    present_carriers: list[str] = Field(default_factory=list)
+    anomaly_threshold_pct: float = Field(default=25.0, ge=0.0, le=500.0)
     metadata_json: dict = Field(default_factory=dict)

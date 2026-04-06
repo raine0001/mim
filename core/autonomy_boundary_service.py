@@ -6,9 +6,18 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from core.execution_truth_governance_service import latest_execution_truth_governance_snapshot
 from core.execution_truth_service import summarize_execution_truth
-from core.models import ConstraintEvaluation, ExecutionJournal, WorkspaceAutonomyBoundaryProfile, WorkspaceDevelopmentPattern, WorkspaceInterruptionEvent, WorkspaceMonitoringState, WorkspacePolicyExperiment, WorkspaceProposal, WorkspaceReplanSignal
+from core.operator_commitment_outcome_service import latest_scope_commitment_outcome_profile
+from core.operator_preference_convergence_service import (
+    learned_preference_autonomy_influence,
+    latest_scope_learned_preference,
+)
+from core.models import ConstraintEvaluation, ExecutionJournal, WorkspaceAutonomyBoundaryProfile, WorkspaceDevelopmentPattern, WorkspaceInterruptionEvent, WorkspaceMonitoringState, WorkspaceOperatorResolutionCommitment, WorkspacePolicyExperiment, WorkspaceProposal, WorkspaceReplanSignal
 from core.models import CapabilityExecution
+from core.policy_conflict_resolution_service import resolve_autonomy_boundary_policy_conflict
+from core.proposal_arbitration_learning_service import workspace_proposal_arbitration_family_influence
+from core.operator_resolution_service import commitment_downstream_effects, commitment_requested_autonomy_level, commitment_snapshot, latest_active_operator_resolution_commitment
 
 
 PROFILE_STATUSES = {
@@ -230,6 +239,300 @@ def _recommended_boundaries(
     return recommended, target_level, summary, confidence, reasoning
 
 
+def _apply_execution_truth_governance_to_boundaries(
+    *,
+    recommended: dict,
+    target_level: str,
+    confidence: float,
+    summary: str,
+    reasoning: dict,
+    governance: dict,
+) -> tuple[dict, str, str, float, dict]:
+    decision = str(governance.get("governance_decision", "monitor_only") or "monitor_only").strip()
+    if decision == "monitor_only":
+        return recommended, target_level, summary, confidence, reasoning
+
+    downstream_actions = (
+        governance.get("downstream_actions", {})
+        if isinstance(governance.get("downstream_actions", {}), dict)
+        else {}
+    )
+    updated_reasoning = {
+        **reasoning,
+        "execution_truth_governance": governance,
+    }
+    if str(reasoning.get("decision", "")).strip() == "hard_ceiling_enforced":
+        updated_reasoning["execution_truth_governance_applied"] = False
+        return recommended, target_level, summary, confidence, updated_reasoning
+
+    capped_level = str(downstream_actions.get("autonomy_level_cap", "") or "").strip()
+    updated_level = target_level
+    if decision in {"lower_autonomy_boundary", "require_sandbox_experiment"}:
+        updated_level = _shift_level(target_level, -1)
+    elif decision == "escalate_to_operator":
+        updated_level = "operator_required"
+    if capped_level and AUTONOMY_LEVELS.index(updated_level) > AUTONOMY_LEVELS.index(capped_level):
+        updated_level = capped_level
+
+    updated_recommended = _autonomy_for_level(recommended, updated_level)
+    updated_confidence = _bounded(
+        max(confidence, float(governance.get("confidence", 0.0) or 0.0) * 0.9)
+    )
+    updated_summary = f"{summary}; execution_truth_governance={decision}; level={updated_level}"
+    updated_reasoning["execution_truth_governance_applied"] = updated_level != target_level
+    updated_reasoning["target_level"] = updated_level
+    return updated_recommended, updated_level, updated_summary, updated_confidence, updated_reasoning
+
+
+def _apply_operator_resolution_commitment_to_boundaries(
+    *,
+    recommended: dict,
+    target_level: str,
+    confidence: float,
+    summary: str,
+    reasoning: dict,
+    commitment: WorkspaceOperatorResolutionCommitment | None,
+) -> tuple[dict, str, str, float, dict]:
+    if commitment is None:
+        return recommended, target_level, summary, confidence, reasoning
+
+    downstream_effects = commitment_downstream_effects(commitment)
+    decision_type = str(commitment.decision_type or "").strip()
+    authority_level = str(commitment.authority_level or "").strip()
+    updated_reasoning = {
+        **reasoning,
+        "operator_resolution_commitment": {
+            "commitment_id": int(commitment.id),
+            "managed_scope": str(commitment.managed_scope or "").strip(),
+            "decision_type": decision_type,
+            "authority_level": authority_level,
+            "downstream_effects": downstream_effects,
+        },
+    }
+
+    requested_level = commitment_requested_autonomy_level(commitment)
+
+    if requested_level not in AUTONOMY_LEVELS:
+        updated_reasoning["operator_resolution_commitment_applied"] = False
+        return recommended, target_level, summary, confidence, updated_reasoning
+
+    if AUTONOMY_LEVELS.index(requested_level) > AUTONOMY_LEVELS.index(target_level):
+        updated_reasoning["operator_resolution_commitment_applied"] = False
+        return recommended, target_level, summary, confidence, updated_reasoning
+
+    updated_recommended = _autonomy_for_level(recommended, requested_level)
+    updated_summary = f"{summary}; operator_resolution_commitment={decision_type}; level={requested_level}"
+    updated_confidence = _bounded(max(confidence, float(commitment.confidence or 0.0) * 0.95))
+    updated_reasoning["operator_resolution_commitment_applied"] = requested_level != target_level
+    updated_reasoning["target_level"] = requested_level
+    return updated_recommended, requested_level, updated_summary, updated_confidence, updated_reasoning
+
+
+def _apply_operator_resolution_outcome_to_boundaries(
+    *,
+    recommended: dict,
+    target_level: str,
+    confidence: float,
+    summary: str,
+    reasoning: dict,
+    outcome: object | None,
+) -> tuple[dict, str, str, float, dict]:
+    if outcome is None:
+        return recommended, target_level, summary, confidence, reasoning
+
+    learning = (
+        outcome.learning_signals_json
+        if isinstance(getattr(outcome, "learning_signals_json", {}), dict)
+        else {}
+    )
+    outcome_status = str(getattr(outcome, "outcome_status", "") or "").strip()
+    cap = str(learning.get("autonomy_level_cap", "") or "").strip()
+    updated_reasoning = {
+        **reasoning,
+        "operator_resolution_outcome": {
+            "outcome_id": int(getattr(outcome, "id", 0) or 0),
+            "outcome_status": outcome_status,
+            "decision_type": str(getattr(outcome, "decision_type", "") or "").strip(),
+            "learning_signals": learning,
+        },
+    }
+
+    updated_level = target_level
+    if outcome_status == "harmful":
+        updated_level = "operator_required"
+    elif outcome_status in {"ineffective", "abandoned"}:
+        if AUTONOMY_LEVELS.index(target_level) > AUTONOMY_LEVELS.index("operator_required"):
+            updated_level = "operator_required"
+    if cap in AUTONOMY_LEVELS and AUTONOMY_LEVELS.index(updated_level) > AUTONOMY_LEVELS.index(cap):
+        updated_level = cap
+    if updated_level == target_level:
+        updated_reasoning["operator_resolution_outcome_applied"] = False
+        return recommended, target_level, summary, confidence, updated_reasoning
+
+    updated_reasoning["operator_resolution_outcome_applied"] = True
+    updated_reasoning["target_level"] = updated_level
+    updated_summary = f"{summary}; operator_resolution_outcome={outcome_status}; level={updated_level}"
+    updated_confidence = _bounded(
+        max(confidence, float(getattr(outcome, "learning_confidence", 0.0) or 0.0) * 0.9)
+    )
+    return (
+        _autonomy_for_level(recommended, updated_level),
+        updated_level,
+        updated_summary,
+        updated_confidence,
+        updated_reasoning,
+    )
+
+
+def _apply_operator_learned_preference_to_boundaries(
+    *,
+    recommended: dict,
+    target_level: str,
+    confidence: float,
+    summary: str,
+    reasoning: dict,
+    preference: dict | None,
+) -> tuple[dict, str, str, float, dict]:
+    influence = learned_preference_autonomy_influence(preference=preference)
+    preferred_level = str(influence.get("preferred_autonomy_level") or "").strip()
+    serializable_preference = {}
+    if isinstance(preference, dict):
+        serializable_preference = {
+            **preference,
+            "last_updated": (
+                preference.get("last_updated").isoformat()
+                if getattr(preference.get("last_updated"), "isoformat", None)
+                else preference.get("last_updated")
+            ),
+        }
+    updated_reasoning = {
+        **reasoning,
+        "operator_learned_preference": {
+            **serializable_preference,
+            "preferred_autonomy_level": preferred_level,
+            "rationale": str(influence.get("rationale") or "").strip(),
+        },
+    }
+    if preferred_level not in AUTONOMY_LEVELS:
+        updated_reasoning["operator_learned_preference_applied"] = False
+        return recommended, target_level, summary, confidence, updated_reasoning
+    if AUTONOMY_LEVELS.index(preferred_level) > AUTONOMY_LEVELS.index(target_level):
+        updated_reasoning["operator_learned_preference_applied"] = False
+        return recommended, target_level, summary, confidence, updated_reasoning
+    if preferred_level == target_level:
+        updated_reasoning["operator_learned_preference_applied"] = False
+        return recommended, target_level, summary, confidence, updated_reasoning
+    updated_reasoning["operator_learned_preference_applied"] = True
+    updated_reasoning["target_level"] = preferred_level
+    return (
+        _autonomy_for_level(recommended, preferred_level),
+        preferred_level,
+        f"{summary}; operator_learned_preference={str(preference.get('preference_direction') or '').strip()}; level={preferred_level}",
+        _bounded(max(confidence, float(influence.get("confidence", 0.0) or 0.0) * 0.9)),
+        updated_reasoning,
+    )
+
+
+def _autonomy_review_related_proposal_types() -> list[str]:
+    return [
+        "rescan_zone",
+        "confirm_target_ready",
+        "monitor_search_adjacent_zone",
+        "verify_moved_object",
+    ]
+
+
+async def _proposal_arbitration_autonomy_review(
+    *,
+    scope: str,
+    target_level: str,
+    db: AsyncSession,
+) -> dict:
+    related_zone = str(scope or "").strip() or "global"
+    influence = await workspace_proposal_arbitration_family_influence(
+        proposal_types=_autonomy_review_related_proposal_types(),
+        related_zone=related_zone,
+        db=db,
+        max_abs_bias=0.08,
+    )
+    review_weight = max(
+        0.0,
+        min(0.08, float(influence.get("aggregate_priority_bias", 0.0) or 0.0)),
+    )
+    applied = bool(influence.get("applied", False)) and review_weight >= 0.01
+    target_level_cap = ""
+    if applied and AUTONOMY_LEVELS.index(target_level) > AUTONOMY_LEVELS.index("bounded_auto"):
+        target_level_cap = "bounded_auto"
+    rationale = ""
+    if applied:
+        rationale = (
+            "Proposal arbitration learning favors evidence-gathering and scope-stabilization proposals, "
+            "so autonomy review keeps the scope at bounded_auto or below until that pattern changes."
+        )
+    return {
+        "related_zone": related_zone,
+        "proposal_types": influence.get("proposal_types", []),
+        "sample_count": int(influence.get("sample_count", 0) or 0),
+        "aggregate_priority_bias": round(
+            float(influence.get("aggregate_priority_bias", 0.0) or 0.0),
+            6,
+        ),
+        "review_weight": round(review_weight, 6),
+        "target_level_cap": target_level_cap,
+        "rationale": rationale,
+        "learning": influence.get("learning", []),
+        "applied": applied,
+    }
+
+
+def _apply_proposal_arbitration_to_boundaries(
+    *,
+    recommended: dict,
+    target_level: str,
+    confidence: float,
+    summary: str,
+    reasoning: dict,
+    review: dict,
+) -> tuple[dict, str, str, float, dict]:
+    if not isinstance(review, dict):
+        return recommended, target_level, summary, confidence, reasoning
+
+    updated_reasoning = {
+        **reasoning,
+        "proposal_arbitration_autonomy_review": review,
+    }
+    if not bool(review.get("applied", False)):
+        updated_reasoning["proposal_arbitration_autonomy_review_applied"] = False
+        return recommended, target_level, summary, confidence, updated_reasoning
+
+    if str(reasoning.get("decision", "")).strip() == "hard_ceiling_enforced":
+        updated_reasoning["proposal_arbitration_autonomy_review_applied"] = False
+        return recommended, target_level, summary, confidence, updated_reasoning
+
+    capped_level = str(review.get("target_level_cap", "") or "").strip()
+    updated_level = target_level
+    if capped_level in AUTONOMY_LEVELS and AUTONOMY_LEVELS.index(updated_level) > AUTONOMY_LEVELS.index(capped_level):
+        updated_level = capped_level
+
+    updated_reasoning["proposal_arbitration_autonomy_review_applied"] = True
+    updated_reasoning["proposal_arbitration_autonomy_review_level_adjusted"] = updated_level != target_level
+    if updated_level != target_level:
+        updated_reasoning["target_level"] = updated_level
+
+    updated_summary = summary
+    rationale = str(review.get("rationale", "") or "").strip()
+    if rationale:
+        updated_summary = f"{summary}; proposal_arbitration_autonomy_review={updated_level}; {rationale}"
+
+    return (
+        _autonomy_for_level(recommended, updated_level),
+        updated_level,
+        updated_summary,
+        confidence,
+        updated_reasoning,
+    )
+
+
 async def evaluate_adaptive_autonomy_boundaries(
     *,
     actor: str,
@@ -383,6 +686,10 @@ async def evaluate_adaptive_autonomy_boundaries(
         managed_scope=(scope.strip() if str(scope).strip() else "global"),
         max_age_hours=max(1, int(lookback_hours)),
     )
+    execution_truth_governance = await latest_execution_truth_governance_snapshot(
+        managed_scope=(scope.strip() if str(scope).strip() else "global"),
+        db=db,
+    )
 
     monitoring = (
         await db.execute(select(WorkspaceMonitoringState).order_by(WorkspaceMonitoringState.id.asc()))
@@ -454,6 +761,123 @@ async def evaluate_adaptive_autonomy_boundaries(
         hard_ceiling_violations=hard_ceiling_violations,
         sample_count=sample_count,
     )
+    baseline_target_level = current_level
+    operator_resolution_commitment = await latest_active_operator_resolution_commitment(
+        scope=scope,
+        db=db,
+    )
+    operator_resolution_outcome = await latest_scope_commitment_outcome_profile(
+        managed_scope=scope,
+        db=db,
+    )
+    learned_operator_preference = await latest_scope_learned_preference(
+        managed_scope=scope,
+        db=db,
+        operator_commitment=operator_resolution_commitment,
+    )
+    proposal_arbitration_autonomy_review = await _proposal_arbitration_autonomy_review(
+        scope=scope,
+        target_level=current_level,
+        db=db,
+    )
+    recommended, current_level, adaptation_summary, boundary_confidence, adaptation_reasoning = _apply_proposal_arbitration_to_boundaries(
+        recommended=recommended,
+        target_level=current_level,
+        confidence=boundary_confidence,
+        summary=adaptation_summary,
+        reasoning=adaptation_reasoning,
+        review=proposal_arbitration_autonomy_review,
+    )
+    serializable_preference = {}
+    if isinstance(learned_operator_preference, dict):
+        serializable_preference = {
+            **learned_operator_preference,
+            "last_updated": (
+                learned_operator_preference.get("last_updated").isoformat()
+                if getattr(learned_operator_preference.get("last_updated"), "isoformat", None)
+                else learned_operator_preference.get("last_updated")
+            ),
+        }
+    adaptation_reasoning = {
+        **adaptation_reasoning,
+        "execution_truth_governance": execution_truth_governance,
+        "operator_resolution_commitment": commitment_snapshot(
+            operator_resolution_commitment
+        ),
+        "operator_resolution_outcome": {
+            "outcome_id": int(getattr(operator_resolution_outcome, "id", 0) or 0),
+            "outcome_status": str(
+                getattr(operator_resolution_outcome, "outcome_status", "") or ""
+            ).strip(),
+            "decision_type": str(
+                getattr(operator_resolution_outcome, "decision_type", "") or ""
+            ).strip(),
+            "learning_signals": (
+                operator_resolution_outcome.learning_signals_json
+                if operator_resolution_outcome is not None
+                and isinstance(
+                    getattr(operator_resolution_outcome, "learning_signals_json", {}),
+                    dict,
+                )
+                else {}
+            ),
+        },
+        "operator_learned_preference": {
+            **serializable_preference,
+            "preferred_autonomy_level": str(
+                learned_preference_autonomy_influence(
+                    preference=learned_operator_preference
+                ).get("preferred_autonomy_level")
+                or ""
+            ).strip(),
+        },
+        "proposal_arbitration_autonomy_review": proposal_arbitration_autonomy_review,
+    }
+    policy_conflict_resolution = {}
+    if str(adaptation_reasoning.get("decision", "")).strip() != "hard_ceiling_enforced":
+        policy_conflict_resolution = await resolve_autonomy_boundary_policy_conflict(
+            managed_scope=scope,
+            baseline_target_level=baseline_target_level,
+            execution_truth_governance=execution_truth_governance,
+            operator_resolution_commitment=operator_resolution_commitment,
+            operator_resolution_outcome=operator_resolution_outcome,
+            learned_preference=learned_operator_preference,
+            proposal_arbitration_review=proposal_arbitration_autonomy_review,
+            db=db,
+        )
+        policy_effects = (
+            policy_conflict_resolution.get("policy_effects_json", {})
+            if isinstance(policy_conflict_resolution.get("policy_effects_json", {}), dict)
+            else {}
+        )
+        resolved_level = str(policy_effects.get("target_level") or "").strip()
+        if resolved_level in AUTONOMY_LEVELS:
+            current_level = resolved_level
+            recommended = _autonomy_for_level(recommended, current_level)
+            adaptation_summary = (
+                f"{adaptation_summary}; policy_conflict_resolution="
+                f"{str(policy_conflict_resolution.get('winning_policy_source') or '').strip()}; "
+                f"level={current_level}"
+            )
+            boundary_confidence = _bounded(
+                max(
+                    boundary_confidence,
+                    float(policy_conflict_resolution.get("conflict_confidence", 0.0) or 0.0),
+                )
+            )
+        adaptation_reasoning["policy_conflict_resolution_applied"] = bool(resolved_level)
+    else:
+        adaptation_reasoning["policy_conflict_resolution_applied"] = False
+    adaptation_reasoning["policy_conflict_resolution"] = policy_conflict_resolution
+    adaptation_reasoning["operator_resolution_commitment_applied"] = bool(
+        adaptation_reasoning.get("operator_resolution_commitment", {})
+        and str(policy_conflict_resolution.get("winning_policy_source") or "").strip()
+        == "operator_commitment"
+        and str(policy_conflict_resolution.get("decision_family") or "").strip()
+        == "autonomy_boundary"
+        and adaptation_reasoning.get("policy_conflict_resolution_applied", False)
+    )
+    adaptation_reasoning["target_level"] = current_level
 
     evidence_inputs = {
         "success_rate": success_rate,
@@ -485,6 +909,9 @@ async def evaluate_adaptive_autonomy_boundaries(
             "freshness": execution_truth_summary.get("freshness", {}),
             "managed_scope": execution_truth_summary.get("managed_scope", "global"),
         },
+        "execution_truth_governance": execution_truth_governance,
+        "proposal_arbitration_autonomy_review": proposal_arbitration_autonomy_review,
+        "policy_conflict_resolution": policy_conflict_resolution,
     }
 
     applied: dict = {}
@@ -603,6 +1030,11 @@ def to_autonomy_boundary_profile_out(row: WorkspaceAutonomyBoundaryProfile) -> d
         "execution_truth_influence": (
             adaptation_reasoning.get("execution_truth_influence", {})
             if isinstance(adaptation_reasoning.get("execution_truth_influence", {}), dict)
+            else {}
+        ),
+        "proposal_arbitration_autonomy_review": (
+            adaptation_reasoning.get("proposal_arbitration_autonomy_review", {})
+            if isinstance(adaptation_reasoning.get("proposal_arbitration_autonomy_review", {}), dict)
             else {}
         ),
         "metadata_json": row.metadata_json if isinstance(row.metadata_json, dict) else {},

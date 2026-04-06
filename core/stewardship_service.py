@@ -5,9 +5,17 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from core.execution_truth_governance_service import latest_execution_truth_governance_snapshot
 from core.execution_truth_service import derive_execution_truth_signals
 from core.improvement_governance_service import list_improvement_backlog
 from core.maintenance_service import run_environment_maintenance_cycle
+from core.operator_preference_convergence_service import (
+    learned_preference_stewardship_weight_delta,
+    latest_scope_learned_preference,
+)
+from core.policy_conflict_resolution_service import resolve_stewardship_policy_conflict
+from core.proposal_arbitration_learning_service import workspace_proposal_arbitration_family_influence
+from core.operator_resolution_service import commitment_downstream_effects, commitment_snapshot, latest_active_operator_resolution_commitment
 from core.models import (
     CapabilityExecution,
     UserPreference,
@@ -523,7 +531,7 @@ async def _recent_patterns(
     )
 
 
-async def _preference_weight(*, db: AsyncSession) -> float:
+async def _preference_weight(*, db: AsyncSession, managed_scope: str = "global") -> float:
     rows = (
         (
             await db.execute(
@@ -561,6 +569,15 @@ async def _preference_weight(*, db: AsyncSession) -> float:
             weight = _bounded(weight + (0.25 * confidence))
         if ptype == "prefer_minimal_interruption" and bool(value):
             weight = _bounded(weight + (0.15 * confidence))
+    learned_preference = await latest_scope_learned_preference(
+        managed_scope=managed_scope,
+        db=db,
+        operator_commitment=await latest_active_operator_resolution_commitment(
+            scope=managed_scope,
+            db=db,
+        ),
+    )
+    weight = _bounded(weight + learned_preference_stewardship_weight_delta(preference=learned_preference))
     return _bounded(weight)
 
 
@@ -863,11 +880,101 @@ def _inquiry_candidates(*, deviation_signals: list[dict]) -> list[dict]:
     return candidates
 
 
+def _followup_trigger_related_proposal_types(trigger_type: str) -> list[str]:
+    mapping = {
+        "persistent_zone_degradation": ["rescan_zone", "monitor_recheck_workspace"],
+        "stale_zone_detected": ["rescan_zone", "monitor_search_adjacent_zone"],
+        "zone_uncertainty_above_target": ["confirm_target_ready", "verify_moved_object"],
+        "zone_drift_above_target": ["rescan_zone", "verify_moved_object"],
+        "key_object_unknown": ["verify_moved_object", "confirm_target_ready"],
+        "execution_slower_than_expected": ["monitor_recheck_workspace", "rescan_zone"],
+        "retry_instability_detected": ["monitor_recheck_workspace", "rescan_zone"],
+        "fallback_path_used": ["monitor_recheck_workspace"],
+        "simulation_reality_mismatch": ["rescan_zone", "monitor_recheck_workspace"],
+        "environment_shift_during_execution": ["rescan_zone", "monitor_search_adjacent_zone"],
+    }
+    proposal_types = mapping.get(str(trigger_type or "").strip(), [])
+    return [item for item in proposal_types if str(item).strip()]
+
+
+async def _proposal_arbitration_followup_preferences(
+    *,
+    managed_scope: str,
+    inquiry_candidates: list[dict],
+    degraded_signals: list[dict],
+    db: AsyncSession,
+) -> dict:
+    triggers: list[str] = []
+    seen: set[str] = set()
+    for collection, key in ((inquiry_candidates, "trigger"), (degraded_signals, "signal_type")):
+        if not isinstance(collection, list):
+            continue
+        for item in collection:
+            if not isinstance(item, dict):
+                continue
+            trigger = str(item.get(key, "") or "").strip()
+            if not trigger or trigger in seen:
+                continue
+            seen.add(trigger)
+            triggers.append(trigger)
+
+    preferences: list[dict] = []
+    for index, trigger in enumerate(triggers):
+        proposal_types = _followup_trigger_related_proposal_types(trigger)
+        if not proposal_types:
+            continue
+        influence = await workspace_proposal_arbitration_family_influence(
+            proposal_types=proposal_types,
+            related_zone=managed_scope,
+            db=db,
+            max_abs_bias=0.08,
+        )
+        preference_weight = float(influence.get("aggregate_priority_bias", 0.0) or 0.0)
+        preferences.append(
+            {
+                "trigger_type": trigger,
+                "preference_weight": round(preference_weight, 6),
+                "sample_count": int(influence.get("sample_count", 0) or 0),
+                "proposal_types": influence.get("proposal_types", proposal_types),
+                "learning": influence.get("learning", []),
+                "applied": bool(influence.get("applied", False)),
+                "_index": index,
+            }
+        )
+
+    if not preferences:
+        return {
+            "preferred_followup_type": "",
+            "preferred_followup_weight": 0.0,
+            "preferences": [],
+            "applied": False,
+        }
+
+    ranked = sorted(
+        preferences,
+        key=lambda item: (-float(item.get("preference_weight", 0.0) or 0.0), int(item.get("_index", 0) or 0)),
+    )
+    preferred = ranked[0]
+    preferred_type = ""
+    preferred_weight = float(preferred.get("preference_weight", 0.0) or 0.0)
+    if int(preferred.get("sample_count", 0) or 0) >= 2 and preferred_weight > 0.0:
+        preferred_type = str(preferred.get("trigger_type", "") or "").strip()
+    for item in preferences:
+        item.pop("_index", None)
+    return {
+        "preferred_followup_type": preferred_type,
+        "preferred_followup_weight": round(preferred_weight if preferred_type else 0.0, 6),
+        "preferences": preferences,
+        "applied": bool(preferred_type),
+    }
+
+
 def _followup_summary(
     *,
     persistent_degradation: bool,
     inquiry_candidates: list[dict],
     degraded_signals: list[dict],
+    proposal_arbitration_followup: dict | None = None,
 ) -> dict:
     candidate_rows = inquiry_candidates if isinstance(inquiry_candidates, list) else []
     candidate_types: list[str] = []
@@ -891,6 +998,30 @@ def _followup_summary(
         seen.add(signal_type)
         candidate_types.append(signal_type)
 
+    followup_preferences = (
+        proposal_arbitration_followup
+        if isinstance(proposal_arbitration_followup, dict)
+        else {}
+    )
+    preference_rows = (
+        followup_preferences.get("preferences", [])
+        if isinstance(followup_preferences.get("preferences", []), list)
+        else []
+    )
+    preference_lookup = {
+        str(item.get("trigger_type", "") or "").strip(): float(item.get("preference_weight", 0.0) or 0.0)
+        for item in preference_rows
+        if isinstance(item, dict)
+    }
+    indexed_types = list(enumerate(candidate_types))
+    indexed_types.sort(
+        key=lambda item: (
+            -float(preference_lookup.get(item[1], 0.0) or 0.0),
+            int(item[0]),
+        )
+    )
+    candidate_types = [item[1] for item in indexed_types]
+
     followup_generated = bool(candidate_types)
     followup_suppressed = bool(persistent_degradation and not followup_generated)
     followup_status = "not_needed"
@@ -906,6 +1037,9 @@ def _followup_summary(
         "followup_generated": followup_generated,
         "followup_suppressed": followup_suppressed,
         "followup_status": followup_status,
+        "preferred_followup_type": str(followup_preferences.get("preferred_followup_type", "") or ""),
+        "preferred_followup_weight": float(followup_preferences.get("preferred_followup_weight", 0.0) or 0.0),
+        "proposal_arbitration_followup": followup_preferences,
     }
 
 
@@ -1257,7 +1391,23 @@ async def run_stewardship_cycle(
     concepts = await _recent_concepts(lookback_hours=lookback_hours, db=db)
     patterns = await _recent_patterns(lookback_hours=lookback_hours, db=db)
     boundary = await _latest_boundary(db=db)
-    preference_weight = await _preference_weight(db=db)
+    preference_weight = await _preference_weight(db=db, managed_scope=managed_scope)
+    execution_truth_governance = await latest_execution_truth_governance_snapshot(
+        managed_scope=managed_scope,
+        db=db,
+    )
+    operator_resolution_commitment = await latest_active_operator_resolution_commitment(
+        scope=managed_scope,
+        db=db,
+    )
+    operator_resolution_effects = commitment_downstream_effects(
+        operator_resolution_commitment
+    )
+    learned_operator_preference = await latest_scope_learned_preference(
+        managed_scope=managed_scope,
+        db=db,
+        operator_commitment=operator_resolution_commitment,
+    )
     backlog_rows = await list_improvement_backlog(
         db=db, status="", risk_level="", limit=25
     )
@@ -1291,7 +1441,13 @@ async def run_stewardship_cycle(
         managed_scope=managed_scope,
         desired_state_id=int(desired_state_row.id),
         target_environment_state=desired_state,
-        maintenance_priority="high" if preference_weight >= 0.65 else "normal",
+        maintenance_priority=(
+            "high"
+            if preference_weight >= 0.65
+            or str(execution_truth_governance.get("governance_decision", "monitor_only"))
+            != "monitor_only"
+            else "normal"
+        ),
         db=db,
     )
 
@@ -1309,11 +1465,54 @@ async def run_stewardship_cycle(
     )
     boundary_allowed = True
     allow_auto_execution = bool(auto_execute)
+    governance_actions = (
+        execution_truth_governance.get("downstream_actions", {})
+        if isinstance(execution_truth_governance.get("downstream_actions", {}), dict)
+        else {}
+    )
+    governance_blocks_auto = not bool(
+        governance_actions.get("stewardship_auto_execute_allowed", True)
+    )
+    commitment_blocks_auto = bool(
+        operator_resolution_effects.get("stewardship_defer_actions", False)
+    ) or str(operator_resolution_effects.get("stewardship_mode", "") or "").strip() == "deferred"
+    if not commitment_blocks_auto and operator_resolution_commitment is not None:
+        if str(operator_resolution_commitment.decision_type or "").strip() in {
+            "defer_action",
+            "require_additional_evidence",
+        }:
+            commitment_blocks_auto = True
+    boundary_blocks_auto = False
     if (
         autonomy_level in {"manual_only", "operator_required"}
         and boundary_confidence >= 0.5
     ):
-        allow_auto_execution = False
+        boundary_allowed = False
+        boundary_blocks_auto = True
+
+    policy_conflict_resolution = await resolve_stewardship_policy_conflict(
+        managed_scope=managed_scope,
+        requested_auto_execution=bool(auto_execute),
+        execution_truth_governance=execution_truth_governance,
+        operator_resolution_commitment=operator_resolution_commitment,
+        learned_preference=learned_operator_preference,
+        autonomy_level=autonomy_level,
+        boundary_confidence=boundary_confidence,
+        db=db,
+    )
+    policy_conflict_effects = (
+        policy_conflict_resolution.get("policy_effects_json", {})
+        if isinstance(policy_conflict_resolution.get("policy_effects_json", {}), dict)
+        else {}
+    )
+    if "allow_auto_execution" in policy_conflict_effects:
+        allow_auto_execution = bool(policy_conflict_effects.get("allow_auto_execution", False))
+    else:
+        if governance_blocks_auto or commitment_blocks_auto or boundary_blocks_auto:
+            allow_auto_execution = False
+    if governance_blocks_auto or commitment_blocks_auto or boundary_blocks_auto:
+        allow_auto_execution = bool(allow_auto_execution and not (governance_blocks_auto or commitment_blocks_auto or boundary_blocks_auto)) if "allow_auto_execution" not in policy_conflict_effects else allow_auto_execution
+    if boundary_blocks_auto and str(policy_conflict_resolution.get("winning_policy_source", "")).strip() == "autonomy_boundary":
         boundary_allowed = False
 
     should_run_correction = bool(
@@ -1331,6 +1530,40 @@ async def run_stewardship_cycle(
     )
     if not bool(throttle_state.get("allowed", False)):
         allow_auto_execution = False
+
+    if operator_resolution_commitment is not None:
+        selected_actions.append(
+            {
+                "action_type": "operator_resolution_commitment_applied",
+                "managed_scope": managed_scope,
+                "decision_type": str(
+                    operator_resolution_commitment.decision_type or ""
+                ).strip(),
+                "authority_level": str(
+                    operator_resolution_commitment.authority_level or ""
+                ).strip(),
+                "effects": operator_resolution_effects,
+                "auto_execute_blocked": bool(commitment_blocks_auto),
+            }
+        )
+
+    if str(policy_conflict_resolution.get("conflict_state", "")).strip() != "advisory":
+        selected_actions.append(
+            {
+                "action_type": "policy_conflict_resolution_applied",
+                "managed_scope": managed_scope,
+                "decision_family": str(
+                    policy_conflict_resolution.get("decision_family", "")
+                ).strip(),
+                "winning_policy_source": str(
+                    policy_conflict_resolution.get("winning_policy_source", "")
+                ).strip(),
+                "conflict_state": str(
+                    policy_conflict_resolution.get("conflict_state", "")
+                ).strip(),
+                "policy_effects": policy_conflict_effects,
+            }
+        )
 
     if should_run_correction:
         if bool(throttle_state.get("allowed", False)):
@@ -1378,6 +1611,18 @@ async def run_stewardship_cycle(
                 }
             )
 
+    if str(execution_truth_governance.get("governance_decision", "monitor_only")) != "monitor_only":
+        selected_actions.append(
+            {
+                "action_type": "execution_truth_governance_applied",
+                "managed_scope": managed_scope,
+                "governance_decision": str(
+                    execution_truth_governance.get("governance_decision", "monitor_only")
+                ),
+                "reason": str(execution_truth_governance.get("governance_reason", "") or "").strip(),
+            }
+        )
+
     post_assessment = await _assess_environment_state(
         stewardship_id=int(stewardship.id),
         managed_scope=managed_scope,
@@ -1395,10 +1640,17 @@ async def run_stewardship_cycle(
         or post_assessment.get("deviation_signals", [])
         or post_inquiry_candidates
     )
+    proposal_arbitration_followup = await _proposal_arbitration_followup_preferences(
+        managed_scope=managed_scope,
+        inquiry_candidates=post_inquiry_candidates,
+        degraded_signals=post_assessment.get("deviation_signals", []),
+        db=db,
+    )
     followup_summary = _followup_summary(
         persistent_degradation=persistent_degradation,
         inquiry_candidates=post_inquiry_candidates,
         degraded_signals=post_assessment.get("deviation_signals", []),
+        proposal_arbitration_followup=proposal_arbitration_followup,
     )
     execution_truth_signal_count = int(
         post_assessment.get("execution_truth_summary", {}).get("signal_count", 0)
@@ -1458,6 +1710,14 @@ async def run_stewardship_cycle(
 
     if actions_executed > 0 and improved:
         last_decision_summary = "executed_corrective_actions"
+    elif post_assessment.get("needs_intervention", False) and str(
+        policy_conflict_resolution.get("winning_policy_source", "")
+    ).strip() == "operator_commitment":
+        last_decision_summary = "defer_to_operator_commitment"
+    elif post_assessment.get("needs_intervention", False) and str(
+        policy_conflict_resolution.get("winning_policy_source", "")
+    ).strip() == "execution_truth_governance":
+        last_decision_summary = "defer_to_execution_truth_governance"
     elif post_assessment.get("needs_intervention", False) and not allow_auto_execution:
         last_decision_summary = "defer_to_operator_boundary"
     elif not post_assessment.get("needs_intervention", False):
@@ -1508,6 +1768,10 @@ async def run_stewardship_cycle(
         "current_metrics": post_assessment.get("system_metrics", {}),
         "latest_assessment": post_assessment,
         "governance": governance,
+        "operator_resolution_commitment": commitment_snapshot(
+            operator_resolution_commitment
+        ),
+        "policy_conflict_resolution": policy_conflict_resolution,
     }
 
     verification = {
@@ -1524,11 +1788,24 @@ async def run_stewardship_cycle(
         "followup_generated": bool(followup_summary.get("followup_generated", False)),
         "followup_suppressed": bool(followup_summary.get("followup_suppressed", False)),
         "followup_status": str(followup_summary.get("followup_status", "not_needed")),
+        "preferred_followup_type": str(followup_summary.get("preferred_followup_type", "")),
+        "preferred_followup_weight": float(followup_summary.get("preferred_followup_weight", 0.0) or 0.0),
+        "proposal_arbitration_followup": followup_summary.get("proposal_arbitration_followup", {}),
         "execution_truth_signal_count": execution_truth_signal_count,
         "execution_truth_signal_types": execution_truth_signal_types,
         "execution_truth_followup_recommended": execution_truth_followup_recommended,
         "maintenance_run_id": int(maintenance_run.id) if maintenance_run else None,
         "throttle_state": throttle_state,
+        "execution_truth_governance": execution_truth_governance,
+        "operator_resolution_commitment": commitment_snapshot(
+            operator_resolution_commitment
+        ),
+        "operator_resolution_blocked_auto_execution": bool(commitment_blocks_auto),
+        "policy_conflict_resolution": policy_conflict_resolution,
+        "policy_conflict_blocked_auto_execution": not bool(
+            allow_auto_execution
+        )
+        and bool(auto_execute),
     }
 
     cycle = WorkspaceStewardshipCycle(
@@ -1550,6 +1827,11 @@ async def run_stewardship_cycle(
             "throttle_state": throttle_state,
             "decision": stewardship.last_decision_summary,
             "desired_state": desired_state,
+            "execution_truth_governance": execution_truth_governance,
+            "operator_resolution_commitment": commitment_snapshot(
+                operator_resolution_commitment
+            ),
+            "policy_conflict_resolution": policy_conflict_resolution,
         },
         integration_evidence_json={
             "desired_state_id": int(desired_state_row.id),
@@ -1560,6 +1842,10 @@ async def run_stewardship_cycle(
             "autonomy_boundary_id": int(boundary.id) if boundary else None,
             "operator_preference_weight": preference_weight,
             "governance": governance,
+            "operator_resolution_commitment": commitment_snapshot(
+                operator_resolution_commitment
+            ),
+            "policy_conflict_resolution": policy_conflict_resolution,
         },
         maintenance_run_id=(int(maintenance_run.id) if maintenance_run else None),
         improved=improved,
@@ -1597,9 +1883,18 @@ async def run_stewardship_cycle(
         "followup_generated": bool(followup_summary.get("followup_generated", False)),
         "followup_suppressed": bool(followup_summary.get("followup_suppressed", False)),
         "followup_status": str(followup_summary.get("followup_status", "not_needed")),
+        "preferred_followup_type": str(followup_summary.get("preferred_followup_type", "")),
+        "preferred_followup_weight": float(followup_summary.get("preferred_followup_weight", 0.0) or 0.0),
+        "proposal_arbitration_followup": followup_summary.get("proposal_arbitration_followup", {}),
         "execution_truth_signal_count": execution_truth_signal_count,
         "execution_truth_signal_types": execution_truth_signal_types,
         "execution_truth_followup_recommended": execution_truth_followup_recommended,
+        "execution_truth_governance": execution_truth_governance,
+        "operator_resolution_commitment": commitment_snapshot(
+            operator_resolution_commitment
+        ),
+        "operator_resolution_blocked_auto_execution": bool(commitment_blocks_auto),
+        "policy_conflict_resolution": policy_conflict_resolution,
         "system_metrics": post_assessment.get("system_metrics", {}),
         "integrations": {
             "strategy_goals": len(strategy_goals),
@@ -1749,6 +2044,11 @@ def to_stewardship_cycle_out(row: WorkspaceStewardshipCycle) -> dict:
             if isinstance(assessment.get("post", {}), dict)
             else row.degraded_signals_json
         ),
+        proposal_arbitration_followup=(
+            verification.get("proposal_arbitration_followup", {})
+            if isinstance(verification.get("proposal_arbitration_followup", {}), dict)
+            else {}
+        ),
     )
     return {
         "cycle_id": int(row.id),
@@ -1780,6 +2080,8 @@ def to_stewardship_cycle_out(row: WorkspaceStewardshipCycle) -> dict:
         "followup_generated": bool(followup_summary.get("followup_generated", False)),
         "followup_suppressed": bool(followup_summary.get("followup_suppressed", False)),
         "followup_status": str(followup_summary.get("followup_status", "not_needed")),
+        "preferred_followup_type": str(followup_summary.get("preferred_followup_type", "")),
+        "preferred_followup_weight": float(followup_summary.get("preferred_followup_weight", 0.0) or 0.0),
         "maintenance_run_id": row.maintenance_run_id,
         "improved": bool(row.improved),
         "metadata_json": metadata,
