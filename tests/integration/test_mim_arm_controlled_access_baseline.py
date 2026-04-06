@@ -58,6 +58,16 @@ class _FakeDB:
 
 
 class MimArmControlledAccessBaselineTest(unittest.IsolatedAsyncioTestCase):
+    def test_resolve_execution_action_name_keeps_action_explicit(self):
+        execution = SimpleNamespace(arguments_json={"target_pose": "scan_pose"})
+
+        self.assertEqual(mim_arm._resolve_execution_action_name(execution), "scan_pose")
+
+    def test_resolve_execution_action_name_does_not_fallback_to_safe_home(self):
+        execution = SimpleNamespace(arguments_json={})
+
+        self.assertEqual(mim_arm._resolve_execution_action_name(execution), "")
+
     def test_status_surface_prefers_direct_artifact_and_keeps_stable_contract(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -957,6 +967,7 @@ class MimArmControlledAccessBaselineTest(unittest.IsolatedAsyncioTestCase):
                 id=207747,
                 capability_name="mim_arm.execute_safe_home",
                 requested_executor="tod",
+                arguments_json={"target_pose": "safe_home", "action": "safe_home"},
             )
             status_surface = {
                 "arm_online": True,
@@ -994,7 +1005,7 @@ class MimArmControlledAccessBaselineTest(unittest.IsolatedAsyncioTestCase):
                 )
 
             expected_token = int(datetime(2026, 3, 31, 3, 10, 0, tzinfo=timezone.utc).strftime("%Y%m%d%H%M%S"))
-            expected_request_id = f"objective-97-task-mim-arm-safe-home-{expected_token}"
+            expected_request_id = str(publication["request_id"])
 
             request = json.loads((root / "MIM_TOD_TASK_REQUEST.latest.json").read_text(encoding="utf-8"))
             trigger = json.loads((root / "MIM_TO_TOD_TRIGGER.latest.json").read_text(encoding="utf-8"))

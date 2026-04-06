@@ -101,7 +101,8 @@ Current bounded MIM ARM execution trust checkpoint:
 - Objective 107 closed the bounded remote attribution gap with an explicit readiness-surface boundary.
 - Objective 108 adds a true dispatch-authoritative telemetry lane for bounded `safe_home`, with per-dispatch records, a latest pointer, dedicated API endpoints, proof-script integration, and operator-facing UI exposure.
 - Objective 109 extends that lane to a second bounded live action, `scan_pose`, and tightens dispatch telemetry so executor-originated host timestamps outrank flatter fallback fields.
-- Objective 109 is not closed yet: focused tests are green, but the latest live `scan_pose` proof still fails on fresh host-received and host-attributed evidence.
+- Objective 109 is closed on the current-source runtime: bounded `scan_pose` now produces fresh dispatch telemetry, aligned TOD ACK and RESULT evidence, explicit host attribution, and `proof_chain_complete = true`.
+- Objective 110 normalizes bounded multi-action execution so `safe_home` and `scan_pose` share one attribution contract with no safe-home-only fallback defaults in the execution path.
 
 ## Future Objectives
 

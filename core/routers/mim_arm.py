@@ -223,8 +223,8 @@ def _bounded_action_execution_phrase(action_name: str) -> str:
 
 def _resolve_execution_action_name(execution: CapabilityExecution) -> str:
     arguments = _json_dict(getattr(execution, "arguments_json", {}))
-    action_name = str(arguments.get("target_pose") or arguments.get("action") or "safe_home").strip()
-    return action_name or "safe_home"
+    action_name = str(arguments.get("target_pose") or arguments.get("action") or "").strip()
+    return action_name
 
 
 class MimArmRefreshStatusRequest(BaseModel):
@@ -683,7 +683,7 @@ def publish_mim_arm_execution_to_tod(
         "dispatch_telemetry": record_dispatch_telemetry_from_publish(
             shared_root=shared_root,
             execution_id=execution_id,
-            capability_name=str(getattr(execution, "capability_name", "mim_arm.execute_safe_home") or "mim_arm.execute_safe_home").strip(),
+            capability_name=str(getattr(execution, "capability_name", "") or "").strip(),
             execution_lane=str(getattr(execution, "requested_executor", "tod") or "tod").strip() or "tod",
             request_payload=request_payload,
             trigger_payload=trigger_payload,
@@ -1448,32 +1448,6 @@ def _build_bounded_pose_event_and_resolution(
     return event, resolution
 
 
-def _build_safe_home_event_and_resolution(
-    *,
-    payload: MimArmExecuteSafeHomeRequest,
-    status: dict[str, object],
-) -> tuple[InputEvent, InputEventResolution]:
-    return _build_bounded_pose_event_and_resolution(
-        payload=payload,
-        status=status,
-        action_name="safe_home",
-        capability_name="mim_arm.execute_safe_home",
-    )
-
-
-def _build_scan_pose_event_and_resolution(
-    *,
-    payload: MimArmExecuteSafeHomeRequest,
-    status: dict[str, object],
-) -> tuple[InputEvent, InputEventResolution]:
-    return _build_bounded_pose_event_and_resolution(
-        payload=payload,
-        status=status,
-        action_name="scan_pose",
-        capability_name="mim_arm.execute_scan_pose",
-    )
-
-
 def _proposal_reason(action_name: str, status: dict[str, object]) -> str:
     return (
         f"Proposal for '{action_name}': review the posture below and approve the "
@@ -1699,12 +1673,12 @@ async def _execute_bounded_pose(
     capability_name: str,
 ) -> dict[str, object]:
     status = load_mim_arm_status_surface()
-    event_builder = (
-        _build_scan_pose_event_and_resolution
-        if action_name == "scan_pose"
-        else _build_safe_home_event_and_resolution
+    event, resolution = _build_bounded_pose_event_and_resolution(
+        payload=payload,
+        status=status,
+        action_name=action_name,
+        capability_name=capability_name,
     )
-    event, resolution = event_builder(payload=payload, status=status)
 
     db.add(event)
     await db.flush()
