@@ -96,6 +96,7 @@ Example TOD config:
 - `GET /gateway/capabilities/executions/{execution_id}/handoff`
 - `POST /gateway/capabilities/executions/{execution_id}/feedback`
 - `GET /gateway/capabilities/executions/{execution_id}/feedback`
+- `GET /gateway/capabilities/executions/truth/latest`
 
 Execution handoff payload includes:
 
@@ -121,6 +122,25 @@ Feedback auth/safety boundary:
 
 - actor allow-list enforced by MIM (`execution_feedback_allowed_actors`)
 - optional shared key header `X-MIM-Feedback-Key` when MIM `execution_feedback_api_key` is set
+
+### Execution-truth bridge projection (Objective 80.2)
+
+Canonical shared execution-truth publication now uses:
+
+- `runtime/shared/TOD_EXECUTION_TRUTH.latest.json`
+- alias mirror: `runtime/shared/TOD_execution_truth.latest.json`
+
+The projection contains:
+
+- bridge packet metadata
+- execution-truth summary counts
+- recent projected `execution_truth_v1` payloads
+- derived deviation signals for each projected execution
+
+Validation helpers:
+
+- `scripts/check_tod_execution_truth_alias_sync.sh`
+- `scripts/validate_tod_execution_truth_bridge.sh`
 
 ## TOD command mapping
 

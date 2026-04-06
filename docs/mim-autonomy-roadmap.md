@@ -61,6 +61,48 @@ This roadmap is the master sequencing document for MIM objective development. It
 - Objective 54 — Self-guided improvement loop
 - Objective 55 — Improvement prioritization and governance
 
+## Runtime Governance and Inspectability Objectives
+
+- Objective 57 — Goal strategy engine
+- Objective 58 — Adaptive autonomy boundaries
+- Objective 60 — Environment stewardship loop
+- Objective 80 — Execution truth convergence
+- Objective 81 — Execution truth governance loop
+- Objective 82 — Live perception governance grounding
+- Objective 83 — Governed inquiry resolution loop
+- Objective 84 — Operator-visible system reasoning
+- Objective 85 — Operator-governed resolution commitments
+- Objective 86 — Commitment enforcement and drift monitoring loop
+- Objective 87 — Commitment outcome and learning loop
+- Objective 88 — Operator preference and policy convergence
+- Objective 89 — Proposal policy convergence
+- Objective 90 — Cross-policy conflict resolution
+
+Current checkpoint before Objective 91:
+
+- Objective 90 is broadened and green in the current bounded slice, not complete.
+- The stable validated checkpoint covers proposal shaping, stewardship, autonomy, governed inquiry answer-path arbitration, bounded governed inquiry decision-state suppression/cooldown hold behavior, pre-execution policy gating across the live execution creation paths, and mandatory TOD execution-readiness enforcement across execution, trace, proposal, conflict, and state-bus surfaces.
+- The remaining Objective 90 gap is the wider contradictory-reopen inquiry matrix, which is explicitly deferred rather than silently treated as done.
+
+Objectives 91 through 95 now add the control and stability plane on top of that checkpoint:
+
+- Objective 91 adds durable execution traces and causality events.
+- Objective 92 persists intent lineage independently from transient dispatch.
+- Objective 93 stores orchestration checkpoints for governed executions.
+- Objective 94 adds scope-aware operator hard-stop, pause, and redirect overrides.
+- Objective 95 adds execution stability scoring and mitigation reporting.
+
+Next planned slice after the green 95 checkpoint:
+
+- Objective 96 extends the control plane into recovery and safe resume so failed, blocked, paused, and degraded executions can be evaluated and retried through one bounded recovery contract instead of ad hoc follow-up.
+
+Current bounded MIM ARM execution trust checkpoint:
+
+- Objective 107 closed the bounded remote attribution gap with an explicit readiness-surface boundary.
+- Objective 108 adds a true dispatch-authoritative telemetry lane for bounded `safe_home`, with per-dispatch records, a latest pointer, dedicated API endpoints, proof-script integration, and operator-facing UI exposure.
+- Objective 109 extends that lane to a second bounded live action, `scan_pose`, and tightens dispatch telemetry so executor-originated host timestamps outrank flatter fallback fields.
+- Objective 109 is not closed yet: focused tests are green, but the latest live `scan_pose` proof still fails on fresh host-received and host-attributed evidence.
+
 ## Future Objectives
 
 - Objective 58 — Adaptive autonomy boundaries (experience-conditioned autonomy limits)
@@ -74,6 +116,9 @@ This roadmap is the master sequencing document for MIM objective development. It
 - 39–44: Priority, preferences, constraint reasoning
 - 45–49: Constraint learning, horizon planning, strategy, self-improvement
 - 50+: Environment maintenance, policy experimentation, concept formation, developmental memory, self-guided improvement
+- 80–84: Runtime governance, inquiry control, and operator-visible reasoning
+- 85–87: Durable operator resolution commitments, enforcement, and outcome learning
+- 88–90: Preference convergence, proposal arbitration propagation, proposal policy stabilization, and cross-policy conflict resolution across stacked governance surfaces
 
 ## Governance Notes
 

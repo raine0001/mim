@@ -50,3 +50,39 @@ Target objective: Objective 60 — Environment Stewardship Loop
 ## Status
 
 PROMOTED AND VERIFIED
+
+## 2026-03-24 Post-Promotion Closure Addendum
+
+Objective 60 was not provisional at the time of this follow-up pass, so no second promotion run was required.
+
+What changed after original promotion:
+
+- the stewardship inquiry follow-up path was tightened so inquiry-triggered bounded rescans create workspace proposals in `pending` status.
+- this closes a queue-compatibility gap where the follow-up path could create a proposal record that did not enter the workspace proposal scheduler.
+
+Additional closure evidence:
+
+- Focused stewardship base gate:
+	- `tests/integration/test_objective60_environment_stewardship_loop.py`
+	- Expected contract revalidated alongside follow-up closure pass.
+- Focused stewardship inquiry follow-up gate:
+	- `tests/integration/test_objective60_stewardship_inquiry_followup.py`
+	- Result: `Ran 3 tests ... OK`
+	- Confirms:
+		- persistent degradation remains surfaced
+		- inquiry candidates remain shaped correctly
+		- bounded follow-up answers still tighten stewardship or create improvement proposals
+		- `stabilize_scope_now` now inserts a `pending` workspace rescan proposal that is visible in the workspace queue
+- Adjacent regression revalidation after the queue fix:
+	- `tests.test_objective_lifecycle`
+	- `tests.integration.test_objective77_mim_ui_conversation_policy_bridge`
+	- `tests.integration.test_objective80_execution_truth_contract_surface`
+	- `tests.integration.test_objective80_execution_truth_bridge_projection`
+	- `tests.integration.test_objective81_execution_truth_governance_loop`
+	- `tests.integration.test_objective82_live_perception_governance_grounding`
+	- Result: `Ran 71 tests ... OK`
+
+Closure status:
+
+- Objective 60 remains promoted and verified.
+- Stewardship inquiry follow-up path is now closed.

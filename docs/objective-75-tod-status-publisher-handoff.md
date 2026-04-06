@@ -10,6 +10,115 @@ This note captured the last external blocker after MIM-side Objective 75 produce
 
 That blocker is now resolved. TOD canonical publication now surfaces manifest and handshake refresh evidence, and the recoupled bridge path passes the stricter MIM-side gates.
 
+## Topology Clarification
+
+The MIM producer host and the TOD consumer host can be different machines.
+
+Producer host responsibilities:
+
+1. host `/home/testpilot/mim/runtime/shared`
+2. run `scripts/export_mim_context.py`
+3. generate canonical MIM artifacts
+4. publish:
+   - `MIM_CONTEXT_EXPORT.latest.json`
+   - `MIM_MANIFEST.latest.json`
+   - `MIM_TOD_HANDSHAKE_PACKET.latest.json`
+   - `MIM_TOD_ALIGNMENT_REQUEST.latest.json`
+
+Consumer host responsibilities:
+
+1. run TOD
+2. pull the producer-host artifacts via `Invoke-TODSharedStateSync.ps1`
+3. mirror them into the TOD-side staging directory such as `tod/out/context-sync/ssh-shared`
+4. compute consumer-side derived state such as `TOD_INTEGRATION_STATUS.latest.json`
+5. drive listener, catch-up, and UI status surfaces
+
+Implication:
+
+1. canonical MIM truth is produced on the MIM host, not on the TOD host
+2. exporter hardening fixes must exist on the MIM host to change canonical truth
+3. the TOD host only ingests, mirrors, evaluates, and displays what the MIM host published
+
+## Correct Recovery Sequence
+
+When canonical MIM truth is stale, the correct fix sequence is:
+
+1. deploy the exporter fix on the MIM producer host
+2. rerun `scripts/export_mim_context.py` on the MIM producer host
+3. regenerate the canonical MIM artifacts on the producer host
+4. run `Invoke-TODSharedStateSync.ps1` on the TOD consumer host
+5. let TOD recompute integration status, catch-up, and UI surfaces from the refreshed pull
+
+This means a stale-canonical failure belongs first to MIM producer-side publication, not TOD transport.
+
+## Operator Runbook
+
+Use this sequence when canonical MIM truth is suspected to be stale.
+
+### A. MIM Producer Host
+
+From the MIM checkout on the producer host:
+
+```bash
+cd /home/testpilot/mim
+source .venv/bin/activate
+.venv/bin/python scripts/export_mim_context.py --output-dir runtime/shared --no-root-mirror
+```
+
+Validate the regenerated producer artifacts:
+
+```bash
+grep -n '"objective_active"\|"current_next_objective"\|"schema_version"\|"release_tag"' runtime/shared/MIM_CONTEXT_EXPORT.latest.json
+grep -n '"objective_active"\|"current_next_objective"\|"schema_version"\|"release_tag"' runtime/shared/MIM_TOD_HANDSHAKE_PACKET.latest.json
+stat runtime/shared/MIM_CONTEXT_EXPORT.latest.json runtime/shared/MIM_TOD_HANDSHAKE_PACKET.latest.json runtime/shared/MIM_MANIFEST.latest.json
+```
+
+Expected outcome:
+
+1. fresh timestamps on the shared artifacts
+2. objective, release tag, and schema version match the intended producer-host truth
+3. context export, manifest, and handshake packet agree
+
+### B. TOD Consumer Host
+
+From the TOD checkout on the consumer host, run the shared-state pull:
+
+```powershell
+Invoke-TODSharedStateSync.ps1
+```
+
+Then validate the staged pull and derived TOD status:
+
+```powershell
+Get-Content tod/out/context-sync/ssh-shared/MIM_CONTEXT_EXPORT.latest.json
+Get-Content tod/out/context-sync/ssh-shared/MIM_TOD_HANDSHAKE_PACKET.latest.json
+Get-Content tod/out/context-sync/ssh-shared/MIM_MANIFEST.latest.json
+Get-Content tod/out/context-sync/ssh-shared/TOD_INTEGRATION_STATUS.latest.json
+```
+
+Expected outcome:
+
+1. the staged `ssh-shared` files match the producer-host exports
+2. `TOD_INTEGRATION_STATUS.latest.json` reports populated refresh evidence
+3. `objective_alignment` reflects the refreshed canonical MIM truth
+
+### C. Final Cross-Check
+
+Confirm the consumer-host derived status includes all of the following:
+
+1. `mim_refresh.attempted=true`
+2. `mim_refresh.copied_json=true`
+3. `mim_refresh.copied_yaml=true`
+4. `mim_refresh.copied_manifest=true`
+5. populated `mim_refresh.source_manifest`
+6. populated `mim_refresh.source_handshake_packet`
+7. `mim_handshake.available=true`
+8. `mim_handshake.objective_active` matches the producer-host export
+9. `mim_handshake.schema_version` matches the producer-host manifest truth
+10. `objective_alignment.status` is `in_sync` or `aligned`
+
+If the producer-host export is correct but the consumer-host status is stale, the remaining fault is in TOD pull, staging, or derived-status publication.
+
 ## Closure Outcome
 
 Observed in the fresh canonical publication and downstream gate artifacts:

@@ -6,6 +6,7 @@ Objective 77 introduces an automated conversation simulation/evaluation harness 
 It focuses on policy and orchestration quality, not base-model retraining.
 
 Key outcomes:
+
 - Structured scenario library and synthetic persona coverage.
 - Repeatable staged evaluation runs (smoke, expanded, stress, regression).
 - Deterministic seeded runs for comparison.
@@ -25,6 +26,7 @@ Key outcomes:
 ## Stages
 
 Default target conversation counts:
+
 - `smoke`: 25
 - `expanded`: 100
 - `stress`: 500
@@ -45,6 +47,7 @@ the runner samples additional pairs deterministically from the same pool.
 - overall
 
 Additional targeted failure checks:
+
 - `context_drift`
 - `over_explaining`
 - `repeated_clarifier_pattern`
@@ -53,6 +56,7 @@ Additional targeted failure checks:
 ## Regression Gate
 
 Optional baseline comparison enforces drift budgets:
+
 - `max_overall_drop` (default: 0.03)
 - `max_bucket_drop` (default: 0.08)
 - `max_failure_increase` (default: 10)
@@ -97,6 +101,7 @@ MIM_TEST_BASE_URL=http://127.0.0.1:18001 scripts/run_conversation_eval_regressio
 Focused pack file: `conversation_scenarios/focused_failure_tag_scenarios.json`
 
 Buckets:
+
 - `low_relevance_focus`
 - `response_loop_focus`
 - `safety_boundary_focus`
@@ -108,11 +113,13 @@ MIM_TEST_BASE_URL=http://127.0.0.1:18001 scripts/run_conversation_targeted_ab.sh
 ```
 
 This produces:
+
 - `runtime/reports/conversation_targeted_ab_A.json`
 - `runtime/reports/conversation_targeted_ab_B.json`
 - `runtime/reports/conversation_targeted_ab_diff.json`
 
 Comparison focuses by default on:
+
 - `low_relevance`
 - `response_loop_risk`
 - `missing_safety_boundary`
@@ -120,6 +127,7 @@ Comparison focuses by default on:
 ## CI Regression Gates
 
 Primary gate scripts:
+
 - `scripts/enforce_conversation_regression_gate.py`
 - `scripts/run_conversation_quality_gate.sh`
 
@@ -136,6 +144,7 @@ MIM_TEST_BASE_URL=http://127.0.0.1:18001 scripts/run_conversation_quality_gate.s
 ```
 
 Gate metrics:
+
 - `overall`
 - `failure_count`
 - `low_relevance`
@@ -143,6 +152,7 @@ Gate metrics:
 - `missing_safety_boundary`
 
 Policy:
+
 - warning bands for small movement (`overall`, `failure_count`, `low_relevance`)
 - hard fail on `response_loop_risk` regressions
 - hard fail on `missing_safety_boundary` regressions
