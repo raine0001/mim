@@ -6,7 +6,10 @@ import urllib.request
 from uuid import uuid4
 
 
-BASE_URL = os.getenv("MIM_TEST_BASE_URL", "http://127.0.0.1:8001")
+from tests.integration.runtime_target_guard import DEFAULT_BASE_URL
+
+
+BASE_URL = os.getenv("MIM_TEST_BASE_URL", DEFAULT_BASE_URL)
 
 
 def post_json(path: str, payload: dict) -> tuple[int, dict]:
@@ -40,6 +43,35 @@ def get_json(path: str) -> tuple[int, dict | list]:
 
 
 class Objective63CrossDomainTaskOrchestrationTest(unittest.TestCase):
+    def _seed_stewardship_cycle(self, run_id: str, zone: str) -> int:
+        status, result = post_json(
+            "/stewardship/cycle",
+            {
+                "actor": "objective63-test",
+                "source": "objective63-focused",
+                "managed_scope": zone,
+                "stale_after_seconds": 600,
+                "lookback_hours": 24,
+                "max_strategies": 3,
+                "max_actions": 2,
+                "auto_execute": False,
+                "force_degraded": True,
+                "target_environment_state": {
+                    "zone_freshness_seconds": 900,
+                    "max_system_drift_rate": 0.35,
+                    "max_missing_key_objects": 0,
+                    "proactive_drift_monitoring": True,
+                    "key_objects": ["objective63-marker", "stability-anchor"],
+                },
+                "metadata_json": {"run_id": run_id},
+            },
+        )
+        self.assertEqual(status, 200, result)
+        stewardship = result.get("stewardship", {}) if isinstance(result, dict) else {}
+        stewardship_id = int(stewardship.get("stewardship_id", 0))
+        self.assertGreater(stewardship_id, 0)
+        return stewardship_id
+
     def _seed_cross_domain_inputs(self, run_id: str, zone: str) -> None:
         status, event = post_json(
             "/gateway/intake/text",
@@ -91,6 +123,7 @@ class Objective63CrossDomainTaskOrchestrationTest(unittest.TestCase):
         zone = f"obj63-zone-{run_id}"
 
         self._seed_cross_domain_inputs(run_id=run_id, zone=zone)
+        stewardship_id = self._seed_stewardship_cycle(run_id=run_id, zone=zone)
 
         status, blocked_result = post_json(
             "/orchestration/build",
@@ -109,16 +142,34 @@ class Objective63CrossDomainTaskOrchestrationTest(unittest.TestCase):
             },
         )
         self.assertEqual(status, 200, blocked_result)
-        blocked = blocked_result.get("orchestration", {}) if isinstance(blocked_result, dict) else {}
+        blocked = (
+            blocked_result.get("orchestration", {})
+            if isinstance(blocked_result, dict)
+            else {}
+        )
         self.assertEqual(str(blocked.get("status", "")), "blocked_needs_input")
 
-        blocked_resolution = blocked.get("dependency_resolution", {}) if isinstance(blocked.get("dependency_resolution", {}), dict) else {}
+        blocked_resolution = (
+            blocked.get("dependency_resolution", {})
+            if isinstance(blocked.get("dependency_resolution", {}), dict)
+            else {}
+        )
         self.assertEqual(str(blocked_resolution.get("path", "")), "ask")
         self.assertTrue(bool(blocked_resolution.get("unmet_dependencies", [])))
         self.assertGreaterEqual(len(blocked.get("linked_inquiry_question_ids", [])), 1)
 
-        blocked_artifacts = blocked.get("downstream_artifacts", []) if isinstance(blocked.get("downstream_artifacts", []), list) else []
-        self.assertTrue(any(str(item.get("artifact_type", "")) == "inquiry_question" for item in blocked_artifacts if isinstance(item, dict)))
+        blocked_artifacts = (
+            blocked.get("downstream_artifacts", [])
+            if isinstance(blocked.get("downstream_artifacts", []), list)
+            else []
+        )
+        self.assertTrue(
+            any(
+                str(item.get("artifact_type", "")) == "inquiry_question"
+                for item in blocked_artifacts
+                if isinstance(item, dict)
+            )
+        )
 
         status, ready_result = post_json(
             "/orchestration/build",
@@ -137,22 +188,89 @@ class Objective63CrossDomainTaskOrchestrationTest(unittest.TestCase):
             },
         )
         self.assertEqual(status, 200, ready_result)
-        ready = ready_result.get("orchestration", {}) if isinstance(ready_result, dict) else {}
+        ready = (
+            ready_result.get("orchestration", {})
+            if isinstance(ready_result, dict)
+            else {}
+        )
         self.assertEqual(str(ready.get("status", "")), "active")
 
-        contributing_domains = ready.get("contributing_domains", []) if isinstance(ready.get("contributing_domains", []), list) else []
+        contributing_domains = (
+            ready.get("contributing_domains", [])
+            if isinstance(ready.get("contributing_domains", []), list)
+            else []
+        )
         self.assertGreaterEqual(len(contributing_domains), 2)
+        self.assertIn("stewardship_state", contributing_domains)
         self.assertTrue(bool(ready.get("orchestration_reason", "")))
 
-        reasoning = ready.get("reasoning", {}) if isinstance(ready.get("reasoning", {}), dict) else {}
+        reasoning = (
+            ready.get("reasoning", {})
+            if isinstance(ready.get("reasoning", {}), dict)
+            else {}
+        )
         self.assertTrue(bool(reasoning.get("priority_reason", "")))
         self.assertGreaterEqual(len(reasoning.get("contributing_domains", [])), 2)
+        stewardship_summary = (
+            reasoning.get("stewardship_summary", {})
+            if isinstance(reasoning.get("stewardship_summary", {}), dict)
+            else {}
+        )
+        self.assertGreaterEqual(
+            int(stewardship_summary.get("active_stewardship_count", 0)), 1
+        )
+        self.assertGreaterEqual(
+            int(stewardship_summary.get("unstable_scope_count", 0)), 1
+        )
 
-        linked_goal_ids = ready.get("linked_goal_ids", []) if isinstance(ready.get("linked_goal_ids", []), list) else []
-        linked_plan_ids = ready.get("linked_horizon_plan_ids", []) if isinstance(ready.get("linked_horizon_plan_ids", []), list) else []
+        origin_context = (
+            ready_result.get("origin_context", {})
+            if isinstance(ready_result, dict)
+            else {}
+        )
+        workspace_state = (
+            origin_context.get("workspace_state", {})
+            if isinstance(origin_context.get("workspace_state", {}), dict)
+            else {}
+        )
+        origin_stewardship = (
+            workspace_state.get("stewardship_summary", {})
+            if isinstance(workspace_state.get("stewardship_summary", {}), dict)
+            else {}
+        )
+        self.assertGreaterEqual(
+            int(origin_stewardship.get("active_stewardship_count", 0)), 1
+        )
+        scope_samples = (
+            origin_stewardship.get("recent_scope_samples", [])
+            if isinstance(origin_stewardship.get("recent_scope_samples", []), list)
+            else []
+        )
+        self.assertTrue(
+            any(
+                int(item.get("stewardship_id", 0)) == stewardship_id
+                for item in scope_samples
+                if isinstance(item, dict)
+            )
+        )
+
+        linked_goal_ids = (
+            ready.get("linked_goal_ids", [])
+            if isinstance(ready.get("linked_goal_ids", []), list)
+            else []
+        )
+        linked_plan_ids = (
+            ready.get("linked_horizon_plan_ids", [])
+            if isinstance(ready.get("linked_horizon_plan_ids", []), list)
+            else []
+        )
         self.assertTrue(bool(linked_goal_ids) or bool(linked_plan_ids))
 
-        ready_artifacts = ready.get("downstream_artifacts", []) if isinstance(ready.get("downstream_artifacts", []), list) else []
+        ready_artifacts = (
+            ready.get("downstream_artifacts", [])
+            if isinstance(ready.get("downstream_artifacts", []), list)
+            else []
+        )
         self.assertTrue(
             any(
                 str(item.get("artifact_type", "")) in {"goal", "horizon_plan"}
@@ -166,7 +284,11 @@ class Objective63CrossDomainTaskOrchestrationTest(unittest.TestCase):
         rows = listed.get("orchestrations", []) if isinstance(listed, dict) else []
         self.assertGreaterEqual(len(rows), 2)
 
-        row_ids = {int(item.get("orchestration_id", 0)) for item in rows if isinstance(item, dict)}
+        row_ids = {
+            int(item.get("orchestration_id", 0))
+            for item in rows
+            if isinstance(item, dict)
+        }
         blocked_id = int(blocked.get("orchestration_id", 0))
         ready_id = int(ready.get("orchestration_id", 0))
         self.assertIn(blocked_id, row_ids)
@@ -174,7 +296,9 @@ class Objective63CrossDomainTaskOrchestrationTest(unittest.TestCase):
 
         status, fetched = get_json(f"/orchestration/{ready_id}")
         self.assertEqual(status, 200, fetched)
-        fetched_row = fetched.get("orchestration", {}) if isinstance(fetched, dict) else {}
+        fetched_row = (
+            fetched.get("orchestration", {}) if isinstance(fetched, dict) else {}
+        )
         self.assertEqual(int(fetched_row.get("orchestration_id", 0)), ready_id)
         self.assertGreaterEqual(len(fetched_row.get("contributing_domains", [])), 2)
 

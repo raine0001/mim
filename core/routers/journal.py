@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -78,8 +78,17 @@ async def create_journal(payload: JournalCreate, db: AsyncSession = Depends(get_
 
 
 @router.get("")
-async def list_journal(db: AsyncSession = Depends(get_db)) -> list[dict]:
-    rows = (await db.execute(select(ExecutionJournal).order_by(ExecutionJournal.id.desc()))).scalars().all()
+async def list_journal(
+    limit: int = Query(default=500, ge=1, le=5000),
+    db: AsyncSession = Depends(get_db),
+) -> list[dict]:
+    rows = (
+        await db.execute(
+            select(ExecutionJournal)
+            .order_by(ExecutionJournal.id.desc())
+            .limit(limit)
+        )
+    ).scalars().all()
     return [
         {
             "entry_id": row.id,

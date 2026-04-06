@@ -9,7 +9,13 @@ DEFAULT_POLICY = {
     "low_confidence_behavior": "store_only",
     "require_confirmation_intents": ["execute_capability", "identify_object"],
     "blocked_capability_implications": ["arm_movement", "unsafe_motion"],
-    "ambiguous_keywords": ["something", "somewhere", "around there", "kind of", "maybe"],
+    "ambiguous_keywords": [
+        "something",
+        "somewhere",
+        "around there",
+        "kind of",
+        "maybe",
+    ],
     "unsafe_keywords": ["override safety", "force move", "ignore guardrail"],
     "target_required_verbs": ["move", "pick", "grab", "place", "identify"],
     "max_output_chars": 240,
@@ -53,7 +59,9 @@ def generate_clarification_prompt(escalation_reasons: list[str]) -> str:
     for reason in escalation_reasons:
         if reason in templates:
             return str(templates[reason])
-    return str(templates.get("default", DEFAULT_POLICY["clarification_templates"]["default"]))
+    return str(
+        templates.get("default", DEFAULT_POLICY["clarification_templates"]["default"])
+    )
 
 
 def evaluate_voice_policy(
@@ -78,7 +86,9 @@ def evaluate_voice_policy(
     transcript_l = transcript.lower()
     escalation_reasons: list[str] = []
 
-    ambiguous_keywords = [str(item).lower() for item in policy.get("ambiguous_keywords", [])]
+    ambiguous_keywords = [
+        str(item).lower() for item in policy.get("ambiguous_keywords", [])
+    ]
     if any(keyword in transcript_l for keyword in ambiguous_keywords):
         escalation_reasons.append("ambiguous_command")
 
@@ -86,14 +96,25 @@ def evaluate_voice_policy(
     if any(keyword in transcript_l for keyword in unsafe_keywords):
         escalation_reasons.append("unsafe_action_request")
 
-    blocked_capability_implications = {str(item).lower() for item in policy.get("blocked_capability_implications", [])}
-    if target_capability and target_capability.lower() in blocked_capability_implications:
+    blocked_capability_implications = {
+        str(item).lower() for item in policy.get("blocked_capability_implications", [])
+    }
+    if (
+        target_capability
+        and target_capability.lower() in blocked_capability_implications
+    ):
         escalation_reasons.append("unsafe_action_request")
 
-    target_required_verbs = [str(item).lower() for item in policy.get("target_required_verbs", [])]
-    command_has_target_verb = any(verb in transcript_l for verb in target_required_verbs)
+    target_required_verbs = [
+        str(item).lower() for item in policy.get("target_required_verbs", [])
+    ]
+    command_has_target_verb = any(
+        verb in transcript_l for verb in target_required_verbs
+    )
     vague_target_tokens = {"it", "that", "there", "something", "somewhere"}
-    if command_has_target_verb and any(token in transcript_l.split() for token in vague_target_tokens):
+    if command_has_target_verb and any(
+        token in transcript_l.split() for token in vague_target_tokens
+    ):
         escalation_reasons.append("missing_target")
 
     if confidence_tier == "low":
@@ -105,7 +126,11 @@ def evaluate_voice_policy(
         outcome = "requires_confirmation"
     else:
         low_behavior = str(policy.get("low_confidence_behavior", "store_only"))
-        outcome = low_behavior if low_behavior in {"store_only", "requires_confirmation"} else "store_only"
+        outcome = (
+            low_behavior
+            if low_behavior in {"store_only", "requires_confirmation"}
+            else "store_only"
+        )
 
     if confidence_tier == "low" and outcome != "blocked":
         outcome = str(policy.get("low_confidence_behavior", "store_only"))
@@ -114,9 +139,15 @@ def evaluate_voice_policy(
 
     if "unsafe_action_request" in escalation_reasons:
         outcome = "blocked"
-    elif confidence_tier != "low" and ("ambiguous_command" in escalation_reasons or "missing_target" in escalation_reasons):
+    elif confidence_tier != "low" and (
+        "ambiguous_command" in escalation_reasons
+        or "missing_target" in escalation_reasons
+    ):
         outcome = "requires_confirmation"
-    elif internal_intent in set(policy.get("require_confirmation_intents", [])) and outcome == "auto_execute":
+    elif (
+        internal_intent in set(policy.get("require_confirmation_intents", []))
+        and outcome == "auto_execute"
+    ):
         outcome = "requires_confirmation"
 
     escalation_reasons = list(dict.fromkeys(escalation_reasons))
@@ -128,7 +159,9 @@ def evaluate_voice_policy(
         "low_transcript_confidence",
         "unsafe_action_request",
     }
-    should_prompt = outcome in {"store_only", "blocked"} or any(reason in clarification_reasons for reason in escalation_reasons)
+    should_prompt = outcome in {"store_only", "blocked"} or any(
+        reason in clarification_reasons for reason in escalation_reasons
+    )
     if should_prompt:
         if "requires_clarification" not in escalation_reasons:
             escalation_reasons.append("requires_clarification")
@@ -146,10 +179,22 @@ def evaluate_voice_policy(
 def validate_voice_output(message: str, priority: str) -> dict:
     policy = load_voice_policy()
     max_chars = int(policy.get("max_output_chars", 240))
-    allowed_priorities = {str(item) for item in policy.get("allowed_output_priorities", ["low", "normal", "high"])}
+    allowed_priorities = {
+        str(item)
+        for item in policy.get("allowed_output_priorities", ["low", "normal", "high"])
+    }
 
     if len(message) > max_chars:
         return {"allowed": False, "reason": "output_too_long", "max_chars": max_chars}
     if priority not in allowed_priorities:
-        return {"allowed": False, "reason": "invalid_priority", "allowed_priorities": sorted(allowed_priorities)}
-    return {"allowed": True, "reason": "ok", "max_chars": max_chars, "allowed_priorities": sorted(allowed_priorities)}
+        return {
+            "allowed": False,
+            "reason": "invalid_priority",
+            "allowed_priorities": sorted(allowed_priorities),
+        }
+    return {
+        "allowed": True,
+        "reason": "ok",
+        "max_chars": max_chars,
+        "allowed_priorities": sorted(allowed_priorities),
+    }

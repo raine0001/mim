@@ -6,7 +6,9 @@ from core.interface_service import (
     append_interface_message,
     get_interface_session,
     list_interface_messages,
+    list_pending_interface_approvals,
     list_interface_sessions,
+    maybe_auto_approve_interface_message,
     submit_interface_approval,
     to_interface_approval_out,
     to_interface_message_out,
@@ -108,6 +110,12 @@ async def append_interface_message_endpoint(
             raise HTTPException(status_code=404, detail="interface_session_not_found")
         raise
 
+    auto_approval = await maybe_auto_approve_interface_message(
+        session=session,
+        message=message,
+        db=db,
+    )
+
     await write_journal(
         db,
         actor=payload.actor,
@@ -119,13 +127,33 @@ async def append_interface_message_endpoint(
             "direction": message.direction,
             "role": message.role,
             "requires_approval": bool(message.requires_approval),
+            "auto_approved": auto_approval is not None,
             **payload.metadata_json,
         },
     )
+    if auto_approval is not None:
+        await write_journal(
+            db,
+            actor="mim",
+            action="interface_approval_submitted",
+            target_type="workspace_interface_approval",
+            target_id=str(auto_approval.id),
+            summary=(
+                f"Submitted interface approval {auto_approval.id} "
+                f"decision={auto_approval.decision} session={session.session_key}"
+            ),
+            metadata_json={
+                "message_id": auto_approval.message_id,
+                "decision": auto_approval.decision,
+                "auto_generated": True,
+                **(auto_approval.metadata_json if isinstance(auto_approval.metadata_json, dict) else {}),
+            },
+        )
     await db.commit()
     return {
         "session": to_interface_session_out(session),
         "message": to_interface_message_out(message),
+        "auto_approval": to_interface_approval_out(auto_approval) if auto_approval is not None else None,
     }
 
 
@@ -149,6 +177,25 @@ async def list_interface_messages_endpoint(
     return {
         "session": to_interface_session_out(session),
         "messages": [to_interface_message_out(item) for item in rows],
+    }
+
+
+@router.get("/interface/approvals/pending")
+async def list_pending_interface_approvals_endpoint(
+    source: str = Query(default=""),
+    parsed_intent: str = Query(default=""),
+    limit: int = Query(default=100, ge=1, le=500),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    rows = await list_pending_interface_approvals(
+        limit=limit,
+        source=source,
+        parsed_intent=parsed_intent,
+        db=db,
+    )
+    return {
+        "pending_approval_count": len(rows),
+        "approvals": rows,
     }
 
 

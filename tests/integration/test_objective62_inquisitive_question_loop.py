@@ -6,7 +6,10 @@ import urllib.request
 from uuid import uuid4
 
 
-BASE_URL = os.getenv("MIM_TEST_BASE_URL", "http://127.0.0.1:8001")
+from tests.integration.runtime_target_guard import DEFAULT_BASE_URL
+
+
+BASE_URL = os.getenv("MIM_TEST_BASE_URL", DEFAULT_BASE_URL)
 
 
 def post_json(path: str, payload: dict) -> tuple[int, dict]:
@@ -40,6 +43,35 @@ def get_json(path: str) -> tuple[int, dict | list]:
 
 
 class Objective62InquisitiveQuestionLoopTest(unittest.TestCase):
+    def _seed_stewardship_cycle(self, run_id: str, scope: str) -> int:
+        status, result = post_json(
+            "/stewardship/cycle",
+            {
+                "actor": "objective62-test",
+                "source": "objective62-focused",
+                "managed_scope": scope,
+                "stale_after_seconds": 600,
+                "lookback_hours": 24,
+                "max_strategies": 3,
+                "max_actions": 2,
+                "auto_execute": False,
+                "force_degraded": True,
+                "target_environment_state": {
+                    "zone_freshness_seconds": 900,
+                    "max_system_drift_rate": 0.4,
+                    "max_missing_key_objects": 0,
+                    "proactive_drift_monitoring": False,
+                    "key_objects": ["target-marker", "missing-anchor"],
+                },
+                "metadata_json": {"run_id": run_id},
+            },
+        )
+        self.assertEqual(status, 200, result)
+        stewardship = result.get("stewardship", {}) if isinstance(result, dict) else {}
+        stewardship_id = int(stewardship.get("stewardship_id", 0))
+        self.assertGreater(stewardship_id, 0)
+        return stewardship_id
+
     def _seed_strategy(self, run_id: str, scope: str) -> int:
         status, generated = post_json(
             "/planning/strategies/generate",
@@ -60,7 +92,9 @@ class Objective62InquisitiveQuestionLoopTest(unittest.TestCase):
             },
         )
         self.assertEqual(status, 200, generated)
-        strategies = generated.get("strategies", []) if isinstance(generated, dict) else []
+        strategies = (
+            generated.get("strategies", []) if isinstance(generated, dict) else []
+        )
         self.assertGreaterEqual(len(strategies), 1)
         strategy_id = int(strategies[0].get("strategy_id", 0))
         self.assertGreater(strategy_id, 0)
@@ -130,7 +164,10 @@ class Objective62InquisitiveQuestionLoopTest(unittest.TestCase):
                         "goal_id": f"obj62-goal-{run_id}-{index}",
                         "desired_state": "stable_execution",
                     },
-                    "action_plan": {"action_type": "execute_action_plan", "is_physical": True},
+                    "action_plan": {
+                        "action_type": "execute_action_plan",
+                        "is_physical": True,
+                    },
                     "workspace_state": {
                         "human_in_workspace": False,
                         "human_near_target_zone": False,
@@ -139,7 +176,10 @@ class Objective62InquisitiveQuestionLoopTest(unittest.TestCase):
                         "target_confidence": 0.62,
                         "map_freshness_seconds": 120,
                     },
-                    "system_state": {"throttle_blocked": False, "integrity_risk": False},
+                    "system_state": {
+                        "throttle_blocked": False,
+                        "integrity_risk": False,
+                    },
                     "policy_state": {
                         "min_target_confidence": 0.85,
                         "map_freshness_limit_seconds": 900,
@@ -218,6 +258,7 @@ class Objective62InquisitiveQuestionLoopTest(unittest.TestCase):
         plan_id = self._seed_plan(run_id=run_id, scope=scope)
         self._seed_low_confidence_friction(run_id=run_id)
         self._seed_conflicting_domain_evidence(run_id=run_id, scope=scope)
+        stewardship_id = self._seed_stewardship_cycle(run_id=run_id, scope=scope)
 
         status, generated = post_json(
             "/inquiry/questions/generate",
@@ -231,7 +272,9 @@ class Objective62InquisitiveQuestionLoopTest(unittest.TestCase):
             },
         )
         self.assertEqual(status, 200, generated)
-        questions = generated.get("questions", []) if isinstance(generated, dict) else []
+        questions = (
+            generated.get("questions", []) if isinstance(generated, dict) else []
+        )
         self.assertGreaterEqual(len(questions), 2)
 
         by_trigger = {
@@ -241,6 +284,7 @@ class Objective62InquisitiveQuestionLoopTest(unittest.TestCase):
         }
         self.assertIn("target_confidence_too_low", by_trigger)
         self.assertIn("conflicting_domain_evidence", by_trigger)
+        self.assertIn("stewardship_persistent_degradation", by_trigger)
 
         low_conf_q = by_trigger["target_confidence_too_low"]
         self.assertTrue(bool(low_conf_q.get("why_answer_matters", "")))
@@ -249,7 +293,13 @@ class Objective62InquisitiveQuestionLoopTest(unittest.TestCase):
 
         status, strategy_before = get_json(f"/planning/strategies/{strategy_id}")
         self.assertEqual(status, 200, strategy_before)
-        before_weight = float((strategy_before.get("strategy", {}) if isinstance(strategy_before, dict) else {}).get("influence_weight", 0.0))
+        before_weight = float(
+            (
+                strategy_before.get("strategy", {})
+                if isinstance(strategy_before, dict)
+                else {}
+            ).get("influence_weight", 0.0)
+        )
 
         status, answered = post_json(
             f"/inquiry/questions/{int(low_conf_q.get('question_id', 0))}/answer",
@@ -262,27 +312,97 @@ class Objective62InquisitiveQuestionLoopTest(unittest.TestCase):
         )
         self.assertEqual(status, 200, answered)
         self.assertTrue(bool(answered.get("answered", False)))
-        applied = answered.get("applied_effect", {}) if isinstance(answered, dict) else {}
-        self.assertTrue(bool(applied.get("strategy_shifted", False) or applied.get("plan_unblocked", False)))
+        applied = (
+            answered.get("applied_effect", {}) if isinstance(answered, dict) else {}
+        )
+        self.assertTrue(
+            bool(
+                applied.get("strategy_shifted", False)
+                or applied.get("plan_unblocked", False)
+            )
+        )
 
         status, strategy_after = get_json(f"/planning/strategies/{strategy_id}")
         self.assertEqual(status, 200, strategy_after)
-        after_weight = float((strategy_after.get("strategy", {}) if isinstance(strategy_after, dict) else {}).get("influence_weight", 0.0))
+        after_weight = float(
+            (
+                strategy_after.get("strategy", {})
+                if isinstance(strategy_after, dict)
+                else {}
+            ).get("influence_weight", 0.0)
+        )
         self.assertGreaterEqual(after_weight, before_weight)
+
+        stewardship_q = by_trigger["stewardship_persistent_degradation"]
+        status, stewardship_answered = post_json(
+            f"/inquiry/questions/{int(stewardship_q.get('question_id', 0))}/answer",
+            {
+                "actor": "operator",
+                "selected_path_id": "tighten_scope_tracking",
+                "answer_json": {"reason": "tighten degraded scope tracking"},
+                "metadata_json": {"run_id": run_id},
+            },
+        )
+        self.assertEqual(status, 200, stewardship_answered)
+        stewardship_effect = (
+            stewardship_answered.get("applied_effect", {})
+            if isinstance(stewardship_answered, dict)
+            else {}
+        )
+        self.assertTrue(
+            bool(stewardship_effect.get("stewardship_target_updated", False))
+        )
+        self.assertEqual(
+            int(stewardship_effect.get("stewardship_id", 0)), stewardship_id
+        )
+
+        status, stewardship_after = get_json(f"/stewardship/{stewardship_id}")
+        self.assertEqual(status, 200, stewardship_after)
+        stewardship_row = (
+            stewardship_after.get("stewardship", {})
+            if isinstance(stewardship_after, dict)
+            else {}
+        )
+        target_state = (
+            stewardship_row.get("target_environment_state", {})
+            if isinstance(stewardship_row.get("target_environment_state", {}), dict)
+            else {}
+        )
+        self.assertEqual(int(target_state.get("zone_freshness_seconds", 0)), 300)
+        self.assertAlmostEqual(
+            float(target_state.get("max_system_drift_rate", 0.0)), 0.2, places=6
+        )
+        self.assertTrue(bool(target_state.get("proactive_drift_monitoring", False)))
+        self.assertIn("missing-anchor", target_state.get("key_objects", []))
 
         status, plan_after = get_json(f"/planning/horizon/plans/{plan_id}")
         self.assertEqual(status, 200, plan_after)
-        plan_status = str((plan_after.get("plan", {}) if isinstance(plan_after, dict) else {}).get("status", ""))
-        self.assertIn(plan_status, {"active", "planned", "complete", "replanned", "needs_re_evaluation"})
+        plan_status = str(
+            (plan_after.get("plan", {}) if isinstance(plan_after, dict) else {}).get(
+                "status", ""
+            )
+        )
+        self.assertIn(
+            plan_status,
+            {"active", "planned", "complete", "replanned", "needs_re_evaluation"},
+        )
 
         status, listed_open = get_json("/inquiry/questions?status=open&limit=20")
         self.assertEqual(status, 200, listed_open)
-        open_rows = listed_open.get("questions", []) if isinstance(listed_open, dict) else []
+        open_rows = (
+            listed_open.get("questions", []) if isinstance(listed_open, dict) else []
+        )
         self.assertGreaterEqual(len(open_rows), 1)
         fallback_q = open_rows[0]
-        status, fallback_detail = get_json(f"/inquiry/questions/{int(fallback_q.get('question_id', 0))}")
+        status, fallback_detail = get_json(
+            f"/inquiry/questions/{int(fallback_q.get('question_id', 0))}"
+        )
         self.assertEqual(status, 200, fallback_detail)
-        fallback = fallback_detail.get("question", {}) if isinstance(fallback_detail, dict) else {}
+        fallback = (
+            fallback_detail.get("question", {})
+            if isinstance(fallback_detail, dict)
+            else {}
+        )
         self.assertEqual(str(fallback.get("status", "")), "open")
         self.assertTrue(bool(fallback.get("safe_default_if_unanswered", "")))
 

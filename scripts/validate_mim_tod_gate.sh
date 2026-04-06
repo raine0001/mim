@@ -3,9 +3,11 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 SHARED_DIR="${SHARED_DIR:-$ROOT_DIR/runtime/shared}"
-EXPECTED_OBJECTIVE="${EXPECTED_OBJECTIVE:-74}"
+EXPECTED_OBJECTIVE="${EXPECTED_OBJECTIVE:-75}"
 
 STATUS_FILE="$SHARED_DIR/TOD_INTEGRATION_STATUS.latest.json"
+HANDSHAKE_FILE="$SHARED_DIR/MIM_TOD_HANDSHAKE_PACKET.latest.json"
+MANIFEST_FILE="$SHARED_DIR/MIM_MANIFEST.latest.json"
 
 if [[ ! -f "$STATUS_FILE" ]]; then
   echo "GATE: FAIL"
@@ -13,15 +15,26 @@ if [[ ! -f "$STATUS_FILE" ]]; then
   exit 1
 fi
 
-python3 - "$STATUS_FILE" "$EXPECTED_OBJECTIVE" <<'PY'
+python3 - "$STATUS_FILE" "$HANDSHAKE_FILE" "$MANIFEST_FILE" "$EXPECTED_OBJECTIVE" <<'PY'
 import json
 import sys
 from pathlib import Path
 
 status_path = Path(sys.argv[1])
-expected_objective = int(sys.argv[2])
+handshake_path = Path(sys.argv[2])
+manifest_path = Path(sys.argv[3])
+expected_objective = int(sys.argv[4])
 
-status = json.loads(status_path.read_text())
+status = json.loads(status_path.read_text(encoding="utf-8-sig"))
+
+
+def read_json(path):
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8-sig"))
+    except Exception:
+        return None
 
 def get_path(d, *path):
     cur = d
@@ -36,6 +49,10 @@ def as_int(v):
         return int(v)
     except Exception:
         return None
+
+
+def non_empty(value):
+    return isinstance(value, str) and bool(value.strip())
 
 compatible = get_path(status, "compatible")
 alignment_status = (
@@ -70,6 +87,43 @@ refresh_failure = (
     or get_path(status, "mim_refresh", "failure_reason")
 )
 
+mim_refresh = get_path(status, "mim_refresh") or {}
+published_handshake = get_path(status, "mim_handshake") or {}
+shared_handshake = read_json(handshake_path) if handshake_path.exists() else None
+shared_manifest = read_json(manifest_path) if manifest_path.exists() else None
+shared_truth = (shared_handshake or {}).get("truth") or {}
+shared_manifest_payload = (shared_manifest or {}).get("manifest") or {}
+
+shared_artifacts_present = shared_handshake is not None and shared_manifest is not None
+shared_schema = shared_truth.get("schema_version") or shared_manifest_payload.get("schema_version")
+shared_release = shared_truth.get("release_tag") or shared_manifest_payload.get("release_tag")
+shared_objective = shared_truth.get("objective_active")
+
+refresh_evidence_ok = True
+refresh_evidence_detail = "not required; shared manifest/handshake artifacts not present"
+if shared_artifacts_present:
+    refresh_evidence_checks = [
+        mim_refresh.get("copied_manifest") is True,
+        non_empty(mim_refresh.get("source_manifest")),
+        non_empty(mim_refresh.get("source_handshake_packet")),
+        published_handshake.get("available") is True,
+        str(published_handshake.get("objective_active") or "") == str(shared_objective or ""),
+        str(published_handshake.get("schema_version") or "") == str(shared_schema or ""),
+        str(published_handshake.get("release_tag") or "") == str(shared_release or ""),
+        str(get_path(status, "mim_schema") or "") == str(shared_schema or ""),
+    ]
+    refresh_evidence_ok = all(refresh_evidence_checks)
+    refresh_evidence_detail = (
+        f"copied_manifest={mim_refresh.get('copied_manifest')!r} "
+        f"source_manifest={mim_refresh.get('source_manifest')!r} "
+        f"source_handshake_packet={mim_refresh.get('source_handshake_packet')!r} "
+        f"handshake_available={published_handshake.get('available')!r} "
+        f"published_objective={published_handshake.get('objective_active')!r} shared_objective={shared_objective!r} "
+        f"published_schema={published_handshake.get('schema_version')!r} shared_schema={shared_schema!r} "
+        f"published_release={published_handshake.get('release_tag')!r} shared_release={shared_release!r} "
+        f"mim_schema={get_path(status, 'mim_schema')!r}"
+    )
+
 checks = []
 checks.append(("compatible == true", compatible is True, compatible))
 checks.append((
@@ -91,6 +145,11 @@ checks.append((
     "refresh failure empty",
     refresh_failure in (None, ""),
     refresh_failure,
+))
+checks.append((
+    "canonical refresh evidence matches shared handshake/manifest truth",
+    refresh_evidence_ok,
+    refresh_evidence_detail,
 ))
 
 all_ok = all(ok for _, ok, _ in checks)

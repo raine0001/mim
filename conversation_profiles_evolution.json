@@ -1,0 +1,32 @@
+[
+    {
+        "profile_id": "operator_direct",
+        "description": "Direct operator commands",
+        "style": "concise",
+        "default_confidence": 0.93
+    },
+    {
+        "profile_id": "operator_rambling",
+        "description": "Longer requests with side context",
+        "style": "rambling",
+        "default_confidence": 0.84
+    },
+    {
+        "profile_id": "operator_uncertain",
+        "description": "Hedged and ambiguous phrasing",
+        "style": "uncertain",
+        "default_confidence": 0.80
+    },
+    {
+        "profile_id": "operator_typo_heavy",
+        "description": "Compressed/typo-heavy input",
+        "style": "typo_heavy",
+        "default_confidence": 0.76
+    },
+    {
+        "profile_id": "operator_frustrated",
+        "description": "Impatient tone under failure conditions",
+        "style": "frustrated",
+        "default_confidence": 0.82
+    }
+]

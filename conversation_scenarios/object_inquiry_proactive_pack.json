@@ -1,0 +1,837 @@
+[
+    {
+        "scenario_id": "object_learning_ladder_01",
+        "bucket": "object_learning",
+        "description": "Novel object prompt followed by staged semantic learning.",
+        "actions": [
+            {
+                "type": "camera_event",
+                "device_suffix": "ladder",
+                "observations": [
+                    {
+                        "object_label": "dock_{run_id}",
+                        "confidence": 0.88,
+                        "zone": "bench-{run_id}"
+                    }
+                ]
+            },
+            {
+                "type": "state_expect",
+                "required_prompt_markers": [
+                    "what is dock_{run_id}",
+                    "what does dock_{run_id} do"
+                ]
+            },
+            {
+                "type": "user_turn",
+                "text": "what do you see from the camera?",
+                "parsed_intent": "question",
+                "required_markers": [
+                    "what is dock_{run_id}",
+                    "what does dock_{run_id} do"
+                ],
+                "expected_topic": "object_inquiry"
+            },
+            {
+                "type": "user_turn",
+                "text": "It is a dock charger. It is used for charging the handheld scanner.",
+                "parsed_intent": "discussion",
+                "required_markers": [
+                    "i will remember",
+                    "dock charger",
+                    "charging the handheld scanner",
+                    "who owns dock_{run_id}",
+                    "where should dock_{run_id} normally live"
+                ],
+                "expected_topic": "object_inquiry"
+            },
+            {
+                "type": "object_library_expect",
+                "label": "dock_{run_id}",
+                "expected_metadata": {
+                    "description": "a dock charger",
+                    "purpose": "charging the handheld scanner"
+                },
+                "required_semantic_fields": [
+                    "description",
+                    "purpose"
+                ]
+            }
+        ]
+    },
+    {
+        "scenario_id": "object_inquiry_resume_01",
+        "bucket": "object_learning",
+        "description": "Switch away from object inquiry and return to it cleanly.",
+        "actions": [
+            {
+                "type": "camera_event",
+                "device_suffix": "resume",
+                "observations": [
+                    {
+                        "object_label": "marker_{run_id}",
+                        "confidence": 0.86,
+                        "zone": "table-{run_id}"
+                    }
+                ]
+            },
+            {
+                "type": "user_turn",
+                "text": "what do you see from the camera?",
+                "parsed_intent": "question",
+                "required_markers": [
+                    "what is marker_{run_id}"
+                ]
+            },
+            {
+                "type": "user_turn",
+                "text": "how is TOD doing?",
+                "parsed_intent": "question",
+                "required_markers": [
+                    "tod"
+                ],
+                "expected_topic": "tod_status"
+            },
+            {
+                "type": "user_turn",
+                "text": "ok, back to the camera, what do you see now?",
+                "parsed_intent": "question",
+                "required_markers": [
+                    "what is marker_{run_id}",
+                    "what does marker_{run_id} do"
+                ],
+                "expected_topic": "object_inquiry"
+            }
+        ]
+    },
+    {
+        "scenario_id": "object_correction_loop_01",
+        "bucket": "object_learning",
+        "description": "Initial semantics can be corrected later.",
+        "actions": [
+            {
+                "type": "camera_event",
+                "device_suffix": "correction",
+                "observations": [
+                    {
+                        "object_label": "tool_{run_id}",
+                        "confidence": 0.85,
+                        "zone": "bench-{run_id}"
+                    }
+                ]
+            },
+            {
+                "type": "user_turn",
+                "text": "what do you see from the camera?",
+                "parsed_intent": "question",
+                "required_markers": [
+                    "what is tool_{run_id}"
+                ]
+            },
+            {
+                "type": "user_turn",
+                "text": "It is a mug. It is used for holding pens.",
+                "parsed_intent": "discussion",
+                "required_markers": [
+                    "mug",
+                    "holding pens"
+                ]
+            },
+            {
+                "type": "user_turn",
+                "text": "Actually it is a dock charger. It is used for charging the handheld scanner.",
+                "parsed_intent": "discussion",
+                "required_markers": [
+                    "dock charger",
+                    "charging the handheld scanner"
+                ]
+            },
+            {
+                "type": "object_library_expect",
+                "label": "tool_{run_id}",
+                "expected_metadata": {
+                    "description": "a dock charger",
+                    "purpose": "charging the handheld scanner"
+                },
+                "required_semantic_fields": [
+                    "description",
+                    "purpose"
+                ]
+            }
+        ]
+    },
+    {
+        "scenario_id": "familiar_object_suppression_01",
+        "bucket": "object_continuity",
+        "description": "Known objects should stop triggering novel-object curiosity.",
+        "actions": [
+            {
+                "type": "camera_event",
+                "device_suffix": "familiar-a",
+                "observations": [
+                    {
+                        "object_label": "dock_{run_id}",
+                        "confidence": 0.88,
+                        "zone": "bench-{run_id}"
+                    }
+                ]
+            },
+            {
+                "type": "user_turn",
+                "text": "what do you see from the camera?",
+                "parsed_intent": "question",
+                "required_markers": [
+                    "what is dock_{run_id}"
+                ]
+            },
+            {
+                "type": "user_turn",
+                "text": "It is a dock charger. It is used for charging the handheld scanner.",
+                "parsed_intent": "discussion",
+                "required_markers": [
+                    "dock charger",
+                    "charging the handheld scanner"
+                ]
+            },
+            {
+                "type": "user_turn",
+                "text": "It belongs to Jordan. It should live on the charging bench.",
+                "parsed_intent": "discussion",
+                "required_markers": [
+                    "belongs to jordan",
+                    "charging bench"
+                ]
+            },
+            {
+                "type": "camera_event",
+                "device_suffix": "familiar-b",
+                "observations": [
+                    {
+                        "object_label": "dock_{run_id}",
+                        "confidence": 0.9,
+                        "zone": "bench-{run_id}"
+                    }
+                ]
+            },
+            {
+                "type": "user_turn",
+                "text": "what do you see from the camera?",
+                "parsed_intent": "question",
+                "required_any_markers": [
+                    "i can currently see dock_{run_id}",
+                    "dock_{run_id}"
+                ],
+                "forbidden_markers": [
+                    "what is dock_{run_id}",
+                    "what does dock_{run_id} do"
+                ]
+            }
+        ]
+    },
+    {
+        "scenario_id": "uncertain_object_verification_01",
+        "bucket": "object_continuity",
+        "description": "Moved known objects should trigger verification-style inquiry.",
+        "actions": [
+            {
+                "type": "workspace_scan",
+                "scan_area": "front-{run_id}",
+                "observations": [
+                    {
+                        "label": "widget_{run_id}",
+                        "zone": "front-{run_id}",
+                        "confidence": 0.94,
+                        "owner": "Jordan",
+                        "purpose": "charging the handheld scanner"
+                    }
+                ]
+            },
+            {
+                "type": "camera_event",
+                "device_suffix": "uncertain",
+                "observations": [
+                    {
+                        "object_label": "widget_{run_id}",
+                        "confidence": 0.9,
+                        "zone": "side-{run_id}"
+                    }
+                ]
+            },
+            {
+                "type": "state_expect",
+                "required_prompt_markers": [
+                    "widget_{run_id}"
+                ],
+                "required_any_prompt_markers": [
+                    "confirm",
+                    "intentional",
+                    "seems to have moved"
+                ],
+                "forbidden_prompt_markers": [
+                    "what is widget_{run_id}"
+                ]
+            }
+        ]
+    },
+    {
+        "scenario_id": "missing_object_continuity_01",
+        "bucket": "object_continuity",
+        "description": "Missing known objects should trigger continuity prompts.",
+        "actions": [
+            {
+                "type": "workspace_scan",
+                "scan_area": "shelf-{run_id}",
+                "observations": [
+                    {
+                        "label": "anchor_{run_id}",
+                        "zone": "shelf-{run_id}",
+                        "confidence": 0.95,
+                        "owner": "Jordan",
+                        "purpose": "charging the handheld scanner",
+                        "expected_home_zone": "shelf-{run_id}"
+                    }
+                ]
+            },
+            {
+                "type": "camera_event",
+                "device_suffix": "missing",
+                "observations": [
+                    {
+                        "object_label": "filler_{run_id}",
+                        "confidence": 0.88,
+                        "zone": "shelf-{run_id}"
+                    }
+                ]
+            },
+            {
+                "type": "state_expect",
+                "required_prompt_markers": [
+                    "anchor_{run_id}",
+                    "jordan"
+                ],
+                "required_any_prompt_markers": [
+                    "where did it go",
+                    "did it get moved",
+                    "cannot find"
+                ],
+                "forbidden_prompt_markers": [
+                    "what is anchor_{run_id}"
+                ]
+            }
+        ]
+    },
+    {
+        "scenario_id": "social_blend_with_inquiry_01",
+        "bucket": "mixed_camera_conversation",
+        "description": "Casual conversation should coexist with object inquiry.",
+        "actions": [
+            {
+                "type": "camera_event",
+                "device_suffix": "social",
+                "observations": [
+                    {
+                        "object_label": "notebook_{run_id}",
+                        "confidence": 0.87,
+                        "zone": "desk-{run_id}"
+                    }
+                ]
+            },
+            {
+                "type": "user_turn",
+                "text": "hello mim",
+                "parsed_intent": "question",
+                "required_any_markers": [
+                    "hi",
+                    "ready to help"
+                ]
+            },
+            {
+                "type": "user_turn",
+                "text": "what do you see from the camera?",
+                "parsed_intent": "question",
+                "required_markers": [
+                    "what is notebook_{run_id}"
+                ]
+            }
+        ]
+    },
+    {
+        "scenario_id": "deferral_response_01",
+        "bucket": "mixed_camera_conversation",
+        "description": "User can defer an object inquiry and continue the conversation.",
+        "actions": [
+            {
+                "type": "camera_event",
+                "device_suffix": "defer",
+                "observations": [
+                    {
+                        "object_label": "adapter_{run_id}",
+                        "confidence": 0.86,
+                        "zone": "bench-{run_id}"
+                    }
+                ]
+            },
+            {
+                "type": "user_turn",
+                "text": "what do you see from the camera?",
+                "parsed_intent": "question",
+                "required_markers": [
+                    "what is adapter_{run_id}"
+                ]
+            },
+            {
+                "type": "user_turn",
+                "text": "not now, we can deal with it later",
+                "parsed_intent": "discussion",
+                "required_any_markers": [
+                    "okay",
+                    "understood",
+                    "i will",
+                    "we can"
+                ]
+            },
+            {
+                "type": "user_turn",
+                "text": "how is tod doing?",
+                "parsed_intent": "question",
+                "required_markers": [
+                    "tod"
+                ]
+            }
+        ]
+    },
+    {
+        "scenario_id": "low_information_reply_01",
+        "bucket": "object_learning",
+        "description": "Low-information replies should still keep the inquiry grounded.",
+        "actions": [
+            {
+                "type": "camera_event",
+                "device_suffix": "lowinfo",
+                "observations": [
+                    {
+                        "object_label": "tool_{run_id}",
+                        "confidence": 0.85,
+                        "zone": "bench-{run_id}"
+                    }
+                ]
+            },
+            {
+                "type": "user_turn",
+                "text": "what do you see from the camera?",
+                "parsed_intent": "question",
+                "required_markers": [
+                    "what is tool_{run_id}"
+                ]
+            },
+            {
+                "type": "user_turn",
+                "text": "it's mine, just a tool",
+                "parsed_intent": "discussion",
+                "required_any_markers": [
+                    "tool_{run_id}",
+                    "who owns",
+                    "where should",
+                    "what kind of object"
+                ]
+            }
+        ]
+    },
+    {
+        "scenario_id": "noisy_reply_extraction_01",
+        "bucket": "object_learning",
+        "description": "Noisy object replies should still extract basic semantics.",
+        "actions": [
+            {
+                "type": "camera_event",
+                "device_suffix": "noisy",
+                "observations": [
+                    {
+                        "object_label": "dock_{run_id}",
+                        "confidence": 0.86,
+                        "zone": "bench-{run_id}"
+                    }
+                ]
+            },
+            {
+                "type": "user_turn",
+                "text": "what do you see from the camera?",
+                "parsed_intent": "question",
+                "required_markers": [
+                    "what is dock_{run_id}"
+                ]
+            },
+            {
+                "type": "user_turn",
+                "text": "uh it is like a dock charger... for the scanner",
+                "parsed_intent": "discussion",
+                "required_any_markers": [
+                    "dock charger",
+                    "scanner",
+                    "i will remember"
+                ]
+            },
+            {
+                "type": "object_library_expect",
+                "label": "dock_{run_id}",
+                "expected_any_metadata": {
+                    "description": [
+                        "a dock charger",
+                        "dock charger"
+                    ],
+                    "purpose": [
+                        "charging the handheld scanner",
+                        "for the scanner",
+                        "the scanner",
+                        "scanner"
+                    ]
+                }
+            }
+        ]
+    },
+    {
+        "scenario_id": "long_horizon_drift_01",
+        "bucket": "object_continuity",
+        "description": "Later corrections should update durable semantics.",
+        "actions": [
+            {
+                "type": "camera_event",
+                "device_suffix": "drift",
+                "observations": [
+                    {
+                        "object_label": "dock_{run_id}",
+                        "confidence": 0.89,
+                        "zone": "bench-{run_id}"
+                    }
+                ]
+            },
+            {
+                "type": "user_turn",
+                "text": "what do you see from the camera?",
+                "parsed_intent": "question",
+                "required_markers": [
+                    "what is dock_{run_id}"
+                ]
+            },
+            {
+                "type": "user_turn",
+                "text": "It is a dock charger. It is used for charging the handheld scanner.",
+                "parsed_intent": "discussion",
+                "required_markers": [
+                    "dock charger"
+                ]
+            },
+            {
+                "type": "user_turn",
+                "text": "It belongs to Jordan. It should live on the charging bench.",
+                "parsed_intent": "discussion",
+                "required_markers": [
+                    "belongs to jordan"
+                ]
+            },
+            {
+                "type": "user_turn",
+                "text": "Actually it belongs to Riley now.",
+                "parsed_intent": "discussion",
+                "required_any_markers": [
+                    "riley",
+                    "i will remember"
+                ]
+            },
+            {
+                "type": "object_library_expect",
+                "label": "dock_{run_id}",
+                "expected_metadata": {
+                    "owner": "Riley"
+                }
+            }
+        ]
+    },
+    {
+        "scenario_id": "scene_priority_arbitration_01",
+        "bucket": "object_continuity",
+        "description": "Missing known-object continuity should beat novel-object curiosity.",
+        "actions": [
+            {
+                "type": "workspace_scan",
+                "scan_area": "priority-{run_id}",
+                "observations": [
+                    {
+                        "label": "dock_{run_id}",
+                        "zone": "priority-{run_id}",
+                        "confidence": 0.93,
+                        "owner": "Jordan",
+                        "purpose": "charging the handheld scanner",
+                        "expected_home_zone": "priority-{run_id}"
+                    }
+                ]
+            },
+            {
+                "type": "camera_event",
+                "device_suffix": "priority",
+                "observations": [
+                    {
+                        "object_label": "novel_{run_id}",
+                        "confidence": 0.9,
+                        "zone": "priority-{run_id}"
+                    }
+                ]
+            },
+            {
+                "type": "state_expect",
+                "required_prompt_markers": [
+                    "dock_{run_id}"
+                ],
+                "required_any_prompt_markers": [
+                    "where did it go",
+                    "did it get moved",
+                    "cannot find"
+                ],
+                "forbidden_prompt_markers": [
+                    "what is novel_{run_id}"
+                ]
+            }
+        ]
+    },
+    {
+        "scenario_id": "multi_object_scene_01",
+        "bucket": "mixed_camera_conversation",
+        "description": "Multi-object scenes should stay camera-grounded.",
+        "actions": [
+            {
+                "type": "camera_event",
+                "device_suffix": "multi",
+                "observations": [
+                    {
+                        "object_label": "dock_{run_id}",
+                        "confidence": 0.84,
+                        "zone": "bench-{run_id}"
+                    },
+                    {
+                        "object_label": "charger_{run_id}",
+                        "confidence": 0.83,
+                        "zone": "bench-{run_id}"
+                    }
+                ]
+            },
+            {
+                "type": "user_turn",
+                "text": "what do you see from the camera?",
+                "parsed_intent": "question",
+                "required_any_markers": [
+                    "dock_{run_id}",
+                    "charger_{run_id}",
+                    "camera"
+                ],
+                "forbidden_markers": [
+                    "got it:"
+                ]
+            }
+        ]
+    },
+    {
+        "scenario_id": "preference_shaping_01",
+        "bucket": "mixed_camera_conversation",
+        "description": "Stored conversational preference should coexist with camera inquiry.",
+        "actions": [
+            {
+                "type": "user_turn",
+                "text": "remember i prefer short responses",
+                "parsed_intent": "discussion",
+                "required_any_markers": [
+                    "remember",
+                    "short"
+                ]
+            },
+            {
+                "type": "camera_event",
+                "device_suffix": "pref",
+                "observations": [
+                    {
+                        "object_label": "device_{run_id}",
+                        "confidence": 0.87,
+                        "zone": "desk-{run_id}"
+                    }
+                ]
+            },
+            {
+                "type": "user_turn",
+                "text": "what do you see from the camera?",
+                "parsed_intent": "question",
+                "required_markers": [
+                    "device_{run_id}"
+                ]
+            }
+        ]
+    },
+    {
+        "scenario_id": "mixed_technical_thread_camera_01",
+        "bucket": "mixed_camera_conversation",
+        "description": "Technical conversation should survive a later camera inquiry.",
+        "actions": [
+            {
+                "type": "camera_event",
+                "device_suffix": "mixed-tech",
+                "observations": [
+                    {
+                        "object_label": "dock_{run_id}",
+                        "confidence": 0.88,
+                        "zone": "bench-{run_id}"
+                    }
+                ]
+            },
+            {
+                "type": "user_turn",
+                "text": "research how to build a practical machine learning inference pipeline with bounded risk",
+                "parsed_intent": "question",
+                "required_any_markers": [
+                    "technical framing",
+                    "plan of action"
+                ],
+                "expected_topic": "technical_research"
+            },
+            {
+                "type": "user_turn",
+                "text": "go deeper",
+                "parsed_intent": "discussion",
+                "required_markers": [
+                    "step",
+                    "next step"
+                ],
+                "expected_topic": "technical_research"
+            },
+            {
+                "type": "user_turn",
+                "text": "ok now what do you see from the camera?",
+                "parsed_intent": "question",
+                "required_markers": [
+                    "what is dock_{run_id}"
+                ]
+            }
+        ]
+    },
+    {
+        "scenario_id": "proactive_owner_home_followup_01",
+        "bucket": "object_learning",
+        "description": "Owner and home-zone enrichment remains staged and explicit.",
+        "actions": [
+            {
+                "type": "camera_event",
+                "device_suffix": "owner-home",
+                "observations": [
+                    {
+                        "object_label": "dock_{run_id}",
+                        "confidence": 0.87,
+                        "zone": "bench-{run_id}"
+                    }
+                ]
+            },
+            {
+                "type": "user_turn",
+                "text": "what do you see from the camera?",
+                "parsed_intent": "question",
+                "required_markers": [
+                    "what is dock_{run_id}"
+                ]
+            },
+            {
+                "type": "user_turn",
+                "text": "It is a dock charger. It is used for charging the handheld scanner.",
+                "parsed_intent": "discussion",
+                "required_markers": [
+                    "who owns dock_{run_id}",
+                    "where should dock_{run_id} normally live"
+                ]
+            },
+            {
+                "type": "user_turn",
+                "text": "It belongs to Jordan. It should live on the charging bench.",
+                "parsed_intent": "discussion",
+                "required_markers": [
+                    "belongs to jordan",
+                    "charging bench"
+                ]
+            },
+            {
+                "type": "object_library_expect",
+                "label": "dock_{run_id}",
+                "expected_metadata": {
+                    "owner": "Jordan",
+                    "expected_home_zone": "charging bench"
+                },
+                "required_semantic_fields": [
+                    "owner",
+                    "expected_home_zone"
+                ]
+            }
+        ]
+    },
+    {
+        "scenario_id": "secondary_semantics_followup_01",
+        "bucket": "object_learning",
+        "description": "Secondary semantic enrichment continues after owner/home are known.",
+        "actions": [
+            {
+                "type": "camera_event",
+                "device_suffix": "secondary",
+                "observations": [
+                    {
+                        "object_label": "dock_{run_id}",
+                        "confidence": 0.86,
+                        "zone": "bench-{run_id}"
+                    }
+                ]
+            },
+            {
+                "type": "user_turn",
+                "text": "what do you see from the camera?",
+                "parsed_intent": "question",
+                "required_markers": [
+                    "what is dock_{run_id}"
+                ]
+            },
+            {
+                "type": "user_turn",
+                "text": "It is a dock charger. It is used for charging the handheld scanner.",
+                "parsed_intent": "discussion",
+                "required_markers": [
+                    "who owns dock_{run_id}"
+                ]
+            },
+            {
+                "type": "user_turn",
+                "text": "It belongs to Jordan. It should live on the charging bench.",
+                "parsed_intent": "discussion",
+                "required_markers": [
+                    "what kind of object is dock_{run_id}",
+                    "what should i understand about dock_{run_id}",
+                    "any notes i should remember about dock_{run_id}"
+                ]
+            },
+            {
+                "type": "user_turn",
+                "text": "Category is charging equipment. It means the scanner is ready for handoff. Note that the cable is loose.",
+                "parsed_intent": "discussion",
+                "required_markers": [
+                    "charging equipment",
+                    "ready for handoff",
+                    "cable is loose"
+                ]
+            },
+            {
+                "type": "object_library_expect",
+                "label": "dock_{run_id}",
+                "expected_metadata": {
+                    "category": "charging equipment",
+                    "meaning": "the scanner is ready for handoff",
+                    "user_notes": "the cable is loose"
+                },
+                "required_semantic_fields": [
+                    "category",
+                    "meaning",
+                    "user_notes"
+                ]
+            }
+        ]
+    }
+]

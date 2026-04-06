@@ -6,7 +6,10 @@ import urllib.request
 from uuid import uuid4
 
 
-BASE_URL = os.getenv("MIM_TEST_BASE_URL", "http://127.0.0.1:8001")
+from tests.integration.runtime_target_guard import DEFAULT_BASE_URL
+
+
+BASE_URL = os.getenv("MIM_TEST_BASE_URL", DEFAULT_BASE_URL)
 
 
 def post_json(path: str, payload: dict) -> tuple[int, dict]:
@@ -80,7 +83,12 @@ class Objective26ObjectIdentityPersistenceTest(unittest.TestCase):
             for step in ["accepted", "running"]:
                 status, step_resp = post_json(
                     f"/gateway/capabilities/executions/{execution_id}/feedback",
-                    {"status": step, "reason": step, "actor": "tod", "feedback_json": {}},
+                    {
+                        "status": step,
+                        "reason": step,
+                        "actor": "tod",
+                        "feedback_json": {},
+                    },
                 )
                 self.assertEqual(status, 200, step_resp)
 
@@ -100,7 +108,19 @@ class Objective26ObjectIdentityPersistenceTest(unittest.TestCase):
             self.assertIn("workspace_object_ids", succeeded.get("feedback_json", {}))
             return execution_id
 
-        run_scan(table_zone, [{"label": label_primary, "zone": table_zone, "confidence": 0.93}])
+        run_scan(
+            table_zone,
+            [
+                {
+                    "label": label_primary,
+                    "zone": table_zone,
+                    "confidence": 0.93,
+                    "owner": "Jordan",
+                    "purpose": "holding charging adapters",
+                    "expected_home_zone": table_zone,
+                }
+            ],
+        )
 
         status, objects_by_label = get_json(f"/workspace/objects?label={label_primary}")
         self.assertEqual(status, 200, objects_by_label)
@@ -111,15 +131,33 @@ class Objective26ObjectIdentityPersistenceTest(unittest.TestCase):
         object_id = int(blue_obj["object_memory_id"])
         self.assertEqual(blue_obj.get("zone"), table_zone)
         self.assertIn(blue_obj.get("status"), {"active", "uncertain"})
+        metadata = (
+            blue_obj.get("metadata_json", {}) if isinstance(blue_obj, dict) else {}
+        )
+        self.assertEqual(str(metadata.get("owner", "")).strip(), "Jordan")
+        self.assertEqual(
+            str(metadata.get("purpose", "")).strip(), "holding charging adapters"
+        )
+        self.assertEqual(
+            str(metadata.get("expected_home_zone", "")).strip(), table_zone
+        )
 
-        run_scan(table_zone, [{"label": label_alias, "zone": table_zone, "confidence": 0.86}])
+        run_scan(
+            table_zone, [{"label": label_alias, "zone": table_zone, "confidence": 0.86}]
+        )
         status, after_match = get_json(f"/workspace/objects/{object_id}")
         self.assertEqual(status, 200, after_match)
         self.assertEqual(after_match.get("object_memory_id"), object_id)
         self.assertEqual(after_match.get("zone"), table_zone)
-        self.assertIn(label_alias.lower(), [item.lower() for item in after_match.get("aliases", [])])
+        self.assertIn(
+            label_alias.lower(),
+            [item.lower() for item in after_match.get("aliases", [])],
+        )
 
-        run_scan(shelf_zone, [{"label": label_primary, "zone": shelf_zone, "confidence": 0.9}])
+        run_scan(
+            shelf_zone,
+            [{"label": label_primary, "zone": shelf_zone, "confidence": 0.9}],
+        )
         status, after_move = get_json(f"/workspace/objects/{object_id}")
         self.assertEqual(status, 200, after_move)
         self.assertEqual(after_move.get("zone"), shelf_zone)
@@ -142,14 +180,20 @@ class Objective26ObjectIdentityPersistenceTest(unittest.TestCase):
         )
         self.assertEqual(status, 200, uncertain_resolution_event)
         resolution = uncertain_resolution_event["resolution"]
-        self.assertEqual(resolution.get("reason"), "memory_object_uncertain_requires_reconfirm")
+        self.assertEqual(
+            resolution.get("reason"), "memory_object_uncertain_requires_reconfirm"
+        )
         self.assertEqual(resolution.get("outcome"), "requires_confirmation")
 
-        run_scan(shelf_zone, [{"label": label_other, "zone": shelf_zone, "confidence": 0.82}])
+        run_scan(
+            shelf_zone, [{"label": label_other, "zone": shelf_zone, "confidence": 0.82}]
+        )
         status, after_missing = get_json(f"/workspace/objects/{object_id}")
         self.assertEqual(status, 200, after_missing)
         self.assertIn(after_missing.get("status"), {"missing", "active"})
-        self.assertLessEqual(float(after_missing.get("confidence", 1.0)), moved_confidence)
+        self.assertLessEqual(
+            float(after_missing.get("confidence", 1.0)), moved_confidence
+        )
 
         status, list_by_label = get_json(f"/workspace/objects?label={run_id}")
         self.assertEqual(status, 200, list_by_label)

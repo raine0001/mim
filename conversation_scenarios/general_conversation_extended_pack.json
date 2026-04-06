@@ -1,0 +1,150 @@
+[
+    {
+        "scenario_id": "general_context_return_01",
+        "bucket": "general_extended",
+        "starting_state": "idle",
+        "user_turns": [
+            "hello mim",
+            "what should we prioritize next",
+            "why that",
+            "short final recap"
+        ],
+        "expected_behavior": [
+            "answer_plainly",
+            "avoid_context_drift"
+        ],
+        "failure_conditions": [
+            "context_drift",
+            "response_loop_risk"
+        ]
+    },
+    {
+        "scenario_id": "general_format_shift_01",
+        "bucket": "general_extended",
+        "starting_state": "idle",
+        "user_turns": [
+            "what are you working on right now",
+            "give me the top two upcoming items only",
+            "repeat that as a checklist"
+        ],
+        "expected_behavior": [
+            "answer_plainly",
+            "avoid_context_drift"
+        ],
+        "failure_conditions": [
+            "over_explaining",
+            "context_drift"
+        ]
+    },
+    {
+        "scenario_id": "general_noise_recovery_01",
+        "bucket": "general_extended",
+        "starting_state": "stt_noisy",
+        "user_turns": [
+            "uh",
+            "you know",
+            "okay so how is tod now",
+            "what should i do first"
+        ],
+        "expected_behavior": [
+            "single_prompt_then_wait",
+            "answer_plainly"
+        ],
+        "failure_conditions": [
+            "repeated_clarifier_pattern",
+            "response_loop_risk"
+        ]
+    },
+    {
+        "scenario_id": "general_preference_brevity_01",
+        "bucket": "general_extended",
+        "starting_state": "prior_context",
+        "user_turns": [
+            "remember i prefer short responses",
+            "how should we continue",
+            "summarize in one line"
+        ],
+        "expected_behavior": [
+            "answer_plainly",
+            "avoid_context_drift"
+        ],
+        "failure_conditions": [
+            "over_explaining",
+            "context_drift"
+        ]
+    },
+    {
+        "scenario_id": "general_project_detour_return_01",
+        "bucket": "general_extended",
+        "starting_state": "idle",
+        "user_turns": [
+            "let us keep this simple and conversational",
+            "what should we prioritize next",
+            "now switch to upcoming tasks",
+            "why that one"
+        ],
+        "expected_behavior": [
+            "answer_plainly",
+            "avoid_context_drift"
+        ],
+        "failure_conditions": [
+            "context_drift",
+            "response_loop_risk"
+        ]
+    },
+    {
+        "scenario_id": "general_technical_followup_01",
+        "bucket": "general_extended",
+        "starting_state": "idle",
+        "user_turns": [
+            "research how to build a practical machine learning inference pipeline with bounded risk",
+            "go deeper",
+            "why that",
+            "repeat that as a checklist"
+        ],
+        "expected_behavior": [
+            "answer_plainly",
+            "avoid_context_drift"
+        ],
+        "failure_conditions": [
+            "context_drift",
+            "response_loop_risk"
+        ]
+    },
+    {
+        "scenario_id": "general_capability_shift_01",
+        "bucket": "general_extended",
+        "starting_state": "idle",
+        "user_turns": [
+            "what can you do",
+            "just chatting for now",
+            "ok now check your current health"
+        ],
+        "expected_behavior": [
+            "answer_plainly",
+            "avoid_context_drift"
+        ],
+        "failure_conditions": [
+            "context_drift",
+            "over_explaining"
+        ]
+    },
+    {
+        "scenario_id": "general_status_after_friction_01",
+        "bucket": "general_extended",
+        "starting_state": "idle",
+        "user_turns": [
+            "this is annoying you keep repeating yourself",
+            "what do you need from me",
+            "one line status"
+        ],
+        "expected_behavior": [
+            "answer_plainly",
+            "single_prompt_then_wait"
+        ],
+        "failure_conditions": [
+            "response_loop_risk",
+            "over_explaining"
+        ]
+    }
+]

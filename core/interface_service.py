@@ -6,6 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.models import WorkspaceInterfaceApproval, WorkspaceInterfaceMessage, WorkspaceInterfaceSession
+from core.next_step_adjudication_service import build_interface_auto_approval_decision
 from core.state_bus_service import append_state_bus_event
 
 INTERFACE_SOURCE = "objective74"
@@ -179,6 +180,63 @@ async def list_interface_messages(
     return session, list(rows)
 
 
+async def get_latest_interface_approval(
+    *,
+    message_id: int,
+    db: AsyncSession,
+) -> WorkspaceInterfaceApproval | None:
+    return (
+        await db.execute(
+            select(WorkspaceInterfaceApproval)
+            .where(WorkspaceInterfaceApproval.message_id == int(message_id))
+            .order_by(WorkspaceInterfaceApproval.id.desc())
+            .limit(1)
+        )
+    ).scalars().first()
+
+
+async def list_pending_interface_approvals(
+    *,
+    limit: int,
+    source: str,
+    parsed_intent: str,
+    db: AsyncSession,
+) -> list[dict]:
+    stmt = (
+        select(WorkspaceInterfaceMessage, WorkspaceInterfaceSession)
+        .join(
+            WorkspaceInterfaceSession,
+            WorkspaceInterfaceSession.id == WorkspaceInterfaceMessage.session_id,
+        )
+        .where(WorkspaceInterfaceMessage.requires_approval.is_(True))
+        .order_by(WorkspaceInterfaceMessage.id.desc())
+        .limit(max(1, min(int(limit) * 5, 500)))
+    )
+    if str(source or "").strip():
+        stmt = stmt.where(WorkspaceInterfaceMessage.source == str(source).strip())
+    if str(parsed_intent or "").strip():
+        stmt = stmt.where(WorkspaceInterfaceMessage.parsed_intent == str(parsed_intent).strip())
+
+    rows = (await db.execute(stmt)).all()
+    pending: list[dict] = []
+    for message, session in rows:
+        latest_approval = await get_latest_interface_approval(message_id=int(message.id), db=db)
+        if latest_approval is not None and str(latest_approval.decision or "").strip().lower() != "deferred":
+            continue
+        pending.append(
+            {
+                "session": to_interface_session_out(session),
+                "message": to_interface_message_out(message),
+                "latest_approval": (
+                    to_interface_approval_out(latest_approval) if latest_approval is not None else None
+                ),
+            }
+        )
+        if len(pending) >= max(1, min(int(limit), 500)):
+            break
+    return pending
+
+
 async def submit_interface_approval(
     *,
     session_key: str,
@@ -249,6 +307,40 @@ async def submit_interface_approval(
     )
 
     return session, approval
+
+
+async def maybe_auto_approve_interface_message(
+    *,
+    session: WorkspaceInterfaceSession,
+    message: WorkspaceInterfaceMessage,
+    db: AsyncSession,
+) -> WorkspaceInterfaceApproval | None:
+    if not bool(message.requires_approval):
+        return None
+
+    latest = await get_latest_interface_approval(message_id=int(message.id), db=db)
+    if latest is not None and str(latest.decision or "").strip().lower() != "deferred":
+        return None
+
+    decision = build_interface_auto_approval_decision(
+        parsed_intent=message.parsed_intent,
+        content=message.content,
+        metadata_json=message.metadata_json if isinstance(message.metadata_json, dict) else {},
+    )
+    if not decision.get("auto_approve"):
+        return None
+
+    _, approval = await submit_interface_approval(
+        session_key=session.session_key,
+        actor="mim",
+        source="objective98a",
+        message_id=int(message.id),
+        decision="approved",
+        reason=str(decision.get("reason") or "").strip(),
+        metadata_json=decision.get("metadata_json") if isinstance(decision.get("metadata_json"), dict) else {},
+        db=db,
+    )
+    return approval
 
 
 def to_interface_session_out(row: WorkspaceInterfaceSession) -> dict:

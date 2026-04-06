@@ -67,7 +67,9 @@ def file_mtime_iso(path: Path) -> str:
 def detect_task_num() -> int:
     if not STATE_FILE.exists():
         return 0
-    m = re.search(r"TASK_NUM=(\d+)", STATE_FILE.read_text(encoding="utf-8", errors="ignore"))
+    m = re.search(
+        r"TASK_NUM=(\d+)", STATE_FILE.read_text(encoding="utf-8", errors="ignore")
+    )
     return int(m.group(1)) if m else 0
 
 
@@ -89,7 +91,9 @@ def latest_pass_line() -> str:
 
 
 def status_counts(rows: list[TaskRow]) -> Dict[str, int]:
-    counts = {k: 0 for k in ["not_started", "in_progress", "completed", "blocked", "verified"]}
+    counts = {
+        k: 0 for k in ["not_started", "in_progress", "completed", "blocked", "verified"]
+    }
     for row in rows:
         counts[row.status] += 1
     return counts
@@ -101,26 +105,49 @@ def build_rows() -> list[TaskRow]:
     handshake = read_json(HANDSHAKE)
 
     mim_refresh = integration.get("mim_refresh", {})
+    mim_handshake = integration.get("mim_handshake", {})
     alignment = integration.get("objective_alignment", {})
 
     required_files_present = CONTEXT_JSON.exists() and CONTEXT_YAML.exists()
-    key_fields_ok = bool(integration.get("compatible") is True and alignment.get("aligned") is True)
+    key_fields_ok = bool(
+        integration.get("compatible") is True and alignment.get("aligned") is True
+    )
     alignment_request_present = ALIGNMENT_REQUEST.exists()
     tod_sync_published = bool(integration.get("generated_at"))
+    shared_truth = handshake.get("truth", {})
+    shared_manifest = manifest.get("manifest", {})
+    expected_schema = shared_truth.get("schema_version") or shared_manifest.get(
+        "schema_version"
+    )
+    expected_release = shared_truth.get("release_tag") or shared_manifest.get(
+        "release_tag"
+    )
+    expected_objective = shared_truth.get("objective_active")
+    refresh_failure_empty = str(mim_refresh.get("failure_reason") or "") == ""
     artifact_pull_verified = bool(
-        mim_refresh.get("copied_json")
-        and mim_refresh.get("copied_yaml")
-        and mim_refresh.get("copied_manifest")
-        and mim_refresh.get("ssh_pull", {}).get("json", {}).get("ok")
-        and mim_refresh.get("ssh_pull", {}).get("yaml", {}).get("ok")
+        mim_refresh.get("copied_manifest")
+        and str(mim_refresh.get("source_manifest") or "").strip()
+        and str(mim_refresh.get("source_handshake_packet") or "").strip()
+        and mim_handshake.get("available") is True
+        and str(mim_handshake.get("objective_active") or "")
+        == str(expected_objective or "")
+        and str(mim_handshake.get("schema_version") or "") == str(expected_schema or "")
+        and str(mim_handshake.get("release_tag") or "") == str(expected_release or "")
+        and str(integration.get("mim_schema") or "") == str(expected_schema or "")
+        and refresh_failure_empty
     )
     objective_aligned = bool(alignment.get("aligned"))
 
     readiness_exists = READINESS_REPORT.exists()
     prod_exists = PROD_REPORT.exists()
-    gate_core_ok = bool(integration.get("compatible") is True and objective_aligned)
+    gate_core_ok = bool(
+        integration.get("compatible") is True
+        and objective_aligned
+        and artifact_pull_verified
+        and refresh_failure_empty
+    )
 
-    schema_version = handshake.get("truth", {}).get("schema_version") or manifest.get("manifest", {}).get("schema_version")
+    schema_version = expected_schema
     contract_frozen = bool(schema_version)
 
     rows: list[TaskRow] = [
@@ -209,10 +236,10 @@ def build_rows() -> list[TaskRow]:
             phase="Phase 4 — Promotion gate",
             task="10",
             description="compatibility + alignment pre-promotion gate",
-            status="in_progress" if gate_core_ok else "blocked",
+            status="verified" if gate_core_ok else "in_progress",
             evidence="log entry",
             last_update=file_mtime_iso(LOOP_LOG),
-            confidence="medium",
+            confidence="high" if gate_core_ok else "medium",
         ),
         TaskRow(
             phase="Phase 4 — Promotion gate",
@@ -220,7 +247,9 @@ def build_rows() -> list[TaskRow]:
             description="readiness and production evidence capture",
             status="verified" if (readiness_exists and prod_exists) else "not_started",
             evidence="readiness report" if readiness_exists else "prod report",
-            last_update=max(file_mtime_iso(READINESS_REPORT), file_mtime_iso(PROD_REPORT)),
+            last_update=max(
+                file_mtime_iso(READINESS_REPORT), file_mtime_iso(PROD_REPORT)
+            ),
             confidence="high" if (readiness_exists and prod_exists) else "high",
         ),
     ]
@@ -244,7 +273,9 @@ def write_report(rows: list[TaskRow]) -> None:
     lines: list[str] = []
     lines.append("# Objective 75 Lifecycle Status")
     lines.append("")
-    lines.append(f"Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}")
+    lines.append(
+        f"Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}"
+    )
     lines.append("")
     lines.append("## Summary")
     lines.append("")
@@ -261,7 +292,9 @@ def write_report(rows: list[TaskRow]) -> None:
     lines.append("")
     lines.append("## Task Table")
     lines.append("")
-    lines.append("| Phase | Task | Description | Status | Evidence | Last Update | Confidence |")
+    lines.append(
+        "| Phase | Task | Description | Status | Evidence | Last Update | Confidence |"
+    )
     lines.append("|---|---:|---|---|---|---|---|")
     for row in rows:
         lines.append(
@@ -282,8 +315,12 @@ def write_report(rows: list[TaskRow]) -> None:
     lines.append("")
     lines.append("## Notes")
     lines.append("")
-    lines.append("- Statuses are artifact-derived and intentionally conservative when readiness/prod reports are missing.")
-    lines.append("- Confidence reflects direct deterministic evidence (`high`) vs inferred progression (`medium`/`low`).")
+    lines.append(
+        "- Statuses are artifact-derived and intentionally conservative when readiness/prod reports are missing."
+    )
+    lines.append(
+        "- Confidence reflects direct deterministic evidence (`high`) vs inferred progression (`medium`/`low`)."
+    )
 
     OUTPUT_MD.write_text("\n".join(lines) + "\n", encoding="utf-8")
 

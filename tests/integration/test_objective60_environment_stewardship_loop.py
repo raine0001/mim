@@ -8,7 +8,10 @@ from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 
-BASE_URL = os.getenv("MIM_TEST_BASE_URL", "http://127.0.0.1:8001")
+from tests.integration.runtime_target_guard import DEFAULT_BASE_URL
+
+
+BASE_URL = os.getenv("MIM_TEST_BASE_URL", DEFAULT_BASE_URL)
 
 
 def post_json(path: str, payload: dict) -> tuple[int, dict]:
@@ -191,6 +194,21 @@ class Objective60EnvironmentStewardshipLoopTest(unittest.TestCase):
                 "max_actions": 5,
                 "auto_execute": True,
                 "force_degraded": False,
+                "target_environment_state": {
+                    "zone_freshness_seconds": 300,
+                    "critical_object_confidence": 0.8,
+                    "max_degraded_zones": 0,
+                    "max_zone_uncertainty_score": 0.35,
+                    "max_system_drift_rate": 0.3,
+                    "max_missing_key_objects": 0,
+                    "key_objects": [f"obj60-critical-missing-{run_id}"],
+                    "intervention_policy": {
+                        "max_interventions_per_window": 1,
+                        "window_minutes": 180,
+                        "scope_cooldown_seconds": 3600,
+                        "per_strategy_limit": 1,
+                    },
+                },
                 "metadata_json": {"run_id": run_id, "phase": "degraded"},
             },
         )
@@ -201,28 +219,216 @@ class Objective60EnvironmentStewardshipLoopTest(unittest.TestCase):
         summary = cycled.get("summary", {}) if isinstance(cycled, dict) else {}
         stewardship_id = int(stewardship.get("stewardship_id", 0) or 0)
         self.assertGreater(stewardship_id, 0)
-        self.assertGreaterEqual(float(cycle.get("post_health", 0.0) or 0.0), float(cycle.get("pre_health", 0.0) or 0.0))
+        self.assertGreater(int(stewardship.get("linked_desired_state_id", 0) or 0), 0)
+        desired_state = (
+            stewardship.get("desired_state", {})
+            if isinstance(stewardship.get("desired_state", {}), dict)
+            else {}
+        )
+        self.assertEqual(
+            int(desired_state.get("desired_state_id", 0) or 0),
+            int(stewardship.get("linked_desired_state_id", 0) or 0),
+        )
+        self.assertEqual(str(desired_state.get("scope", "")), "zone")
+        self.assertEqual(str(desired_state.get("scope_ref", "")), scope)
+        self.assertTrue(
+            str(desired_state.get("created_from", "")).startswith("strategy_goal:")
+        )
+        self.assertGreaterEqual(
+            float(cycle.get("post_health", 0.0) or 0.0),
+            float(cycle.get("pre_health", 0.0) or 0.0),
+        )
         self.assertGreaterEqual(int(summary.get("degraded_signal_count", 0) or 0), 1)
         self.assertGreaterEqual(int(summary.get("actions_executed", 0) or 0), 1)
-        integration = cycle.get("integration_evidence", {}) if isinstance(cycle.get("integration_evidence", {}), dict) else {}
-        strategy_goal_ids = integration.get("strategy_goal_ids", []) if isinstance(integration.get("strategy_goal_ids", []), list) else []
+        self.assertEqual(
+            stewardship.get("target_environment_state", {}).get("key_objects", []),
+            [f"obj60-critical-missing-{run_id}"],
+        )
+        self.assertIn("current_metrics", stewardship)
+        self.assertIn("stability_score", stewardship.get("current_metrics", {}))
+        integration = (
+            cycle.get("integration_evidence", {})
+            if isinstance(cycle.get("integration_evidence", {}), dict)
+            else {}
+        )
+        strategy_goal_ids = (
+            integration.get("strategy_goal_ids", [])
+            if isinstance(integration.get("strategy_goal_ids", []), list)
+            else []
+        )
         self.assertGreaterEqual(len(strategy_goal_ids), 1)
+        self.assertEqual(
+            int(integration.get("desired_state_id", 0) or 0),
+            int(stewardship.get("linked_desired_state_id", 0) or 0),
+        )
         self.assertIn("autonomy_boundary_id", integration)
         self.assertIn("operator_preference_weight", integration)
+        self.assertIn("governance", integration)
+        assessment = (
+            cycle.get("assessment", {})
+            if isinstance(cycle.get("assessment", {}), dict)
+            else {}
+        )
+        verification = (
+            cycle.get("verification", {})
+            if isinstance(cycle.get("verification", {}), dict)
+            else {}
+        )
+        decision = (
+            cycle.get("decision", {})
+            if isinstance(cycle.get("decision", {}), dict)
+            else {}
+        )
+        pre_assessment = (
+            assessment.get("pre", {})
+            if isinstance(assessment.get("pre", {}), dict)
+            else {}
+        )
+        post_assessment = (
+            assessment.get("post", {})
+            if isinstance(assessment.get("post", {}), dict)
+            else {}
+        )
+        pre_system = (
+            pre_assessment.get("system_metrics", {})
+            if isinstance(pre_assessment.get("system_metrics", {}), dict)
+            else {}
+        )
+        post_system = (
+            post_assessment.get("system_metrics", {})
+            if isinstance(post_assessment.get("system_metrics", {}), dict)
+            else {}
+        )
+        self.assertIn("stability_score", pre_system)
+        self.assertIn("uncertainty_score", pre_system)
+        self.assertIn("drift_rate", pre_system)
+        self.assertIn("stability_score", post_system)
+        self.assertIn("remaining_deviation_count", verification)
+        self.assertIn("throttle_state", verification)
+        self.assertIn("throttle_state", decision)
+        self.assertEqual(
+            int(decision.get("desired_state_id", 0) or 0),
+            int(stewardship.get("linked_desired_state_id", 0) or 0),
+        )
+        key_objects = (
+            post_assessment.get("scope_metrics", {}).get("key_objects", [])
+            if isinstance(post_assessment.get("scope_metrics", {}), dict)
+            else []
+        )
+        self.assertTrue(
+            any(
+                str(item.get("object_name", "")) == f"obj60-critical-missing-{run_id}"
+                for item in key_objects
+                if isinstance(item, dict)
+            )
+        )
+
+        status, cycles = get_json(
+            "/stewardship/cycle",
+            {"stewardship_id": stewardship_id, "managed_scope": scope, "limit": 20},
+        )
+        self.assertEqual(status, 200, cycles)
+        cycle_rows = cycles.get("cycles", []) if isinstance(cycles, dict) else []
+        self.assertTrue(
+            any(
+                int(item.get("cycle_id", 0) or 0) == int(cycle.get("cycle_id", 0) or 0)
+                for item in cycle_rows
+                if isinstance(item, dict)
+            )
+        )
 
         status, listed = get_json("/stewardship", {"managed_scope": scope, "limit": 20})
         self.assertEqual(status, 200, listed)
         rows = listed.get("stewardship", []) if isinstance(listed, dict) else []
-        self.assertTrue(any(int(item.get("stewardship_id", 0) or 0) == stewardship_id for item in rows if isinstance(item, dict)))
+        self.assertTrue(
+            any(
+                int(item.get("stewardship_id", 0) or 0) == stewardship_id
+                for item in rows
+                if isinstance(item, dict)
+            )
+        )
 
         status, detail = get_json(f"/stewardship/{stewardship_id}")
         self.assertEqual(status, 200, detail)
-        self.assertEqual(int(detail.get("stewardship", {}).get("stewardship_id", 0) or 0), stewardship_id)
+        self.assertEqual(
+            int(detail.get("stewardship", {}).get("stewardship_id", 0) or 0),
+            stewardship_id,
+        )
 
-        status, history = get_json("/stewardship/history", {"stewardship_id": stewardship_id, "limit": 20})
+        status, history = get_json(
+            "/stewardship/history", {"stewardship_id": stewardship_id, "limit": 20}
+        )
         self.assertEqual(status, 200, history)
         history_rows = history.get("history", []) if isinstance(history, dict) else []
-        self.assertTrue(any(int(item.get("stewardship_id", 0) or 0) == stewardship_id for item in history_rows if isinstance(item, dict)))
+        self.assertTrue(
+            any(
+                int(item.get("stewardship_id", 0) or 0) == stewardship_id
+                for item in history_rows
+                if isinstance(item, dict)
+            )
+        )
+
+        status, throttled = post_json(
+            "/stewardship/cycle",
+            {
+                "actor": "objective60-test",
+                "source": "objective60-focused",
+                "managed_scope": scope,
+                "stale_after_seconds": 300,
+                "lookback_hours": 168,
+                "max_strategies": 5,
+                "max_actions": 5,
+                "auto_execute": True,
+                "force_degraded": True,
+                "target_environment_state": {
+                    "zone_freshness_seconds": 300,
+                    "critical_object_confidence": 0.8,
+                    "max_degraded_zones": 0,
+                    "max_zone_uncertainty_score": 0.35,
+                    "max_system_drift_rate": 0.3,
+                    "max_missing_key_objects": 0,
+                    "key_objects": [f"obj60-critical-missing-{run_id}"],
+                    "intervention_policy": {
+                        "max_interventions_per_window": 1,
+                        "window_minutes": 180,
+                        "scope_cooldown_seconds": 3600,
+                        "per_strategy_limit": 1,
+                    },
+                },
+                "metadata_json": {"run_id": run_id, "phase": "throttled"},
+            },
+        )
+        self.assertEqual(status, 200, throttled)
+        throttled_summary = (
+            throttled.get("summary", {}) if isinstance(throttled, dict) else {}
+        )
+        throttled_cycle = (
+            throttled.get("cycle", {})
+            if isinstance(throttled.get("cycle", {}), dict)
+            else {}
+        )
+        throttled_decision = (
+            throttled_cycle.get("decision", {})
+            if isinstance(throttled_cycle.get("decision", {}), dict)
+            else {}
+        )
+        throttled_verification = (
+            throttled_cycle.get("verification", {})
+            if isinstance(throttled_cycle.get("verification", {}), dict)
+            else {}
+        )
+        throttle_state = (
+            throttled_decision.get("throttle_state", {})
+            if isinstance(throttled_decision.get("throttle_state", {}), dict)
+            else {}
+        )
+        self.assertTrue(bool(throttled_summary.get("throttle_blocked", False)))
+        self.assertEqual(int(throttled_summary.get("actions_executed", -1) or 0), 0)
+        self.assertFalse(bool(throttled_decision.get("allow_auto_execution", True)))
+        self.assertFalse(bool(throttle_state.get("allowed", True)))
+        self.assertTrue(bool(throttle_state.get("scope_cooldown_active", False)))
+        self.assertIn("scope_cooldown_active", throttle_state.get("reasons", []))
+        self.assertIn("throttle_state", throttled_verification)
 
         status, stable = post_json(
             "/stewardship/cycle",
@@ -236,12 +442,35 @@ class Objective60EnvironmentStewardshipLoopTest(unittest.TestCase):
                 "max_actions": 5,
                 "auto_execute": True,
                 "force_degraded": False,
+                "target_environment_state": {
+                    "zone_freshness_seconds": 86400,
+                    "max_degraded_zones": 0,
+                    "max_missing_key_objects": 0,
+                    "key_objects": [],
+                },
                 "metadata_json": {"run_id": run_id, "phase": "stable"},
             },
         )
         self.assertEqual(status, 200, stable)
         stable_summary = stable.get("summary", {}) if isinstance(stable, dict) else {}
         self.assertEqual(int(stable_summary.get("degraded_signal_count", -1) or 0), 0)
+        stable_cycle = stable.get("cycle", {}) if isinstance(stable, dict) else {}
+        stable_assessment = (
+            stable_cycle.get("assessment", {})
+            if isinstance(stable_cycle.get("assessment", {}), dict)
+            else {}
+        )
+        stable_post = (
+            stable_assessment.get("post", {})
+            if isinstance(stable_assessment.get("post", {}), dict)
+            else {}
+        )
+        stable_post_system = (
+            stable_post.get("system_metrics", {})
+            if isinstance(stable_post.get("system_metrics", {}), dict)
+            else {}
+        )
+        self.assertIn("stability_score", stable_post_system)
 
 
 if __name__ == "__main__":

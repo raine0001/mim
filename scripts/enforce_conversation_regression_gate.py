@@ -12,8 +12,14 @@ def _load(path: Path) -> dict:
 
 
 def _summary(report: dict) -> dict:
-    summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
-    top_failures = summary.get("top_failures", []) if isinstance(summary.get("top_failures"), list) else []
+    summary = (
+        report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+    )
+    top_failures = (
+        summary.get("top_failures", [])
+        if isinstance(summary.get("top_failures"), list)
+        else []
+    )
     failure_map: dict[str, int] = {}
     for item in top_failures:
         if not isinstance(item, dict):
@@ -54,11 +60,15 @@ def _thresholds(mode: str) -> dict:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Enforce conversation regression gate across focused metrics.")
+    parser = argparse.ArgumentParser(
+        description="Enforce conversation regression gate across focused metrics."
+    )
     parser.add_argument("--a", required=True, help="Baseline/report A path")
     parser.add_argument("--b", required=True, help="Candidate/report B path")
     parser.add_argument("--mode", choices=["pr", "nightly"], default="pr")
-    parser.add_argument("--output", default="", help="Optional path to write gate result JSON")
+    parser.add_argument(
+        "--output", default="", help="Optional path to write gate result JSON"
+    )
     args = parser.parse_args()
 
     report_a = _summary(_load(Path(args.a)))
@@ -125,11 +135,23 @@ def main() -> int:
         "report_a": str(args.a),
         "report_b": str(args.b),
         "metrics": {
-            "overall": {"a": report_a["overall"], "b": report_b["overall"], "delta": overall_delta},
-            "failure_count": {"a": report_a["failure_count"], "b": report_b["failure_count"], "delta": failure_delta},
+            "overall": {
+                "a": report_a["overall"],
+                "b": report_b["overall"],
+                "delta": overall_delta,
+            },
+            "failure_count": {
+                "a": report_a["failure_count"],
+                "b": report_b["failure_count"],
+                "delta": failure_delta,
+            },
             "low_relevance": {"a": low_rel_a, "b": low_rel_b, "delta": low_rel_delta},
             "response_loop_risk": {"a": loop_a, "b": loop_b, "delta": loop_delta},
-            "missing_safety_boundary": {"a": safety_a, "b": safety_b, "delta": safety_delta},
+            "missing_safety_boundary": {
+                "a": safety_a,
+                "b": safety_b,
+                "delta": safety_delta,
+            },
         },
         "warnings": warnings,
         "failures": failures,

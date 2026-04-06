@@ -74,13 +74,33 @@ trigger_ts = parse_ts(trigger.get("generated_at"))
 ack_ts = parse_ts(ack.get("generated_at"))
 ack_status = str(ack.get("status", "")).strip().lower()
 ack_acknowledges = str(ack.get("acknowledges", "")).strip()
+trigger_sequence = trigger.get("sequence")
+ack_sequence = ack.get("ack_sequence")
+acknowledged_trigger_sequence = ack.get("acknowledged_trigger_sequence")
+observed_at = parse_ts(ack.get("observed_at"))
 
 checks = []
 checks.append(("trigger timestamp parseable", trigger_ts is not None, trigger.get("generated_at")))
 checks.append(("ack timestamp parseable", ack_ts is not None, ack.get("generated_at")))
 checks.append(("ack status is runtime (not ready_template)", ack_status not in {"", "ready_template"}, ack.get("status")))
+if observed_at is not None:
+    checks.append(("ack observed_at parseable", True, ack.get("observed_at")))
+elif ack.get("observed_at") is not None:
+    checks.append(("ack observed_at parseable", False, ack.get("observed_at")))
 if expected_task_id:
     checks.append(("acknowledges expected task", ack_acknowledges == expected_task_id, ack_acknowledges))
+if trigger_sequence is not None and acknowledged_trigger_sequence is not None:
+    checks.append((
+        "acknowledged trigger sequence matches trigger sequence",
+        str(acknowledged_trigger_sequence) == str(trigger_sequence),
+        {"trigger_sequence": trigger_sequence, "acknowledged_trigger_sequence": acknowledged_trigger_sequence},
+    ))
+if ack_sequence is not None:
+    try:
+        ack_sequence_int = int(ack_sequence)
+        checks.append(("ack sequence parseable", ack_sequence_int >= 1, ack_sequence))
+    except Exception:
+        checks.append(("ack sequence parseable", False, ack_sequence))
 
 lag_seconds = None
 if trigger_ts and ack_ts:

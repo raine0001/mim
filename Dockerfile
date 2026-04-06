@@ -15,6 +15,7 @@ RUN pip install --no-cache-dir \
     python-dotenv \
     sqlalchemy \
     asyncpg \
+    httpx \
     SpeechRecognition
 
 EXPOSE 8000

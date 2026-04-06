@@ -15,6 +15,7 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -421,6 +422,7 @@ def run_eval(
         profile_id = str(profile.get("profile_id", "unknown_profile"))
         style = str(profile.get("style", "concise"))
         confidence = float(profile.get("default_confidence", 0.85) or 0.85)
+        session_id = f"eval-{scenario_id}-{profile_id}-{uuid.uuid4().hex[:10]}"
 
         turn_results: list[EvalTurn] = []
         previous_response = ""
@@ -441,6 +443,7 @@ def run_eval(
                         "scenario_id": scenario_id,
                         "profile_id": profile_id,
                         "bucket": bucket,
+                        "conversation_session_id": session_id,
                     },
                 },
             )

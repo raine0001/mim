@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.error import URLError
@@ -11,6 +12,12 @@ from urllib.request import urlopen
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT_DIR = ROOT / "runtime" / "shared"
+WORKSPACE_RUNTIME_BASE_URLS = ["http://127.0.0.1:18001", "http://127.0.0.1:8001"]
+WORKSPACE_RUNTIME_MANIFEST_SOURCES = [
+    f"{base_url}/manifest" for base_url in WORKSPACE_RUNTIME_BASE_URLS
+]
+PROD_RUNTIME_BASE_URL = "http://127.0.0.1:8000"
+PROD_RUNTIME_MANIFEST_SOURCE = f"{PROD_RUNTIME_BASE_URL}/manifest"
 PROMOTED_STATUSES = {
     "promoted",
     "promoted_verified",
@@ -19,6 +26,11 @@ PROMOTED_STATUSES = {
 ACTIVE_IN_FLIGHT_STATUSES = {"implemented", "in_progress"}
 DOC_COMPLETED_STATUSES = {"completed", *PROMOTED_STATUSES}
 OBJECTIVE_TARGET_STATUSES = {*ACTIVE_IN_FLIGHT_STATUSES, *DOC_COMPLETED_STATUSES}
+
+
+def _is_objective_status_source_doc(path: Path) -> bool:
+    name = path.name.lower()
+    return not any(fragment in name for fragment in ("report", "plan", "update"))
 
 
 def _objective_sort_key(objective_ref: str | None) -> tuple[int, int]:
@@ -40,16 +52,72 @@ def _choose_newer_objective(*candidates: str | None) -> str | None:
     return max(values, key=_objective_sort_key)
 
 
-def _fetch_json(url: str, timeout: float = 2.5) -> dict | None:
-    try:
-        with urlopen(url, timeout=timeout) as resp:
-            if resp.status != 200:
-                return None
-            data = resp.read().decode("utf-8")
-            payload = json.loads(data)
-            return payload if isinstance(payload, dict) else None
-    except (URLError, TimeoutError, ValueError):
+def _normalize_objective_ref(value: object) -> str | None:
+    text = str(value or "").strip().replace("_", ".")
+    if not text:
         return None
+    match = re.search(r"(\d+(?:[\._-]\d+)?)", text)
+    if not match:
+        return None
+    return match.group(1).replace("_", ".").replace("-", ".")
+
+
+def _schema_version_sort_key(value: object) -> tuple[int, int, int, int]:
+    text = str(value or "").strip()
+    match = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})-(\d+)", text)
+    if not match:
+        return (0, 0, 0, 0)
+    return tuple(int(part) for part in match.groups())
+
+
+def _read_json_file(path: Path) -> dict | None:
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _latest_live_task_request_signal(shared_dir: Path) -> dict:
+    request_path = shared_dir / "MIM_TOD_TASK_REQUEST.latest.json"
+    payload = _read_json_file(request_path)
+    objective = None
+    if isinstance(payload, dict):
+        objective = _normalize_objective_ref(
+            payload.get("objective_id") or payload.get("task_id")
+        )
+    return {
+        "source": str(request_path.relative_to(ROOT)),
+        "objective": objective,
+        "task_id": str(payload.get("task_id") or "").strip()
+        if isinstance(payload, dict)
+        else "",
+        "available": bool(payload),
+    }
+
+
+def _fetch_json(
+    url: str,
+    timeout: float = 2.5,
+    retries: int = 3,
+    retry_delay_seconds: float = 0.35,
+) -> dict | None:
+    attempts = max(1, int(retries))
+    for attempt in range(attempts):
+        try:
+            with urlopen(url, timeout=timeout) as resp:
+                if resp.status != 200:
+                    return None
+                data = resp.read().decode("utf-8")
+                payload = json.loads(data)
+                return payload if isinstance(payload, dict) else None
+        except (URLError, TimeoutError, ValueError, OSError, ConnectionResetError):
+            if attempt >= attempts - 1:
+                return None
+            time.sleep(retry_delay_seconds)
+    return None
 
 
 def _health(base_urls: list[str]) -> dict:
@@ -71,9 +139,9 @@ def _health(base_urls: list[str]) -> dict:
 
 def _parse_objective_index(
     index_path: Path,
-) -> tuple[str, str | None, str | None, str, str]:
+) -> tuple[str, str | None, str | None, str | None, str, str]:
     if not index_path.exists():
-        return "0", None, None, "1", "none"
+        return "0", None, None, None, "1", "none"
 
     rows: list[tuple[tuple[int, int], str, str]] = []
     for line in index_path.read_text(encoding="utf-8").splitlines():
@@ -93,9 +161,11 @@ def _parse_objective_index(
         rows.append(((major, minor), objective, status))
 
     promoted = [row for row in rows if row[2] in PROMOTED_STATUSES]
+    latest_completed_status: str | None = None
     if promoted:
         promoted.sort(key=lambda item: item[0])
         latest_obj = promoted[-1][1]
+        latest_completed_status = promoted[-1][2]
     else:
         latest_obj = "0"
 
@@ -119,6 +189,7 @@ def _parse_objective_index(
 
     return (
         latest_obj,
+        latest_completed_status,
         objective_in_flight,
         objective_in_flight_status,
         next_obj,
@@ -128,12 +199,14 @@ def _parse_objective_index(
 
 def _parse_objective_docs(
     docs_dir: Path,
-) -> tuple[str | None, str | None, str | None, str]:
+) -> tuple[str | None, str | None, str | None, str | None, str]:
     if not docs_dir.exists():
-        return None, None, None, "none"
+        return None, None, None, None, "none"
 
     rows: list[tuple[tuple[int, int], str, str]] = []
     for path in docs_dir.glob("objective-*.md"):
+        if not _is_objective_status_source_doc(path):
+            continue
         match = re.match(r"objective-(\d+(?:[_\.]\d+)?)", path.name)
         if not match:
             continue
@@ -147,12 +220,15 @@ def _parse_objective_docs(
         rows.append((_objective_sort_key(objective), objective, status))
 
     if not rows:
-        return None, None, None, "none"
+        return None, None, None, None, "none"
 
     latest_completed: str | None = None
+    latest_completed_status: str | None = None
     completed_rows = [row for row in rows if row[2] in DOC_COMPLETED_STATUSES]
     if completed_rows:
-        latest_completed = max(completed_rows, key=lambda item: item[0])[1]
+        newest_completed = max(completed_rows, key=lambda item: item[0])
+        latest_completed = newest_completed[1]
+        latest_completed_status = newest_completed[2]
 
     objective_in_flight: str | None = None
     objective_in_flight_status: str | None = None
@@ -165,6 +241,7 @@ def _parse_objective_docs(
     most_recent_status = max(rows, key=lambda item: item[0])[2]
     return (
         latest_completed,
+        latest_completed_status,
         objective_in_flight,
         objective_in_flight_status,
         most_recent_status,
@@ -344,6 +421,7 @@ def _objective_target_metadata(
         return None
     return {
         "objective": objective_ref,
+        "status": objective_status,
         "schema_version": target.get("schema_version"),
         "release_tag": target.get("release_tag"),
         "source": target.get("source"),
@@ -403,33 +481,67 @@ def _to_yaml(value, indent: int = 0) -> str:
     return f"{prefix}{json.dumps(value)}"
 
 
-def _resolve_manifest(objective_target: dict | None = None) -> tuple[dict, dict]:
-    local_runtime_sources = [
-        "http://127.0.0.1:18001/manifest",
-        "http://127.0.0.1:8001/manifest",
-    ]
-    prod_runtime_source = "http://127.0.0.1:8000/manifest"
+def _resolve_manifest(
+    objective_target: dict | None = None,
+    *,
+    prefer_prod_runtime: bool = False,
+) -> tuple[dict, dict]:
+    local_runtime_sources = list(WORKSPACE_RUNTIME_MANIFEST_SOURCES)
+    prod_runtime_source = PROD_RUNTIME_MANIFEST_SOURCE
     shared_manifest_path = ROOT / "runtime" / "shared" / "MIM_MANIFEST.latest.json"
     manifest_candidate_diagnostics: list[dict] = []
+    objective_target_status = (
+        str(objective_target.get("status", "")).strip().lower()
+        if isinstance(objective_target, dict)
+        else ""
+    )
+    prefer_prod_runtime = prefer_prod_runtime or (
+        objective_target_status in PROMOTED_STATUSES
+    )
 
     selected_manifest: dict | None = None
     selected_base_source = ""
     selected_reason = ""
 
-    for source in local_runtime_sources:
+    preferred_runtime_sources = (
+        [prod_runtime_source, *local_runtime_sources]
+        if prefer_prod_runtime
+        else list(local_runtime_sources)
+    )
+
+    for source in preferred_runtime_sources:
         payload = _fetch_json(source)
         candidate = _manifest_candidate_summary(
             source,
             payload,
-            reason="workspace runtime endpoint"
-            if payload
-            else "unreachable_or_invalid",
+            reason=(
+                "promoted prod runtime endpoint"
+                if payload and prefer_prod_runtime and source == prod_runtime_source
+                else "workspace runtime endpoint"
+                if payload
+                else "unreachable_or_invalid"
+            ),
         )
         manifest_candidate_diagnostics.append(candidate)
         if selected_manifest is None and candidate["valid"]:
             selected_manifest = payload
             selected_base_source = source
-            selected_reason = f"selected freshest workspace/runtime manifest from {source} before considering stale prod runtime"
+            if prefer_prod_runtime and source == prod_runtime_source:
+                preferred_objective = ""
+                if isinstance(objective_target, dict):
+                    preferred_objective = str(
+                        objective_target.get("objective") or ""
+                    ).strip()
+                selected_reason = (
+                    f"selected promoted prod manifest from {source}"
+                    + (
+                        f" because objective {preferred_objective} is in a promoted state"
+                        if preferred_objective
+                        else " because prod runtime preference was explicitly requested"
+                    )
+                )
+            else:
+                selected_reason = f"selected freshest workspace/runtime manifest from {source} before considering stale prod runtime"
 
     snapshot_manifest = _manifest_from_shared_snapshot(shared_manifest_path)
     snapshot_source = str(shared_manifest_path.relative_to(ROOT))
@@ -446,17 +558,18 @@ def _resolve_manifest(objective_target: dict | None = None) -> tuple[dict, dict]
         selected_base_source = snapshot_source
         selected_reason = "selected workspace shared snapshot because no fresher runtime manifest was valid"
 
-    prod_manifest = _fetch_json(prod_runtime_source)
-    prod_candidate = _manifest_candidate_summary(
-        prod_runtime_source,
-        prod_manifest,
-        reason="prod runtime fallback" if prod_manifest else "unreachable_or_invalid",
-    )
-    manifest_candidate_diagnostics.append(prod_candidate)
-    if selected_manifest is None and prod_candidate["valid"]:
-        selected_manifest = prod_manifest
-        selected_base_source = prod_runtime_source
-        selected_reason = "fell back to stale prod runtime manifest because newer workspace/runtime sources were unavailable or invalid"
+    if prod_runtime_source not in preferred_runtime_sources:
+        prod_manifest = _fetch_json(prod_runtime_source)
+        prod_candidate = _manifest_candidate_summary(
+            prod_runtime_source,
+            prod_manifest,
+            reason="prod runtime fallback" if prod_manifest else "unreachable_or_invalid",
+        )
+        manifest_candidate_diagnostics.append(prod_candidate)
+        if selected_manifest is None and prod_candidate["valid"]:
+            selected_manifest = prod_manifest
+            selected_base_source = prod_runtime_source
+            selected_reason = "fell back to stale prod runtime manifest because newer workspace/runtime sources were unavailable or invalid"
 
     fallback_source = "core/manifest.py"
     fallback_manifest = _fallback_manifest_from_source(ROOT / "core" / "manifest.py")
@@ -472,6 +585,19 @@ def _resolve_manifest(objective_target: dict | None = None) -> tuple[dict, dict]
         selected_reason = "used static manifest fallback because no runtime or shared manifest source was valid"
 
     selected_manifest = dict(selected_manifest or {})
+    fallback_schema = _clean_target_value(fallback_manifest.get("schema_version"))
+    selected_schema = _clean_target_value(selected_manifest.get("schema_version"))
+    if (
+        fallback_schema
+        and _schema_version_sort_key(fallback_schema)
+        > _schema_version_sort_key(selected_schema)
+    ):
+        selected_manifest["schema_version"] = fallback_schema
+        selected_reason = (
+            f"{selected_reason}; overrode stale runtime/shared schema metadata with newer static schema_version "
+            f"{fallback_schema} from {fallback_source}"
+        )
+
     truth_source_used = selected_base_source
     if objective_target:
         target_schema = _clean_target_value(objective_target.get("schema_version"))
@@ -488,9 +614,9 @@ def _resolve_manifest(objective_target: dict | None = None) -> tuple[dict, dict]
 
     return selected_manifest, {
         "manifest_endpoint_priority": [
-            *local_runtime_sources,
+            *preferred_runtime_sources,
             snapshot_source,
-            prod_runtime_source,
+            *([] if prod_runtime_source in preferred_runtime_sources else [prod_runtime_source]),
         ],
         "manifest_base_source_used": selected_base_source,
         "manifest_source_used": truth_source_used,
@@ -500,9 +626,10 @@ def _resolve_manifest(objective_target: dict | None = None) -> tuple[dict, dict]
     }
 
 
-def build_payload_bundle() -> tuple[dict, dict]:
+def build_payload_bundle(*, prefer_prod_runtime: bool = False) -> tuple[dict, dict]:
     (
         index_latest_completed_objective,
+        index_latest_completed_status,
         index_objective_in_flight,
         index_objective_in_flight_status,
         index_next_objective,
@@ -510,6 +637,7 @@ def build_payload_bundle() -> tuple[dict, dict]:
     ) = _parse_objective_index(ROOT / "docs" / "objective-index.md")
     (
         docs_latest_completed_objective,
+        docs_latest_completed_status,
         docs_objective_in_flight,
         docs_objective_in_flight_status,
         docs_latest_row_status,
@@ -522,6 +650,10 @@ def build_payload_bundle() -> tuple[dict, dict]:
         )
         or index_latest_completed_objective
     )
+    if latest_completed_objective == docs_latest_completed_objective:
+        latest_completed_status = docs_latest_completed_status
+    else:
+        latest_completed_status = index_latest_completed_status
 
     objective_in_flight = _choose_newer_objective(
         index_objective_in_flight,
@@ -532,11 +664,23 @@ def build_payload_bundle() -> tuple[dict, dict]:
     else:
         objective_in_flight_status = index_objective_in_flight_status
 
+    if (
+        objective_in_flight
+        and latest_completed_objective
+        and _objective_sort_key(objective_in_flight)
+        <= _objective_sort_key(latest_completed_objective)
+    ):
+        objective_in_flight = None
+        objective_in_flight_status = None
+
     latest_row_status = (
         docs_latest_row_status
         if docs_latest_row_status != "none"
         else index_latest_row_status
     )
+
+    live_task_signal = _latest_live_task_request_signal(DEFAULT_OUTPUT_DIR)
+    live_task_objective = _normalize_objective_ref(live_task_signal.get("objective"))
 
     next_objective = index_next_objective
     if objective_in_flight and objective_in_flight_status in ACTIVE_IN_FLIGHT_STATUSES:
@@ -549,21 +693,47 @@ def build_payload_bundle() -> tuple[dict, dict]:
         )
         next_objective = str(major_part + 1 if major_part > 0 else 1)
 
+    objective_active = latest_completed_objective
+    objective_active_source = "latest_completed_objective"
+    if objective_in_flight and objective_in_flight_status in ACTIVE_IN_FLIGHT_STATUSES:
+        objective_active = objective_in_flight
+        objective_active_source = "objective_index_or_docs"
+
+    if live_task_objective and _objective_sort_key(live_task_objective) > _objective_sort_key(
+        objective_active
+    ):
+        objective_active = live_task_objective
+        next_objective = live_task_objective
+        objective_active_source = "live_task_request"
+
     objective_target_ref = objective_in_flight
     objective_target_status = objective_in_flight_status
     if not objective_target_ref and latest_completed_objective:
         objective_target_ref = latest_completed_objective
-        objective_target_status = "completed"
+        objective_target_status = latest_completed_status or "completed"
+    if live_task_objective and _objective_sort_key(live_task_objective) > _objective_sort_key(
+        objective_target_ref
+    ):
+        objective_target_ref = live_task_objective
+        objective_target_status = "implemented"
+
+    if (
+        objective_target_ref
+        and latest_completed_objective
+        and objective_target_ref == latest_completed_objective
+        and latest_completed_status in PROMOTED_STATUSES
+    ):
+        objective_target_status = latest_completed_status
 
     objective_target = _objective_target_metadata(
         ROOT / "docs" / "objective-index.md",
         objective_target_ref,
         objective_target_status,
     )
-    manifest, manifest_source = _resolve_manifest(objective_target)
-    objective_active = latest_completed_objective
-    if objective_in_flight and objective_in_flight_status in ACTIVE_IN_FLIGHT_STATUSES:
-        objective_active = objective_in_flight
+    manifest, manifest_source = _resolve_manifest(
+        objective_target,
+        prefer_prod_runtime=prefer_prod_runtime,
+    )
     verification = _verification_summary(latest_completed_objective)
 
     now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -603,6 +773,8 @@ def build_payload_bundle() -> tuple[dict, dict]:
             "objective_index": "docs/objective-index.md",
             **manifest_source,
             "objective_target": objective_target,
+            "live_task_request_signal": live_task_signal,
+            "objective_active_source": objective_active_source,
         },
         "objective_active": objective_active,
         "objective_in_flight": objective_in_flight,
@@ -891,9 +1063,16 @@ if __name__ == "__main__":
         action="store_true",
         help="Do not mirror latest exports at repository root",
     )
+    parser.add_argument(
+        "--prefer-prod-runtime",
+        action="store_true",
+        help="Prefer the production manifest endpoint when resolving export metadata",
+    )
     args = parser.parse_args()
 
-    payload, manifest = build_payload_bundle()
+    payload, manifest = build_payload_bundle(
+        prefer_prod_runtime=args.prefer_prod_runtime
+    )
     write_exports(
         payload, manifest, Path(args.output_dir), mirror_root=not args.no_root_mirror
     )

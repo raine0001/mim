@@ -6,6 +6,7 @@ from core.journal import write_journal
 from core.schemas import StewardshipCycleRequest
 from core.stewardship_service import (
     get_stewardship_state,
+    list_stewardship_cycles,
     list_stewardship_history,
     list_stewardship_states,
     run_stewardship_cycle,
@@ -32,6 +33,7 @@ async def run_stewardship_cycle_endpoint(
         auto_execute=payload.auto_execute,
         force_degraded=payload.force_degraded,
         metadata_json=payload.metadata_json,
+        target_environment_state=payload.target_environment_state,
         db=db,
     )
 
@@ -64,9 +66,31 @@ async def list_stewardship_endpoint(
     limit: int = Query(default=50, ge=1, le=500),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    rows = await list_stewardship_states(managed_scope=managed_scope, limit=limit, db=db)
+    rows = await list_stewardship_states(
+        managed_scope=managed_scope, limit=limit, db=db
+    )
     return {
         "stewardship": [to_stewardship_out(item) for item in rows],
+    }
+
+
+@router.get("/stewardship/cycle")
+async def list_stewardship_cycles_endpoint(
+    stewardship_id: int | None = Query(default=None),
+    cycle_id: int | None = Query(default=None),
+    managed_scope: str = Query(default=""),
+    limit: int = Query(default=100, ge=1, le=500),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    rows = await list_stewardship_cycles(
+        stewardship_id=stewardship_id,
+        cycle_id=cycle_id,
+        managed_scope=managed_scope,
+        limit=limit,
+        db=db,
+    )
+    return {
+        "cycles": [to_stewardship_cycle_out(item) for item in rows],
     }
 
 
@@ -76,7 +100,9 @@ async def list_stewardship_history_endpoint(
     limit: int = Query(default=100, ge=1, le=500),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    rows = await list_stewardship_history(stewardship_id=stewardship_id, limit=limit, db=db)
+    rows = await list_stewardship_history(
+        stewardship_id=stewardship_id, limit=limit, db=db
+    )
     return {
         "history": [to_stewardship_cycle_out(item) for item in rows],
     }

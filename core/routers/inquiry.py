@@ -20,7 +20,7 @@ async def generate_inquiry_questions_endpoint(
     payload: InquiryQuestionGenerateRequest,
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    rows = await generate_inquiry_questions(
+    result = await generate_inquiry_questions(
         actor=payload.actor,
         source=payload.source,
         lookback_hours=payload.lookback_hours,
@@ -29,6 +29,8 @@ async def generate_inquiry_questions_endpoint(
         metadata_json=payload.metadata_json,
         db=db,
     )
+    rows = result.get("questions", []) if isinstance(result, dict) else []
+    decisions = result.get("decisions", []) if isinstance(result, dict) else []
 
     await write_journal(
         db,
@@ -42,6 +44,7 @@ async def generate_inquiry_questions_endpoint(
             "lookback_hours": payload.lookback_hours,
             "max_questions": payload.max_questions,
             "min_soft_friction_count": payload.min_soft_friction_count,
+            "decision_count": len(decisions),
             **payload.metadata_json,
         },
     )
@@ -50,6 +53,7 @@ async def generate_inquiry_questions_endpoint(
     return {
         "generated": len(rows),
         "questions": [to_inquiry_question_out(item) for item in rows],
+        "decisions": decisions,
     }
 
 
