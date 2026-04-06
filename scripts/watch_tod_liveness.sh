@@ -8,6 +8,9 @@ POLL_SECONDS="${POLL_SECONDS:-3}"
 STALE_SECONDS="${STALE_SECONDS:-45}"
 COOLDOWN_SECONDS="${COOLDOWN_SECONDS:-30}"
 TRIGGER_PROTECT_SECONDS="${TRIGGER_PROTECT_SECONDS:-20}"
+RUN_ONCE="${RUN_ONCE:-0}"
+SERVICE_NAME="${SERVICE_NAME:-mim-watch-tod-liveness}"
+LOCK_FILE="${LOCK_FILE:-${SHARED_DIR}/.watch_tod_liveness.lock}"
 
 EVENT_LOG="${SHARED_DIR}/TOD_LIVENESS_EVENTS.latest.jsonl"
 STATE_FILE="${SHARED_DIR}/.tod_liveness_state"
@@ -15,12 +18,17 @@ STATE_FILE="${SHARED_DIR}/.tod_liveness_state"
 WATCH_FILES=(
   "TOD_MIM_TASK_ACK.latest.json"
   "TOD_MIM_TASK_RESULT.latest.json"
-  "TOD_LOOP_JOURNAL.latest.json"
   "TOD_INTEGRATION_STATUS.latest.json"
 )
 
 mkdir -p "${SHARED_DIR}"
 touch "${EVENT_LOG}"
+
+exec 9>"${LOCK_FILE}"
+if ! flock -n 9; then
+  echo "[tod-liveness] another instance is already active; exiting"
+  exit 0
+fi
 
 last_ping_epoch=0
 
@@ -30,6 +38,38 @@ load_state() {
   fi
 }
 
+next_bridge_meta() {
+  eval "$(python3 "${ROOT_DIR}/scripts/bridge_packet_sequence.py" --shared-dir "${SHARED_DIR}" --service "${SERVICE_NAME}" --instance-id "${SERVICE_NAME}:$$")"
+}
+
+sha256_for_file() {
+  local file_path="$1"
+  if [[ -f "${file_path}" ]]; then
+    sha256sum "${file_path}" | awk '{print $1}'
+  fi
+}
+
+current_request_context() {
+  python3 - <<'PY' "${SHARED_DIR}/MIM_TOD_TASK_REQUEST.latest.json"
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+task_id = ""
+correlation_id = ""
+if path.exists():
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+        if isinstance(data, dict):
+            task_id = str(data.get("task_id") or data.get("request_id") or "").strip()
+            correlation_id = str(data.get("correlation_id") or "").strip()
+    except Exception:
+        pass
+print(f"{task_id}|{correlation_id}")
+PY
+}
+
 save_state() {
   printf '%s' "${last_ping_epoch}" > "${STATE_FILE}"
 }
@@ -37,27 +77,32 @@ save_state() {
 oldest_age_seconds() {
   local now
   now="$(date +%s)"
-  local max_age=0
+  local freshest_age=""
+  local saw_file=0
 
   for file_name in "${WATCH_FILES[@]}"; do
     local file_path="${SHARED_DIR}/${file_name}"
     if [[ ! -f "${file_path}" ]]; then
-      echo "999999"
-      return 0
+      continue
     fi
     local mtime
     mtime="$(stat -c %Y "${file_path}" 2>/dev/null || echo 0)"
     if [[ "${mtime}" -eq 0 ]]; then
-      echo "999999"
-      return 0
+      continue
     fi
+    saw_file=1
     local age=$((now - mtime))
-    if (( age > max_age )); then
-      max_age="${age}"
+    if [[ -z "${freshest_age}" || ${age} -lt ${freshest_age} ]]; then
+      freshest_age="${age}"
     fi
   done
 
-  echo "${max_age}"
+  if (( saw_file == 0 )); then
+    echo "999999"
+    return 0
+  fi
+
+  echo "${freshest_age}"
 }
 
 emit_liveness_ping() {
@@ -65,19 +110,38 @@ emit_liveness_ping() {
   local age_seconds="$2"
   local now_iso
   now_iso="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+  local context_pair
+  local current_task_id=""
+  local current_correlation_id=""
+  local ping_path="${SHARED_DIR}/MIM_TO_TOD_PING.latest.json"
+  local ping_sha256=""
 
-  cat > "${SHARED_DIR}/MIM_TO_TOD_PING.latest.json" <<EOF
+  context_pair="$(current_request_context)"
+  current_task_id="${context_pair%%|*}"
+  current_correlation_id="${context_pair#*|}"
+  next_bridge_meta
+
+  cat > "${ping_path}" <<EOF
 {
-  "generated_at": "${now_iso}",
+  "generated_at": "${EMITTED_AT}",
+  "emitted_at": "${EMITTED_AT}",
+  "sequence": ${SEQUENCE},
   "packet_type": "mim-tod-liveness-ping-v1",
   "source_actor": "MIM",
   "target_actor": "TOD",
+  "source_host": "${SOURCE_HOST}",
+  "source_service": "${SOURCE_SERVICE}",
+  "source_instance_id": "${SOURCE_INSTANCE_ID}",
+  "task_id": "${current_task_id}",
+  "correlation_id": "${current_correlation_id}",
   "reason": "${reason}",
   "suspected_stale_seconds": ${age_seconds},
   "requested_action": "respond_with_alive_status",
   "response_file_expected": "TOD_TO_MIM_PING.latest.json"
 }
 EOF
+
+  ping_sha256="$(sha256_for_file "${ping_path}")"
 
   local trigger_file="${SHARED_DIR}/MIM_TO_TOD_TRIGGER.latest.json"
   local existing_trigger=""
@@ -102,18 +166,28 @@ PY
 
   if [[ -n "${existing_trigger}" && "${existing_trigger}" != "liveness_ping" && ${existing_age} -lt ${TRIGGER_PROTECT_SECONDS} ]]; then
     cat >> "${EVENT_LOG}" <<EOF
-{"generated_at":"${now_iso}","event":"liveness_trigger_deferred","reason":"active_non_liveness_trigger","existing_trigger":"${existing_trigger}","existing_trigger_age_seconds":${existing_age},"protect_seconds":${TRIGGER_PROTECT_SECONDS}}
+{"generated_at":"${EMITTED_AT}","event":"liveness_trigger_deferred","reason":"active_non_liveness_trigger","existing_trigger":"${existing_trigger}","existing_trigger_age_seconds":${existing_age},"protect_seconds":${TRIGGER_PROTECT_SECONDS},"task_id":"${current_task_id}","correlation_id":"${current_correlation_id}"}
 EOF
     echo "[tod-liveness] deferred trigger overwrite (active=${existing_trigger}, age=${existing_age}s)"
   else
+    next_bridge_meta
     cat > "${trigger_file}" <<EOF
 {
-  "generated_at": "${now_iso}",
+  "generated_at": "${EMITTED_AT}",
+  "emitted_at": "${EMITTED_AT}",
+  "sequence": ${SEQUENCE},
   "packet_type": "shared-trigger-v1",
   "source_actor": "MIM",
   "target_actor": "TOD",
+  "source_host": "${SOURCE_HOST}",
+  "source_service": "${SOURCE_SERVICE}",
+  "source_instance_id": "${SOURCE_INSTANCE_ID}",
   "trigger": "liveness_ping",
   "artifact": "MIM_TO_TOD_PING.latest.json",
+  "artifact_path": "${ping_path}",
+  "artifact_sha256": "${ping_sha256}",
+  "task_id": "${current_task_id}",
+  "correlation_id": "${current_correlation_id}",
   "action_required": "pull_latest_and_ack",
   "ack_file_expected": "TOD_TO_MIM_TRIGGER_ACK.latest.json"
 }
@@ -121,7 +195,7 @@ EOF
   fi
 
   cat >> "${EVENT_LOG}" <<EOF
-{"generated_at":"${now_iso}","event":"freeze_suspected","reason":"${reason}","stale_seconds":${age_seconds},"action":"ping_emitted"}
+{"generated_at":"${now_iso}","event":"freeze_suspected","reason":"${reason}","stale_seconds":${age_seconds},"action":"ping_emitted","task_id":"${current_task_id}","correlation_id":"${current_correlation_id}"}
 EOF
 
   last_ping_epoch="$(date +%s)"
@@ -166,5 +240,8 @@ while true; do
   fi
 
   emit_alive_event_if_present
+  if [[ "$(printf '%s' "${RUN_ONCE}" | tr '[:upper:]' '[:lower:]')" == "1" || "$(printf '%s' "${RUN_ONCE}" | tr '[:upper:]' '[:lower:]')" == "true" || "$(printf '%s' "${RUN_ONCE}" | tr '[:upper:]' '[:lower:]')" == "yes" ]]; then
+    break
+  fi
   sleep "${POLL_SECONDS}"
 done

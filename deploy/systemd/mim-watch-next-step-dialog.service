@@ -1,0 +1,17 @@
+[Unit]
+Description=MIM Watch Next-Step Dialog Sessions
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=testpilot
+Group=testpilot
+WorkingDirectory=/home/testpilot/mim
+Environment=POLL_SECONDS=3
+ExecStart=/home/testpilot/mim/scripts/watch_mim_next_step_dialog_responder.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

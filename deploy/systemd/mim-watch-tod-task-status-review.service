@@ -1,0 +1,18 @@
+[Unit]
+Description=MIM Watch TOD Task Status Review
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=testpilot
+Group=testpilot
+WorkingDirectory=/home/testpilot/mim
+Environment=POLL_SECONDS=15
+Environment=IDLE_SECONDS=120
+ExecStart=/home/testpilot/mim/scripts/watch_tod_task_status_review.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

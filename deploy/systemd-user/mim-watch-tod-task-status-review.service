@@ -1,0 +1,15 @@
+[Unit]
+Description=MIM Watch TOD Task Status Review (User)
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/testpilot/mim
+Environment=POLL_SECONDS=15
+Environment=IDLE_SECONDS=120
+ExecStart=/home/testpilot/mim/scripts/watch_tod_task_status_review.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

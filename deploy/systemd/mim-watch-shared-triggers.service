@@ -1,0 +1,17 @@
+[Unit]
+Description=MIM Watch Shared Triggers
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=testpilot
+Group=testpilot
+WorkingDirectory=/home/testpilot/mim
+Environment=POLL_SECONDS=2
+ExecStart=/home/testpilot/mim/scripts/watch_shared_triggers.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
