@@ -7,6 +7,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
@@ -21,9 +22,16 @@ from core.mim_arm_dispatch_telemetry import (
     record_dispatch_telemetry_from_publish,
     refresh_dispatch_telemetry_record,
 )
-from core.models import CapabilityExecution, CapabilityRegistration, InputEvent, InputEventResolution
+from core.models import (
+    CapabilityExecution,
+    CapabilityRegistration,
+    ExecutionTaskOrchestration,
+    InputEvent,
+    InputEventResolution,
+)
 from core.routers.self_awareness_router import health_monitor as _mim_health_monitor
 from core.routers import gateway as gateway_router
+from core.task_orchestrator import to_execution_task_orchestration_out
 from core.tod_mim_contract import CONTRACT_SCHEMA_VERSION, normalize_and_validate_file
 
 router = APIRouter(prefix="/mim/arm", tags=["mim-arm"])
@@ -41,6 +49,8 @@ TOD_CATCHUP_GATE_ARTIFACT = "TOD_CATCHUP_GATE.latest.json"
 MIM_ARM_DISPATCH_TELEMETRY_ARTIFACT = "MIM_ARM_DISPATCH_TELEMETRY.latest.json"
 CONTEXT_EXPORT_ARTIFACT = "MIM_CONTEXT_EXPORT.latest.json"
 TOD_BRIDGE_REQUEST_ARTIFACT = "MIM_TOD_BRIDGE_REQUEST.latest.json"
+MIM_ARM_COMPOSED_TASK_ARTIFACT = "MIM_ARM_COMPOSED_TASK.latest.json"
+MIM_ARM_COMPOSED_TASK_DIRNAME = "mim_arm_composed_tasks"
 ARM_SYNC_SCRIPT = PROJECT_ROOT / "scripts" / "sync_mim_arm_host_state.py"
 ARM_STATUS_SCRIPT = PROJECT_ROOT / "scripts" / "generate_mim_arm_status.py"
 BRIDGE_SEQUENCE_SCRIPT = PROJECT_ROOT / "scripts" / "bridge_packet_sequence.py"
@@ -270,6 +280,24 @@ class MimArmExecutionLaneRequest(BaseModel):
     metadata_json: dict = Field(default_factory=dict)
 
 
+class MimArmComposedTaskRequest(BaseModel):
+    actor: str = "operator"
+    reason: str = ""
+    explicit_operator_approval: bool = False
+    shared_workspace_active: bool = False
+    steps: list[str] = Field(default_factory=lambda: ["safe_home", "scan_pose", "capture_frame"])
+    max_retry_per_step: int = Field(default=1, ge=0, le=3)
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class MimArmComposedTaskAdvanceRequest(BaseModel):
+    actor: str = "operator"
+    reason: str = ""
+    explicit_operator_approval: bool = False
+    allow_retry: bool = True
+    metadata_json: dict = Field(default_factory=dict)
+
+
 def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -305,6 +333,11 @@ def _read_json_artifact(path: Path) -> dict:
         return _json_dict(json.loads(path.read_text(encoding="utf-8")))
     except Exception:
         return {}
+
+
+def _write_json_artifact(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
 def _coerce_bool(value: object) -> bool | None:
@@ -816,6 +849,507 @@ def _health_posture() -> dict[str, object]:
         "requires_confirmation": requires_confirmation,
         "summary": summary_text,
     }
+
+
+def _bounded_capability_name(action_name: str) -> str:
+    return f"mim_arm.execute_{action_name}"
+
+
+def _step_key(index: int, action_name: str) -> str:
+    return f"step_{index + 1}_{action_name}"
+
+
+def _normalize_composed_steps(raw_steps: list[str]) -> list[str]:
+    normalized = [str(item or "").strip() for item in raw_steps]
+    normalized = [item for item in normalized if item]
+    if not normalized:
+        normalized = list(BOUNDED_LIVE_ACTIONS)
+    invalid = [item for item in normalized if item not in BOUNDED_LIVE_ACTIONS]
+    if invalid:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "unsupported_composed_task_step",
+                "allowed_steps": list(BOUNDED_LIVE_ACTIONS),
+                "invalid_steps": invalid,
+            },
+        )
+    return normalized
+
+
+def _memory_hygiene_snapshot(*, shared_root: Path = DEFAULT_SHARED_ROOT) -> dict[str, Any]:
+    summary: dict[str, Any] = {}
+    try:
+        raw = _mim_health_monitor.get_health_summary()
+        if isinstance(raw, dict):
+            summary = raw
+    except Exception:
+        summary = {}
+    task_dir = shared_root / MIM_ARM_COMPOSED_TASK_DIRNAME
+    task_files = []
+    if task_dir.exists():
+        task_files = [item for item in task_dir.glob("*.json") if item.is_file()]
+    return {
+        "health_status": str(summary.get("status") or "unknown").strip() or "unknown",
+        "memory_mb": summary.get("memory_mb"),
+        "memory_percent": summary.get("memory_percent"),
+        "artifact_file_count": len(task_files),
+        "retention_limit": 20,
+        "compaction_state": "normal" if len(task_files) <= 20 else "trim_required",
+    }
+
+
+def _composed_task_dir(shared_root: Path) -> Path:
+    return shared_root / MIM_ARM_COMPOSED_TASK_DIRNAME
+
+
+def _composed_task_artifact_path(shared_root: Path, trace_id: str) -> Path:
+    return _composed_task_dir(shared_root) / f"{trace_id}.json"
+
+
+def _latest_composed_task_artifact_path(shared_root: Path) -> Path:
+    return shared_root / MIM_ARM_COMPOSED_TASK_ARTIFACT
+
+
+def _persist_composed_task_snapshot(task: dict[str, Any], *, shared_root: Path = DEFAULT_SHARED_ROOT) -> None:
+    trace_id = str(task.get("trace_id") or "").strip()
+    if not trace_id:
+        return
+    task_path = _composed_task_artifact_path(shared_root, trace_id)
+    latest_path = _latest_composed_task_artifact_path(shared_root)
+    _write_json_artifact(task_path, task)
+    _write_json_artifact(latest_path, task)
+
+    task_files = sorted(
+        [item for item in _composed_task_dir(shared_root).glob("*.json") if item.is_file()],
+        key=lambda item: item.stat().st_mtime,
+        reverse=True,
+    )
+    for stale in task_files[20:]:
+        try:
+            stale.unlink()
+        except OSError:
+            continue
+
+
+def _compact_step_attempt(attempt: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "attempt_number": int(attempt.get("attempt_number") or 0),
+        "execution_id": attempt.get("execution_id"),
+        "step_trace_id": str(attempt.get("step_trace_id") or "").strip(),
+        "request_id": str(attempt.get("request_id") or "").strip(),
+        "task_id": str(attempt.get("task_id") or "").strip(),
+        "correlation_id": str(attempt.get("correlation_id") or "").strip(),
+        "dispatch_decision": str(attempt.get("dispatch_decision") or "").strip(),
+        "status": str(attempt.get("status") or "").strip(),
+        "reason": str(attempt.get("reason") or "").strip(),
+        "handoff_endpoint": str(attempt.get("handoff_endpoint") or "").strip(),
+        "dispatched_at": str(attempt.get("dispatched_at") or _utcnow()).strip(),
+    }
+
+
+def _step_attempt_from_dispatch_response(index: int, action_name: str, response: dict[str, Any]) -> dict[str, Any]:
+    execution = _json_dict(response.get("execution"))
+    feedback = _json_dict(execution.get("feedback_json"))
+    bridge = _json_dict(execution.get("bridge_publication"))
+    return {
+        "step_key": _step_key(index, action_name),
+        "attempt_number": 1,
+        "execution_id": execution.get("execution_id"),
+        "step_trace_id": str(feedback.get("trace_id") or "").strip(),
+        "request_id": str(bridge.get("request_id") or bridge.get("task_id") or "").strip(),
+        "task_id": str(bridge.get("task_id") or bridge.get("request_id") or "").strip(),
+        "correlation_id": str(bridge.get("correlation_id") or "").strip(),
+        "dispatch_decision": str(execution.get("dispatch_decision") or "requires_confirmation").strip(),
+        "status": str(execution.get("status") or "pending_confirmation").strip(),
+        "reason": str(execution.get("reason") or "").strip(),
+        "handoff_endpoint": str(execution.get("handoff_endpoint") or "").strip(),
+        "dispatched_at": _utcnow(),
+    }
+
+
+def _new_composed_step(index: int, action_name: str) -> dict[str, Any]:
+    return {
+        "step_index": index,
+        "step_key": _step_key(index, action_name),
+        "action": action_name,
+        "capability_name": _bounded_capability_name(action_name),
+        "status": "planned",
+        "dispatch_decision": "",
+        "reason": "",
+        "request_id": "",
+        "task_id": "",
+        "correlation_id": "",
+        "execution_id": None,
+        "step_trace_id": "",
+        "retry_count": 0,
+        "proof_chain_complete": False,
+        "proof_requirements": {},
+        "failure_classification": "",
+        "attempts": [],
+    }
+
+
+def _apply_attempt_to_step(step: dict[str, Any], attempt: dict[str, Any], *, increment_retry: bool = False) -> dict[str, Any]:
+    attempts = [item for item in step.get("attempts", []) if isinstance(item, dict)]
+    sanitized = _compact_step_attempt(attempt)
+    sanitized["attempt_number"] = len(attempts) + 1
+    attempts.append(sanitized)
+    step.update(
+        {
+            "status": sanitized["status"],
+            "dispatch_decision": sanitized["dispatch_decision"],
+            "reason": sanitized["reason"],
+            "request_id": sanitized["request_id"],
+            "task_id": sanitized["task_id"],
+            "correlation_id": sanitized["correlation_id"],
+            "execution_id": sanitized["execution_id"],
+            "step_trace_id": sanitized["step_trace_id"],
+            "attempts": attempts[-4:],
+        }
+    )
+    if increment_retry:
+        step["retry_count"] = int(step.get("retry_count") or 0) + 1
+    return step
+
+
+def _telemetry_source(telemetry: dict[str, Any], kind: str) -> dict[str, Any]:
+    for item in telemetry.get("evidence_sources", []) if isinstance(telemetry.get("evidence_sources", []), list) else []:
+        payload = _json_dict(item)
+        if str(payload.get("kind") or "").strip() == kind:
+            return payload
+    return {}
+
+
+def _host_attribution_matches(*, shared_root: Path, request_id: str, task_id: str, correlation_id: str) -> bool:
+    payload = _read_json_artifact(shared_root / ARM_HOST_STATE_ARTIFACT)
+    if not payload:
+        return False
+    last_result = _json_dict(payload.get("last_command_result"))
+    evidence = _json_dict(payload.get("command_evidence"))
+    ids = {value for value in (request_id, task_id, correlation_id) if value}
+    if not ids:
+        return False
+    candidates = {
+        str(last_result.get("request_id") or "").strip(),
+        str(last_result.get("task_id") or "").strip(),
+        str(last_result.get("correlation_id") or "").strip(),
+        str(evidence.get("request_id") or "").strip(),
+        str(evidence.get("task_id") or "").strip(),
+        str(evidence.get("correlation_id") or "").strip(),
+        str(payload.get("last_request_id") or "").strip(),
+        str(payload.get("last_task_id") or "").strip(),
+        str(payload.get("last_correlation_id") or "").strip(),
+    }
+    candidates.discard("")
+    return bool(candidates.intersection(ids))
+
+
+def _step_proof_from_telemetry(step: dict[str, Any], *, shared_root: Path) -> tuple[dict[str, bool], bool, str]:
+    request_id = str(step.get("request_id") or "").strip()
+    if not request_id:
+        return ({}, False, "")
+    telemetry = refresh_dispatch_telemetry_record(shared_root, request_id=request_id)
+    if not telemetry:
+        return ({}, False, "")
+
+    step["request_id"] = str(telemetry.get("request_id") or request_id).strip()
+    step["task_id"] = str(telemetry.get("task_id") or step.get("task_id") or request_id).strip()
+    step["correlation_id"] = str(telemetry.get("correlation_id") or step.get("correlation_id") or "").strip()
+
+    ack = _telemetry_source(telemetry, "task_ack_artifact")
+    result = _telemetry_source(telemetry, "task_result_artifact")
+    publication_boundary = _telemetry_source(telemetry, "publication_boundary")
+    host_attribution = _host_attribution_matches(
+        shared_root=shared_root,
+        request_id=str(step.get("request_id") or "").strip(),
+        task_id=str(step.get("task_id") or "").strip(),
+        correlation_id=str(step.get("correlation_id") or "").strip(),
+    )
+    proof_requirements = {
+        "dispatch_telemetry_present": True,
+        "request_task_correlation_aligned": bool(
+            str(telemetry.get("request_id") or "").strip()
+            and str(telemetry.get("task_id") or "").strip()
+            and str(telemetry.get("correlation_id") or "").strip()
+        ),
+        "host_received_timestamp_present": bool(str(telemetry.get("host_received_timestamp") or "").strip()),
+        "host_completed_timestamp_present": bool(str(telemetry.get("host_completed_timestamp") or "").strip()),
+        "tod_ack_result_aligned": bool(ack.get("matched") and result.get("matched")),
+        "explicit_host_attribution_present": bool(host_attribution),
+    }
+    proof_chain_complete = bool(publication_boundary.get("matched")) and all(proof_requirements.values())
+    completion_status = str(telemetry.get("completion_status") or "pending").strip().lower() or "pending"
+    reason = str(telemetry.get("result_reason") or step.get("reason") or "").strip()
+
+    step["proof_requirements"] = proof_requirements
+    step["proof_chain_complete"] = proof_chain_complete
+    if proof_chain_complete:
+        step["status"] = "proved"
+    elif completion_status == "completed":
+        step["status"] = "completed_unproved"
+    elif completion_status == "failed":
+        step["status"] = "failed"
+    elif str(telemetry.get("dispatch_status") or "").strip() in {"host_received", "completed"}:
+        step["status"] = "in_progress"
+    step["reason"] = reason
+    return proof_requirements, proof_chain_complete, reason
+
+
+def _classify_step_failure(step: dict[str, Any]) -> str:
+    reason = str(step.get("reason") or "").strip().lower()
+    if not reason and str(step.get("status") or "").strip() != "failed":
+        return ""
+    if reason in {"execution_timeout", "transport_dispatch_failed", "failed", "succeeded"}:
+        return "retryable_transport"
+    if "timeout" in reason or "transport" in reason or "publish" in reason:
+        return "retryable_transport"
+    if "interrupted" in reason or "stop" in reason:
+        return "operator_interrupted"
+    if reason:
+        return "non_retryable"
+    return "retryable_transport"
+
+
+def _build_operator_summary(task: dict[str, Any]) -> str:
+    steps = [item for item in task.get("steps", []) if isinstance(item, dict)]
+    if not steps:
+        return "No composed arm steps are currently tracked."
+    current_index = int(task.get("current_step_index") or 0)
+    current_index = max(0, min(current_index, len(steps) - 1))
+    current = steps[current_index]
+    completed = len([item for item in steps if bool(item.get("proof_chain_complete"))])
+    return (
+        f"Composed task {task.get('trace_id', '')} is {task.get('status', 'active')} with "
+        f"{completed}/{len(steps)} proved steps. Current step is {current.get('action', 'unknown')} "
+        f"({current.get('status', 'planned')})."
+    )
+
+
+def _build_operator_commands(task: dict[str, Any]) -> list[dict[str, str]]:
+    trace_id = str(task.get("trace_id") or "").strip()
+    decision = _json_dict(task.get("decision"))
+    if not trace_id:
+        return []
+    commands = [
+        {
+            "method": "GET",
+            "path": f"/mim/arm/tasks/composed/{trace_id}",
+            "purpose": "Review the composed task state and current step proof.",
+        }
+    ]
+    code = str(decision.get("code") or "").strip()
+    if code in {"dispatch_next_step", "retry_current_step", "await_current_step_proof", "operator_review_current_step", "await_operator_approval_for_next_step"}:
+        commands.append(
+            {
+                "method": "POST",
+                "path": f"/mim/arm/tasks/composed/{trace_id}/advance",
+                "purpose": "Refresh proof, then either advance or retry the bounded step if policy allows.",
+            }
+        )
+    return commands
+
+
+def _reconcile_composed_task(
+    task: dict[str, Any],
+    *,
+    shared_root: Path = DEFAULT_SHARED_ROOT,
+    explicit_operator_approval: bool = False,
+    allow_retry: bool = True,
+) -> dict[str, Any]:
+    steps = [item for item in task.get("steps", []) if isinstance(item, dict)]
+    if not steps:
+        task["status"] = "failed"
+        task["decision"] = {"code": "task_missing_steps", "detail": "No composed steps were found."}
+        task["operator_summary"] = _build_operator_summary(task)
+        task["operator_commands"] = _build_operator_commands(task)
+        return task
+
+    current_index = int(task.get("current_step_index") or 0)
+    current_index = max(0, min(current_index, len(steps) - 1))
+    task["current_step_index"] = current_index
+    current = steps[current_index]
+
+    if str(current.get("request_id") or "").strip():
+        _, proof_chain_complete, _ = _step_proof_from_telemetry(current, shared_root=shared_root)
+        if not proof_chain_complete and str(current.get("status") or "").strip() == "failed":
+            current["failure_classification"] = _classify_step_failure(current)
+
+    proved_steps = [item for item in steps if bool(item.get("proof_chain_complete"))]
+    task["memory_hygiene"] = _memory_hygiene_snapshot(shared_root=shared_root)
+
+    if len(proved_steps) == len(steps):
+        task["status"] = "completed"
+        task["current_step_key"] = "completed"
+        task["decision"] = {
+            "code": "task_completed",
+            "detail": "Every bounded step has an ACK/RESULT proof chain and explicit host attribution.",
+        }
+    elif str(current.get("status") or "").strip() in {"pending_confirmation", "awaiting_review"}:
+        task["status"] = "awaiting_operator"
+        task["current_step_key"] = str(current.get("step_key") or "").strip()
+        task["decision"] = {
+            "code": "operator_review_current_step",
+            "detail": f"Current step {current.get('action', 'unknown')} is still waiting for explicit operator approval.",
+        }
+    elif str(current.get("status") or "").strip() == "blocked":
+        task["status"] = "awaiting_operator"
+        task["current_step_key"] = str(current.get("step_key") or "").strip()
+        blocked_reason = str(current.get("reason") or current.get("dispatch_decision") or "execution_blocked").strip()
+        task["decision"] = {
+            "code": "operator_review_current_step",
+            "detail": f"Current step {current.get('action', 'unknown')} is blocked ({blocked_reason}). Review readiness or policy before retrying bounded execution.",
+        }
+    elif bool(current.get("proof_chain_complete")):
+        if current_index + 1 >= len(steps):
+            task["status"] = "completed"
+            task["current_step_key"] = "completed"
+            task["decision"] = {
+                "code": "task_completed",
+                "detail": "Every bounded step has now been proved complete.",
+            }
+        elif explicit_operator_approval:
+            task["status"] = "active"
+            task["current_step_key"] = str(current.get("step_key") or "").strip()
+            task["decision"] = {
+                "code": "dispatch_next_step",
+                "detail": f"Step {current.get('action', 'unknown')} is proved complete; dispatch the next bounded step.",
+            }
+        else:
+            task["status"] = "awaiting_operator"
+            task["current_step_key"] = str(current.get("step_key") or "").strip()
+            task["decision"] = {
+                "code": "await_operator_approval_for_next_step",
+                "detail": f"Step {current.get('action', 'unknown')} is proved complete. Explicit approval is still required before the next step dispatch.",
+            }
+    elif str(current.get("status") or "").strip() == "failed":
+        failure_classification = str(current.get("failure_classification") or _classify_step_failure(current)).strip()
+        current["failure_classification"] = failure_classification
+        retry_budget = int(task.get("max_retry_per_step") or 0)
+        retry_count = int(current.get("retry_count") or 0)
+        if allow_retry and explicit_operator_approval and failure_classification == "retryable_transport" and retry_count < retry_budget:
+            task["status"] = "recovery_pending"
+            task["current_step_key"] = str(current.get("step_key") or "").strip()
+            task["decision"] = {
+                "code": "retry_current_step",
+                "detail": f"Retry step {current.get('action', 'unknown')} within the bounded retry budget.",
+            }
+        else:
+            task["status"] = "degraded"
+            task["current_step_key"] = str(current.get("step_key") or "").strip()
+            task["decision"] = {
+                "code": "rollback_safe_home",
+                "detail": f"Stop advancing. Review step {current.get('action', 'unknown')} and consider bounded rollback to safe_home.",
+            }
+    else:
+        task["status"] = "active"
+        task["current_step_key"] = str(current.get("step_key") or "").strip()
+        task["decision"] = {
+            "code": "await_current_step_proof",
+            "detail": f"Waiting for ACK/RESULT proof and host attribution on step {current.get('action', 'unknown')}.",
+        }
+
+    task["steps"] = steps
+    task["operator_summary"] = _build_operator_summary(task)
+    task["operator_commands"] = _build_operator_commands(task)
+    return task
+
+
+async def _load_execution_orchestration_row(db: AsyncSession, trace_id: str) -> ExecutionTaskOrchestration | None:
+    return (
+        (
+            await db.execute(
+                select(ExecutionTaskOrchestration)
+                .where(ExecutionTaskOrchestration.trace_id == str(trace_id or "").strip())
+                .order_by(ExecutionTaskOrchestration.id.desc())
+                .limit(1)
+            )
+        )
+        .scalars()
+        .first()
+    )
+
+
+def _load_composed_task_from_orchestration(row: ExecutionTaskOrchestration, *, shared_root: Path = DEFAULT_SHARED_ROOT) -> dict[str, Any]:
+    metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
+    composed_task = _json_dict(metadata.get("composed_task"))
+    if composed_task:
+        return composed_task
+    payload = _read_json_artifact(_composed_task_artifact_path(shared_root, row.trace_id))
+    return payload if payload else {}
+
+
+def _apply_composed_task_to_orchestration(
+    row: ExecutionTaskOrchestration,
+    task: dict[str, Any],
+    *,
+    base_metadata: dict[str, Any] | None = None,
+) -> None:
+    steps = [item for item in task.get("steps", []) if isinstance(item, dict)]
+    current_index = int(task.get("current_step_index") or 0)
+    current_index = max(0, min(current_index, len(steps) - 1)) if steps else 0
+    current = steps[current_index] if steps else {}
+    row.execution_id = current.get("execution_id") if current else row.execution_id
+    row.orchestration_status = str(task.get("status") or "active").strip() or "active"
+    row.current_step_key = str(task.get("current_step_key") or current.get("step_key") or "created").strip() or "created"
+    row.step_state_json = steps
+    row.checkpoint_json = {
+        "task_kind": "mim_arm_composed_sequence",
+        "current_step_index": current_index,
+        "total_steps": len(steps),
+        "proved_steps": len([item for item in steps if bool(item.get("proof_chain_complete"))]),
+        "latest_request_id": str(current.get("request_id") or "").strip(),
+        "latest_task_id": str(current.get("task_id") or "").strip(),
+        "latest_correlation_id": str(current.get("correlation_id") or "").strip(),
+        "decision": _json_dict(task.get("decision")),
+    }
+    row.retry_count = sum(int(item.get("retry_count") or 0) for item in steps)
+    row.rollback_state_json = {
+        "fallback_action": "safe_home",
+        "rollback_recommended": str(_json_dict(task.get("decision")).get("code") or "") == "rollback_safe_home",
+        "rollback_reason": str(_json_dict(task.get("decision")).get("detail") or "").strip(),
+    }
+    row.metadata_json = {
+        **(row.metadata_json if isinstance(row.metadata_json, dict) else {}),
+        **(base_metadata if isinstance(base_metadata, dict) else {}),
+        "composed_task": task,
+        "operator_summary": str(task.get("operator_summary") or "").strip(),
+        "decision": _json_dict(task.get("decision")),
+        "memory_hygiene": _json_dict(task.get("memory_hygiene")),
+    }
+
+
+def _build_composed_task_snapshot(
+    *,
+    trace_id: str,
+    request: MimArmComposedTaskRequest,
+    first_response: dict[str, Any],
+    steps: list[str],
+) -> dict[str, Any]:
+    task_steps = [_new_composed_step(index, action_name) for index, action_name in enumerate(steps)]
+    first_attempt = _step_attempt_from_dispatch_response(0, steps[0], first_response)
+    _apply_attempt_to_step(task_steps[0], first_attempt)
+    task = {
+        "trace_id": trace_id,
+        "task_kind": "mim_arm_composed_sequence",
+        "created_at": _utcnow(),
+        "updated_at": _utcnow(),
+        "status": "active",
+        "reason": str(request.reason or "").strip(),
+        "actor": str(request.actor or "operator").strip() or "operator",
+        "explicit_operator_approval": bool(request.explicit_operator_approval),
+        "shared_workspace_active": bool(request.shared_workspace_active),
+        "max_retry_per_step": int(request.max_retry_per_step or 0),
+        "steps": task_steps,
+        "current_step_index": 0,
+        "current_step_key": task_steps[0]["step_key"],
+        "decision": {},
+        "operator_summary": "",
+        "operator_commands": [],
+        "memory_hygiene": {},
+        "metadata_json": _json_dict(request.metadata_json),
+    }
+    return task
 
 
 def _latest_readiness(shared_root: Path) -> dict[str, object]:
@@ -1904,6 +2438,237 @@ def get_dispatch_telemetry(request_id: str) -> dict[str, object]:
     if not payload:
         raise HTTPException(status_code=404, detail="dispatch telemetry not found")
     return payload
+
+
+@router.post("/tasks/composed")
+async def create_composed_task(
+    payload: MimArmComposedTaskRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    steps = _normalize_composed_steps(payload.steps)
+    first_action = steps[0]
+    first_response = await _execute_bounded_pose(
+        payload=MimArmExecuteSafeHomeRequest(
+            actor=payload.actor,
+            reason=payload.reason,
+            explicit_operator_approval=payload.explicit_operator_approval,
+            shared_workspace_active=payload.shared_workspace_active,
+            metadata_json={
+                **_json_dict(payload.metadata_json),
+                "composed_task": {"steps": steps, "max_retry_per_step": int(payload.max_retry_per_step or 0)},
+            },
+        ),
+        db=db,
+        action_name=first_action,
+        capability_name=_bounded_capability_name(first_action),
+    )
+
+    execution = _json_dict(first_response.get("execution"))
+    feedback = _json_dict(execution.get("feedback_json"))
+    trace_id = str(feedback.get("trace_id") or "").strip()
+    if not trace_id:
+        raise HTTPException(status_code=500, detail="composed_task_trace_id_missing")
+    row = await _load_execution_orchestration_row(db, trace_id)
+    if row is None:
+        raise HTTPException(status_code=500, detail="composed_task_orchestration_missing")
+
+    task = _build_composed_task_snapshot(
+        trace_id=trace_id,
+        request=payload,
+        first_response=first_response,
+        steps=steps,
+    )
+    task = _reconcile_composed_task(
+        task,
+        shared_root=DEFAULT_SHARED_ROOT,
+        explicit_operator_approval=bool(payload.explicit_operator_approval),
+        allow_retry=True,
+    )
+    _apply_composed_task_to_orchestration(
+        row,
+        task,
+        base_metadata={
+            "composed_task_created_by": str(payload.actor or "operator").strip() or "operator",
+            "composed_task_reason": str(payload.reason or "").strip(),
+        },
+    )
+    await append_execution_trace_event(
+        db=db,
+        trace_id=trace_id,
+        execution_id=int(execution.get("execution_id") or 0) or None,
+        intent_id=row.intent_id,
+        event_type="composed_task_created",
+        event_stage="orchestration",
+        causality_role="effect",
+        summary=f"Created composed bounded arm task with {len(steps)} steps.",
+        payload_json={
+            "steps": steps,
+            "decision": _json_dict(task.get("decision")),
+            "max_retry_per_step": int(payload.max_retry_per_step or 0),
+        },
+    )
+    await db.commit()
+    _persist_composed_task_snapshot(task, shared_root=DEFAULT_SHARED_ROOT)
+    return {
+        "task": task,
+        "decision": _json_dict(task.get("decision")),
+        "operator_summary": str(task.get("operator_summary") or "").strip(),
+        "operator_commands": task.get("operator_commands", []),
+        "orchestration": to_execution_task_orchestration_out(row),
+    }
+
+
+@router.get("/tasks/composed/{trace_id}")
+async def get_composed_task(
+    trace_id: str,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    row = await _load_execution_orchestration_row(db, trace_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="composed_task_not_found")
+    task = _load_composed_task_from_orchestration(row, shared_root=DEFAULT_SHARED_ROOT)
+    if not task:
+        raise HTTPException(status_code=404, detail="composed_task_state_missing")
+    task = _reconcile_composed_task(task, shared_root=DEFAULT_SHARED_ROOT, explicit_operator_approval=False, allow_retry=False)
+    _apply_composed_task_to_orchestration(row, task)
+    await db.commit()
+    _persist_composed_task_snapshot(task, shared_root=DEFAULT_SHARED_ROOT)
+    return {
+        "task": task,
+        "decision": _json_dict(task.get("decision")),
+        "operator_summary": str(task.get("operator_summary") or "").strip(),
+        "operator_commands": task.get("operator_commands", []),
+        "orchestration": to_execution_task_orchestration_out(row),
+    }
+
+
+@router.get("/tasks/composed/{trace_id}/decision")
+async def get_composed_task_decision(
+    trace_id: str,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    payload = await get_composed_task(trace_id=trace_id, db=db)
+    task = _json_dict(payload.get("task"))
+    return {
+        "trace_id": trace_id,
+        "decision": _json_dict(task.get("decision")),
+        "operator_summary": str(task.get("operator_summary") or "").strip(),
+        "memory_hygiene": _json_dict(task.get("memory_hygiene")),
+    }
+
+
+@router.post("/tasks/composed/{trace_id}/advance")
+async def advance_composed_task(
+    trace_id: str,
+    payload: MimArmComposedTaskAdvanceRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    row = await _load_execution_orchestration_row(db, trace_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="composed_task_not_found")
+    task = _load_composed_task_from_orchestration(row, shared_root=DEFAULT_SHARED_ROOT)
+    if not task:
+        raise HTTPException(status_code=404, detail="composed_task_state_missing")
+
+    explicit_operator_approval = bool(payload.explicit_operator_approval or task.get("explicit_operator_approval"))
+    task = _reconcile_composed_task(
+        task,
+        shared_root=DEFAULT_SHARED_ROOT,
+        explicit_operator_approval=explicit_operator_approval,
+        allow_retry=bool(payload.allow_retry),
+    )
+
+    decision = _json_dict(task.get("decision"))
+    decision_code = str(decision.get("code") or "").strip()
+    steps = [item for item in task.get("steps", []) if isinstance(item, dict)]
+    current_index = int(task.get("current_step_index") or 0)
+    current_index = max(0, min(current_index, len(steps) - 1)) if steps else 0
+
+    if decision_code == "dispatch_next_step" and current_index + 1 < len(steps):
+        next_index = current_index + 1
+        next_step = steps[next_index]
+        next_action = str(next_step.get("action") or "").strip()
+        response = await _execute_bounded_pose(
+            payload=MimArmExecuteSafeHomeRequest(
+                actor=payload.actor,
+                reason=payload.reason or f"advance composed task {trace_id}",
+                explicit_operator_approval=explicit_operator_approval,
+                shared_workspace_active=bool(task.get("shared_workspace_active")),
+                metadata_json={
+                    **_json_dict(task.get("metadata_json")),
+                    **_json_dict(payload.metadata_json),
+                    "composed_task": {"trace_id": trace_id, "step_index": next_index, "step_key": next_step.get("step_key")},
+                },
+            ),
+            db=db,
+            action_name=next_action,
+            capability_name=_bounded_capability_name(next_action),
+        )
+        attempt = _step_attempt_from_dispatch_response(next_index, next_action, response)
+        _apply_attempt_to_step(next_step, attempt)
+        task["current_step_index"] = next_index
+        task["current_step_key"] = str(next_step.get("step_key") or "").strip()
+    elif decision_code == "retry_current_step" and steps:
+        current_step = steps[current_index]
+        current_action = str(current_step.get("action") or "").strip()
+        response = await _execute_bounded_pose(
+            payload=MimArmExecuteSafeHomeRequest(
+                actor=payload.actor,
+                reason=payload.reason or f"retry composed task {trace_id}",
+                explicit_operator_approval=explicit_operator_approval,
+                shared_workspace_active=bool(task.get("shared_workspace_active")),
+                metadata_json={
+                    **_json_dict(task.get("metadata_json")),
+                    **_json_dict(payload.metadata_json),
+                    "composed_task": {"trace_id": trace_id, "step_index": current_index, "step_key": current_step.get("step_key"), "retry": True},
+                },
+            ),
+            db=db,
+            action_name=current_action,
+            capability_name=_bounded_capability_name(current_action),
+        )
+        attempt = _step_attempt_from_dispatch_response(current_index, current_action, response)
+        _apply_attempt_to_step(current_step, attempt, increment_retry=True)
+
+    task["updated_at"] = _utcnow()
+    task = _reconcile_composed_task(
+        task,
+        shared_root=DEFAULT_SHARED_ROOT,
+        explicit_operator_approval=explicit_operator_approval,
+        allow_retry=bool(payload.allow_retry),
+    )
+    _apply_composed_task_to_orchestration(
+        row,
+        task,
+        base_metadata={
+            "composed_task_last_actor": str(payload.actor or "operator").strip() or "operator",
+            "composed_task_last_reason": str(payload.reason or "").strip(),
+        },
+    )
+    await append_execution_trace_event(
+        db=db,
+        trace_id=trace_id,
+        execution_id=row.execution_id,
+        intent_id=row.intent_id,
+        event_type="composed_task_advanced",
+        event_stage="orchestration",
+        causality_role="effect",
+        summary=str(_json_dict(task.get("decision")).get("detail") or "Composed task advanced.").strip(),
+        payload_json={
+            "decision": _json_dict(task.get("decision")),
+            "current_step_key": str(task.get("current_step_key") or "").strip(),
+            "current_step_index": int(task.get("current_step_index") or 0),
+        },
+    )
+    await db.commit()
+    _persist_composed_task_snapshot(task, shared_root=DEFAULT_SHARED_ROOT)
+    return {
+        "task": task,
+        "decision": _json_dict(task.get("decision")),
+        "operator_summary": str(task.get("operator_summary") or "").strip(),
+        "operator_commands": task.get("operator_commands", []),
+        "orchestration": to_execution_task_orchestration_out(row),
+    }
 
 
 @router.post("/management/refresh-status")

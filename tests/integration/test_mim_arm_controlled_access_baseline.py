@@ -1249,3 +1249,176 @@ class MimArmControlledAccessBaselineTest(unittest.IsolatedAsyncioTestCase):
                 "tod_action": "capture_frame",
             },
         )
+
+    def test_composed_step_proof_promotes_to_proved_when_ack_result_and_host_match(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            request_id = "objective-111-task-mim-arm-safe-home-1"
+            telemetry_dir = root / "mim_arm_dispatch_telemetry"
+            telemetry_dir.mkdir(parents=True, exist_ok=True)
+            (telemetry_dir / f"{request_id}.json").write_text(
+                json.dumps(
+                    {
+                        "request_id": request_id,
+                        "task_id": request_id,
+                        "correlation_id": "corr-safe-home-1",
+                        "dispatch_status": "published_remote",
+                        "completion_status": "pending",
+                        "evidence_sources": [
+                            {"kind": "publication_boundary", "matched": True},
+                        ],
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (root / mim_arm.TOD_TASK_RESULT_ARTIFACT).write_text(
+                json.dumps(
+                    {
+                        "request_id": request_id,
+                        "task_id": request_id,
+                        "correlation_id": "corr-safe-home-1",
+                        "generated_at": "2026-04-07T01:05:03Z",
+                        "status": "success",
+                        "reason": "safe_home_completed",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (root / "TOD_MIM_TASK_ACK.latest.json").write_text(
+                json.dumps(
+                    {
+                        "request_id": request_id,
+                        "task_id": request_id,
+                        "correlation_id": "corr-safe-home-1",
+                        "generated_at": "2026-04-07T01:05:01Z",
+                        "status": "accepted",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (root / mim_arm.ARM_HOST_STATE_ARTIFACT).write_text(
+                json.dumps(
+                    {
+                        "last_request_id": request_id,
+                        "last_task_id": request_id,
+                        "last_correlation_id": "corr-safe-home-1",
+                        "last_command_result": {
+                            "request_id": request_id,
+                            "task_id": request_id,
+                            "correlation_id": "corr-safe-home-1",
+                        },
+                        "command_evidence": {
+                            "request_id": request_id,
+                            "task_id": request_id,
+                            "correlation_id": "corr-safe-home-1",
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            step = mim_arm._new_composed_step(0, "safe_home")
+            step["request_id"] = request_id
+            step["task_id"] = request_id
+            step["correlation_id"] = "corr-safe-home-1"
+
+            proof_requirements, proof_chain_complete, reason = mim_arm._step_proof_from_telemetry(
+                step,
+                shared_root=root,
+            )
+
+        self.assertTrue(proof_chain_complete)
+        self.assertEqual(step["status"], "proved")
+        self.assertEqual(reason, "safe_home_completed")
+        self.assertTrue(proof_requirements["tod_ack_result_aligned"])
+        self.assertTrue(proof_requirements["explicit_host_attribution_present"])
+
+    def test_reconcile_composed_task_retries_retryable_failed_step_within_budget(self):
+        task = {
+            "trace_id": "trace-objective-112",
+            "status": "active",
+            "current_step_index": 0,
+            "current_step_key": "step_1_safe_home",
+            "max_retry_per_step": 1,
+            "steps": [
+                {
+                    "step_index": 0,
+                    "step_key": "step_1_safe_home",
+                    "action": "safe_home",
+                    "status": "failed",
+                    "reason": "transport_dispatch_failed",
+                    "retry_count": 0,
+                    "proof_chain_complete": False,
+                }
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            reconciled = mim_arm._reconcile_composed_task(
+                task,
+                shared_root=Path(tmpdir),
+                explicit_operator_approval=True,
+                allow_retry=True,
+            )
+
+        self.assertEqual(reconciled["status"], "recovery_pending")
+        self.assertEqual(reconciled["decision"]["code"], "retry_current_step")
+        self.assertEqual(reconciled["steps"][0]["failure_classification"], "retryable_transport")
+
+    def test_reconcile_composed_task_surfaces_blocked_step_for_operator_review(self):
+        task = {
+            "trace_id": "trace-objective-111-blocked",
+            "status": "active",
+            "current_step_index": 0,
+            "current_step_key": "step_1_safe_home",
+            "steps": [
+                {
+                    "step_index": 0,
+                    "step_key": "step_1_safe_home",
+                    "action": "safe_home",
+                    "status": "blocked",
+                    "dispatch_decision": "blocked",
+                    "reason": "execution_readiness_blocked",
+                    "retry_count": 0,
+                    "proof_chain_complete": False,
+                }
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            reconciled = mim_arm._reconcile_composed_task(
+                task,
+                shared_root=Path(tmpdir),
+                explicit_operator_approval=True,
+                allow_retry=True,
+            )
+
+        self.assertEqual(reconciled["status"], "awaiting_operator")
+        self.assertEqual(reconciled["decision"]["code"], "operator_review_current_step")
+        self.assertIn("execution_readiness_blocked", reconciled["decision"]["detail"])
+
+    def test_persist_composed_task_snapshot_prunes_older_task_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            task_dir = root / mim_arm.MIM_ARM_COMPOSED_TASK_DIRNAME
+            task_dir.mkdir(parents=True, exist_ok=True)
+            for index in range(25):
+                (task_dir / f"trace-old-{index}.json").write_text("{}\n", encoding="utf-8")
+
+            mim_arm._persist_composed_task_snapshot(
+                {
+                    "trace_id": "trace-current",
+                    "status": "active",
+                    "current_step_index": 0,
+                    "steps": [],
+                },
+                shared_root=root,
+            )
+
+            retained = [item for item in task_dir.glob("*.json") if item.is_file()]
+
+        self.assertLessEqual(len(retained), 20)
