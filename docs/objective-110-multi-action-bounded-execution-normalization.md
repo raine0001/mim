@@ -22,6 +22,7 @@ The current normalization slices lock in the shared contract already proven for:
 - Removed the `mim_arm.execute_safe_home` fallback from publish-time dispatch telemetry recording so telemetry reflects the execution capability supplied by the live execution record.
 - Added `mim_arm.execute_capture_frame` to the same bounded live execution lane used by `safe_home` and `scan_pose`.
 - Made bounded publish-time bridge projection fail fast when execution records omit explicit action identity.
+- Added an explicit TOD bridge-dispatch hint for `capture_frame` (`tod_action=run-bridge-request`) plus a dedicated `MIM_TOD_BRIDGE_REQUEST.latest.json` artifact and bridge metadata so downstream listeners can route the action through the accepted bridge executor without re-resolving the wrapper request back into `run-bridge-request`.
 - Added focused regression coverage proving action resolution stays explicit and does not silently collapse to `safe_home`.
 - Standardized the proof harness into one named checklist for every bounded action: dispatch telemetry present, request-task-correlation aligned, host received timestamp present, host completed timestamp present, TOD ACK and RESULT aligned, explicit host attribution present, and `proof_chain_complete = true`.
 

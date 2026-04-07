@@ -1144,3 +1144,108 @@ class MimArmControlledAccessBaselineTest(unittest.IsolatedAsyncioTestCase):
                     status={"arm_online": True},
                     shared_root=root,
                 )
+
+    def test_publish_capture_frame_to_tod_sets_explicit_tod_bridge_action(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fake_execution = SimpleNamespace(
+                id=207749,
+                capability_name="mim_arm.execute_capture_frame",
+                requested_executor="tod",
+                arguments_json={"action": "capture_frame"},
+            )
+            status_surface = {
+                "arm_online": True,
+                "camera_online": True,
+                "current_pose": [90, 90, 90, 90, 90, 90],
+                "mode": "development",
+                "serial_ready": True,
+                "estop_ok": True,
+                "tod_execution_allowed": True,
+                "motion_allowed": True,
+            }
+            sequence_outputs = [
+                SimpleNamespace(
+                    stdout="SEQUENCE=51\nEMITTED_AT=2026-04-07T00:10:01Z\nSOURCE_HOST=MIM\nSOURCE_SERVICE=mim_arm_capture_frame_dispatch\nSOURCE_INSTANCE_ID=mim_arm_capture_frame_dispatch:207749\n",
+                    returncode=0,
+                ),
+                SimpleNamespace(
+                    stdout="SEQUENCE=52\nEMITTED_AT=2026-04-07T00:10:02Z\nSOURCE_HOST=MIM\nSOURCE_SERVICE=mim_arm_capture_frame_dispatch\nSOURCE_INSTANCE_ID=mim_arm_capture_frame_dispatch:207749\n",
+                    returncode=0,
+                ),
+            ]
+
+            with patch.object(mim_arm.subprocess, "run", side_effect=sequence_outputs), patch.object(
+                mim_arm,
+                "_env_flag",
+                return_value=False,
+            ), patch.object(
+                mim_arm,
+                "_audit_tod_bridge_write",
+            ):
+                publication = mim_arm.publish_mim_arm_execution_to_tod(
+                    execution=fake_execution,
+                    status=status_surface,
+                    shared_root=root,
+                )
+
+            request = json.loads((root / "MIM_TOD_TASK_REQUEST.latest.json").read_text(encoding="utf-8"))
+            bridge_request = json.loads((root / mim_arm.TOD_BRIDGE_REQUEST_ARTIFACT).read_text(encoding="utf-8"))
+
+        self.assertTrue(publication["local_written"])
+        self.assertEqual(request["action"], "capture_frame")
+        self.assertEqual(request["RequestId"], publication["request_id"])
+        self.assertEqual(request["RequestPath"], str(root / mim_arm.TOD_BRIDGE_REQUEST_ARTIFACT))
+        self.assertEqual(request["CorrelationId"], publication["correlation_id"])
+        self.assertEqual(request["tod_action"], "run-bridge-request")
+        self.assertEqual(request["bridge_request_id"], publication["request_id"])
+        self.assertEqual(
+            request["tod_action_args"],
+            {
+                "RequestId": publication["request_id"],
+                "RequestPath": str(root / mim_arm.TOD_BRIDGE_REQUEST_ARTIFACT),
+                "CorrelationId": publication["correlation_id"],
+                "Action": "capture_frame",
+                "CapabilityName": "mim_arm.execute_capture_frame",
+            },
+        )
+        self.assertEqual(
+            request["tod_bridge_request"],
+            {
+                "action": "capture_frame",
+                "Action": "capture_frame",
+                "capability_name": "mim_arm.execute_capture_frame",
+                "CapabilityName": "mim_arm.execute_capture_frame",
+                "execution_lane": "tod_bridge_request",
+                "request_id": publication["request_id"],
+                "RequestId": publication["request_id"],
+                "request_path": str(root / mim_arm.TOD_BRIDGE_REQUEST_ARTIFACT),
+                "RequestPath": str(root / mim_arm.TOD_BRIDGE_REQUEST_ARTIFACT),
+                "correlation_id": publication["correlation_id"],
+                "CorrelationId": publication["correlation_id"],
+            },
+        )
+        self.assertEqual(
+            bridge_request,
+            {
+                "version": "1.0",
+                "source": "MIM",
+                "target": "TOD",
+                "generated_at": request["generated_at"],
+                "emitted_at": request["generated_at"],
+                "sequence": request["sequence"],
+                "objective_id": request["objective_id"],
+                "objective": request["objective"],
+                "task_id": publication["request_id"],
+                "request_id": publication["request_id"],
+                "correlation_id": publication["correlation_id"],
+                "CorrelationId": publication["correlation_id"],
+                "action": "capture_frame",
+                "Action": "capture_frame",
+                "capability_name": "mim_arm.execute_capture_frame",
+                "CapabilityName": "mim_arm.execute_capture_frame",
+                "execution_lane": "tod_bridge_request",
+                "command": {"name": "capture_frame", "args": {}},
+                "tod_action": "capture_frame",
+            },
+        )

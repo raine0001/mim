@@ -40,6 +40,7 @@ TOD_TASK_RESULT_ARTIFACT = "TOD_MIM_TASK_RESULT.latest.json"
 TOD_CATCHUP_GATE_ARTIFACT = "TOD_CATCHUP_GATE.latest.json"
 MIM_ARM_DISPATCH_TELEMETRY_ARTIFACT = "MIM_ARM_DISPATCH_TELEMETRY.latest.json"
 CONTEXT_EXPORT_ARTIFACT = "MIM_CONTEXT_EXPORT.latest.json"
+TOD_BRIDGE_REQUEST_ARTIFACT = "MIM_TOD_BRIDGE_REQUEST.latest.json"
 ARM_SYNC_SCRIPT = PROJECT_ROOT / "scripts" / "sync_mim_arm_host_state.py"
 ARM_STATUS_SCRIPT = PROJECT_ROOT / "scripts" / "generate_mim_arm_status.py"
 BRIDGE_SEQUENCE_SCRIPT = PROJECT_ROOT / "scripts" / "bridge_packet_sequence.py"
@@ -496,6 +497,7 @@ def publish_mim_arm_execution_to_tod(
     objective = _active_objective_metadata(shared_root)
     objective_id = objective.get("objective_id", "")
     objective_ref = objective.get("objective_ref", "") or "objective-unknown"
+    tod_action = "run-bridge-request" if action_name == "capture_frame" else ""
 
     request_meta = _bridge_meta(
         shared_root=shared_root,
@@ -508,6 +510,32 @@ def publish_mim_arm_execution_to_tod(
     request_id = f"{objective_ref}-task-mim-arm-{action_slug}-{publish_freshness_token}"
     correlation_id = f"obj{objective_id or 'unknown'}-mim-arm-{action_slug}-{publish_freshness_token}"
     request_path = shared_root / "MIM_TOD_TASK_REQUEST.latest.json"
+    bridge_request_path = shared_root / TOD_BRIDGE_REQUEST_ARTIFACT
+    bridge_request_payload = {
+        "version": "1.0",
+        "source": "MIM",
+        "target": "TOD",
+        "generated_at": request_generated_at,
+        "emitted_at": request_generated_at,
+        "sequence": request_sequence,
+        "objective_id": objective_ref,
+        "objective": objective_ref,
+        "task_id": request_id,
+        "request_id": request_id,
+        "correlation_id": correlation_id,
+        "CorrelationId": correlation_id,
+        "action": action_name,
+        "Action": action_name,
+        "capability_name": capability_name,
+        "CapabilityName": capability_name,
+        "execution_lane": "tod_bridge_request" if tod_action else "",
+        "command": {
+            "name": action_name,
+            "args": {},
+        },
+    }
+    if tod_action:
+        bridge_request_payload["tod_action"] = action_name
     request_payload = {
         "version": "1.0",
         "source": "MIM",
@@ -519,7 +547,9 @@ def publish_mim_arm_execution_to_tod(
         "source_service": str(request_meta.get("SOURCE_SERVICE") or publication_service).strip() or publication_service,
         "source_instance_id": str(request_meta.get("SOURCE_INSTANCE_ID") or publication_instance).strip() or publication_instance,
         "correlation_id": correlation_id,
+        "CorrelationId": correlation_id if tod_action else "",
         "request_id": request_id,
+        "RequestId": request_id if tod_action else "",
         "freshness_token": publish_freshness_token,
         "publish_index": request_sequence,
         "objective_id": objective_ref,
@@ -528,9 +558,12 @@ def publish_mim_arm_execution_to_tod(
         "scope": _bounded_action_execution_phrase(action_name),
         "priority": "high",
         "action": action_name,
+        "tod_action": tod_action,
+        "bridge_request_id": request_id if tod_action else "",
         "capability_name": capability_name,
         "requested_executor": str(getattr(execution, "requested_executor", "tod") or "tod").strip() or "tod",
         "execution_id": execution_id,
+        "RequestPath": str(bridge_request_path) if tod_action else "",
         "handoff_endpoint": f"/gateway/capabilities/executions/{execution_id}/handoff",
         "feedback_endpoint": f"/gateway/capabilities/executions/{execution_id}/feedback",
         "telemetry_contract": {
@@ -574,6 +607,28 @@ def publish_mim_arm_execution_to_tod(
         },
         "notes": f"Automatically projected from approved MIM arm {action_display} execution binding.",
     }
+    if tod_action:
+        request_payload["tod_action_args"] = {
+            "RequestId": request_id,
+            "RequestPath": str(bridge_request_path),
+            "CorrelationId": correlation_id,
+            "Action": action_name,
+            "CapabilityName": capability_name,
+        }
+        request_payload["tod_bridge_request"] = {
+            "action": action_name,
+            "Action": action_name,
+            "capability_name": capability_name,
+            "CapabilityName": capability_name,
+            "execution_lane": "tod_bridge_request",
+            "request_id": request_id,
+            "RequestId": request_id,
+            "request_path": str(bridge_request_path),
+            "RequestPath": str(bridge_request_path),
+            "correlation_id": correlation_id,
+            "CorrelationId": correlation_id,
+        }
+        bridge_request_path.write_text(json.dumps(bridge_request_payload, indent=2) + "\n", encoding="utf-8")
     request_path.write_text(json.dumps(request_payload, indent=2) + "\n", encoding="utf-8")
     _, request_errors = normalize_and_validate_file(
         request_path,
@@ -659,6 +714,8 @@ def publish_mim_arm_execution_to_tod(
                 "core.routers.mim_arm._publish_tod_bridge_request",
                 "--request-file",
                 str(request_path),
+                "--bridge-request-file",
+                str(bridge_request_path),
                 "--trigger-file",
                 str(trigger_path),
                 "--verify-task-id",

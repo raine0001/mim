@@ -297,6 +297,11 @@ def parse_args() -> argparse.Namespace:
         default=str(DEFAULT_SHARED_DIR / "MIM_TOD_TASK_REQUEST.latest.json"),
     )
     parser.add_argument(
+        "--bridge-request-file",
+        default="",
+        help="Optional bridge request artifact to publish alongside the top-level task request.",
+    )
+    parser.add_argument(
         "--trigger-file",
         default=str(DEFAULT_SHARED_DIR / "MIM_TO_TOD_TRIGGER.latest.json"),
     )
@@ -379,6 +384,7 @@ def _publish_with_paramiko(
     password: str,
     remote_root: str,
     request_file: Path,
+    bridge_request_file: Path | None,
     trigger_file: Path,
     verify_task_id: str,
     caller: str,
@@ -399,8 +405,11 @@ def _publish_with_paramiko(
         sftp = client.open_sftp()
         try:
             request_remote_path = f"{remote_root}/MIM_TOD_TASK_REQUEST.latest.json"
+            bridge_request_remote_path = f"{remote_root}/{bridge_request_file.name}" if bridge_request_file else ""
             trigger_remote_path = f"{remote_root}/MIM_TO_TOD_TRIGGER.latest.json"
             sftp.put(str(request_file), request_remote_path)
+            if bridge_request_file:
+                sftp.put(str(bridge_request_file), bridge_request_remote_path)
             sftp.put(str(trigger_file), trigger_remote_path)
             with sftp.open(request_remote_path, "rb") as handle:
                 remote_request_bytes = handle.read()
@@ -489,9 +498,12 @@ def _publish_with_paramiko(
 def main() -> int:
     args = parse_args()
     request_file = Path(args.request_file).expanduser().resolve()
+    bridge_request_file = Path(args.bridge_request_file).expanduser().resolve() if str(args.bridge_request_file).strip() else None
     trigger_file = Path(args.trigger_file).expanduser().resolve()
     if not request_file.exists():
         raise SystemExit(f"Request file missing: {request_file}")
+    if bridge_request_file and not bridge_request_file.exists():
+        raise SystemExit(f"Bridge request file missing: {bridge_request_file}")
     if not trigger_file.exists():
         raise SystemExit(f"Trigger file missing: {trigger_file}")
 
@@ -521,6 +533,7 @@ def main() -> int:
             password=password,
             remote_root=args.remote_root,
             request_file=request_file,
+            bridge_request_file=bridge_request_file,
             trigger_file=trigger_file,
             verify_task_id=args.verify_task_id.strip(),
             caller=args.caller.strip(),
@@ -539,6 +552,12 @@ def main() -> int:
         str(request_file),
         f"{args.ssh_user}@{args.host}:{args.remote_root}/MIM_TOD_TASK_REQUEST.latest.json",
     ], check=True)
+    if bridge_request_file:
+        subprocess.run([
+            *(_scp_base_command(args.host, args.ssh_user, args.ssh_port, args.password_env)),
+            str(bridge_request_file),
+            f"{args.ssh_user}@{args.host}:{args.remote_root}/{bridge_request_file.name}",
+        ], check=True)
     subprocess.run([
         *(_scp_base_command(args.host, args.ssh_user, args.ssh_port, args.password_env)),
         str(trigger_file),
