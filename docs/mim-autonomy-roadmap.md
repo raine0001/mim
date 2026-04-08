@@ -149,6 +149,40 @@ Current autonomy-feedback-stability checkpoint after Objectives 150 through 152:
 - Objective 152 exposes a stability-guard summary that rolls runtime health, recovery posture, governance signals, and TOD escalation blockers into one operator-visible guard surface.
 - This closes the bounded 142-152 conversation and operator-awareness tranche in the current repo state.
 
+Current conversation continuity checkpoint after Objective 153:
+
+- Objective 153 persists gateway text turns into workspace interface sessions and message history so the conversation lane can recover continuity from stored session context.
+- Pending action requests now survive confirm, revise, cancel, pause, and resume follow-ups through the interface-session bridge instead of depending on one transient clarification branch.
+- Precision-prompt follow-ups now preserve prior topic continuity for terse `status`, `after`, and `recap` replies.
+- The authoritative focused lane passed on the fresh current-source runtime on `:18001` across Objectives 79, 153, and 74.
+
+Current self-evolution checkpoint after Objective 164:
+
+- Objective 164 adds `/improvement/self-evolution` as a bounded aggregate over proposals, recommendations, and ranked backlog state.
+- Refresh mode reuses the existing governed Objective 55 backlog refresh path, so the new surface extends the current improvement loop instead of duplicating it.
+- The snapshot exposes loop status, summary text, status counts, risk/governance counts, and top ranked items so self-evolution state is inspectable from one endpoint.
+- The authoritative focused lane passed on the fresh current-source runtime on `:18001` across Objectives 54, 55, and 164.
+
+Current self-evolution guidance checkpoint after Objective 165:
+
+- Objective 165 adds `/improvement/self-evolution/next-action` as a bounded decision surface over the Objective 164 snapshot.
+- The next-action contract recommends one inspectable follow-up step at a time, including review of operator-gated recommendations, ranked backlog inspection, recommendation generation, or bounded refresh.
+- This slice stays non-destructive: it recommends existing improvement routes rather than mutating state or creating a parallel approval engine.
+- The authoritative focused lane passed on the fresh current-source runtime on `:18001` across Objectives 54, 55, 164, and 165.
+
+Current self-evolution briefing checkpoint after Objective 166:
+
+- Objective 166 adds `/improvement/self-evolution/briefing` as a resolved operator packet over the Objective 165 next-action contract.
+- The briefing returns the current snapshot, the recommended next action, and the concrete target proposal, recommendation, or backlog detail needed to inspect that action.
+- This slice stays bounded and non-destructive: it resolves existing state into one operator-facing packet without introducing a new mutation path.
+- The authoritative focused lane passed on the fresh current-source runtime on `:18001` across Objectives 54, 55, 164, 165, and 166.
+
+Current self-evolution operator-visibility checkpoint after Objective 167:
+
+- Objective 167 threads the Objective 166 briefing packet into `/mim/ui/state` so the operator_reasoning surface and system reasoning panel expose the current self-evolution snapshot, recommended next action, and resolved target summary in one place.
+- This slice stays non-destructive: the MIM UI reads the existing self-evolution briefing contract with `refresh=false` and does not create a parallel recommendation path.
+- The authoritative focused lane passed on the fresh current-source runtime on `:18001` across Objectives 54, 55, 164, 165, 166, and 167.
+
 ## Future Objectives
 
 - Objective 58 — Adaptive autonomy boundaries (experience-conditioned autonomy limits)
@@ -168,7 +202,8 @@ Current autonomy-feedback-stability checkpoint after Objectives 150 through 152:
 - 116–122: Boundary-envelope propagation plus recovery taxonomy, tuning, recovery-derived commitments, and recovery-aware commitment evaluation
 - 123–130: Recovery-commitment lifecycle, conflict handling, propagation, rollout preview, admission control, and operator rollup
 - 131–141: Strategy planning, intent understanding, explainability, confidence, refinement, environment awareness, context persistence, coordination, and safety envelope
-- 142–152: Conversation reliability, TOD dialog convergence, action confirmation, interrupt/control continuity, error clarity, system awareness, consistency enforcement, trust signals, lightweight autonomy, human feedback capture, and stability guards
+- 142–153: Conversation reliability, TOD dialog convergence, action confirmation, interrupt/control continuity, error clarity, system awareness, consistency enforcement, trust signals, lightweight autonomy, human feedback capture, stability guards, and session continuity bridging
+- 164–167: Self-evolution core snapshot, bounded next-action guidance, resolved briefing packets, and operator-visible UI integration over proposals, recommendations, and backlog governance
 
 ## Governance Notes
 

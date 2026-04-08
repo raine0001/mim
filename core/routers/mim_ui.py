@@ -65,6 +65,7 @@ from core.operator_resolution_service import (
 )
 from core.policy_conflict_resolution_service import list_workspace_policy_conflict_profiles
 from core.proposal_policy_convergence_service import list_workspace_proposal_policy_preferences
+from core.self_evolution_service import build_self_evolution_briefing
 from core.runtime_recovery_service import RuntimeRecoveryService
 from core.ui_health_service import (
   build_mim_ui_health_snapshot,
@@ -966,6 +967,7 @@ def _build_operator_reasoning_summary(
     collaboration_progress: dict | None = None,
     dispatch_telemetry: dict | None = None,
     tod_decision_process: dict | None = None,
+    self_evolution: dict | None = None,
     runtime_health: dict | None = None,
     runtime_recovery: dict | None = None,
 ) -> str:
@@ -976,6 +978,7 @@ def _build_operator_reasoning_summary(
       dispatch_telemetry if isinstance(dispatch_telemetry, dict) else {}
     )
     tod_decision_process = tod_decision_process if isinstance(tod_decision_process, dict) else {}
+    self_evolution = self_evolution if isinstance(self_evolution, dict) else {}
     runtime_health = runtime_health if isinstance(runtime_health, dict) else {}
     runtime_recovery = runtime_recovery if isinstance(runtime_recovery, dict) else {}
     parts: list[str] = []
@@ -1007,6 +1010,9 @@ def _build_operator_reasoning_summary(
     dispatch_summary = str(dispatch_telemetry.get("summary") or "").strip()
     if dispatch_summary:
       parts.append(f"Dispatch telemetry: {dispatch_summary}")
+    self_evolution_summary = str(self_evolution.get("summary") or "").strip()
+    if self_evolution_summary:
+      parts.append(f"Self-evolution: {self_evolution_summary}")
     runtime_summary = summarize_runtime_health(runtime_health)
     runtime_status = str(runtime_health.get("status") or "").strip()
     if runtime_summary and runtime_status and runtime_status != "healthy":
@@ -1131,6 +1137,58 @@ def _operator_execution_readiness_snapshot(readiness: dict) -> dict:
         "freshness_state": str(readiness.get("freshness_state") or "").strip(),
         "valid": bool(readiness.get("valid", False)),
         "authoritative": bool(readiness.get("authoritative", False)),
+    }
+
+
+def _operator_self_evolution_snapshot(briefing: dict) -> dict:
+    packet = briefing if isinstance(briefing, dict) else {}
+    snapshot = packet.get("snapshot", {}) if isinstance(packet.get("snapshot", {}), dict) else {}
+    decision = packet.get("decision", {}) if isinstance(packet.get("decision", {}), dict) else {}
+    target = packet.get("target", {}) if isinstance(packet.get("target", {}), dict) else {}
+    recommendation = (
+        target.get("recommendation", {}) if isinstance(target.get("recommendation", {}), dict) else {}
+    )
+    backlog_item = (
+        target.get("backlog_item", {}) if isinstance(target.get("backlog_item", {}), dict) else {}
+    )
+    proposal = target.get("proposal", {}) if isinstance(target.get("proposal", {}), dict) else {}
+    action = decision.get("action", {}) if isinstance(decision.get("action", {}), dict) else {}
+
+    target_summary = ""
+    if recommendation:
+        target_summary = str(
+            recommendation.get("summary")
+            or recommendation.get("recommendation_type")
+            or ""
+        ).strip()
+    elif backlog_item:
+        target_summary = str(
+            backlog_item.get("summary")
+            or backlog_item.get("proposal_type")
+            or ""
+        ).strip()
+    elif proposal:
+        target_summary = str(
+            proposal.get("summary")
+            or proposal.get("proposal_type")
+            or ""
+        ).strip()
+
+    summary = str(decision.get("summary") or snapshot.get("summary") or "").strip()
+    return {
+        "summary": _compact_sentence(summary, max_len=200),
+        "status": str(snapshot.get("status") or "").strip(),
+        "decision_type": str(decision.get("decision_type") or "").strip(),
+        "priority": str(decision.get("priority") or "").strip(),
+        "target_kind": str(target.get("target_kind") or decision.get("target_kind") or "").strip(),
+        "target_id": target.get("target_id", decision.get("target_id")),
+        "target_summary": _compact_sentence(target_summary, max_len=180),
+        "action": action,
+        "snapshot": snapshot,
+        "decision": decision,
+        "target": target,
+        "metadata_json": packet.get("metadata_json", {}) if isinstance(packet.get("metadata_json", {}), dict) else {},
+        "created_at": packet.get("created_at"),
     }
 
 
@@ -2099,6 +2157,7 @@ def _build_operator_reasoning_payload(
     collaboration_progress: dict,
     dispatch_telemetry: dict,
     tod_decision_process: dict,
+    self_evolution_briefing: dict,
     runtime_health: dict,
     runtime_recovery: dict,
     latest_execution_row: CapabilityExecution | None,
@@ -2133,6 +2192,7 @@ def _build_operator_reasoning_payload(
     recovery_learning = _operator_execution_recovery_learning_snapshot(execution_recovery)
     recovery_policy_tuning = _operator_execution_recovery_policy_tuning_snapshot(execution_recovery)
     strategy_plan = _operator_strategy_plan_snapshot(strategy_plan_row)
+    self_evolution = _operator_self_evolution_snapshot(self_evolution_briefing)
     trust_explainability = _operator_trust_explainability_snapshot(strategy_plan)
     recovery_governance_rollup = _operator_recovery_governance_rollup_snapshot(
       execution_recovery=execution_recovery,
@@ -2188,6 +2248,7 @@ def _build_operator_reasoning_payload(
             collaboration_progress=collaboration_progress,
             dispatch_telemetry=dispatch_telemetry,
             tod_decision_process=tod_decision_process,
+            self_evolution=self_evolution,
             runtime_health=runtime_health,
             runtime_recovery=runtime_recovery,
         ),
@@ -2222,6 +2283,7 @@ def _build_operator_reasoning_payload(
         "collaboration_progress": collaboration_progress,
         "dispatch_telemetry": dispatch_telemetry,
         "tod_decision_process": tod_decision_process,
+        "self_evolution": self_evolution,
         "runtime_health": runtime_health,
         "runtime_recovery": runtime_recovery,
     }
@@ -3391,6 +3453,7 @@ async def mim_ui_page() -> str:
       const autonomy = (reasoning && typeof reasoning.autonomy === 'object') ? reasoning.autonomy : {};
       const stewardship = (reasoning && typeof reasoning.stewardship === 'object') ? reasoning.stewardship : {};
       const recommendation = (reasoning && typeof reasoning.current_recommendation === 'object') ? reasoning.current_recommendation : {};
+      const selfEvolution = (reasoning && typeof reasoning.self_evolution === 'object') ? reasoning.self_evolution : {};
       const trust = (reasoning && typeof reasoning.trust_explainability === 'object') ? reasoning.trust_explainability : {};
       const lightweightAutonomy = (reasoning && typeof reasoning.lightweight_autonomy === 'object') ? reasoning.lightweight_autonomy : {};
       const feedbackLoop = (reasoning && typeof reasoning.feedback_loop === 'object') ? reasoning.feedback_loop : {};
@@ -3471,6 +3534,23 @@ async def mim_ui_page() -> str:
           title: 'Current recommendation',
           meta,
           note: String(recommendation.summary || '').trim(),
+        });
+      }
+
+      if (String(selfEvolution.summary || '').trim()) {
+        const meta = [
+          selfEvolution.decision_type && String(selfEvolution.decision_type || '').trim().replaceAll('_', ' '),
+          selfEvolution.priority,
+          selfEvolution.target_kind && `target ${String(selfEvolution.target_kind || '').trim().replaceAll('_', ' ')}`,
+        ].filter(Boolean).join(' | ');
+        const notes = [
+          String(selfEvolution.summary || '').trim(),
+          String(selfEvolution.target_summary || '').trim() && `Target: ${String(selfEvolution.target_summary || '').trim()}`,
+        ].filter(Boolean).join('. ');
+        entries.push({
+          title: 'Self-evolution',
+          meta,
+          note: notes,
         });
       }
 
@@ -8296,6 +8376,21 @@ async def mim_ui_state(db: AsyncSession = Depends(get_db)) -> dict:
     collaboration_progress = _operator_collaboration_progress_snapshot()
     dispatch_telemetry = _operator_dispatch_telemetry_snapshot()
     tod_decision_process = _operator_tod_decision_process_snapshot()
+    self_evolution_briefing = await build_self_evolution_briefing(
+      actor="mim_ui_state",
+      source="mim_ui_operator_reasoning",
+      refresh=False,
+      lookback_hours=168,
+      min_occurrence_count=2,
+      auto_experiment_limit=3,
+      limit=5,
+      db=db,
+    )
+    self_evolution_briefing = (
+      self_evolution_briefing.get("briefing", {})
+      if isinstance(self_evolution_briefing, dict)
+      else {}
+    )
     runtime_recovery = runtime_recovery_service.get_summary()
 
     operator_reasoning = _build_operator_reasoning_payload(
@@ -8327,6 +8422,7 @@ async def mim_ui_state(db: AsyncSession = Depends(get_db)) -> dict:
         collaboration_progress=collaboration_progress,
         dispatch_telemetry=dispatch_telemetry,
         tod_decision_process=tod_decision_process,
+        self_evolution_briefing=self_evolution_briefing,
         runtime_health=runtime_health,
         runtime_recovery=runtime_recovery,
         latest_execution_row=latest_recovery_execution,
@@ -8362,6 +8458,7 @@ async def mim_ui_state(db: AsyncSession = Depends(get_db)) -> dict:
             "tod_collaboration_progress",
             "mim_arm_dispatch_telemetry",
             "tod_decision_process_visibility",
+            "self_evolution_operator_visibility",
             "runtime_health_visibility",
         ],
         "inquiry_prompt": inquiry_prompt,
@@ -8398,6 +8495,11 @@ async def mim_ui_state(db: AsyncSession = Depends(get_db)) -> dict:
               operator_reasoning.get("current_recommendation", {}).get("source") or ""
             ).strip()
             if isinstance(operator_reasoning.get("current_recommendation", {}), dict)
+            else "",
+            "self_evolution_summary": str(
+              operator_reasoning.get("self_evolution", {}).get("summary") or ""
+            ).strip()
+            if isinstance(operator_reasoning.get("self_evolution", {}), dict)
             else "",
             "trust_signal_summary": str(operator_reasoning.get("trust_signal_summary") or "").strip(),
             "lightweight_autonomy_summary": str(operator_reasoning.get("lightweight_autonomy", {}).get("summary") or "").strip()
