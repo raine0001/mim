@@ -4485,6 +4485,263 @@ def _normalize_conversation_query(text: str) -> str:
     return normalized
 
 
+def _is_interruption_query(normalized_query: str) -> bool:
+    query = str(normalized_query or "").strip().lower()
+    if not query:
+        return False
+    if query in {
+        "wait",
+        "wait stop",
+        "stop",
+        "no stop",
+        "hold on",
+        "pause",
+        "cancel that",
+        "never mind",
+        "scratch that",
+    }:
+        return True
+    return any(
+        query.startswith(prefix)
+        for prefix in (
+            "wait ",
+            "stop ",
+            "hold on ",
+            "pause ",
+            "cancel that ",
+            "never mind ",
+            "scratch that ",
+        )
+    )
+
+
+def _is_pause_control_query(normalized_query: str) -> bool:
+    query = str(normalized_query or "").strip().lower()
+    if not query:
+        return False
+    if query in {"pause", "hold", "hold it", "pause that", "hold that"}:
+        return True
+    return any(
+        query.startswith(prefix)
+        for prefix in ("pause ", "hold ", "hold that ", "pause that ")
+    )
+
+
+def _is_resume_control_query(normalized_query: str) -> bool:
+    query = str(normalized_query or "").strip().lower()
+    if not query:
+        return False
+    if query in {
+        "resume",
+        "continue",
+        "proceed",
+        "continue now",
+        "resume now",
+        "go ahead",
+    }:
+        return True
+    return any(
+        query.startswith(prefix)
+        for prefix in ("resume ", "continue ", "proceed ", "go ahead with ")
+    )
+
+
+def _is_cancel_control_query(normalized_query: str) -> bool:
+    query = str(normalized_query or "").strip().lower()
+    if not query:
+        return False
+    if query in {"cancel", "cancel it", "cancel that", "drop it"}:
+        return True
+    return any(
+        query.startswith(prefix)
+        for prefix in ("cancel ", "cancel that ", "cancel it ", "drop ")
+    )
+
+
+def _is_unsafe_or_risky_query(normalized_query: str) -> bool:
+    query = str(normalized_query or "").strip().lower()
+    if not query:
+        return False
+    return any(
+        marker in query
+        for marker in {
+            "unsafe",
+            "risky operation",
+            "dangerous",
+            "harmful",
+        }
+    )
+
+
+def _is_private_runtime_request_query(normalized_query: str) -> bool:
+    query = str(normalized_query or "").strip().lower()
+    if not query:
+        return False
+    return any(
+        marker in query
+        for marker in {
+            "private runtime details",
+            "private runtime",
+            "runtime secrets",
+            "passwords",
+            "secret keys",
+            "private logs",
+        }
+    )
+
+
+def _is_external_action_overclaim_query(normalized_query: str) -> bool:
+    query = str(normalized_query or "").strip().lower()
+    if not query:
+        return False
+    return any(
+        marker in query
+        for marker in {
+            "already executed",
+            "already ran",
+            "already completed",
+            "already did that external step",
+            "confirm you already executed",
+            "confirm you already ran",
+        }
+    )
+
+
+def _is_ambiguous_external_action_query(normalized_query: str) -> bool:
+    query = str(normalized_query or "").strip().lower()
+    if not query:
+        return False
+    if "external action" not in query and "external actions" not in query:
+        return False
+    return any(
+        marker in query
+        for marker in {
+            "whatever",
+            "anything needed",
+            "anything necessary",
+            "do whatever",
+            "any external actions",
+        }
+    )
+
+
+def _conversation_boundary_response(normalized_query: str) -> str:
+    query = str(normalized_query or "").strip().lower()
+    if not query:
+        return ""
+
+    if _is_private_runtime_request_query(query):
+        return (
+            "I cannot share all private runtime details. I can give a scoped health, task, or reasoning summary instead."
+        )
+
+    if _is_external_action_overclaim_query(query):
+        return (
+            "I cannot claim an external step already happened without execution evidence. "
+            "I can check status or confirm the action request before anything is queued."
+        )
+
+    if _is_unsafe_or_risky_query(query):
+        return (
+            "I cannot help with unsafe or risky operations. "
+            "I can help with a safer alternative, a risk check, or a step-by-step review instead."
+        )
+
+    if _is_ambiguous_external_action_query(query):
+        return (
+            "I cannot choose unspecified external actions on your behalf. "
+            "Name the one action you want, and I will confirm it before execution."
+        )
+
+    return ""
+
+
+def _extract_conversation_correction(normalized_query: str) -> str:
+    query = str(normalized_query or "").strip().lower()
+    if not query:
+        return ""
+
+    correction_patterns = (
+        r"^(?:no\s+)?actually\s+",
+        r"^(?:no\s+)?instead\s+",
+        r"^no\s+i\s+said\s+",
+        r"^i\s+said\s+",
+        r"^no\s+",
+    )
+    for pattern in correction_patterns:
+        corrected = re.sub(pattern, "", query, count=1).strip()
+        if corrected and corrected != query:
+            return corrected
+    return ""
+
+
+def _priority_two_item_response(last_topic: str) -> str:
+    if last_topic == "objective":
+        return "Top two next items: 1. Keep conversation flow reliable. 2. Keep task-state handoff explicit."
+    return "Top two upcoming items: 1. Stabilize conversation handling. 2. Verify the next TOD handoff."
+
+
+def _continuation_response(last_topic: str) -> str:
+    if last_topic == "technical_research":
+        return "Continue with the next bounded research step, then stop when the evidence stops improving."
+    if last_topic in {"priorities", "objective", "project_planning"}:
+        return "Continue with one concrete task at a time: verify the current state, then take the next handoff or test run."
+    if last_topic in {"risk", "risk_reduction"}:
+        return "Continue by checking whether the fix held in live state, not just in tests."
+    return "Continue with one concrete question or one action, and I will keep it direct."
+
+
+def _is_action_request_query(normalized_query: str) -> bool:
+    query = str(normalized_query or "").strip().lower()
+    if not query:
+        return False
+
+    non_action_prefixes = (
+        "what ",
+        "how ",
+        "why ",
+        "when ",
+        "where ",
+        "who ",
+        "are ",
+        "is ",
+        "do you ",
+        "can you ",
+        "could you ",
+        "would you ",
+        "will you ",
+        "should you ",
+        "status",
+        "check status",
+    )
+    if query.startswith(non_action_prefixes):
+        return False
+
+    action_prefixes = (
+        "start ",
+        "run ",
+        "execute ",
+        "launch ",
+        "queue ",
+        "open ",
+        "create ",
+        "post ",
+        "send ",
+        "scan ",
+        "move ",
+        "deploy ",
+    )
+    return query.startswith(action_prefixes)
+
+
+def _action_confirmation_response(normalized_query: str) -> str:
+    action_summary = _compact_text(normalized_query.rstrip(".?"), 96)
+    return (
+        f"Before I treat that as an action: please confirm you want me to '{action_summary}'. "
+        "Say confirm to approve it, revise it in one sentence, or cancel it."
+    )
+
+
 def _object_query_tokens(text: str) -> set[str]:
     normalized = _normalize_conversation_query(text)
     stopwords = {
@@ -5270,6 +5527,24 @@ def _conversation_topic_key(normalized_query: str, response: str = "") -> str:
     query = str(normalized_query or "").strip().lower()
     prompt = str(response or "").strip().lower()
 
+    if prompt.startswith("i cannot share all private runtime details"):
+        return "safety_boundary"
+    if prompt.startswith("i cannot claim an external step already happened"):
+        return "safety_boundary"
+    if prompt.startswith("i cannot help with unsafe or risky operations"):
+        return "safety_boundary"
+    if prompt.startswith("i cannot choose unspecified external actions"):
+        return "safety_boundary"
+    if _is_pause_control_query(query) or prompt.startswith("paused. the pending action"):
+        return "interrupt_control"
+    if _is_resume_control_query(query) or prompt.startswith("resumed at the conversation layer"):
+        return "interrupt_control"
+    if _is_cancel_control_query(query) or prompt.startswith("cancelled. i will not treat"):
+        return "interrupt_control"
+    if _is_interruption_query(query) or prompt.startswith("understood. i stopped"):
+        return "interrupt_control"
+    if prompt.startswith("before i treat that as an action:"):
+        return "action_confirmation"
     if (
         "technical framing:" in prompt
         or "plan of action:" in prompt
@@ -5291,6 +5566,45 @@ def _conversation_topic_key(normalized_query: str, response: str = "") -> str:
         or "the system is mim plus tod" in prompt
     ):
         return "system"
+    if (
+        any(
+            token in query
+            for token in {
+                "continue automatically",
+                "act automatically",
+                "automatic right now",
+                "autonomy right now",
+            }
+        )
+        or prompt.startswith("automatic continuation is limited")
+    ):
+        return "lightweight_autonomy"
+    if (
+        any(
+            token in query
+            for token in {
+                "give feedback",
+                "how do i give feedback",
+                "feedback loop",
+                "feedback for you",
+            }
+        )
+        or prompt.startswith("Give feedback in one sentence:")
+    ):
+        return "human_feedback"
+    if (
+        any(
+            token in query
+            for token in {
+                "system stable",
+                "are you stable",
+                "stability guard",
+                "stability right now",
+            }
+        )
+        or prompt.startswith("Stability guard:")
+    ):
+        return "system_stability"
     if (
         any(
             token in query
@@ -5514,9 +5828,69 @@ def _conversation_followup_response(
     if query in {"thanks", "thank you", "ok thanks", "okay thanks"}:
         return "You're welcome."
 
+    boundary_response = _conversation_boundary_response(query)
+    if boundary_response:
+        return boundary_response
+
+    if _is_pause_control_query(query):
+        if last_topic == "action_confirmation":
+            return "Paused. The pending action stays on hold until you say confirm, revise it, or cancel it."
+        return "Paused at the conversation layer. Tell me when you want to resume."
+
+    if _is_resume_control_query(query):
+        if last_topic == "action_confirmation":
+            return "Resumed at the conversation layer. If the pending action is still correct, say confirm."
+        return "Resumed at the conversation layer. Restate the one question or action you want next."
+
+    if _is_cancel_control_query(query):
+        if last_topic == "action_confirmation":
+            return "Cancelled. I will not treat the pending action as approved."
+        return "Cancelled at the conversation layer."
+
+    if _is_interruption_query(query):
+        return "Understood. I stopped the prior thread. Tell me the one thing you want next."
+
+    if last_topic == "action_confirmation":
+        if query in {"confirm", "yes confirm", "confirmed", "approve", "yes proceed"}:
+            return "Confirmed. I will treat that as an explicit action request and keep the execution step separate from this conversation reply."
+        if any(token in query for token in {"revise", "change it", "update it"}):
+            return "Understood. Replace the pending action with the revised one in a single sentence."
+
+    if query in {
+        "what did you hear",
+        "what did you hear me say",
+        "what did you hear from me",
+    }:
+        last_user_input = str(session_context.get("last_user_input") or "").strip()
+        if last_user_input:
+            return f"I heard: '{_compact_text(last_user_input, 96)}'."
+        return "I do not have a fresh prior turn to quote yet."
+
     technical_followup = _technical_research_followup_response(query, session_context)
     if technical_followup:
         return technical_followup
+
+    if any(
+        token in query
+        for token in {
+            "top two upcoming items",
+            "top two upcoming items only",
+            "top two items only",
+            "top two only",
+        }
+    ):
+        return _priority_two_item_response(last_topic)
+
+    if any(
+        token in query
+        for token in {
+            "how should we continue",
+            "how do we continue",
+            "how should we proceed",
+            "how do we proceed",
+        }
+    ):
+        return _continuation_response(last_topic)
 
     if any(
         token in query
@@ -5648,6 +6022,26 @@ def _is_conversation_followup_query(normalized_query: str) -> bool:
         "thank you",
         "ok thanks",
         "okay thanks",
+        "confirm",
+        "yes confirm",
+        "confirmed",
+        "approve",
+        "yes proceed",
+        "pause",
+        "hold",
+        "hold it",
+        "pause that",
+        "resume",
+        "continue",
+        "proceed",
+        "go ahead",
+        "cancel",
+        "cancel it",
+        "cancel that",
+        "drop it",
+        "revise",
+        "change it",
+        "update it",
     }
     return any(marker in query for marker in followup_markers) or bool(
         re.search(r"\bstep\s+\d+\b", query)
@@ -5665,6 +6059,35 @@ def _conversation_response(
 
     if not raw:
         return "I am listening. Ask one question or tell me one action you want."
+
+    boundary_response = _conversation_boundary_response(normalized_query)
+    if boundary_response:
+        return boundary_response
+
+    if _is_pause_control_query(normalized_query):
+        return "Paused at the conversation layer. Tell me when you want to resume."
+
+    if _is_resume_control_query(normalized_query):
+        return "Resumed at the conversation layer. Restate the one question or action you want next."
+
+    if _is_cancel_control_query(normalized_query):
+        return "Cancelled at the conversation layer."
+
+    if _is_interruption_query(normalized_query):
+        return "Understood. I stopped the prior thread. Tell me the one thing you want next."
+
+    correction_query = ""
+    if int(context.get("correction_depth", 0) or 0) < 1:
+        correction_query = _extract_conversation_correction(normalized_query)
+    if correction_query:
+        return _conversation_response(
+            correction_query,
+            {
+                **context,
+                "correction_depth": int(context.get("correction_depth", 0) or 0)
+                + 1,
+            },
+        )
 
     followup_response = _conversation_followup_response(normalized_query, context)
     if followup_response:
@@ -5718,6 +6141,82 @@ def _conversation_response(
         or ("do you know" in normalized_query and "mim" in normalized_query)
     ):
         return "Yes. I am MIM."
+
+    if any(
+        token in normalized_query
+        for token in {
+            "chatting for now",
+            "just chatting for now",
+            "keep this casual",
+        }
+    ):
+        return "Understood. I will stay in conversation mode until you ask for a concrete action."
+
+    if any(
+        token in normalized_query
+        for token in {
+            "prefer short responses",
+            "prefer short answers",
+            "keep responses short",
+            "keep answers short",
+        }
+    ):
+        return "Understood. I will keep responses short."
+
+    if _is_action_request_query(normalized_query):
+        return _action_confirmation_response(normalized_query)
+
+    if any(
+        token in normalized_query
+        for token in {
+            "do not start anything automatically",
+            "dont start anything automatically",
+            "do not run anything automatically",
+            "dont run anything automatically",
+        }
+    ):
+        return "Understood. I will not start actions automatically without an explicit request."
+
+    if any(
+        token in normalized_query
+        for token in {
+            "can you continue automatically",
+            "can you act automatically",
+            "automatic right now",
+            "what is your autonomy right now",
+        }
+    ):
+        return (
+            "Automatic continuation is limited to bounded low-risk steps when the safety envelope says it is safe to continue. "
+            "Otherwise I keep operator confirmation in the loop."
+        )
+
+    if any(
+        token in normalized_query
+        for token in {
+            "how do i give feedback",
+            "give feedback",
+            "feedback loop",
+            "feedback for you",
+        }
+    ):
+        return (
+            "Give feedback in one sentence: what happened, what was wrong or right, and what you want next. "
+            "I use that to tighten the next recommendation or handoff."
+        )
+
+    if any(
+        token in normalized_query
+        for token in {
+            "is the system stable",
+            "are you stable",
+            "stability guard",
+            "stability right now",
+        }
+    ):
+        return (
+            "Stability guard: I treat runtime health degradation, recovery instability, and MIM to TOD drift as stop signals before automatic continuation."
+        )
 
     if any(
         token in normalized_query
@@ -5777,6 +6276,19 @@ def _conversation_response(
         }
     ):
         return "I need one concrete request from you: a question, a short plan, or an action."
+
+    if any(
+        token in normalized_query
+        for token in {
+            "what did you hear",
+            "what did you hear me say",
+            "what did you hear from me",
+        }
+    ):
+        last_user_input = str(context.get("last_user_input") or "").strip()
+        if last_user_input:
+            return f"I heard: '{_compact_text(last_user_input, 96)}'."
+        return "I do not have a fresh prior turn to quote yet."
 
     if any(
         token in normalized_query

@@ -36,7 +36,7 @@ mkdir -p "${SHARED_DIR}"
 
 allow_local_only="$(printf '%s' "${ALLOW_LOCAL_ONLY_CANONICAL_WRITE}" | tr '[:upper:]' '[:lower:]')"
 if [[ "${allow_local_only}" != "1" && "${allow_local_only}" != "true" && "${allow_local_only}" != "yes" ]]; then
-  echo "[dispatch] local-only canonical writer blocked; continuous dispatch must not overwrite the TOD-facing request lane while the authoritative boundary remains remote. Set ALLOW_LOCAL_ONLY_CANONICAL_WRITE=1 to opt in explicitly."
+  echo "[dispatch] local-only canonical writer blocked; continuous dispatch must not overwrite the canonical TOD-facing request lane at 192.168.1.120:/home/testpilot/mim/runtime/shared. Set ALLOW_LOCAL_ONLY_CANONICAL_WRITE=1 to opt in explicitly."
   exit 0
 fi
 
@@ -67,7 +67,9 @@ record_bridge_audit() {
     --service-name "${SERVICE_NAME}" \
     --task-id "${CURRENT_TASK_ID:-}" \
     --objective-id "${OBJECTIVE_ID:-}" \
-    --publish-target "/home/testpilot/mim/runtime/shared" \
+    --publish-target "/home/testpilot/mim/runtime/shared -> ${MIM_TOD_SSH_HOST:-192.168.1.120}:${MIM_TOD_SSH_REMOTE_ROOT:-/home/testpilot/mim/runtime/shared}" \
+    --remote-host "${MIM_TOD_SSH_HOST:-192.168.1.120}" \
+    --remote-root "${MIM_TOD_SSH_REMOTE_ROOT:-/home/testpilot/mim/runtime/shared}" \
     --artifact-path "${artifact_path}" >/dev/null
 }
 

@@ -511,8 +511,8 @@ class SelfHealthMonitor:
         publication_boundary = self._read_json(self.state_dir / "MIM_TOD_PUBLICATION_BOUNDARY.latest.json")
         coordination_request = self._read_json(self.state_dir / "TOD_MIM_COORDINATION_REQUEST.latest.json")
         coordination_ack = self._read_json(self.state_dir / "MIM_TOD_COORDINATION_ACK.latest.json")
-        remote_request = publication_boundary.get("remote_request") if isinstance((publication_boundary or {}).get("remote_request"), dict) else None
-        effective_task_request = remote_request if remote_request else task_request
+        authoritative_request = publication_boundary.get("authoritative_request") if isinstance((publication_boundary or {}).get("authoritative_request"), dict) else None
+        effective_task_request = authoritative_request if authoritative_request else task_request
 
         export_age = self._age_seconds_from_payload(context_export, ["exported_at", "generated_at"])
         task_objective = self._normalized_objective(effective_task_request)
@@ -546,20 +546,28 @@ class SelfHealthMonitor:
                 )
             )
 
-        if task_source_service in {"objective75_overnight", "continuous_task_dispatch"}:
+        authoritative_host = self._text((publication_boundary or {}).get("authoritative_host"))
+        authoritative_root = self._text((publication_boundary or {}).get("authoritative_root"))
+        if publication_boundary and (
+            authoritative_host != "192.168.1.120"
+            or authoritative_root != "/home/testpilot/mim/runtime/shared"
+        ):
             diagnostics.append(
                 RuntimeDiagnostic(
-                    code="local_only_task_request_writer_active",
+                    code="communication_authority_drift",
                     severity="high",
-                    summary="A local-only writer is occupying the canonical TOD request slot.",
+                    summary="Communication authority drifted away from the canonical MIM shared root.",
                     detail=(
-                        "The latest MIM_TOD_TASK_REQUEST artifact was written by a local-only publisher even though the operative TOD boundary is the remote Raspberry Pi shared surface. "
+                        "The latest publication-boundary artifact does not point at the canonical MIM/TOD communication root "
+                        "192.168.1.120:/home/testpilot/mim/runtime/shared. "
+                        f"authoritative_host={authoritative_host or 'missing'}, authoritative_root={authoritative_root or 'missing'}, "
                         f"source_service={task_source_service or 'unknown'}, task_objective={task_objective or 'unknown'}."
                     ),
                     metadata={
                         "source_service": task_source_service,
                         "task_objective": task_objective,
-                        "authoritative_surface": "remote_raspberry_pi",
+                        "authoritative_host": authoritative_host,
+                        "authoritative_root": authoritative_root,
                     },
                 )
             )

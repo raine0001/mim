@@ -210,7 +210,9 @@ record_bridge_audit() {
     --service-name "${SERVICE_NAME}" \
     --task-id "${TASK_PREFIX}-$(printf '%03d' "$TASK_NUM")" \
     --objective-id "${OBJECTIVE_TAG}" \
-    --publish-target "/home/testpilot/mim/runtime/shared" \
+    --publish-target "/home/testpilot/mim/runtime/shared -> ${MIM_TOD_SSH_HOST:-192.168.1.120}:${MIM_TOD_SSH_REMOTE_ROOT:-/home/testpilot/mim/runtime/shared}" \
+    --remote-host "${MIM_TOD_SSH_HOST:-192.168.1.120}" \
+    --remote-root "${MIM_TOD_SSH_REMOTE_ROOT:-/home/testpilot/mim/runtime/shared}" \
     --artifact-path "${artifact_path}" >/dev/null
 }
 
@@ -801,7 +803,7 @@ while true; do
   if local_only_canonical_write_block_active; then
     stamp="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
     if [[ "$LOCAL_ONLY_BLOCK_LOGGED" != "1" ]]; then
-      echo "[$stamp] local-only canonical writer blocked; objective75 overnight must not overwrite the TOD-facing request lane while the authoritative boundary remains remote. Set ALLOW_LOCAL_ONLY_CANONICAL_WRITE=1 to opt in explicitly." | tee -a "$LOG_DIR/objective75_overnight.log"
+      echo "[$stamp] local-only canonical writer blocked; objective75 overnight must not overwrite the canonical TOD-facing request lane at 192.168.1.120:/home/testpilot/mim/runtime/shared. Set ALLOW_LOCAL_ONLY_CANONICAL_WRITE=1 to opt in explicitly." | tee -a "$LOG_DIR/objective75_overnight.log"
       LOCAL_ONLY_BLOCK_LOGGED=1
     fi
     sleep "$LOCAL_ONLY_WRITER_BLOCK_SLEEP_SECONDS"

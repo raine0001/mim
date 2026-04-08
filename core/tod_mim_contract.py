@@ -209,8 +209,8 @@ CANONICAL_WRITERS = [
     {
         "writer_id": "scripts/publish_tod_bridge_artifacts_remote.py",
         "status": "active",
-        "artifact_domain": "remote_publish",
-        "role": "canonical_remote_publisher",
+        "artifact_domain": "communication_boundary_sync",
+        "role": "canonical_communication_publisher",
     },
 ]
 
@@ -309,7 +309,10 @@ def _default_objective_id(payload: dict[str, Any]) -> str:
 
 
 def _default_task_id(payload: dict[str, Any]) -> str:
-    return str(payload.get("task_id") or "").strip()
+    explicit_task_id = str(payload.get("task_id") or "").strip()
+    if explicit_task_id:
+        return explicit_task_id
+    return str(payload.get("request_id") or "").strip()
 
 
 def _default_request_id(payload: dict[str, Any]) -> str:
@@ -353,12 +356,7 @@ def normalize_message(
         request_id = _default_request_id(normalized)
         correlation_id = _default_correlation_id(normalized)
         normalized["objective_id"] = objective_id
-        if task_id:
-            normalized["task_id"] = task_id
-        elif message_kind == "request":
-            normalized.pop("task_id", None)
-        else:
-            normalized["task_id"] = task_id
+        normalized["task_id"] = task_id
         normalized["request_id"] = request_id
         normalized["correlation_id"] = correlation_id
         normalized.setdefault(

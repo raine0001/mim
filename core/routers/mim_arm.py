@@ -46,6 +46,7 @@ ARM_REFRESH_STATUS_ARTIFACT = "mim_arm_refresh_status.latest.json"
 TOD_COMMAND_STATUS_ARTIFACT = "TOD_MIM_COMMAND_STATUS.latest.json"
 TOD_TASK_RESULT_ARTIFACT = "TOD_MIM_TASK_RESULT.latest.json"
 TOD_CATCHUP_GATE_ARTIFACT = "TOD_CATCHUP_GATE.latest.json"
+MIM_DECISION_TASK_ARTIFACT = "MIM_DECISION_TASK.latest.json"
 MIM_ARM_DISPATCH_TELEMETRY_ARTIFACT = "MIM_ARM_DISPATCH_TELEMETRY.latest.json"
 CONTEXT_EXPORT_ARTIFACT = "MIM_CONTEXT_EXPORT.latest.json"
 TOD_BRIDGE_REQUEST_ARTIFACT = "MIM_TOD_BRIDGE_REQUEST.latest.json"
@@ -400,11 +401,11 @@ def _audit_tod_bridge_write(
             "--objective-id",
             objective_id,
             "--publish-target",
-            f"/home/testpilot/mim/runtime/shared -> {os.getenv('MIM_ARM_SSH_HOST', '')}:{os.getenv('MIM_ARM_SSH_REMOTE_ROOT', '/home/testpilot/mim/runtime/shared')}",
+            f"/home/testpilot/mim/runtime/shared -> {os.getenv('MIM_TOD_SSH_HOST', '192.168.1.120')}:{os.getenv('MIM_TOD_SSH_REMOTE_ROOT', '/home/testpilot/mim/runtime/shared')}",
             "--remote-host",
-            os.getenv("MIM_ARM_SSH_HOST", ""),
+            os.getenv("MIM_TOD_SSH_HOST", "192.168.1.120"),
             "--remote-root",
-            os.getenv("MIM_ARM_SSH_REMOTE_ROOT", "/home/testpilot/mim/runtime/shared"),
+            os.getenv("MIM_TOD_SSH_REMOTE_ROOT", "/home/testpilot/mim/runtime/shared"),
             "--publish-attempted",
             "true" if publish_attempted else "false",
             "--publish-succeeded",
@@ -1075,7 +1076,7 @@ def _step_proof_from_telemetry(step: dict[str, Any], *, shared_root: Path) -> tu
         ),
         "host_received_timestamp_present": bool(str(telemetry.get("host_received_timestamp") or "").strip()),
         "host_completed_timestamp_present": bool(str(telemetry.get("host_completed_timestamp") or "").strip()),
-        "tod_ack_result_aligned": bool(ack.get("matched") and result.get("matched")),
+        "tod_ack_result_aligned": bool(result.get("matched") and (ack.get("matched") or result.get("ack_inferred"))),
         "explicit_host_attribution_present": bool(host_attribution),
     }
     proof_chain_complete = bool(publication_boundary.get("matched")) and all(proof_requirements.values())
@@ -1452,6 +1453,31 @@ def _tod_execution_gate_reason(readiness: dict[str, object], catchup: dict[str, 
     return ""
 
 
+def _persistent_communication_dispatch_gate(shared_root: Path) -> dict[str, object]:
+    payload = _read_json_artifact(shared_root / MIM_DECISION_TASK_ARTIFACT)
+    communication_escalation = _json_dict(payload.get("communication_escalation"))
+    required = bool(communication_escalation.get("required") is True)
+    required_cycle_count = int(communication_escalation.get("required_cycle_count", 0) or 0)
+    threshold_cycles = int(communication_escalation.get("block_dispatch_threshold_cycles", 3) or 3)
+    if required and required_cycle_count > threshold_cycles:
+        return {
+            "active": True,
+            "reason_code": "communication_escalation_persistent",
+            "required_cycle_count": required_cycle_count,
+            "threshold_cycles": threshold_cycles,
+            "detail": str(communication_escalation.get("detail") or "").strip(),
+            "code": str(communication_escalation.get("code") or "").strip(),
+        }
+    return {
+        "active": False,
+        "reason_code": "",
+        "required_cycle_count": required_cycle_count,
+        "threshold_cycles": threshold_cycles,
+        "detail": str(communication_escalation.get("detail") or "").strip(),
+        "code": str(communication_escalation.get("code") or "").strip(),
+    }
+
+
 def load_mim_arm_status_surface(*, shared_root: Path = DEFAULT_SHARED_ROOT) -> dict[str, object]:
     status_payload = _read_json_artifact(shared_root / ARM_STATUS_ARTIFACT)
     host_state_payload = _read_json_artifact(shared_root / ARM_HOST_STATE_ARTIFACT)
@@ -1461,6 +1487,7 @@ def load_mim_arm_status_surface(*, shared_root: Path = DEFAULT_SHARED_ROOT) -> d
     readiness = _latest_readiness(shared_root)
     catchup = _catchup_gate(shared_root)
     catchup_summary = _build_tod_catchup_summary(catchup)
+    communication_dispatch_gate = _persistent_communication_dispatch_gate(shared_root)
     health = _health_posture()
 
     process_service = _json_dict(diagnostic.get("process_service"))
@@ -1541,6 +1568,8 @@ def load_mim_arm_status_surface(*, shared_root: Path = DEFAULT_SHARED_ROOT) -> d
             last_error = str(likely_root_cause.get("summary") or "").strip() or None
 
     tod_execution_block_reason = _tod_execution_gate_reason(readiness, catchup)
+    if not tod_execution_block_reason and bool(communication_dispatch_gate.get("active", False)):
+        tod_execution_block_reason = str(communication_dispatch_gate.get("reason_code") or "").strip()
     tod_execution_allowed = tod_execution_block_reason == ""
 
     motion_block_reasons: list[str] = []
@@ -1610,6 +1639,7 @@ def load_mim_arm_status_surface(*, shared_root: Path = DEFAULT_SHARED_ROOT) -> d
             "promotion_ready": catchup.get("promotion_ready"),
             "gate_confidence": catchup.get("confidence"),
             "catchup_detail": catchup_summary,
+            "communication_dispatch_gate": communication_dispatch_gate,
         },
         "self_health": health,
         "source_artifacts": {
@@ -1619,6 +1649,7 @@ def load_mim_arm_status_surface(*, shared_root: Path = DEFAULT_SHARED_ROOT) -> d
             "tod_command_status": str(shared_root / TOD_COMMAND_STATUS_ARTIFACT),
             "tod_task_result": str(shared_root / TOD_TASK_RESULT_ARTIFACT),
             "tod_catchup_gate": str(shared_root / TOD_CATCHUP_GATE_ARTIFACT),
+            "mim_decision_task": str(shared_root / MIM_DECISION_TASK_ARTIFACT),
         },
     }
 
@@ -1678,7 +1709,16 @@ def build_mim_arm_control_readiness(
     if not access_ready:
         recommended_next_step = "Restore arm host access and fresh probe visibility before attempting control promotion."
     elif not bool(status.get("tod_execution_allowed", False)):
-        if not bool(catchup_detail.get("refresh_evidence_ok", True)):
+        if str(status.get("tod_execution_block_reason") or "").strip() == "communication_escalation_persistent":
+            communication_gate = _json_dict(_json_dict(status.get("tod_readiness")).get("communication_dispatch_gate"))
+            required_cycle_count = int(communication_gate.get("required_cycle_count", 0) or 0)
+            threshold_cycles = int(communication_gate.get("threshold_cycles", 3) or 3)
+            recommended_next_step = (
+                "Persistent TOD communication escalation is blocking new dispatch. "
+                f"Wait for TOD recovery evidence or clear escalation after more than {threshold_cycles} cycles "
+                f"(current {required_cycle_count})."
+            )
+        elif not bool(catchup_detail.get("refresh_evidence_ok", True)):
             recommended_next_step = "Publish a fresh TOD integration status so canonical refresh evidence matches the current MIM handshake and manifest before bounded live arm dispatch."
         elif not bool(catchup_detail.get("fresh", True)):
             recommended_next_step = "Refresh the TOD catchup status artifacts so the catchup gate becomes fresh before bounded live arm dispatch."

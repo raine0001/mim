@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Publish bridge request/trigger artifacts into the remote shared root TOD actually polls."""
+"""Publish bridge request/trigger artifacts into the canonical MIM/TOD shared root."""
 
 from __future__ import annotations
 
@@ -27,6 +27,11 @@ except Exception:  # pragma: no cover - optional dependency fallback
 
 DEFAULT_SHARED_DIR = PROJECT_ROOT / "runtime" / "shared"
 BOUNDARY_STATUS_PATH = DEFAULT_SHARED_DIR / "MIM_TOD_PUBLICATION_BOUNDARY.latest.json"
+CANONICAL_COMMUNICATION_HOST = os.getenv("MIM_TOD_SSH_HOST", "192.168.1.120")
+CANONICAL_COMMUNICATION_ROOT = str(DEFAULT_SHARED_DIR.resolve())
+CANONICAL_COMMUNICATION_SURFACE = "mim_runtime_shared"
+DEFAULT_CANONICAL_SSH_USER = os.getenv("MIM_TOD_SSH_USER", os.getenv("MIM_TOD_SSH_HOST_USER", "testpilot"))
+DEFAULT_CANONICAL_SSH_PORT = int(os.getenv("MIM_TOD_SSH_PORT", "22") or "22")
 
 
 def _append_publish_audit(*, caller: str, host: str, remote_root: str, request_file: Path, trigger_file: Path, objective_id: str, request_task_id: str, trigger_task_id: str, request_generated_at: object, trigger_generated_at: object, success: bool, returncode: int, stdout: str, stderr: str, remote_request_meta: dict[str, object], remote_trigger_meta: dict[str, object]) -> None:
@@ -107,6 +112,29 @@ def _extract_remote_artifact_metadata(*, remote_path: str, raw_bytes: bytes, pay
     }
 
 
+def _is_local_canonical_target(*, host: str, remote_root: str) -> bool:
+    normalized_host = str(host or "").strip().lower()
+    try:
+        resolved_root = str(Path(remote_root).expanduser().resolve())
+    except Exception:
+        resolved_root = str(remote_root or "").strip()
+    return normalized_host in {"127.0.0.1", "localhost", CANONICAL_COMMUNICATION_HOST.lower()} and resolved_root == CANONICAL_COMMUNICATION_ROOT
+
+
+def _local_artifact_metadata(path: Path) -> dict[str, object]:
+    payload = _verify_payload(path)
+    raw_bytes = path.read_bytes()
+    stat_result = path.stat()
+    return _extract_remote_artifact_metadata(
+        remote_path=str(path),
+        raw_bytes=raw_bytes,
+        payload=payload,
+        realpath=str(path.resolve()),
+        inode=stat_result.st_ino,
+        size=stat_result.st_size,
+    )
+
+
 def _write_boundary_status(
     *,
     host: str,
@@ -137,10 +165,14 @@ def _write_boundary_status(
     payload = {
         "generated_at": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "type": "mim_tod_publication_boundary_status_v1",
-        "authoritative_surface": "remote_raspberry_pi",
-        "authoritative_host": host,
-        "authoritative_root": remote_root,
+        "authoritative_surface": CANONICAL_COMMUNICATION_SURFACE,
+        "authoritative_host": CANONICAL_COMMUNICATION_HOST,
+        "authoritative_root": CANONICAL_COMMUNICATION_ROOT,
         "local_surface": str(request_file.parent),
+        "local_surface_role": "authoritative_communication_root",
+        "mirror_surface": "execution_evidence_mirror",
+        "mirror_host": host,
+        "mirror_root": remote_root,
         "request_alignment": {
             "request_id_match": remote_request_id == local_request_id,
             "task_id_match": remote_request_task_id == local_request_task_id,
@@ -177,6 +209,19 @@ def _write_boundary_status(
             "source_service": str(request_payload.get("source_service") or ""),
             "source_instance_id": str(request_payload.get("source_instance_id") or ""),
         },
+        "authoritative_request": {
+            "path": str(request_file),
+            "realpath": str(request_file.resolve()),
+            "sha256": local_request_sha,
+            "inode": request_file.stat().st_ino,
+            "size": request_file.stat().st_size,
+            "task_id": local_request_task_id,
+            "request_id": local_request_id,
+            "objective_id": str(request_payload.get("objective_id") or ""),
+            "generated_at": request_payload.get("generated_at"),
+            "source_service": str(request_payload.get("source_service") or ""),
+            "source_instance_id": str(request_payload.get("source_instance_id") or ""),
+        },
         "remote_trigger": {
             "path": remote_trigger_path,
             "realpath": remote_trigger_realpath,
@@ -188,6 +233,16 @@ def _write_boundary_status(
             "generated_at": remote_trigger_meta.get("generated_at"),
         },
         "local_trigger": {
+            "path": str(trigger_file),
+            "realpath": str(trigger_file.resolve()),
+            "sha256": local_trigger_sha,
+            "inode": trigger_file.stat().st_ino,
+            "size": trigger_file.stat().st_size,
+            "task_id": local_trigger_task_id,
+            "request_id": local_trigger_request_id,
+            "generated_at": trigger_payload.get("generated_at"),
+        },
+        "authoritative_trigger": {
             "path": str(trigger_file),
             "realpath": str(trigger_file.resolve()),
             "sha256": local_trigger_sha,
@@ -276,21 +331,21 @@ def _collect_remote_metadata_via_paramiko(*, client, remote_paths):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--host", default=os.getenv("MIM_ARM_SSH_HOST", "192.168.1.90"))
+    parser.add_argument("--host", default=os.getenv("MIM_TOD_SSH_HOST", CANONICAL_COMMUNICATION_HOST))
     parser.add_argument(
         "--ssh-user",
-        default=os.getenv("MIM_ARM_SSH_HOST_USER", os.getenv("MIM_ARM_SSH_USER", "testpilot")),
+        default=DEFAULT_CANONICAL_SSH_USER,
     )
     parser.add_argument(
         "--ssh-port",
         type=int,
-        default=int(os.getenv("MIM_ARM_SSH_HOST_PORT", "22") or "22"),
+        default=DEFAULT_CANONICAL_SSH_PORT,
     )
-    parser.add_argument("--password-env", default="MIM_ARM_SSH_HOST_PASS")
+    parser.add_argument("--password-env", default="MIM_TOD_SSH_PASS")
     parser.add_argument(
         "--remote-root",
-        default="/home/testpilot/mim/runtime/shared",
-        help="Remote shared root that TOD polls.",
+        default=CANONICAL_COMMUNICATION_ROOT,
+        help="Canonical TOD-facing shared root on the communication authority host.",
     )
     parser.add_argument(
         "--request-file",
@@ -321,8 +376,8 @@ def parse_args() -> argparse.Namespace:
 def _resolve_password(password_env: str) -> str:
     return (
         os.getenv(password_env, "")
-        or os.getenv("MIM_ARM_SSH_HOST_PASS", "")
-        or os.getenv("MIM_ARM_SSH_PASSWORD", "")
+        or os.getenv("MIM_TOD_SSH_PASSWORD", "")
+        or os.getenv("MIM_TOD_SSH_PASS", "")
     )
 
 
@@ -524,6 +579,61 @@ def main() -> int:
     if trigger_errors:
         raise SystemExit(f"Contract validation failed for trigger artifact: {trigger_errors}")
 
+    request_payload = _verify_payload(request_file)
+    trigger_payload = _verify_payload(trigger_file)
+    if _is_local_canonical_target(host=str(args.host), remote_root=str(args.remote_root)):
+        remote_request_meta = _local_artifact_metadata(request_file)
+        remote_trigger_meta = _local_artifact_metadata(trigger_file)
+        request_task_id = str(remote_request_meta.get("task_id") or "")
+        request_request_id = str(remote_request_meta.get("request_id") or request_task_id)
+        trigger_task_id = str(remote_trigger_meta.get("task_id") or "")
+        trigger_request_id = str(remote_trigger_meta.get("request_id") or trigger_task_id)
+        verify_task_id = args.verify_task_id.strip()
+        if verify_task_id and (request_request_id != verify_task_id or trigger_request_id != verify_task_id):
+            raise RuntimeError(
+                f"Local verification failed: request request_id={request_request_id!r}, trigger request_id={trigger_request_id!r}, expected {verify_task_id!r}"
+            )
+        payload = {
+            "remote_root": CANONICAL_COMMUNICATION_ROOT,
+            "request_task_id": request_task_id,
+            "request_request_id": request_request_id,
+            "trigger_task_id": trigger_task_id,
+            "trigger_request_id": trigger_request_id,
+            "request_generated_at": request_payload.get("generated_at"),
+            "trigger_generated_at": trigger_payload.get("generated_at"),
+            "request_sha256": str(remote_request_meta.get("sha256") or ""),
+            "trigger_sha256": str(remote_trigger_meta.get("sha256") or ""),
+            "publication_mode": "canonical_local_root",
+        }
+        _append_publish_audit(
+            caller=args.caller.strip(),
+            host=CANONICAL_COMMUNICATION_HOST,
+            remote_root=CANONICAL_COMMUNICATION_ROOT,
+            request_file=request_file,
+            trigger_file=trigger_file,
+            objective_id=str(request_payload.get("objective_id") or ""),
+            request_task_id=request_task_id,
+            trigger_task_id=trigger_task_id,
+            request_generated_at=request_payload.get("generated_at"),
+            trigger_generated_at=trigger_payload.get("generated_at"),
+            success=True,
+            returncode=0,
+            stdout=json.dumps(payload, indent=2),
+            stderr="",
+            remote_request_meta=remote_request_meta,
+            remote_trigger_meta=remote_trigger_meta,
+        )
+        _write_boundary_status(
+            host=CANONICAL_COMMUNICATION_HOST,
+            remote_root=CANONICAL_COMMUNICATION_ROOT,
+            request_file=request_file,
+            trigger_file=trigger_file,
+            remote_request_meta=remote_request_meta,
+            remote_trigger_meta=remote_trigger_meta,
+        )
+        print(json.dumps(payload, indent=2))
+        return 0
+
     password = _resolve_password(args.password_env)
     if password and shutil.which("sshpass") is None:
         return _publish_with_paramiko(
@@ -538,9 +648,6 @@ def main() -> int:
             verify_task_id=args.verify_task_id.strip(),
             caller=args.caller.strip(),
         )
-
-    request_payload = _verify_payload(request_file)
-    trigger_payload = _verify_payload(trigger_file)
 
     subprocess.run([
         *(_ssh_base_command(args.host, args.ssh_user, args.ssh_port, args.password_env)),

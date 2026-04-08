@@ -121,6 +121,34 @@ Current bounded MIM ARM execution trust checkpoint:
 - Objective 109 is closed on the current-source runtime: bounded `scan_pose` now produces fresh dispatch telemetry, aligned TOD ACK and RESULT evidence, explicit host attribution, and `proof_chain_complete = true`.
 - Objective 110 normalizes bounded multi-action execution so `safe_home`, `scan_pose`, and `capture_frame` share one attribution contract with no hidden action fallback defaults in the execution path, and one proof checklist now governs every bounded-action live proof.
 
+Current conversation and dialog checkpoint after Objectives 142 and 143:
+
+- Objective 142 hardens the deterministic conversation layer so interruptions, direct corrections, short-response preferences, and bounded follow-up formatting requests stay on-topic instead of falling through to generic acknowledgements.
+- Objective 142 also strengthens the structured conversation regression scorer so interruption, correction, concise-response, mode-shift, and remembered-preference failures are explicitly detectable.
+- Objective 143 keeps TOD dialog mirrors converged by updating each per-session `.latest.json` snapshot when the aggregate dialog index is marked `replied`.
+
+Current action-control checkpoint after Objectives 144 and 145:
+
+- Objective 144 adds a bounded action confirmation layer so imperative conversation turns now require explicit operator confirmation before they are treated as approved action requests.
+- Objective 144 also tightens regression scoring so `ask_confirmation_before_action` only passes when a real confirmation prompt is present.
+- Objective 145 makes pause, resume, cancel, and stop control turns deterministic in the conversation lane, including while an action-confirmation thread is pending.
+- Objective 145 fixes control precedence so pause/resume/cancel paths are not swallowed by the older generic interruption branch.
+
+Current error-clarity and operator-trust checkpoint after Objectives 146 through 149:
+
+- Objective 146 adds explicit error-clarity replies for unsafe requests, private-runtime disclosure requests, ambiguous external-action requests, and unsupported claims that external work already happened.
+- Objective 146 also extends regression scoring so safe refusals now fail if they do not offer a constructive alternative.
+- Objective 147 exposes current recommendation summaries more directly in the operator-visible UI state and system reasoning panel.
+- Objective 148 centralizes conversation boundary handling so safety and limitation replies execute before generic control-path fallbacks.
+- Objective 149 exposes strategy-derived trust signals in the operator-visible reasoning surface, including what MIM did, what it will do next, and why the current confidence posture is justified.
+
+Current autonomy-feedback-stability checkpoint after Objectives 150 through 152:
+
+- Objective 150 exposes a bounded autonomy posture that tells the operator whether automatic continuation is currently allowed for low-risk steps or held behind safeguards.
+- Objective 151 exposes a compact human-feedback loop summary so the latest execution feedback posture is visible without reading raw execution payloads.
+- Objective 152 exposes a stability-guard summary that rolls runtime health, recovery posture, governance signals, and TOD escalation blockers into one operator-visible guard surface.
+- This closes the bounded 142-152 conversation and operator-awareness tranche in the current repo state.
+
 ## Future Objectives
 
 - Objective 58 — Adaptive autonomy boundaries (experience-conditioned autonomy limits)
@@ -139,6 +167,8 @@ Current bounded MIM ARM execution trust checkpoint:
 - 88–90: Preference convergence, proposal arbitration propagation, proposal policy stabilization, and cross-policy conflict resolution across stacked governance surfaces
 - 116–122: Boundary-envelope propagation plus recovery taxonomy, tuning, recovery-derived commitments, and recovery-aware commitment evaluation
 - 123–130: Recovery-commitment lifecycle, conflict handling, propagation, rollout preview, admission control, and operator rollup
+- 131–141: Strategy planning, intent understanding, explainability, confidence, refinement, environment awareness, context persistence, coordination, and safety envelope
+- 142–152: Conversation reliability, TOD dialog convergence, action confirmation, interrupt/control continuity, error clarity, system awareness, consistency enforcement, trust signals, lightweight autonomy, human feedback capture, and stability guards
 
 ## Governance Notes
 

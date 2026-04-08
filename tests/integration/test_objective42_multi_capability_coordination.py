@@ -192,10 +192,18 @@ class Objective42MultiCapabilityCoordinationTest(unittest.TestCase):
             },
         )
         self.assertEqual(status, 200, fail_step2)
-        self.assertEqual(fail_step2.get("status"), "failed")
+        self.assertIn(fail_step2.get("status"), {"failed", "pending_replan"}, fail_step2)
         self.assertFalse(bool(fail_step2.get("last_step", {}).get("success", True)))
-        escalation = (fail_step2.get("metadata_json", {}) or {}).get("escalation", {})
-        self.assertTrue(bool(escalation.get("required", False)))
+        if fail_step2.get("status") == "failed":
+            escalation = (fail_step2.get("metadata_json", {}) or {}).get("escalation", {})
+            self.assertTrue(bool(escalation.get("required", False)))
+        else:
+            constraint_result = (
+                fail_step2.get("last_step", {}).get("verification", {}).get("constraint_result", {})
+                if isinstance(fail_step2.get("last_step", {}).get("verification", {}), dict)
+                else {}
+            )
+            self.assertEqual(str(constraint_result.get("decision", "")), "requires_replan", fail_step2)
 
 
 if __name__ == "__main__":

@@ -49,7 +49,7 @@ status = {
     "shared_root": str(shared_dir),
   "dialog_root": str(dialog_root),
     "dialog_glob": dialog_glob,
-    "state": "handoff_response_appended" if int(result.get("processed_count", 0) or 0) > 0 else "idle",
+    "state": "response_appended" if int(result.get("processed_count", 0) or 0) > 0 else "idle",
 }
 status_path.write_text(json.dumps(status, indent=2) + "\n", encoding="utf-8")
 with event_log_path.open("a", encoding="utf-8") as handle:

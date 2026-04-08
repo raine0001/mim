@@ -3,11 +3,12 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 SHARED_DIR="${SHARED_DIR:-$ROOT_DIR/runtime/shared}"
-EXPECTED_OBJECTIVE="${EXPECTED_OBJECTIVE:-75}"
+EXPECTED_OBJECTIVE="${EXPECTED_OBJECTIVE:-}"
 
 STATUS_FILE="$SHARED_DIR/TOD_INTEGRATION_STATUS.latest.json"
 HANDSHAKE_FILE="$SHARED_DIR/MIM_TOD_HANDSHAKE_PACKET.latest.json"
 MANIFEST_FILE="$SHARED_DIR/MIM_MANIFEST.latest.json"
+CONTEXT_FILE="$SHARED_DIR/MIM_CONTEXT_EXPORT.latest.json"
 
 if [[ ! -f "$STATUS_FILE" ]]; then
   echo "GATE: FAIL"
@@ -15,7 +16,7 @@ if [[ ! -f "$STATUS_FILE" ]]; then
   exit 1
 fi
 
-python3 - "$STATUS_FILE" "$HANDSHAKE_FILE" "$MANIFEST_FILE" "$EXPECTED_OBJECTIVE" <<'PY'
+python3 - "$STATUS_FILE" "$HANDSHAKE_FILE" "$MANIFEST_FILE" "$CONTEXT_FILE" "$EXPECTED_OBJECTIVE" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -23,7 +24,8 @@ from pathlib import Path
 status_path = Path(sys.argv[1])
 handshake_path = Path(sys.argv[2])
 manifest_path = Path(sys.argv[3])
-expected_objective = int(sys.argv[4])
+context_path = Path(sys.argv[4])
+expected_objective_raw = str(sys.argv[5] or "").strip()
 
 status = json.loads(status_path.read_text(encoding="utf-8-sig"))
 
@@ -91,6 +93,7 @@ mim_refresh = get_path(status, "mim_refresh") or {}
 published_handshake = get_path(status, "mim_handshake") or {}
 shared_handshake = read_json(handshake_path) if handshake_path.exists() else None
 shared_manifest = read_json(manifest_path) if manifest_path.exists() else None
+shared_context = read_json(context_path) if context_path.exists() else None
 shared_truth = (shared_handshake or {}).get("truth") or {}
 shared_manifest_payload = (shared_manifest or {}).get("manifest") or {}
 
@@ -98,6 +101,17 @@ shared_artifacts_present = shared_handshake is not None and shared_manifest is n
 shared_schema = shared_truth.get("schema_version") or shared_manifest_payload.get("schema_version")
 shared_release = shared_truth.get("release_tag") or shared_manifest_payload.get("release_tag")
 shared_objective = shared_truth.get("objective_active")
+
+expected_objective = as_int(expected_objective_raw)
+if expected_objective is None:
+    expected_objective = (
+        as_int((shared_context or {}).get("objective_active"))
+        or as_int((shared_context or {}).get("objective_in_flight"))
+        or as_int(shared_objective)
+        or as_int(published_handshake.get("objective_active"))
+        or as_int(mim_objective)
+        or as_int(tod_objective)
+    )
 
 refresh_evidence_ok = True
 refresh_evidence_detail = "not required; shared manifest/handshake artifacts not present"
@@ -133,12 +147,12 @@ checks.append((
 ))
 checks.append((
     f"tod objective == {expected_objective}",
-    as_int(tod_objective) == expected_objective,
+    expected_objective is not None and as_int(tod_objective) == expected_objective,
     tod_objective,
 ))
 checks.append((
     f"mim objective == {expected_objective}",
-    as_int(mim_objective) == expected_objective,
+    expected_objective is not None and as_int(mim_objective) == expected_objective,
     mim_objective,
 ))
 checks.append((

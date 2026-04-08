@@ -56,12 +56,63 @@ def _read_json(path: Path) -> dict[str, Any]:
     return loaded if isinstance(loaded, dict) else {}
 
 
-def _find_first_json(candidates: list[Path]) -> tuple[Path | None, dict[str, Any]]:
+def _parse_timestamp(value: object) -> datetime:
+    if not isinstance(value, str):
+        return datetime.min.replace(tzinfo=timezone.utc)
+    text = value.strip()
+    if not text:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return datetime.min.replace(tzinfo=timezone.utc)
+
+
+def _payload_timestamp(payload: dict[str, Any]) -> datetime:
+    bridge_runtime = payload.get("bridge_runtime") if isinstance(payload.get("bridge_runtime"), dict) else {}
+    current_processing = bridge_runtime.get("current_processing") if isinstance(bridge_runtime.get("current_processing"), dict) else {}
+    last_command_result = payload.get("last_command_result") if isinstance(payload.get("last_command_result"), dict) else {}
+    for candidate in (
+        payload.get("generated_at"),
+        payload.get("emitted_at"),
+        payload.get("observed_at"),
+        payload.get("host_timestamp"),
+        current_processing.get("generated_at"),
+        current_processing.get("emitted_at"),
+        last_command_result.get("host_completed_timestamp"),
+        last_command_result.get("host_received_timestamp"),
+        last_command_result.get("last_command_sent_at"),
+    ):
+        parsed = _parse_timestamp(candidate)
+        if parsed != datetime.min.replace(tzinfo=timezone.utc):
+            return parsed
+    return datetime.min.replace(tzinfo=timezone.utc)
+
+
+def _find_best_json(candidates: list[Path]) -> tuple[Path | None, dict[str, Any]]:
+    best_path: Path | None = None
+    best_payload: dict[str, Any] = {}
+    best_rank = (datetime.min.replace(tzinfo=timezone.utc), -10**9)
+    for index, path in enumerate(candidates):
+        payload = _read_json(path)
+        if not payload:
+            continue
+        rank = (_payload_timestamp(payload), -index)
+        if rank > best_rank:
+            best_rank = rank
+            best_path = path
+            best_payload = payload
+    if best_path is not None:
+        return best_path, best_payload
     for path in candidates:
         payload = _read_json(path)
         if payload:
             return path, payload
     return None, {}
+
+
+def _find_first_json(candidates: list[Path]) -> tuple[Path | None, dict[str, Any]]:
+    return _find_best_json(candidates)
 
 
 def _unique_paths(candidates: list[Path]) -> list[Path]:

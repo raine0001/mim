@@ -50,10 +50,10 @@ class DispatchIdentifierResolutionTests(unittest.TestCase):
 
 
 class PublicationBoundaryTests(unittest.TestCase):
-    def test_boundary_matches_when_remote_request_and_trigger_align(self) -> None:
+    def test_boundary_matches_when_authoritative_request_and_trigger_align(self) -> None:
         payload = {
-            "remote_request": {"request_id": "objective-107-request-001"},
-            "remote_trigger": {"request_id": "objective-107-request-001"},
+            "authoritative_request": {"request_id": "objective-107-request-001"},
+            "authoritative_trigger": {"request_id": "objective-107-request-001"},
             "request_alignment": {"request_id_match": True},
             "trigger_alignment": {"request_id_match": True},
         }
@@ -62,10 +62,10 @@ class PublicationBoundaryTests(unittest.TestCase):
             MODULE._boundary_matches_dispatch_identifier(payload, "objective-107-request-001")
         )
 
-    def test_boundary_does_not_match_when_remote_trigger_differs(self) -> None:
+    def test_boundary_does_not_match_when_authoritative_trigger_differs(self) -> None:
         payload = {
-            "remote_request": {"request_id": "objective-107-request-001"},
-            "remote_trigger": {"request_id": "objective-107-request-002"},
+            "authoritative_request": {"request_id": "objective-107-request-001"},
+            "authoritative_trigger": {"request_id": "objective-107-request-002"},
             "request_alignment": {"request_id_match": True},
             "trigger_alignment": {"request_id_match": False},
         }

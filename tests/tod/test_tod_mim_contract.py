@@ -29,7 +29,7 @@ class TodMimContractTest(unittest.TestCase):
         self.assertEqual(payload["schema_version"], "2026-04-02-communication-contract-v1")
         self.assertEqual(payload["target_executor"], "TOD")
         self.assertEqual(payload["command"], {"name": "safe_home", "args": {}})
-        self.assertNotIn("task_id", payload)
+        self.assertEqual(payload["task_id"], "objective-97-request-001")
         self.assertIn("source_identity", payload)
         self.assertIn("transport", payload)
         self.assertIn("execution_policy", payload)

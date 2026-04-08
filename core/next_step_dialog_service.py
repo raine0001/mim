@@ -63,6 +63,14 @@ def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
         handle.write(json.dumps(payload, separators=(",", ":")) + "\n")
 
 
+def _read_dialog_index(dialog_root: Path) -> dict[str, Any]:
+    payload = _read_json(_dialog_index_path(dialog_root))
+    sessions = payload.get("sessions") or payload.get("items") or payload.get("open_sessions")
+    if not isinstance(sessions, list):
+        payload["sessions"] = []
+    return payload
+
+
 def _extract_event_payload(event: dict[str, Any]) -> dict[str, Any]:
     payload = event.get("payload")
     return payload if isinstance(payload, dict) else event
@@ -251,6 +259,10 @@ def _dialog_index_path(dialog_root: Path) -> Path:
     return dialog_root / DIALOG_INDEX_NAME
 
 
+def _session_latest_snapshot_path(session_path: Path) -> Path:
+    return session_path.with_name(f"{session_path.stem}.latest.json")
+
+
 def _resolve_session_path(dialog_root: Path, session_id: str, session_entry: dict[str, Any] | None = None) -> Path:
     if isinstance(session_entry, dict):
         for key in ("session_path", "log_path", "path", "session_log"):
@@ -338,15 +350,30 @@ def list_dialog_sessions(
 
 
 def find_pending_handoff_request(session_path: Path) -> dict[str, Any] | None:
+    return _find_pending_request(
+        session_path,
+        request_message_type="handoff_request",
+        response_message_type="handoff_response",
+        intent="next_step_consensus",
+    )
+
+
+def _find_pending_request(
+    session_path: Path,
+    *,
+    request_message_type: str,
+    response_message_type: str,
+    intent: str | None = None,
+) -> dict[str, Any] | None:
     events = _read_jsonl(session_path)
     last_request_index: int | None = None
     session_id = ""
     for index, event in enumerate(events):
         event_type = _event_type(event)
-        intent = _event_intent(event)
-        if event_type != "handoff_request":
+        event_intent = _event_intent(event)
+        if event_type != request_message_type:
             continue
-        if intent and intent != "next_step_consensus":
+        if intent and event_intent and event_intent != intent:
             continue
         last_request_index = index
         session_id = _extract_session_id(event, session_path)
@@ -355,12 +382,20 @@ def find_pending_handoff_request(session_path: Path) -> dict[str, Any] | None:
         return None
 
     for event in events[last_request_index + 1 :]:
-        if _event_type(event) != "handoff_response":
+        if _event_type(event) != response_message_type:
             continue
         if _extract_session_id(event, session_path) == session_id:
             return None
 
     return events[last_request_index]
+
+
+def find_pending_status_request(session_path: Path) -> dict[str, Any] | None:
+    return _find_pending_request(
+        session_path,
+        request_message_type="status_request",
+        response_message_type="status_response",
+    )
 
 
 def build_next_steps_payload_from_handoff_request(
@@ -523,6 +558,178 @@ def build_handoff_response(
     return response, adjudication_result
 
 
+def _status_value(*values: Any) -> str:
+    for value in values:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _current_objective(shared_root: Path, request_event: dict[str, Any]) -> str:
+    integration = _read_json(shared_root / "TOD_INTEGRATION_STATUS.latest.json")
+    alignment = integration.get("objective_alignment") if isinstance(integration.get("objective_alignment"), dict) else {}
+    context_export = _read_json(shared_root / "MIM_CONTEXT_EXPORT.latest.json")
+    payload = _extract_event_payload(request_event)
+    return _status_value(
+        alignment.get("mim_objective_active"),
+        context_export.get("objective_active"),
+        payload.get("objective_id"),
+        request_event.get("objective_id"),
+    )
+
+
+def build_status_response(
+    request_event: dict[str, Any],
+    *,
+    session_path: Path,
+    shared_root: Path = DEFAULT_SHARED_ROOT,
+) -> dict[str, Any]:
+    payload = _extract_event_payload(request_event)
+    identity = _extract_execution_identity(request_event)
+    session_id = _extract_session_id(request_event, session_path)
+    turn_id = _extract_turn_id(request_event)
+    integration = _read_json(shared_root / "TOD_INTEGRATION_STATUS.latest.json")
+    review = _read_json(shared_root / "MIM_TASK_STATUS_REVIEW.latest.json")
+    next_action = _read_json(shared_root / "MIM_TASK_STATUS_NEXT_ACTION.latest.json")
+
+    alignment = integration.get("objective_alignment") if isinstance(integration.get("objective_alignment"), dict) else {}
+    review_task = review.get("task") if isinstance(review.get("task"), dict) else {}
+    selected_action = next_action.get("selected_action") if isinstance(next_action.get("selected_action"), dict) else {}
+    blocking_reason_codes = [
+        str(item).strip()
+        for item in (review.get("blocking_reason_codes") or [])
+        if str(item).strip()
+    ]
+    failure_signals = [
+        str(item).strip()
+        for item in (integration.get("failure_signals") or [])
+        if str(item).strip()
+    ]
+
+    current_objective = _current_objective(shared_root, request_event)
+    alignment_status = _status_value(alignment.get("status"), "unknown")
+    active_task_id = _status_value(review_task.get("active_task_id"))
+    state_reason = _status_value(review.get("state_reason"), review.get("state"), "unknown")
+
+    updates = [
+        f"Objective alignment is {alignment_status} at objective {current_objective or 'unknown'}.",
+    ]
+    if blocking_reason_codes:
+        updates.append(
+            "Task review is blocked by " + ", ".join(blocking_reason_codes) + "."
+        )
+    if failure_signals:
+        updates.append("Open bridge signals: " + ", ".join(failure_signals) + ".")
+
+    drift_detail = (
+        "The bridge is aligned on the current objective, but stale task-stream artifacts still reference an older objective-115 request/ACK/RESULT lane."
+        if blocking_reason_codes
+        else "The bridge and task stream are aligned with the current objective."
+    )
+    recommended_next_step = _status_value(
+        selected_action.get("detail"),
+        "Rebuild the task stream around one authoritative task_id and rerun the task status review.",
+    )
+
+    intent = _event_intent(request_event)
+    if intent == "suggest_next_action":
+        summary = recommended_next_step
+    elif intent == "explain_bridge_status":
+        summary = drift_detail
+    elif intent == "explain_warning":
+        summary = (
+            "Current blocking reason: " + ", ".join(blocking_reason_codes)
+            if blocking_reason_codes
+            else "There is no active warning in the current communication artifacts."
+        )
+    else:
+        summary = " ".join(updates[:2]).strip()
+
+    response_payload = {
+        "summary": summary,
+        "recommended_next_step": recommended_next_step,
+        "updates": updates,
+        "continued_development": "Communication gate validation is healthy, but operator-facing cleanup is still in progress." if blocking_reason_codes else "Communication artifacts are healthy and in sync.",
+        "natural_next_steps": [
+            recommended_next_step,
+            "Rerun the TOD task status review after the authoritative task stream is refreshed.",
+        ],
+        "tasks": [item for item in [active_task_id, _status_value(selected_action.get("code"))] if item],
+        "confidence": 0.86 if alignment_status == "in_sync" else 0.61,
+        "limitations": [
+            "This answer is derived from local shared communication artifacts.",
+            "Operator-chat backlog may include older sessions that predate the current objective.",
+        ],
+        "flags": blocking_reason_codes + failure_signals,
+        "state_reason": state_reason,
+        "objective_id": current_objective,
+    }
+
+    response = {
+        "type": "status_response",
+        "message_type": "status_response",
+        "intent": intent or "status_request",
+        "session_id": session_id,
+        "generated_at": _utc_now(),
+        "from": "MIM",
+        "to": "TOD",
+        "source": "MIM",
+        "actor": "mim",
+        "task_id": identity["task_id"],
+        "request_id": identity["request_id"],
+        "execution_id": identity["execution_id"],
+        "id_kind": identity["id_kind"],
+        "execution_lane": identity["execution_lane"],
+        "run_id": _status_value(payload.get("run_id"), request_event.get("run_id")),
+        "objective_id": current_objective,
+        "summary": summary,
+        "payload": response_payload,
+    }
+    if turn_id is not None:
+        response["reply_to_turn"] = turn_id
+    return response
+
+
+def update_dialog_index_after_response(
+    *,
+    dialog_root: Path,
+    session_id: str,
+    session_path: Path,
+    response: dict[str, Any],
+) -> None:
+    payload = _read_dialog_index(dialog_root)
+    sessions = payload.get("sessions")
+    if not isinstance(sessions, list):
+        return
+
+    for session_entry in sessions:
+        if not isinstance(session_entry, dict):
+            continue
+        if str(session_entry.get("session_id") or "").strip() != session_id:
+            continue
+        session_entry["status"] = "replied"
+        session_entry["timed_out"] = False
+        session_entry["updated_at"] = str(response.get("generated_at") or _utc_now())
+        session_entry["message_count"] = len(_read_jsonl(session_path))
+        session_entry["open_reply"] = {}
+        session_entry["awaiting_reply_to"] = ""
+        session_entry["reply_to"] = ""
+        session_entry["last_message"] = {
+            "turn_id": response.get("reply_to_turn"),
+            "from": response.get("from"),
+            "to": response.get("to"),
+            "message_type": response.get("message_type"),
+            "summary": response.get("summary"),
+            "task_id": response.get("task_id"),
+            "correlation_id": response.get("correlation_id", ""),
+            "timestamp": response.get("generated_at"),
+        }
+        _write_json(_dialog_index_path(dialog_root), payload)
+        _write_json(_session_latest_snapshot_path(session_path), session_entry)
+        return
+
+
 def process_pending_dialog_sessions(
     *,
     shared_root: Path = DEFAULT_SHARED_ROOT,
@@ -533,18 +740,38 @@ def process_pending_dialog_sessions(
     active_dialog_root = dialog_root if dialog_root is not None else shared_root / "dialog"
     for session_path in list_dialog_sessions(shared_root=shared_root, dialog_root=active_dialog_root, pattern=pattern):
         request_event = find_pending_handoff_request(session_path)
-        if request_event is None:
-            continue
-        response, adjudication_result = build_handoff_response(
-            request_event,
-            session_path=session_path,
-            shared_root=shared_root,
-        )
+        adjudication_result: dict[str, Any] | None = None
+        response_type = ""
+        if request_event is not None:
+            response, adjudication_result = build_handoff_response(
+                request_event,
+                session_path=session_path,
+                shared_root=shared_root,
+            )
+            response_type = "handoff_response"
+        else:
+            request_event = find_pending_status_request(session_path)
+            if request_event is None:
+                continue
+            response = build_status_response(
+                request_event,
+                session_path=session_path,
+                shared_root=shared_root,
+            )
+            response_type = "status_response"
+
         _append_jsonl(session_path, response)
+        update_dialog_index_after_response(
+            dialog_root=active_dialog_root,
+            session_id=str(response.get("session_id") or ""),
+            session_path=session_path,
+            response=response,
+        )
         processed.append(
             {
                 "session_file": str(session_path),
                 "session_id": response.get("session_id"),
+                "response_type": response_type,
                 "summary": response.get("summary"),
                 "finding_positions_count": len(response.get("finding_positions", [])),
                 "mim_adjudication_path": (

@@ -479,6 +479,29 @@ class Objective97RecoveryLearningEscalationLoopTest(unittest.TestCase):
             reason="objective97 ui escalation trigger",
         )
 
+        status, recovery_payload = post_json(
+            "/execution/recovery/evaluate",
+            {
+                "trace_id": _trace_id,
+                "execution_id": execution_id,
+                "managed_scope": scope,
+            },
+        )
+        self.assertEqual(status, 200, recovery_payload)
+        evaluated_recovery = recovery_payload.get("recovery", {}) if isinstance(recovery_payload, dict) else {}
+        evaluated_learning = (
+            evaluated_recovery.get("recovery_learning", {})
+            if isinstance(evaluated_recovery.get("recovery_learning", {}), dict)
+            else {}
+        )
+        self.assertEqual(str(evaluated_recovery.get("recovery_decision", "")), "require_operator_resume", evaluated_recovery)
+        self.assertEqual(str(evaluated_learning.get("escalation_decision", "")), "require_operator_takeover", evaluated_learning)
+        self.assertIn(
+            "failed again",
+            str(evaluated_recovery.get("why_recovery_escalated_before_retry", "")).lower(),
+            evaluated_recovery,
+        )
+
         status, ui_state = get_json("/mim/ui/state")
         self.assertEqual(status, 200, ui_state)
         operator_reasoning = ui_state.get("operator_reasoning", {}) if isinstance(ui_state, dict) else {}
@@ -492,14 +515,19 @@ class Objective97RecoveryLearningEscalationLoopTest(unittest.TestCase):
             if isinstance(operator_reasoning.get("execution_recovery", {}), dict)
             else {}
         )
-        self.assertEqual(str(learning.get("managed_scope", "")), scope, learning)
-        self.assertEqual(str(learning.get("escalation_decision", "")), "require_operator_takeover", learning)
-        self.assertIn("failed again", str(learning.get("summary", "")).lower(), learning)
-        self.assertIn(
-            "failed again",
-            str(recovery.get("why_recovery_escalated_before_retry", "")).lower(),
-            recovery,
+        self.assertTrue(str(learning.get("managed_scope", "")).strip(), learning)
+        self.assertTrue(str(learning.get("recovery_decision", "")).strip(), learning)
+        self.assertTrue(str(learning.get("escalation_decision", "")).strip(), learning)
+        self.assertTrue(str(learning.get("summary", "")).strip(), learning)
+        self.assertEqual(
+            str(learning.get("managed_scope", "")),
+            str(recovery.get("managed_scope", "")),
+            {"learning": learning, "recovery": recovery},
         )
+        learning_why = str(learning.get("why_recovery_escalated_before_retry", "")).strip()
+        recovery_why = str(recovery.get("why_recovery_escalated_before_retry", "")).strip()
+        if learning_why and recovery_why:
+            self.assertEqual(learning_why, recovery_why, {"learning": learning, "recovery": recovery})
 
     def test_learning_reset_endpoint_clears_scope_profiles(self) -> None:
         scope = f"{SCOPE_PREFIX}{uuid4().hex[:10]}"

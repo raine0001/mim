@@ -24,8 +24,10 @@
     "publication_path": {
       "transport_id": "mim_server_shared_artifact_boundary",
       "local_surface": "/home/testpilot/mim/runtime/shared",
-      "authoritative_surface": "remote_raspberry_pi",
-      "execution_path_label": "remote_ephemeral (derived from shared-latest bridge publication plus successful remote publish)"
+      "authoritative_surface": "mim_runtime_shared",
+      "authoritative_host": "192.168.1.120",
+      "authoritative_root": "/home/testpilot/mim/runtime/shared",
+      "execution_path_label": "execution_evidence_mirror_only (arm-host evidence is non-authoritative for TOD/MIM communication)"
     },
     "override_config": {
       "used": false,

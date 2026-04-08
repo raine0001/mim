@@ -1,0 +1,14 @@
+[Unit]
+Description=MIM Watch TOD Console Probe (User)
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/testpilot/mim
+Environment=POLL_SECONDS=60
+ExecStart=/home/testpilot/mim/scripts/watch_tod_console_probe.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

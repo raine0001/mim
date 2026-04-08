@@ -206,10 +206,14 @@ def describe_recovery_alert(
     issue_detail = first_text(recovery_alert, "issue_detail") or ""
     recovery_action = first_text(recovery_alert, "recovery_action") or "observe"
     alert_task_id = first_text(recovery_alert, "task_id", "request_id")
+    if alert_task_id and execution_id and alert_task_id != execution_id:
+        return (
+            "stale_tod_recovery_signal_ignored",
+            "no_recovery_alert_present",
+            f"ignoring stale TOD recovery alert for authoritative_task={alert_task_id} while tracking {format_execution_reference(execution_id, id_kind)}",
+        )
     task_note = ""
     tracked_ref = format_execution_reference(execution_id, id_kind)
-    if alert_task_id and execution_id and alert_task_id != execution_id:
-        task_note = f" authoritative_task={alert_task_id} tracked_{tracked_ref}."
     return (
         "auto_observing_tod_recovery_signal",
         progress_classification or task_state,

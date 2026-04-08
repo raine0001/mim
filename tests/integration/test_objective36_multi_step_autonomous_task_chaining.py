@@ -207,6 +207,18 @@ class Objective36MultiStepAutonomousTaskChainingTest(unittest.TestCase):
         self.assertEqual(status, 200, cooldown_chain)
         cooldown_chain_id = int(cooldown_chain["chain_id"])
 
+        if str(cooldown_chain.get("status", "")) == "pending_approval":
+            status, cooldown_approved = post_json(
+                f"/workspace/chains/{cooldown_chain_id}/approve",
+                {
+                    "actor": "operator",
+                    "reason": "approved objective36 cooldown chain",
+                    "metadata_json": {"run_id": run_id},
+                },
+            )
+            self.assertEqual(status, 200, cooldown_approved)
+            self.assertEqual(cooldown_approved.get("status"), "active", cooldown_approved)
+
         status, cooldown_first = post_json(
             f"/workspace/chains/{cooldown_chain_id}/advance",
             {
@@ -256,6 +268,18 @@ class Objective36MultiStepAutonomousTaskChainingTest(unittest.TestCase):
         )
         self.assertEqual(status, 200, failure_chain)
         failure_chain_id = int(failure_chain["chain_id"])
+
+        if str(failure_chain.get("status", "")) == "pending_approval":
+            status, failure_approved = post_json(
+                f"/workspace/chains/{failure_chain_id}/approve",
+                {
+                    "actor": "operator",
+                    "reason": "approved objective36 failure policy chain",
+                    "metadata_json": {"run_id": run_id},
+                },
+            )
+            self.assertEqual(status, 200, failure_approved)
+            self.assertEqual(failure_approved.get("status"), "active", failure_approved)
 
         status, failed = post_json(
             f"/workspace/chains/{failure_chain_id}/advance",

@@ -7,6 +7,7 @@ UNIT_DIR="$ROOT_DIR/deploy/systemd"
 UNITS=(
   mim-watch-shared-triggers.service
   mim-watch-tod-liveness.service
+  mim-watch-tod-console-probe.service
   mim-watch-tod-catchup-status.service
   mim-watch-tod-task-status-review.service
   mim-watch-objective75-cycle-pass.service
@@ -20,6 +21,7 @@ UNITS=(
 for script in \
   "$ROOT_DIR/scripts/watch_shared_triggers.sh" \
   "$ROOT_DIR/scripts/watch_tod_liveness.sh" \
+  "$ROOT_DIR/scripts/watch_tod_console_probe.sh" \
   "$ROOT_DIR/scripts/watch_tod_catchup_status.sh" \
   "$ROOT_DIR/scripts/watch_tod_task_status_review.sh" \
   "$ROOT_DIR/scripts/watch_objective75_cycle_pass.sh" \
@@ -47,6 +49,7 @@ echo "Stopping manually launched duplicates (if any)..."
 pkill -f '/home/testpilot/mim/scripts/run_objective75_overnight_loop.sh' 2>/dev/null || true
 pkill -f '/home/testpilot/mim/scripts/watch_shared_triggers.sh' 2>/dev/null || true
 pkill -f '/home/testpilot/mim/scripts/watch_tod_liveness.sh' 2>/dev/null || true
+pkill -f '/home/testpilot/mim/scripts/watch_tod_console_probe.sh' 2>/dev/null || true
 pkill -f '/home/testpilot/mim/scripts/watch_tod_catchup_status.sh' 2>/dev/null || true
 pkill -f '/home/testpilot/mim/scripts/watch_tod_task_status_review.sh' 2>/dev/null || true
 pkill -f '/home/testpilot/mim/scripts/watch_objective75_cycle_pass.sh' 2>/dev/null || true

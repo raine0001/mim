@@ -372,3 +372,80 @@ class GenerateMimArmHostStateTest(unittest.TestCase):
         self.assertEqual(payload["command_evidence"]["correlation_id"], "obj109-mim-arm-scan-pose-fresh")
         self.assertEqual(payload["command_evidence"]["attribution_source"], "source_payload")
         self.assertEqual(payload["last_request_id"], "objective-109-task-mim-arm-scan-pose-fresh")
+
+    def test_main_prefers_freshest_live_artifact_over_static_ack_priority(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            output_path = root / "mim_arm_host_state.latest.json"
+            args = SimpleNamespace(
+                shared_root=str(root),
+                output=str(output_path),
+                process_match="mim_arm|arm_ui|uvicorn|python.*app",
+                controller_glob=["/dev/ttyUSB*", "/dev/ttyACM*", "/dev/serial/by-id/*"],
+                camera_glob=["/dev/video*"],
+                input_json=[],
+                arm_url="http://192.168.1.90:5000/arm_state",
+                sim_estop_ok=True,
+            )
+            (root / "TOD_MIM_TASK_ACK.latest.json").write_text(
+                json.dumps(
+                    {
+                        "generated_at": "2026-04-07T03:00:47Z",
+                        "request_id": "objective-115-task-mim-arm-safe-home-stale",
+                        "task_id": "objective-115-task-mim-arm-safe-home-stale",
+                        "correlation_id": "obj115-stale",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (root / "TOD_MIM_TASK_RESULT.latest.json").write_text(
+                json.dumps(
+                    {
+                        "generated_at": "2026-04-07T03:30:54Z",
+                        "request_id": "objective-115-task-mim-arm-safe-home-fresh",
+                        "task_id": "objective-115-task-mim-arm-safe-home-fresh",
+                        "correlation_id": "obj115-fresh",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            arm_state_payload = {
+                "app_alive": True,
+                "current_pose": [90, 90, 90, 90, 90, 90],
+                "estop": {"active": None, "supported": False},
+                "mode": "development",
+                "runtime": "sim",
+                "serial": {"serial_ready": True, "status": "ok"},
+                "camera": {"status": "ok"},
+                "status": "ok",
+            }
+
+            with patch.object(generate_mim_arm_host_state, "parse_args", return_value=args), patch.object(
+                generate_mim_arm_host_state,
+                "_read_local_json_url",
+                return_value=arm_state_payload,
+            ), patch.object(
+                generate_mim_arm_host_state,
+                "run_local",
+                side_effect=[
+                    {"stdout": "python3 app.py", "ok": True, "returncode": 0, "stderr": "", "duration_ms": 1.0, "command": []},
+                    {"stdout": "/dev/ttyACM0", "ok": True, "returncode": 0, "stderr": "", "duration_ms": 1.0, "command": []},
+                    {"stdout": "/dev/video0", "ok": True, "returncode": 0, "stderr": "", "duration_ms": 1.0, "command": []},
+                ],
+            ), patch.object(
+                generate_mim_arm_host_state,
+                "_uptime_seconds",
+                return_value=123.0,
+            ), patch.object(
+                generate_mim_arm_host_state.socket,
+                "gethostname",
+                return_value="raspberrypi",
+            ):
+                exit_code = generate_mim_arm_host_state.main()
+                payload = json.loads(output_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(payload["source_payload_path"].endswith("TOD_MIM_TASK_RESULT.latest.json"))
+        self.assertEqual(payload["last_request_id"], "objective-115-task-mim-arm-safe-home-fresh")

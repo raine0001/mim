@@ -14,6 +14,7 @@ DEFAULT_BASE_URL = "http://127.0.0.1:18001"
 BASE_URL = os.getenv("MIM_TEST_BASE_URL", DEFAULT_BASE_URL)
 SHARED_RUNTIME_ROOT = Path(__file__).resolve().parents[2] / "runtime" / "shared"
 COLLAB_PROGRESS_FILE = SHARED_RUNTIME_ROOT / "MIM_TOD_COLLAB_PROGRESS.latest.json"
+DECISION_PROCESS_FILE = SHARED_RUNTIME_ROOT / "MIM_DECISION_TASK.latest.json"
 
 
 def _target_selection_message() -> str:
@@ -146,6 +147,19 @@ class Objective84OperatorVisibleSystemReasoningTest(unittest.TestCase):
                 COLLAB_PROGRESS_FILE.unlink()
             return
         COLLAB_PROGRESS_FILE.write_text(prior, encoding="utf-8")
+
+    def _write_decision_process_fixture(self, payload: dict) -> str | None:
+        SHARED_RUNTIME_ROOT.mkdir(parents=True, exist_ok=True)
+        prior = DECISION_PROCESS_FILE.read_text(encoding="utf-8") if DECISION_PROCESS_FILE.exists() else None
+        DECISION_PROCESS_FILE.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        return prior
+
+    def _restore_decision_process_fixture(self, prior: str | None) -> None:
+        if prior is None:
+            if DECISION_PROCESS_FILE.exists():
+                DECISION_PROCESS_FILE.unlink()
+            return
+        DECISION_PROCESS_FILE.write_text(prior, encoding="utf-8")
 
     def _register_workspace_scan(self) -> None:
         status, payload = post_json(
@@ -379,6 +393,11 @@ class Objective84OperatorVisibleSystemReasoningTest(unittest.TestCase):
         self.assertIn('id="systemReasoningList"', html)
         self.assertIn('id="systemReasoningSummary"', html)
         self.assertIn("function renderSystemReasoningPanel(reasoning = {})", html)
+        self.assertIn("Current recommendation", html)
+        self.assertIn("Trust signals", html)
+        self.assertIn("Lightweight autonomy", html)
+        self.assertIn("Human feedback loop", html)
+        self.assertIn("Stability guard", html)
 
     def test_state_exposes_operator_visible_reasoning_bundle(self) -> None:
         run_id = uuid4().hex[:8]
@@ -447,14 +466,25 @@ class Objective84OperatorVisibleSystemReasoningTest(unittest.TestCase):
         status, state = get_json("/mim/ui/state")
         self.assertEqual(status, 200, state)
         self.assertIn("operator_reasoning_summary", state.get("runtime_features", []))
+        self.assertIn("system_awareness_visibility", state.get("runtime_features", []))
+        self.assertIn("operator_trust_signals", state.get("runtime_features", []))
+        self.assertIn("lightweight_autonomy_guidance", state.get("runtime_features", []))
+        self.assertIn("human_feedback_loop", state.get("runtime_features", []))
+        self.assertIn("system_stability_guard", state.get("runtime_features", []))
 
         operator_reasoning = state.get("operator_reasoning", {}) if isinstance(state, dict) else {}
         self.assertTrue(str(operator_reasoning.get("summary", "")).strip(), operator_reasoning)
+        self.assertTrue(str(operator_reasoning.get("trust_signal_summary", "")).strip(), operator_reasoning)
         runtime_health = operator_reasoning.get("runtime_health", {}) if isinstance(operator_reasoning.get("runtime_health", {}), dict) else {}
         self.assertTrue(str(runtime_health.get("summary", "")).strip(), runtime_health)
         self.assertEqual(
             str((state.get("conversation_context", {}) or {}).get("operator_reasoning_summary", "")).strip(),
             str(operator_reasoning.get("summary", "")).strip(),
+            state,
+        )
+        self.assertEqual(
+            str((state.get("conversation_context", {}) or {}).get("trust_signal_summary", "")).strip(),
+            str(operator_reasoning.get("trust_signal_summary", "")).strip(),
             state,
         )
         self.assertEqual(
@@ -482,6 +512,44 @@ class Objective84OperatorVisibleSystemReasoningTest(unittest.TestCase):
         self.assertEqual(str(autonomy.get("scope", "")).strip(), scope, autonomy)
         self.assertEqual(str(autonomy.get("governance_decision", "")).strip(), governance_decision, autonomy)
         self.assertTrue(str(autonomy.get("adaptation_summary", "")).strip(), autonomy)
+
+        recommendation = operator_reasoning.get("current_recommendation", {}) if isinstance(operator_reasoning.get("current_recommendation", {}), dict) else {}
+        self.assertTrue(str(recommendation.get("summary", "")).strip(), recommendation)
+        self.assertTrue(str(recommendation.get("source", "")).strip(), recommendation)
+        self.assertEqual(
+            str((state.get("conversation_context", {}) or {}).get("current_recommendation_summary", "")).strip(),
+            str(recommendation.get("summary", "")).strip(),
+            state,
+        )
+
+        trust = operator_reasoning.get("trust_explainability", {}) if isinstance(operator_reasoning.get("trust_explainability", {}), dict) else {}
+        self.assertTrue(str(trust.get("what_it_did", "")).strip(), trust)
+        self.assertTrue(str(trust.get("what_it_will_do_next", "")).strip(), trust)
+        self.assertIn(str(trust.get("confidence_tier", "")).strip(), {"", "low", "guarded", "medium", "moderate", "high"}, trust)
+
+        lightweight_autonomy = operator_reasoning.get("lightweight_autonomy", {}) if isinstance(operator_reasoning.get("lightweight_autonomy", {}), dict) else {}
+        self.assertTrue(str(lightweight_autonomy.get("summary", "")).strip(), lightweight_autonomy)
+        self.assertEqual(
+            str((state.get("conversation_context", {}) or {}).get("lightweight_autonomy_summary", "")).strip(),
+            str(lightweight_autonomy.get("summary", "")).strip(),
+            state,
+        )
+
+        feedback_loop = operator_reasoning.get("feedback_loop", {}) if isinstance(operator_reasoning.get("feedback_loop", {}), dict) else {}
+        self.assertTrue(str(feedback_loop.get("summary", "")).strip(), feedback_loop)
+        self.assertEqual(
+            str((state.get("conversation_context", {}) or {}).get("feedback_loop_summary", "")).strip(),
+            str(feedback_loop.get("summary", "")).strip(),
+            state,
+        )
+
+        stability_guard = operator_reasoning.get("stability_guard", {}) if isinstance(operator_reasoning.get("stability_guard", {}), dict) else {}
+        self.assertTrue(str(stability_guard.get("summary", "")).strip(), stability_guard)
+        self.assertEqual(
+            str((state.get("conversation_context", {}) or {}).get("stability_guard_summary", "")).strip(),
+            str(stability_guard.get("summary", "")).strip(),
+            state,
+        )
 
         stewardship = operator_reasoning.get("stewardship", {}) if isinstance(operator_reasoning.get("stewardship", {}), dict) else {}
         self.assertEqual(str(stewardship.get("managed_scope", "")).strip(), scope, stewardship)
@@ -769,6 +837,90 @@ class Objective84OperatorVisibleSystemReasoningTest(unittest.TestCase):
             )
         finally:
             self._restore_collaboration_progress_fixture(prior)
+
+    def test_state_exposes_tod_decision_process_in_operator_reasoning(self) -> None:
+        task_id = f"objective97-decision-task-{uuid4().hex[:8]}"
+        prior = self._write_decision_process_fixture(
+            {
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "state": "watching",
+                "decision_process": {
+                    "generated_at": datetime.now(timezone.utc).isoformat(),
+                    "state": "watching",
+                    "questions": {
+                        "tod_knows_what_mim_did": {
+                            "known": False,
+                            "detail": "TOD has not yet acknowledged the latest MIM action",
+                            "evidence": ["awaiting_ack"],
+                        },
+                        "mim_knows_what_tod_did": {
+                            "known": True,
+                            "detail": "TOD reported active review status",
+                            "evidence": ["task_status_review"],
+                        },
+                        "tod_current_work": {
+                            "known": True,
+                            "task_id": task_id,
+                            "objective_id": "objective-97",
+                            "phase": "reviewing_request",
+                            "detail": "TOD is reviewing the current request",
+                        },
+                        "tod_liveness": {
+                            "status": "silent",
+                            "ask_required": True,
+                            "latest_progress_age_seconds": 180,
+                            "ping_response_age_seconds": 75,
+                            "primary_alert_code": "tod_silent",
+                        },
+                    },
+                    "communication_escalation": {
+                        "required": True,
+                        "code": "tod_silent",
+                        "detail": "TOD has gone silent long enough to require escalation",
+                        "console_url": "http://192.168.1.161:8844",
+                        "kick_hint": "ask_loudly",
+                    },
+                    "selected_action": {
+                        "code": "ask_loudly",
+                        "detail": "Ask TOD loudly for status",
+                    },
+                },
+                "blocking_reason_codes": ["communication_escalation"],
+            }
+        )
+        try:
+            status, state = get_json("/mim/ui/state")
+            self.assertEqual(status, 200, state)
+            self.assertIn("tod_decision_process_visibility", state.get("runtime_features", []))
+
+            operator_reasoning = state.get("operator_reasoning", {}) if isinstance(state, dict) else {}
+            decision = operator_reasoning.get("tod_decision_process", {}) if isinstance(operator_reasoning.get("tod_decision_process", {}), dict) else {}
+            self.assertEqual(str(decision.get("state", "")).strip(), "watching", decision)
+            self.assertFalse(bool((decision.get("tod_knows_what_mim_did", {}) if isinstance(decision.get("tod_knows_what_mim_did", {}), dict) else {}).get("known")), decision)
+            self.assertTrue(bool((decision.get("mim_knows_what_tod_did", {}) if isinstance(decision.get("mim_knows_what_tod_did", {}), dict) else {}).get("known")), decision)
+            self.assertEqual(
+                str((decision.get("tod_current_work", {}) if isinstance(decision.get("tod_current_work", {}), dict) else {}).get("task_id", "")).strip(),
+                task_id,
+                decision,
+            )
+            self.assertEqual(
+                str((decision.get("tod_liveness", {}) if isinstance(decision.get("tod_liveness", {}), dict) else {}).get("status", "")).strip(),
+                "silent",
+                decision,
+            )
+            self.assertTrue(
+                bool((decision.get("communication_escalation", {}) if isinstance(decision.get("communication_escalation", {}), dict) else {}).get("required")),
+                decision,
+            )
+            self.assertEqual(
+                str((decision.get("selected_action", {}) if isinstance(decision.get("selected_action", {}), dict) else {}).get("code", "")).strip(),
+                "ask_loudly",
+                decision,
+            )
+            self.assertIn("TOD does not know what MIM did", str(decision.get("summary", "")).strip())
+            self.assertIn("TOD decision", str(operator_reasoning.get("summary", "")).strip())
+        finally:
+            self._restore_decision_process_fixture(prior)
 
 
 if __name__ == "__main__":

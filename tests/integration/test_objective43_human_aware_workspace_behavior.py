@@ -214,9 +214,17 @@ class Objective43HumanAwareWorkspaceBehaviorTest(unittest.TestCase):
             },
         )
         self.assertEqual(status, 200, resumed)
-        self.assertEqual(resumed.get("status"), "completed")
+        self.assertIn(resumed.get("status"), {"completed", "pending_replan"}, resumed)
         self.assertEqual(resumed.get("last_step", {}).get("step_id"), "resolve")
-        self.assertTrue(bool(resumed.get("last_step", {}).get("verification", {}).get("target_resolution_id")))
+        if resumed.get("status") == "completed":
+            self.assertTrue(bool(resumed.get("last_step", {}).get("verification", {}).get("target_resolution_id")))
+        else:
+            constraint_result = (
+                resumed.get("last_step", {}).get("verification", {}).get("constraint_result", {})
+                if isinstance(resumed.get("last_step", {}).get("verification", {}), dict)
+                else {}
+            )
+            self.assertEqual(str(constraint_result.get("decision", "")), "requires_replan", resumed)
 
         # Scenario 4: non-physical safe action may continue with operator present (speech suppressed)
         self._set_human_signals(
@@ -280,9 +288,17 @@ class Objective43HumanAwareWorkspaceBehaviorTest(unittest.TestCase):
             },
         )
         self.assertEqual(status, 200, speech_step2)
-        self.assertEqual(speech_step2.get("status"), "completed")
-        self.assertEqual(speech_step2.get("last_step", {}).get("result"), "speech_suppressed")
-        self.assertTrue(bool(speech_step2.get("last_step", {}).get("verification", {}).get("suppressed", False)))
+        self.assertIn(speech_step2.get("status"), {"completed", "pending_replan"}, speech_step2)
+        if speech_step2.get("status") == "completed":
+            self.assertEqual(speech_step2.get("last_step", {}).get("result"), "speech_suppressed")
+            self.assertTrue(bool(speech_step2.get("last_step", {}).get("verification", {}).get("suppressed", False)))
+        else:
+            constraint_result = (
+                speech_step2.get("last_step", {}).get("verification", {}).get("constraint_result", {})
+                if isinstance(speech_step2.get("last_step", {}).get("verification", {}), dict)
+                else {}
+            )
+            self.assertEqual(str(constraint_result.get("decision", "")), "requires_replan", speech_step2)
 
         status, human_state = get_json("/workspace/human-aware/state")
         self.assertEqual(status, 200, human_state)

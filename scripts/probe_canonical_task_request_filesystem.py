@@ -23,6 +23,9 @@ except Exception:  # pragma: no cover - optional dependency fallback
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_PATH = PROJECT_ROOT / "runtime" / "shared" / "MIM_TOD_TASK_REQUEST.latest.json"
+DEFAULT_CANONICAL_SSH_USER = os.getenv("MIM_TOD_SSH_USER", os.getenv("MIM_TOD_SSH_HOST_USER", "testpilot"))
+DEFAULT_CANONICAL_SSH_PORT = int(os.getenv("MIM_TOD_SSH_PORT", "22") or "22")
+DEFAULT_CANONICAL_PASSWORD_ENV = "MIM_TOD_SSH_PASS"
 
 
 def parse_args() -> argparse.Namespace:
@@ -41,7 +44,7 @@ def parse_args() -> argparse.Namespace:
         "--user",
         "--ssh-user",
         dest="ssh_user",
-        default=os.getenv("MIM_ARM_SSH_HOST_USER", os.getenv("MIM_ARM_SSH_USER", "testpilot")),
+        default=DEFAULT_CANONICAL_SSH_USER,
         help="SSH user for remote probing.",
     )
     parser.add_argument(
@@ -52,7 +55,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--ssh-port",
         type=int,
-        default=int(os.getenv("MIM_ARM_SSH_HOST_PORT", "22") or "22"),
+        default=DEFAULT_CANONICAL_SSH_PORT,
         help="SSH port for remote probing.",
     )
     parser.add_argument(
@@ -62,7 +65,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--password-env",
-        default="MIM_ARM_SSH_HOST_PASS",
+        default=DEFAULT_CANONICAL_PASSWORD_ENV,
         help="Environment variable holding the SSH password when sshpass is needed.",
     )
     parser.add_argument(
@@ -76,8 +79,8 @@ def parse_args() -> argparse.Namespace:
 def _resolve_password(password_env: str) -> str:
     return (
         os.getenv(password_env, "")
-        or os.getenv("MIM_ARM_SSH_HOST_PASS", "")
-        or os.getenv("MIM_ARM_SSH_PASSWORD", "")
+        or os.getenv("MIM_TOD_SSH_PASSWORD", "")
+        or os.getenv("MIM_TOD_SSH_PASS", "")
     )
 
 

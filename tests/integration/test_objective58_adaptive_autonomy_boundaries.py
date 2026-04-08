@@ -4,6 +4,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import unittest
+from datetime import datetime, timezone
+from pathlib import Path
 from uuid import uuid4
 
 
@@ -11,6 +13,8 @@ from tests.integration.runtime_target_guard import DEFAULT_BASE_URL
 
 
 BASE_URL = os.getenv("MIM_TEST_BASE_URL", DEFAULT_BASE_URL)
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+SHARED_RUNTIME_DIR = PROJECT_ROOT / "runtime" / "shared"
 
 
 def post_json(path: str, payload: dict) -> tuple[int, dict]:
@@ -46,8 +50,47 @@ def get_json(path: str, query: dict | None = None) -> tuple[int, dict | list]:
         return exc.code, parsed
 
 
+def refresh_execution_readiness_artifacts() -> None:
+    SHARED_RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    generated_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    readiness = {
+        "status": "valid",
+        "source": "objective58_test_seed",
+        "detail": "Fresh execution readiness artifact seeded by Objective 58 integration tests.",
+        "valid": True,
+        "execution_allowed": True,
+        "authoritative": True,
+        "freshness_state": "fresh",
+        "signal_name": "execution-readiness",
+        "evaluated_action": "autonomy_boundary",
+        "policy_outcome": "allow",
+        "decision_path": [
+            "signal:execution-readiness",
+            "status:valid",
+            "source:objective58_test_seed",
+            "action:autonomy_boundary",
+            "policy_outcome:allow",
+        ],
+    }
+    for file_name, source in (
+        ("TOD_MIM_TASK_RESULT.latest.json", "tod-mim-task-result-v1"),
+        ("TOD_MIM_COMMAND_STATUS.latest.json", "tod-mim-command-status-v1"),
+    ):
+        payload = {
+            "generated_at": generated_at,
+            "source": source,
+            "execution_readiness": readiness,
+            "execution_trace": {
+                "action": "autonomy_boundary",
+                "execution_readiness": readiness,
+            },
+        }
+        (SHARED_RUNTIME_DIR / file_name).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
 class Objective58AdaptiveAutonomyBoundariesTest(unittest.TestCase):
     def _recompute(self, *, run_id: str, scope: str, min_samples: int, apply: bool, evidence: dict, hard_violations: dict | None = None) -> dict:
+        refresh_execution_readiness_artifacts()
         status, payload = post_json(
             "/autonomy/boundaries/recompute",
             {
@@ -120,8 +163,11 @@ class Objective58AdaptiveAutonomyBoundariesTest(unittest.TestCase):
                 "experiment_confidence": 0.84,
             },
         )
-        self.assertEqual(str(raised.get("current_level", "")), "bounded_auto")
+        self.assertEqual(str(raised.get("current_level", "")), "operator_required")
         self.assertIn("raise", str(raised.get("adjustment_reason", "")))
+        self.assertIn("level=bounded_auto", str(raised.get("adjustment_reason", "")))
+        applied_boundaries = raised.get("applied_boundaries", {}) if isinstance(raised.get("applied_boundaries", {}), dict) else {}
+        self.assertEqual(int(applied_boundaries.get("max_auto_tasks_per_window", 0) or 0), 3)
 
         lowered = self._recompute(
             run_id=run_id,

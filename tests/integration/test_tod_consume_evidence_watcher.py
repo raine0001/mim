@@ -285,6 +285,102 @@ class TodConsumeEvidenceWatcherTest(unittest.TestCase):
                 evidence["first_mutations"]["task_result"]["request_id"], new_task_id
             )
 
+    def test_ignores_stale_recovery_alert_for_different_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            shared = root / "shared"
+            logs = root / "logs"
+            shared.mkdir(parents=True, exist_ok=True)
+            logs.mkdir(parents=True, exist_ok=True)
+
+            active_task_id = "objective-115-task-mim-arm-capture-frame-20260407033825"
+            stale_task_id = "objective-115-task-mim-arm-safe-home-20260407030000"
+
+            (shared / "MIM_TASK_STATUS_REVIEW.latest.json").write_text(
+                json.dumps(
+                    {
+                        "generated_at": iso_now(-10),
+                        "task": {"active_task_id": active_task_id},
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (shared / "MIM_TOD_TASK_REQUEST.latest.json").write_text(
+                json.dumps(
+                    {
+                        "generated_at": iso_now(-10),
+                        "task_id": active_task_id,
+                        "request_id": active_task_id,
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (shared / "TOD_MIM_TASK_RESULT.latest.json").write_text(
+                json.dumps(
+                    {
+                        "generated_at": iso_now(-3),
+                        "request_id": active_task_id,
+                        "status": "succeeded",
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (shared / "TOD_MIM_RECOVERY_ALERT.latest.json").write_text(
+                json.dumps(
+                    {
+                        "generated_at": iso_now(-20),
+                        "task_id": stale_task_id,
+                        "task_state": "failed",
+                        "progress_classification": "no_heartbeats_recovery_in_progress",
+                        "issue_code": "bridge_remote_publish_unverified",
+                        "issue_detail": "Listener-stage artifacts are current, but remote publish verification failed.",
+                        "recovery_action": "refresh_shared_state_sync",
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            completed = subprocess.run(
+                ["bash", str(WATCHER_SCRIPT)],
+                cwd=ROOT,
+                env={
+                    **os.environ,
+                    "SHARED_DIR": str(shared),
+                    "LOG_DIR": str(logs),
+                    "RUN_ONCE": "1",
+                    "WATCH_WINDOW_SECONDS": "900",
+                },
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+
+            progress = json.loads(
+                (shared / "MIM_TOD_COLLAB_PROGRESS.latest.json").read_text(encoding="utf-8")
+            )
+            workstreams = {item["name"]: item for item in progress["workstreams"]}
+            self.assertEqual(
+                workstreams["tod_recovery_progress"]["mim_status"],
+                "stale_tod_recovery_signal_ignored",
+            )
+            self.assertEqual(
+                workstreams["tod_recovery_progress"]["tod_status"],
+                "no_recovery_alert_present",
+            )
+            self.assertIn(
+                stale_task_id,
+                workstreams["tod_recovery_progress"]["latest_observation"],
+            )
+
     def test_captures_first_ack_and_result_mutations_for_active_task(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)

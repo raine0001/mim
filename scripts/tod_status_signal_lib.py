@@ -161,10 +161,80 @@ def _first_text(payload: dict, *keys: str) -> str:
     return ""
 
 
+def _trigger_ack_task_identity(trigger_ack: dict) -> str:
+    trigger_ack = _as_dict(trigger_ack)
+    if not trigger_ack:
+        return ""
+
+    trigger_context = _as_dict(trigger_ack.get("trigger_context"))
+    bridge_runtime = _as_dict(trigger_ack.get("bridge_runtime"))
+    current_processing = _as_dict(bridge_runtime.get("current_processing"))
+    return _first_text(
+        trigger_ack,
+        "task_id",
+        "request_id",
+        "acknowledges",
+        "current_task_id",
+    ) or _first_text(
+        trigger_context,
+        "task_id",
+        "request_id",
+    ) or _first_text(
+        current_processing,
+        "task_id",
+        "request_id",
+    )
+
+
 def _bridge_current_processing_task_id(task_result: dict) -> str:
     bridge_runtime = _as_dict(task_result.get("bridge_runtime"))
     current_processing = _as_dict(bridge_runtime.get("current_processing"))
     return _first_text(current_processing, "task_id", "request_id")
+
+
+def _sanitize_persistent_task(
+    *,
+    persistent_task: dict,
+    task_request: dict,
+    trigger: dict,
+    task_result: dict,
+) -> dict:
+    sanitized = dict(persistent_task)
+    if not sanitized:
+        return sanitized
+
+    persistent_status = _first_text(sanitized, "status").lower()
+    persistent_objective = normalize_objective(
+        sanitized.get("objective_id") or sanitized.get("task_id")
+    )
+    request_task_id = _first_text(task_request, "task_id", "request_id")
+    request_objective = normalize_objective(
+        task_request.get("objective_id")
+        or task_request.get("objective")
+        or request_task_id
+    )
+    trigger_name = _first_text(trigger, "trigger")
+    actionable_trigger = trigger_name not in {"", "liveness_ping"}
+    trigger_objective = normalize_objective(
+        trigger.get("objective_id")
+        or (_first_text(trigger, "task_id", "request_id") if actionable_trigger else "")
+    )
+    result_request_id = _first_text(task_result, "request_id", "task_id")
+    result_objective = normalize_objective(
+        task_result.get("objective_id") or result_request_id
+    )
+
+    live_objective = request_objective or trigger_objective or result_objective
+    live_task_present = bool(request_task_id or actionable_trigger or result_request_id)
+    persistent_terminal = persistent_status in TERMINAL_RESULT_STATUSES | {"completed"}
+
+    if live_task_present and persistent_terminal:
+        return {}
+
+    if live_objective and persistent_objective and live_objective != persistent_objective:
+        return {}
+
+    return sanitized
 
 
 def _authoritative_task_override(
@@ -446,6 +516,69 @@ def build_system_alert_summary(
     }
 
 
+def reconcile_system_alert_summary_for_review(
+    *,
+    system_alert_summary: dict | None,
+    review: dict | None,
+) -> dict:
+    system_alert_summary = _as_dict(system_alert_summary)
+    review = _as_dict(review)
+    task = _as_dict(review.get("task"))
+
+    active_task_id = _first_text(task, "active_task_id")
+    trigger_ack_task_id = _first_text(task, "trigger_ack_task_id")
+    task_ack_request_id = _first_text(task, "task_ack_request_id")
+    result_request_id = _first_text(task, "result_request_id")
+    blocking_reason_codes = {
+        str(item).strip()
+        for item in review.get("blocking_reason_codes", [])
+        if str(item).strip()
+    }
+
+    alerts = [
+        dict(item)
+        for item in system_alert_summary.get("alerts", [])
+        if isinstance(item, dict)
+    ]
+    if not alerts:
+        return {
+            "generated_at": str(system_alert_summary.get("generated_at") or ""),
+            "type": str(system_alert_summary.get("type") or "mim_system_alerts_v1"),
+            "active": False,
+            "highest_severity": "none",
+            "primary_alert": {},
+            "alerts": [],
+        }
+
+    stale_trigger_alert_cleared = bool(
+        active_task_id
+        and active_task_id in {trigger_ack_task_id, task_ack_request_id, result_request_id}
+        and "trigger_ack_not_current" not in blocking_reason_codes
+    )
+    if stale_trigger_alert_cleared:
+        alerts = [
+            item
+            for item in alerts
+            if _first_text(item, "code") != "stale_trigger_ack_failures"
+        ]
+
+    severity_rank = {"none": 0, "info": 1, "warning": 2, "critical": 3}
+    highest = "none"
+    for alert in alerts:
+        sev = str(alert.get("severity") or "none").strip().lower()
+        if severity_rank.get(sev, 0) > severity_rank.get(highest, 0):
+            highest = sev
+
+    return {
+        "generated_at": str(system_alert_summary.get("generated_at") or ""),
+        "type": str(system_alert_summary.get("type") or "mim_system_alerts_v1"),
+        "active": bool(alerts),
+        "highest_severity": highest,
+        "primary_alert": alerts[0] if alerts else {},
+        "alerts": alerts,
+    }
+
+
 def build_task_status_review(
     *,
     task_request: dict | None,
@@ -470,13 +603,19 @@ def build_task_status_review(
     troubleshooting_authority = _as_dict(troubleshooting_authority)
     persistent_task = _as_dict(persistent_task)
     system_alert_summary = _as_dict(system_alert_summary)
+    persistent_task = _sanitize_persistent_task(
+        persistent_task=persistent_task,
+        task_request=task_request,
+        trigger=trigger,
+        task_result=task_result,
+    )
 
     trigger_name = _first_text(trigger, "trigger")
     actionable_trigger = trigger_name not in {"", "liveness_ping"}
 
     request_task_id = _first_text(task_request, "task_id", "request_id")
     trigger_task_id = _first_text(trigger, "task_id", "request_id") if actionable_trigger else ""
-    trigger_ack_task_id = _first_text(trigger_ack, "task_id", "request_id")
+    trigger_ack_task_id = _trigger_ack_task_identity(trigger_ack)
     task_ack_request_id = _first_text(task_ack, "request_id", "task_id")
     result_request_id = _first_text(task_result, "request_id", "task_id")
     persistent_task_id = _first_text(persistent_task, "task_id", "request_id")
@@ -626,9 +765,23 @@ def build_task_status_review(
         system_alert_summary.get("highest_severity") or "none"
     ).strip().lower()
     primary_alert = _as_dict(system_alert_summary.get("primary_alert"))
-    if highest_alert_severity == "critical" and not terminal_execution_failure:
+    primary_alert_code = _first_text(primary_alert, "code")
+    stale_trigger_alert_cleared = bool(
+        primary_alert_code == "stale_trigger_ack_failures"
+        and active_task_id
+        and (
+            trigger_ack_task_id == active_task_id
+            or task_ack_request_id == active_task_id
+            or result_request_id == active_task_id
+        )
+    )
+    if (
+        highest_alert_severity == "critical"
+        and not terminal_execution_failure
+        and not stale_trigger_alert_cleared
+    ):
         add_reason("system_alert_critical")
-        primary_code = _first_text(primary_alert, "code") or "critical_alert"
+        primary_code = primary_alert_code or "critical_alert"
         primary_detail = _first_text(primary_alert, "detail") or "Critical system alert active"
         add_action(
             "acknowledge_and_remediate_system_alerts",
@@ -648,7 +801,13 @@ def build_task_status_review(
             "Restart or recover the TOD listener bridge so TOD_TO_MIM_TRIGGER_ACK.latest.json mutates for the current task_id across two consecutive cycles.",
         )
 
-    if active_task_id and task_ack_request_id and task_ack_request_id != active_task_id:
+    if (
+        active_task_id
+        and task_ack_request_id
+        and task_ack_request_id != active_task_id
+        and not terminal_authoritative_result
+        and not completed_stream_superseded
+    ):
         add_reason("task_ack_request_mismatch")
         add_action(
             "reissue_task_with_matching_ack",
@@ -779,6 +938,227 @@ def build_task_status_review(
             "highest_severity": highest_alert_severity,
             "primary_alert_code": _first_text(primary_alert, "code"),
         },
+    }
+
+
+def build_mim_tod_decision_snapshot(
+    *,
+    review: dict | None,
+    next_action: dict | None,
+    system_alert_summary: dict | None,
+    coordination_request: dict | None,
+    coordination_ack: dict | None,
+    ping_response: dict | None,
+    console_probe: dict | None,
+    now: datetime | None = None,
+    tod_console_url: str = "http://192.168.1.161:8844",
+) -> dict:
+    reference = now or datetime.now(timezone.utc)
+    review = _as_dict(review)
+    next_action = _as_dict(next_action)
+    system_alert_summary = _as_dict(system_alert_summary)
+    coordination_request = _as_dict(coordination_request)
+    coordination_ack = _as_dict(coordination_ack)
+    ping_response = _as_dict(ping_response)
+    console_probe = _as_dict(console_probe)
+
+    task = _as_dict(review.get("task"))
+    idle = _as_dict(review.get("idle"))
+    selected_action = _as_dict(next_action.get("selected_action"))
+    primary_alert = _as_dict(system_alert_summary.get("primary_alert"))
+    blocking_reason_codes = [
+        str(item).strip()
+        for item in review.get("blocking_reason_codes", [])
+        if str(item).strip()
+    ]
+
+    active_task_id = _first_text(task, "active_task_id")
+    objective_id = normalize_objective(task.get("objective_id") or active_task_id)
+    state = _first_text(review, "state")
+    state_reason = _first_text(review, "state_reason")
+    trigger_name = _first_text(task, "trigger_name")
+    trigger_ack_task_id = _first_text(task, "trigger_ack_task_id")
+    task_ack_request_id = _first_text(task, "task_ack_request_id")
+    result_request_id = _first_text(task, "result_request_id")
+    coordination_request_id = _first_text(coordination_request, "request_id", "task_id")
+    coordination_ack_id = _first_text(coordination_ack, "request_id", "task_id")
+    ping_status = _first_text(ping_response, "heartbeat_status", "status").lower()
+    highest_severity = _first_text(system_alert_summary, "highest_severity").lower() or "none"
+    latest_progress_age_seconds = idle.get("latest_progress_age_seconds")
+    ping_age_seconds = artifact_age_seconds(payload=ping_response, now=reference)
+    console_probe_age_seconds = artifact_age_seconds(payload=console_probe, now=reference)
+    console_probe_status = _first_text(console_probe, "status").lower()
+    console_probe_http_status = console_probe.get("http_status")
+
+    tod_has_current_task_evidence = []
+    if active_task_id and trigger_ack_task_id == active_task_id:
+        tod_has_current_task_evidence.append("trigger_ack_current")
+    if active_task_id and task_ack_request_id == active_task_id:
+        tod_has_current_task_evidence.append("task_ack_current")
+    if active_task_id and result_request_id == active_task_id:
+        tod_has_current_task_evidence.append("task_result_current")
+    if active_task_id and coordination_ack_id == active_task_id:
+        tod_has_current_task_evidence.append("coordination_ack_current")
+
+    mim_has_tod_activity_evidence = []
+    if active_task_id and task_ack_request_id == active_task_id:
+        mim_has_tod_activity_evidence.append("tod_task_ack_current")
+    if active_task_id and result_request_id == active_task_id:
+        mim_has_tod_activity_evidence.append("tod_task_result_current")
+    if coordination_request_id:
+        mim_has_tod_activity_evidence.append("tod_coordination_request_seen")
+    if ping_age_seconds is not None and ping_age_seconds <= 90 and ping_status in {"alive", "degraded", "ok"}:
+        mim_has_tod_activity_evidence.append("tod_ping_response_recent")
+    if (
+        console_probe_age_seconds is not None
+        and console_probe_age_seconds <= 180
+        and console_probe_status == "reachable"
+    ):
+        mim_has_tod_activity_evidence.append("tod_console_probe_recent")
+
+    tod_knows_mim_did = bool(tod_has_current_task_evidence)
+    mim_knows_tod_did = bool(mim_has_tod_activity_evidence)
+
+    tod_work_phase = {
+        "awaiting_trigger_ack": "tod_has_not_confirmed_observation",
+        "awaiting_task_ack": "tod_has_seen_request_waiting_acceptance",
+        "awaiting_result": "tod_is_working_or_finishing",
+        "completed": "tod_published_terminal_result",
+        "failed": "tod_published_terminal_failure",
+        "idle_blocked": "tod_progress_uncertain_blocked",
+        "dispatch_blocked": "dispatch_blocked_before_safe_work_start",
+        "queued": "mim_has_work_queued",
+        "no_active_task": "no_active_tod_task_detected",
+    }.get(state, "unknown")
+
+    tod_work_known = bool(active_task_id or coordination_request_id or coordination_ack_id)
+    tod_work_detail = ""
+    if active_task_id:
+        tod_work_detail = f"review_state={state or 'unknown'} trigger={trigger_name or 'none'}"
+    elif coordination_request_id:
+        tod_work_detail = "TOD coordination request observed without active task review"
+    elif coordination_ack_id:
+        tod_work_detail = "TOD coordination ack observed without active task review"
+
+    silence_reasons = {
+        "trigger_ack_not_current",
+        "consume_watch_timeout",
+        "catchup_gate_blocked",
+        "system_alert_critical",
+    }
+    silence_detected = bool(
+        state in {"idle_blocked", "dispatch_blocked"}
+        and (
+            any(code in silence_reasons for code in blocking_reason_codes)
+            or highest_severity in {"critical", "warning"}
+            or (isinstance(latest_progress_age_seconds, int) and latest_progress_age_seconds >= 120)
+        )
+        and not mim_knows_tod_did
+    )
+    degraded_detected = bool(
+        not silence_detected
+        and state in {"idle_blocked", "dispatch_blocked", "awaiting_trigger_ack", "awaiting_task_ack"}
+        and (
+            any(code in silence_reasons for code in blocking_reason_codes)
+            or highest_severity == "warning"
+            or (isinstance(latest_progress_age_seconds, int) and latest_progress_age_seconds >= 60)
+        )
+    )
+
+    liveness_status = "alive"
+    if silence_detected:
+        liveness_status = "silent"
+    elif degraded_detected:
+        liveness_status = "degraded"
+    elif state in {"completed", "failed"}:
+        liveness_status = "terminal"
+
+    escalation_required = liveness_status in {"silent", "degraded"} and state not in {"completed", "failed"}
+    escalation_code = "monitor_only"
+    escalation_detail = "Keep observing the current TOD lane."
+    if liveness_status == "silent":
+        escalation_code = "ask_tod_status_loudly"
+        escalation_detail = (
+            "TOD is not providing current ACK, RESULT, coordination, or fresh ping evidence. "
+            "Emit a liveness ask, verify the shared trigger path, and use the TOD console if recovery evidence does not appear."
+        )
+    elif liveness_status == "degraded":
+        escalation_code = "verify_tod_progress"
+        escalation_detail = (
+            "TOD progress evidence is weak or aging. Verify current task ownership, confirm liveness, and recover the bridge before sending more work."
+        )
+
+    return {
+        "generated_at": reference.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "type": "mim_tod_decision_snapshot_v1",
+        "owner_actor": "MIM",
+        "target_actor": "TOD",
+        "active_task_id": active_task_id,
+        "objective_id": objective_id,
+        "state": state,
+        "state_reason": state_reason,
+        "questions": {
+            "tod_knows_what_mim_did": {
+                "known": tod_knows_mim_did,
+                "evidence": tod_has_current_task_evidence,
+                "detail": (
+                    "TOD has current-task evidence."
+                    if tod_knows_mim_did
+                    else "MIM has not observed current-task TOD evidence yet."
+                ),
+            },
+            "mim_knows_what_tod_did": {
+                "known": mim_knows_tod_did,
+                "evidence": mim_has_tod_activity_evidence,
+                "detail": (
+                    "MIM has recent TOD-side evidence."
+                    if mim_knows_tod_did
+                    else "MIM lacks fresh TOD-side evidence and should verify liveness/progress."
+                ),
+            },
+            "tod_current_work": {
+                "known": tod_work_known,
+                "task_id": active_task_id,
+                "objective_id": objective_id,
+                "phase": tod_work_phase,
+                "detail": tod_work_detail,
+            },
+            "tod_liveness": {
+                "status": liveness_status,
+                "ping_response_age_seconds": ping_age_seconds,
+                "latest_progress_age_seconds": latest_progress_age_seconds,
+                "console_probe_age_seconds": console_probe_age_seconds,
+                "console_probe_status": console_probe_status,
+                "console_probe_http_status": console_probe_http_status,
+                "ask_required": escalation_required,
+                "primary_alert_code": _first_text(primary_alert, "code"),
+            },
+        },
+        "communication_escalation": {
+            "required": escalation_required,
+            "code": escalation_code,
+            "detail": escalation_detail,
+            "supplemental_console_probe": {
+                "authoritative": False,
+                "status": console_probe_status,
+                "age_seconds": console_probe_age_seconds,
+                "http_status": console_probe_http_status,
+            },
+            "trigger_artifact": "MIM_TO_TOD_TRIGGER.latest.json",
+            "ping_artifact": "MIM_TO_TOD_PING.latest.json",
+            "response_artifact": "TOD_TO_MIM_PING.latest.json",
+            "console_url": tod_console_url.strip(),
+            "kick_hint": (
+                "Use the shared trigger/ping lane first; if TOD stays silent, inspect the TOD console and recover the TOD-side listener/executor."
+                if escalation_required
+                else "No TOD kick required right now."
+            ),
+        },
+        "selected_action": {
+            "code": _first_text(selected_action, "code") or "monitor_only",
+            "detail": _first_text(selected_action, "detail") or "No blocking action selected; continue monitoring.",
+        },
+        "blocking_reason_codes": blocking_reason_codes,
     }
 
 

@@ -1925,6 +1925,156 @@ def _operator_trust_explainability_snapshot(strategy_plan: dict) -> dict:
   }
 
 
+def _operator_trust_signal_summary(
+    trust_explainability: dict,
+    recommendation: dict,
+) -> str:
+  trust = trust_explainability if isinstance(trust_explainability, dict) else {}
+  recommended = recommendation if isinstance(recommendation, dict) else {}
+  parts: list[str] = []
+  if str(trust.get("what_it_did") or "").strip():
+    parts.append(f"did: {str(trust.get('what_it_did') or '').strip()}")
+  if str(trust.get("what_it_will_do_next") or "").strip():
+    parts.append(f"next: {str(trust.get('what_it_will_do_next') or '').strip()}")
+  if str(trust.get("confidence_reasoning") or "").strip():
+    parts.append(
+      f"confidence: {str(trust.get('confidence_reasoning') or '').strip()}"
+    )
+  if str(recommended.get("summary") or "").strip():
+    parts.append(f"recommendation: {str(recommended.get('summary') or '').strip()}")
+  if bool(trust.get("operator_review_required", False)):
+    parts.append("operator review required")
+  elif trust.get("safe_to_continue") is True:
+    parts.append("safe to continue")
+  return _compact_sentence(". ".join(part for part in parts if part), max_len=220)
+
+
+def _operator_lightweight_autonomy_snapshot(
+    autonomy: dict,
+    trust_explainability: dict,
+    recommendation: dict,
+) -> dict:
+  autonomy_state = autonomy if isinstance(autonomy, dict) else {}
+  trust = trust_explainability if isinstance(trust_explainability, dict) else {}
+  recommended = recommendation if isinstance(recommendation, dict) else {}
+  current_level = str(autonomy_state.get("current_level") or "").strip()
+  operator_review_required = bool(trust.get("operator_review_required", False))
+  automatic_ready = bool(
+    trust.get("safe_to_continue")
+    and trust.get("can_continue")
+    and not operator_review_required
+    and current_level not in {"operator_required", "manual_only"}
+  )
+  if automatic_ready:
+    summary = (
+      "Automatic continuation is currently limited to bounded low-risk steps under the active safety envelope."
+    )
+  else:
+    summary = (
+      "Automatic continuation is currently held behind operator review or runtime safeguards."
+    )
+  if str(recommended.get("summary") or "").strip():
+    summary = f"{summary} {str(recommended.get('summary') or '').strip()}"
+  return {
+    "current_level": current_level,
+    "automatic_ready": automatic_ready,
+    "operator_review_required": operator_review_required,
+    "managed_scope": str(autonomy_state.get("scope") or "").strip(),
+    "recommended_source": str(recommended.get("source") or "").strip(),
+    "recommended_decision": str(recommended.get("decision") or "").strip(),
+    "summary": _compact_sentence(summary, max_len=220),
+  }
+
+
+def _operator_feedback_loop_snapshot(execution_row: CapabilityExecution | None) -> dict:
+  if execution_row is None:
+    return {
+      "execution_id": 0,
+      "managed_scope": "",
+      "latest_actor": "",
+      "latest_status": "",
+      "latest_reason": "",
+      "history_count": 0,
+      "summary": "Awaiting explicit human feedback.",
+    }
+  feedback = execution_row.feedback_json if isinstance(execution_row.feedback_json, dict) else {}
+  history = [item for item in (feedback.get("history") or []) if isinstance(item, dict)]
+  latest_feedback = history[-1] if history else {}
+  actor = str(
+    latest_feedback.get("actor")
+    or feedback.get("last_feedback_actor")
+    or "operator_loop"
+  ).strip()
+  status = str(
+    latest_feedback.get("status")
+    or feedback.get("last_feedback_status")
+    or execution_row.status
+    or ""
+  ).strip()
+  reason = str(
+    latest_feedback.get("reason")
+    or feedback.get("last_feedback_reason")
+    or execution_row.reason
+    or ""
+  ).strip()
+  summary = "Awaiting explicit human feedback."
+  if actor or status or reason:
+    summary = _compact_sentence(
+      f"Latest feedback loop state: {actor or 'operator'} marked {status or 'updated'}"
+      f"{f' because {reason}' if reason else ''}.",
+      max_len=200,
+    )
+  return {
+    "execution_id": int(execution_row.id),
+    "managed_scope": str(execution_row.managed_scope or "").strip(),
+    "latest_actor": actor,
+    "latest_status": status,
+    "latest_reason": reason,
+    "history_count": len(history),
+    "summary": summary,
+  }
+
+
+def _operator_stability_guard_snapshot(
+    runtime_health: dict,
+    runtime_recovery: dict,
+    gateway_governance: dict,
+    tod_decision_process: dict,
+) -> dict:
+  health = runtime_health if isinstance(runtime_health, dict) else {}
+  recovery = runtime_recovery if isinstance(runtime_recovery, dict) else {}
+  governance = gateway_governance if isinstance(gateway_governance, dict) else {}
+  tod_decision = tod_decision_process if isinstance(tod_decision_process, dict) else {}
+  blockers: list[str] = []
+  if str(health.get("status") or "").strip() not in {"", "healthy"}:
+    blockers.append(str(health.get("status") or "").strip().replace("_", " "))
+  if str(recovery.get("status") or "").strip() not in {"", "healthy"}:
+    blockers.append(str(recovery.get("status") or "").strip().replace("_", " "))
+  if str(governance.get("primary_signal") or "").strip():
+    blockers.append(str(governance.get("primary_signal") or "").strip().replace("_", " "))
+  escalation = (
+    tod_decision.get("communication_escalation", {})
+    if isinstance(tod_decision.get("communication_escalation", {}), dict)
+    else {}
+  )
+  if bool(escalation.get("required", False)):
+    blockers.append(str(escalation.get("code") or "communication escalation").strip().replace("_", " "))
+  active = bool(blockers)
+  summary = (
+    "Stability guard sees no active runtime or handoff blockers."
+    if not active
+    else _compact_sentence(
+      f"Stability guard is holding on {', '.join(blockers[:4])}.",
+      max_len=200,
+    )
+  )
+  return {
+    "active": active,
+    "blocking_conditions": blockers[:6],
+    "summary": summary,
+  }
+
+
 def _build_operator_reasoning_payload(
     *,
     goal_row: WorkspaceStrategyGoal | None,
@@ -1951,6 +2101,7 @@ def _build_operator_reasoning_payload(
     tod_decision_process: dict,
     runtime_health: dict,
     runtime_recovery: dict,
+    latest_execution_row: CapabilityExecution | None,
     strategy_plan_row: ExecutionStrategyPlan | None,
 ) -> dict:
     goal = _operator_goal_snapshot(goal_row)
@@ -1995,12 +2146,28 @@ def _build_operator_reasoning_payload(
         governance=governance,
         autonomy=autonomy,
         stewardship=stewardship,
-      commitment=commitment,
+        commitment=commitment,
         recovery_commitment=recovery_commitment,
         execution_recovery=recovery,
         commitment_monitoring=commitment_monitoring,
         commitment_outcome=commitment_outcome,
         strategy_plan=strategy_plan,
+    )
+    trust_signal_summary = _operator_trust_signal_summary(
+        trust_explainability,
+        recommendation,
+    )
+    lightweight_autonomy = _operator_lightweight_autonomy_snapshot(
+      autonomy,
+      trust_explainability,
+      recommendation,
+    )
+    feedback_loop = _operator_feedback_loop_snapshot(latest_execution_row)
+    stability_guard = _operator_stability_guard_snapshot(
+      runtime_health,
+      runtime_recovery,
+      gateway_governance,
+      tod_decision_process,
     )
     return {
         "summary": _build_operator_reasoning_summary(
@@ -2040,6 +2207,10 @@ def _build_operator_reasoning_payload(
         "execution_recovery_governance_rollup": recovery_governance_rollup,
         "strategy_plan": strategy_plan,
         "trust_explainability": trust_explainability,
+        "trust_signal_summary": trust_signal_summary,
+        "lightweight_autonomy": lightweight_autonomy,
+        "feedback_loop": feedback_loop,
+        "stability_guard": stability_guard,
         "current_recommendation": recommendation,
         "resolution_commitment": commitment,
         "commitment_monitoring": commitment_monitoring,
@@ -3219,6 +3390,11 @@ async def mim_ui_page() -> str:
       const gatewayGovernance = (reasoning && typeof reasoning.gateway_governance === 'object') ? reasoning.gateway_governance : {};
       const autonomy = (reasoning && typeof reasoning.autonomy === 'object') ? reasoning.autonomy : {};
       const stewardship = (reasoning && typeof reasoning.stewardship === 'object') ? reasoning.stewardship : {};
+      const recommendation = (reasoning && typeof reasoning.current_recommendation === 'object') ? reasoning.current_recommendation : {};
+      const trust = (reasoning && typeof reasoning.trust_explainability === 'object') ? reasoning.trust_explainability : {};
+      const lightweightAutonomy = (reasoning && typeof reasoning.lightweight_autonomy === 'object') ? reasoning.lightweight_autonomy : {};
+      const feedbackLoop = (reasoning && typeof reasoning.feedback_loop === 'object') ? reasoning.feedback_loop : {};
+      const stabilityGuard = (reasoning && typeof reasoning.stability_guard === 'object') ? reasoning.stability_guard : {};
 
       if (String(goal.reasoning_summary || '').trim()) {
         entries.push({
@@ -3282,6 +3458,82 @@ async def mim_ui_page() -> str:
           title: 'Stewardship',
           meta: bits.join(' | '),
           note,
+        });
+      }
+
+      if (String(recommendation.summary || '').trim()) {
+        const meta = [
+          recommendation.source,
+          recommendation.decision && String(recommendation.decision || '').trim().replaceAll('_', ' '),
+          recommendation.managed_scope && `scope ${String(recommendation.managed_scope || '').trim()}`,
+        ].filter(Boolean).join(' | ');
+        entries.push({
+          title: 'Current recommendation',
+          meta,
+          note: String(recommendation.summary || '').trim(),
+        });
+      }
+
+      if (
+        String(trust.what_it_did || '').trim()
+        || String(trust.what_it_will_do_next || '').trim()
+        || String(trust.confidence_reasoning || '').trim()
+      ) {
+        const trustMeta = [
+          trust.confidence_tier,
+          Number.isFinite(Number(trust.confidence)) ? `confidence ${Number(trust.confidence).toFixed(2)}` : '',
+          trust.operator_review_required ? 'operator review required' : (trust.safe_to_continue ? 'safe to continue' : ''),
+        ].filter(Boolean).join(' | ');
+        const trustNotes = [
+          String(trust.what_it_did || '').trim() && `Did: ${String(trust.what_it_did || '').trim()}`,
+          String(trust.what_it_will_do_next || '').trim() && `Next: ${String(trust.what_it_will_do_next || '').trim()}`,
+          String(trust.confidence_reasoning || '').trim() && `Why: ${String(trust.confidence_reasoning || '').trim()}`,
+          String(trust.stop_reason || '').trim() && `Stop reason: ${String(trust.stop_reason || '').trim()}`,
+        ].filter(Boolean).join('. ');
+        entries.push({
+          title: 'Trust signals',
+          meta: trustMeta,
+          note: trustNotes,
+        });
+      }
+
+      if (String(lightweightAutonomy.summary || '').trim()) {
+        const meta = [
+          lightweightAutonomy.current_level,
+          lightweightAutonomy.automatic_ready ? 'bounded auto-ready' : 'operator-held',
+          lightweightAutonomy.managed_scope && `scope ${String(lightweightAutonomy.managed_scope || '').trim()}`,
+        ].filter(Boolean).join(' | ');
+        entries.push({
+          title: 'Lightweight autonomy',
+          meta,
+          note: String(lightweightAutonomy.summary || '').trim(),
+        });
+      }
+
+      if (String(feedbackLoop.summary || '').trim()) {
+        const meta = [
+          feedbackLoop.latest_actor,
+          feedbackLoop.latest_status,
+          Number(feedbackLoop.history_count || 0) > 0 ? `${Number(feedbackLoop.history_count || 0)} feedback updates` : '',
+        ].filter(Boolean).join(' | ');
+        entries.push({
+          title: 'Human feedback loop',
+          meta,
+          note: String(feedbackLoop.summary || '').trim(),
+        });
+      }
+
+      if (String(stabilityGuard.summary || '').trim()) {
+        const meta = [
+          stabilityGuard.active ? 'active guard' : 'guard clear',
+          Array.isArray(stabilityGuard.blocking_conditions) && stabilityGuard.blocking_conditions.length > 0
+            ? `${stabilityGuard.blocking_conditions.length} blockers`
+            : '',
+        ].filter(Boolean).join(' | ');
+        entries.push({
+          title: 'Stability guard',
+          meta,
+          note: String(stabilityGuard.summary || '').trim(),
         });
       }
 
@@ -8077,6 +8329,7 @@ async def mim_ui_state(db: AsyncSession = Depends(get_db)) -> dict:
         tod_decision_process=tod_decision_process,
         runtime_health=runtime_health,
         runtime_recovery=runtime_recovery,
+        latest_execution_row=latest_recovery_execution,
         strategy_plan_row=latest_strategy_plan,
     )
 
@@ -8094,7 +8347,12 @@ async def mim_ui_state(db: AsyncSession = Depends(get_db)) -> dict:
             "camera_scene_context",
             "object_memory_bridge",
             "conversation_policy_tightened",
+          "system_awareness_visibility",
             "operator_reasoning_summary",
+          "operator_trust_signals",
+            "lightweight_autonomy_guidance",
+            "human_feedback_loop",
+            "system_stability_guard",
             "operator_resolution_commitments",
             "operator_commitment_enforcement_monitoring",
             "operator_preference_convergence",
@@ -8131,6 +8389,26 @@ async def mim_ui_state(db: AsyncSession = Depends(get_db)) -> dict:
             "camera_object_states": camera_object_states,
             "camera_object_details": camera_object_details,
             "operator_reasoning_summary": str(operator_reasoning.get("summary") or "").strip(),
+            "current_recommendation_summary": str(
+              operator_reasoning.get("current_recommendation", {}).get("summary") or ""
+            ).strip()
+            if isinstance(operator_reasoning.get("current_recommendation", {}), dict)
+            else "",
+            "current_recommendation_source": str(
+              operator_reasoning.get("current_recommendation", {}).get("source") or ""
+            ).strip()
+            if isinstance(operator_reasoning.get("current_recommendation", {}), dict)
+            else "",
+            "trust_signal_summary": str(operator_reasoning.get("trust_signal_summary") or "").strip(),
+            "lightweight_autonomy_summary": str(operator_reasoning.get("lightweight_autonomy", {}).get("summary") or "").strip()
+            if isinstance(operator_reasoning.get("lightweight_autonomy", {}), dict)
+            else "",
+            "feedback_loop_summary": str(operator_reasoning.get("feedback_loop", {}).get("summary") or "").strip()
+            if isinstance(operator_reasoning.get("feedback_loop", {}), dict)
+            else "",
+            "stability_guard_summary": str(operator_reasoning.get("stability_guard", {}).get("summary") or "").strip()
+            if isinstance(operator_reasoning.get("stability_guard", {}), dict)
+            else "",
             "runtime_health_summary": str(operator_reasoning.get("runtime_health", {}).get("summary") or "").strip()
             if isinstance(operator_reasoning.get("runtime_health", {}), dict)
             else "",

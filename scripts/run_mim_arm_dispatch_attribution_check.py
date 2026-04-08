@@ -27,6 +27,8 @@ DEFAULT_PUBLICATION_BOUNDARY = DEFAULT_SHARED_DIR / "MIM_TOD_PUBLICATION_BOUNDAR
 DEFAULT_LOCAL_TASK_ACK = DEFAULT_SHARED_DIR / "TOD_MIM_TASK_ACK.latest.json"
 DEFAULT_LOCAL_TASK_RESULT = DEFAULT_SHARED_DIR / "TOD_MIM_TASK_RESULT.latest.json"
 DEFAULT_LOCAL_HOST_STATE = DEFAULT_SHARED_DIR / "mim_arm_host_state.latest.json"
+CANONICAL_COMMUNICATION_HOST = "192.168.1.120"
+CANONICAL_COMMUNICATION_ROOT = "/home/testpilot/mim/runtime/shared"
 DEFAULT_DISPATCH_TELEMETRY_ENDPOINT_TEMPLATE = "/mim/arm/dispatch-telemetry/{request_id}"
 HOST_STATE_SYNC_SCRIPT = PROJECT_ROOT / "scripts" / "sync_mim_arm_host_state.py"
 BOUNDED_LIVE_ACTIONS = ("capture_frame", "safe_home", "scan_pose")
@@ -261,16 +263,16 @@ def _resolve_dispatch_identifier(bridge_publication: dict[str, Any]) -> tuple[st
 
 
 def _boundary_matches_dispatch_identifier(boundary_payload: dict[str, Any], dispatch_identifier: str) -> bool:
-    remote_request = _json_dict(boundary_payload.get("remote_request"))
-    remote_trigger = _json_dict(boundary_payload.get("remote_trigger"))
+    authoritative_request = _json_dict(boundary_payload.get("authoritative_request")) or _json_dict(boundary_payload.get("local_request"))
+    authoritative_trigger = _json_dict(boundary_payload.get("authoritative_trigger")) or _json_dict(boundary_payload.get("local_trigger"))
     request_alignment = _json_dict(boundary_payload.get("request_alignment"))
     trigger_alignment = _json_dict(boundary_payload.get("trigger_alignment"))
-    remote_request_id = str(remote_request.get("request_id") or remote_request.get("task_id") or "").strip()
-    remote_trigger_id = str(remote_trigger.get("request_id") or remote_trigger.get("task_id") or "").strip()
+    authoritative_request_id = str(authoritative_request.get("request_id") or authoritative_request.get("task_id") or "").strip()
+    authoritative_trigger_id = str(authoritative_trigger.get("request_id") or authoritative_trigger.get("task_id") or "").strip()
     return bool(
         dispatch_identifier
-        and remote_request_id == dispatch_identifier
-        and remote_trigger_id == dispatch_identifier
+        and authoritative_request_id == dispatch_identifier
+        and authoritative_trigger_id == dispatch_identifier
         and bool(request_alignment.get("request_id_match"))
         and bool(trigger_alignment.get("request_id_match"))
     )
@@ -578,7 +580,8 @@ def main() -> int:
             "publication_boundary": {
                 "path": str(Path(str(args.publication_boundary)).expanduser().resolve()),
                 "payload": publication_boundary,
-                "remote_publication_matches_dispatch_identifier": publication_boundary_matches,
+                "authoritative_surface": f"{CANONICAL_COMMUNICATION_HOST}:{CANONICAL_COMMUNICATION_ROOT}",
+                "communication_authority_matches_dispatch_identifier": publication_boundary_matches,
             },
             "remote_command_status": {
                 "available": remote_status_available and not bool(command_status_after_error),
@@ -637,7 +640,7 @@ def main() -> int:
         "summary": {
             "dispatch_identifier": dispatch_identifier,
             "dispatch_identifier_kind": identifier_kind,
-            "remote_publication_boundary_matches_dispatch_identifier": publication_boundary_matches,
+            "communication_authority_matches_dispatch_identifier": publication_boundary_matches,
             "proof_requirements": proof_requirements,
             "remote_command_status_available": remote_status_available and not bool(command_status_after_error),
             "remote_command_status_surface_kind": remote_status_classification.get("surface_kind"),

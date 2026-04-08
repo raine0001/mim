@@ -55,7 +55,8 @@ That separation is part of the system contract now. Do not blur these lanes in f
 
 - Shared-artifact transport id: `mim_server_shared_artifact_boundary`
 - Local publication surface: `/home/testpilot/mim/runtime/shared`
-- Remote authoritative surface: `remote_raspberry_pi`
+- Communication authority host: `192.168.1.120`
+- Communication authority root: `/home/testpilot/mim/runtime/shared`
 - Frozen bridge files:
   - `MIM_TOD_TASK_REQUEST.latest.json`
   - `MIM_TO_TOD_TRIGGER.latest.json`
@@ -63,7 +64,7 @@ That separation is part of the system contract now. Do not blur these lanes in f
   - `TOD_MIM_TASK_RESULT.latest.json`
   - `MIM_TOD_PUBLICATION_BOUNDARY.latest.json`
 
-The baseline term `remote_ephemeral` refers to this shared-latest bridge publication path: a locally written latest artifact pair immediately published to the remote Raspberry Pi authoritative root, then consumed by the TOD listener.
+The baseline term `remote_ephemeral` refers to the execution-evidence mirror path only. The authoritative TOD/MIM communication contract remains the canonical shared root on `192.168.1.120:/home/testpilot/mim/runtime/shared`.
 
 ## Memory Profile
 

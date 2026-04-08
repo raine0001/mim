@@ -11,6 +11,8 @@ RECORD_DIRECTORY_NAME = "mim_arm_dispatch_telemetry"
 TASK_ACK_ARTIFACT_NAME = "TOD_MIM_TASK_ACK.latest.json"
 TASK_RESULT_ARTIFACT_NAME = "TOD_MIM_TASK_RESULT.latest.json"
 PUBLICATION_BOUNDARY_ARTIFACT_NAME = "MIM_TOD_PUBLICATION_BOUNDARY.latest.json"
+CANONICAL_COMMUNICATION_HOST = "192.168.1.120"
+CANONICAL_COMMUNICATION_ROOT = "/home/testpilot/mim/runtime/shared"
 
 
 def _json_dict(value: Any) -> dict[str, Any]:
@@ -119,6 +121,16 @@ def _feedback_timestamp(payload: dict[str, Any], primary_field: str) -> str:
     )
 
 
+def _result_implies_ack(payload: dict[str, Any]) -> bool:
+    if str(payload.get("message_kind") or "").strip().lower() == "result":
+        if str(payload.get("ack_sequence") or "").strip():
+            return True
+        if str(payload.get("acknowledged_trigger_sequence") or "").strip():
+            return True
+    ack_status = str(payload.get("ack_status") or payload.get("status") or "").strip().lower()
+    return ack_status in {"accepted", "acknowledged", "success", "succeeded", "completed"}
+
+
 def _upsert_evidence_source(record: dict[str, Any], source: dict[str, Any]) -> None:
     key = str(source.get("kind") or "").strip()
     if not key:
@@ -140,18 +152,20 @@ def _load_boundary_evidence(shared_root: Path, *, request_id: str, task_id: str)
     payload = _read_json(shared_root / PUBLICATION_BOUNDARY_ARTIFACT_NAME)
     if not payload:
         return {}
-    remote_request = _json_dict(payload.get("remote_request"))
-    remote_trigger = _json_dict(payload.get("remote_trigger"))
-    request_match = str(remote_request.get("request_id") or remote_request.get("task_id") or "").strip() in {request_id, task_id}
-    trigger_match = str(remote_trigger.get("request_id") or remote_trigger.get("task_id") or "").strip() in {request_id, task_id}
+    authoritative_request = _json_dict(payload.get("authoritative_request")) or _json_dict(payload.get("local_request"))
+    authoritative_trigger = _json_dict(payload.get("authoritative_trigger")) or _json_dict(payload.get("local_trigger"))
+    request_match = str(authoritative_request.get("request_id") or authoritative_request.get("task_id") or "").strip() in {request_id, task_id}
+    trigger_match = str(authoritative_trigger.get("request_id") or authoritative_trigger.get("task_id") or "").strip() in {request_id, task_id}
     if not request_match and not trigger_match:
         return {}
     return {
         "kind": "publication_boundary",
-        "role": "remote_dispatch_authority",
+        "role": "communication_authority",
         "path": str((shared_root / PUBLICATION_BOUNDARY_ARTIFACT_NAME).resolve()),
         "matched": bool(request_match and trigger_match),
-        "observed_at": str(remote_request.get("generated_at") or remote_trigger.get("generated_at") or "").strip(),
+        "observed_at": str(authoritative_request.get("generated_at") or authoritative_trigger.get("generated_at") or "").strip(),
+        "authoritative_host": CANONICAL_COMMUNICATION_HOST,
+        "authoritative_root": CANONICAL_COMMUNICATION_ROOT,
         "request_alignment": _json_dict(payload.get("request_alignment")),
         "trigger_alignment": _json_dict(payload.get("trigger_alignment")),
     }
@@ -354,6 +368,14 @@ def refresh_dispatch_telemetry_record(
             result_payload,
             ["host_completed_timestamp", "completed_at", "finished_at", "resolved_at", "generated_at", "emitted_at"],
         )
+        ack_inferred = _result_implies_ack(result_payload)
+        received_timestamp = _extract_timestamp(
+            result_payload,
+            ["host_received_timestamp", "accepted_at", "received_at", "generated_at", "emitted_at"],
+        )
+        if ack_inferred and received_timestamp and str(record.get("host_received_timestamp") or "").strip() != received_timestamp:
+            record["host_received_timestamp"] = received_timestamp
+            changed = True
         if completed_timestamp and str(record.get("host_completed_timestamp") or "").strip() != completed_timestamp:
             record["host_completed_timestamp"] = completed_timestamp
             changed = True
@@ -376,6 +398,8 @@ def refresh_dispatch_telemetry_record(
                 "role": "host_completed",
                 "path": str((shared_root / TASK_RESULT_ARTIFACT_NAME).resolve()),
                 "matched": True,
+                "ack_inferred": ack_inferred,
+                "received_timestamp_inferred": bool(ack_inferred and received_timestamp),
                 "matched_fields": result_fields,
                 "observed_at": completed_timestamp,
             },

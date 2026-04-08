@@ -132,7 +132,9 @@ class RebuildTodIntegrationStatusTest(unittest.TestCase):
             self.assertEqual(rebuilt["mim_refresh"]["failure_reason"], "")
             self.assertEqual(rebuilt["live_task_request"]["publication_lane"], "local_only")
             self.assertTrue(rebuilt["live_task_request"]["local_only_writer"])
-            self.assertEqual(rebuilt["publication_boundary"]["authoritative_surface"], "remote_raspberry_pi")
+            self.assertEqual(rebuilt["publication_boundary"]["authoritative_surface"], "mim_runtime_shared")
+            self.assertEqual(rebuilt["publication_boundary"]["authoritative_host"], "192.168.1.120")
+            self.assertEqual(rebuilt["publication_boundary"]["authoritative_root"], "/home/testpilot/mim/runtime/shared")
 
             gate = subprocess.run(
                 ["bash", str(GATE_SCRIPT)],
@@ -233,7 +235,7 @@ class RebuildTodIntegrationStatusTest(unittest.TestCase):
             gate_signal = json.loads((shared_dir / "TOD_CATCHUP_GATE.latest.json").read_text(encoding="utf-8"))
             self.assertTrue(gate_signal["gate_pass"])
 
-    def test_rebuild_prefers_remote_boundary_request_when_status_artifact_exists(self) -> None:
+    def test_rebuild_prefers_local_authoritative_boundary_request_when_status_artifact_exists(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             shared_dir = Path(tmp_dir)
             self._seed_shared_truth(shared_dir, request_objective="objective-75")
@@ -241,7 +243,17 @@ class RebuildTodIntegrationStatusTest(unittest.TestCase):
                 shared_dir / "MIM_TOD_PUBLICATION_BOUNDARY.latest.json",
                 {
                     "generated_at": "2026-04-02T23:30:00Z",
-                    "authoritative_surface": "remote_raspberry_pi",
+                    "authoritative_surface": "mim_runtime_shared",
+                    "authoritative_host": "192.168.1.120",
+                    "authoritative_root": "/home/testpilot/mim/runtime/shared",
+                    "authoritative_request": {
+                        "path": str(shared_dir / "MIM_TOD_TASK_REQUEST.latest.json"),
+                        "task_id": "objective-97-task-3422",
+                        "objective_id": "objective-75",
+                        "generated_at": "2026-03-31T02:07:23Z",
+                        "source_service": "objective75_overnight",
+                        "source_instance_id": "objective75_overnight:2943914",
+                    },
                     "remote_request": {
                         "path": "/home/testpilot/mim/runtime/shared/MIM_TOD_TASK_REQUEST.latest.json",
                         "task_id": "objective-97-task-remote-9001",
@@ -263,10 +275,10 @@ class RebuildTodIntegrationStatusTest(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
 
             rebuilt = json.loads((shared_dir / "TOD_INTEGRATION_STATUS.latest.json").read_text(encoding="utf-8"))
-            self.assertEqual(rebuilt["live_task_request"]["task_id"], "objective-97-task-remote-9001")
-            self.assertEqual(rebuilt["live_task_request"]["objective_id"], "objective-97")
-            self.assertEqual(rebuilt["live_task_request"]["publication_lane"], "remote_publish_capable")
-            self.assertEqual(rebuilt["publication_boundary"]["authoritative_path"], "/home/testpilot/mim/runtime/shared/MIM_TOD_TASK_REQUEST.latest.json")
+            self.assertEqual(rebuilt["live_task_request"]["task_id"], "objective-97-task-3422")
+            self.assertEqual(rebuilt["live_task_request"]["objective_id"], "objective-75")
+            self.assertEqual(rebuilt["live_task_request"]["publication_lane"], "local_only")
+            self.assertEqual(rebuilt["publication_boundary"]["authoritative_path"], str(shared_dir / "MIM_TOD_TASK_REQUEST.latest.json"))
 
     def test_rebuild_ignores_older_prior_objective_request_for_alignment(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

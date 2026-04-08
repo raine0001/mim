@@ -855,6 +855,55 @@ class MimArmControlledAccessBaselineTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Emergency-stop state is not explicitly confirmed clear", response["resolution"]["clarification_prompt"])
         self.assertFalse(bool(binding_mock.await_args.kwargs.get("force_dispatch")))
 
+    async def test_execute_safe_home_blocks_when_communication_escalation_persists(self):
+        db = _FakeDB()
+        status_surface = {
+            "arm_online": True,
+            "camera_online": True,
+            "serial_ready": True,
+            "estop_ok": True,
+            "estop_supported": True,
+            "current_pose": "scan_pose",
+            "mode": "idle",
+            "tod_execution_allowed": False,
+            "tod_execution_block_reason": "communication_escalation_persistent",
+            "motion_allowed": False,
+            "self_health": {
+                "status": "healthy",
+                "requires_confirmation": False,
+                "summary": "Self-health is healthy; bounded arm proposals remain eligible for TOD review.",
+            },
+        }
+        fake_execution = SimpleNamespace(
+            id=882,
+            capability_name="mim_arm.execute_safe_home",
+            requested_executor="tod",
+            dispatch_decision="blocked",
+            status="blocked",
+            reason="execution_readiness_blocked",
+            feedback_json={"execution_policy_gate": {"dispatch_decision": "blocked"}},
+        )
+
+        with patch.object(mim_arm, "load_mim_arm_status_surface", return_value=status_surface), patch.object(
+            mim_arm.gateway_router,
+            "_create_or_update_execution_binding",
+            AsyncMock(return_value=fake_execution),
+        ) as binding_mock:
+            response = await mim_arm.execute_safe_home(
+                payload=mim_arm.MimArmExecuteSafeHomeRequest(
+                    actor="operator",
+                    reason="try despite persistent communication escalation",
+                    explicit_operator_approval=True,
+                    shared_workspace_active=False,
+                ),
+                db=db,
+            )
+
+        self.assertEqual(response["resolution"]["outcome"], "blocked")
+        self.assertEqual(response["resolution"]["reason"], "execution_readiness_blocked")
+        self.assertIn("communication_escalation_persistent", response["resolution"]["clarification_prompt"])
+        self.assertFalse(bool(binding_mock.await_args.kwargs.get("force_dispatch")))
+
     def test_control_readiness_surfaces_access_management_and_control_blockers(self):
         status_surface = {
             "arm_online": True,
@@ -975,7 +1024,11 @@ class MimArmControlledAccessBaselineTest(unittest.IsolatedAsyncioTestCase):
             (root / mim_arm.ARM_STATUS_ARTIFACT).write_text(
                 json.dumps(
                     {
+                        "host_timestamp": datetime.now(timezone.utc).isoformat(),
+                        "source_host": "mim-arm-pi",
+                        "arm_state_probe": {"available": True},
                         "arm_online": True,
+                        "app_alive": True,
                         "camera_online": True,
                         "serial_ready": True,
                         "estop_ok": True,
@@ -1040,6 +1093,88 @@ class MimArmControlledAccessBaselineTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(catchup_detail["refresh_evidence_ok"])
         self.assertFalse(catchup_detail["fresh"])
         self.assertIn("objective_match", catchup_detail["failed_refresh_checks"])
+
+    def test_status_surface_blocks_dispatch_when_communication_escalation_persists(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / mim_arm.ARM_STATUS_ARTIFACT).write_text(
+                json.dumps(
+                    {
+                        "host_timestamp": datetime.now(timezone.utc).isoformat(),
+                        "source_host": "mim-arm-pi",
+                        "arm_state_probe": {"available": True},
+                        "arm_online": True,
+                        "app_alive": True,
+                        "camera_online": True,
+                        "serial_ready": True,
+                        "estop_ok": True,
+                        "estop_status": "clear",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (root / mim_arm.TOD_COMMAND_STATUS_ARTIFACT).write_text(
+                json.dumps(
+                    {
+                        "generated_at": "2026-03-29T20:00:00Z",
+                        "execution_readiness": {
+                            "status": "valid",
+                            "detail": "Readiness appears valid.",
+                            "execution_allowed": True,
+                            "policy_outcome": "allow",
+                            "freshness_state": "fresh",
+                            "authoritative": True,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (root / mim_arm.TOD_CATCHUP_GATE_ARTIFACT).write_text(
+                json.dumps(
+                    {
+                        "generated_at": "2026-03-29T20:00:00Z",
+                        "gate_pass": True,
+                        "promotion_ready": True,
+                        "confidence": "high",
+                        "details": {
+                            "alignment_status": "in_sync",
+                            "refresh_evidence_ok": True,
+                            "fresh": True,
+                            "refresh_checks": {},
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (root / mim_arm.MIM_DECISION_TASK_ARTIFACT).write_text(
+                json.dumps(
+                    {
+                        "communication_escalation": {
+                            "required": True,
+                            "code": "ask_tod_status_loudly",
+                            "detail": "TOD remains silent.",
+                            "required_cycle_count": 4,
+                            "block_dispatch_threshold_cycles": 3,
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with patch.object(
+                mim_arm._mim_health_monitor,
+                "get_health_summary",
+                return_value={"status": "healthy"},
+            ):
+                surface = mim_arm.load_mim_arm_status_surface(shared_root=root)
+                readiness = mim_arm.build_mim_arm_control_readiness(surface)
+
+        self.assertFalse(surface["tod_execution_allowed"])
+        self.assertEqual(surface["tod_execution_block_reason"], "communication_escalation_persistent")
+        self.assertIn("tod_execution_not_allowed", surface["motion_block_reasons"])
+        self.assertTrue(surface["tod_readiness"]["communication_dispatch_gate"]["active"])
+        self.assertFalse(readiness["control"]["ready"])
+        self.assertIn("Persistent TOD communication escalation", readiness["recommended_next_step"])
 
     def test_publish_mim_arm_execution_to_tod_writes_request_and_trigger_artifacts(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1110,7 +1245,7 @@ class MimArmControlledAccessBaselineTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(publication["local_written"])
         self.assertEqual(publication["task_id"], expected_request_id)
         self.assertEqual(publication["request_id"], expected_request_id)
-        self.assertNotIn("task_id", request)
+        self.assertEqual(request["task_id"], expected_request_id)
         self.assertEqual(request["request_id"], expected_request_id)
         self.assertEqual(request["action"], "safe_home")
         self.assertEqual(request["execution_id"], 207747)
@@ -1325,6 +1460,96 @@ class MimArmControlledAccessBaselineTest(unittest.IsolatedAsyncioTestCase):
             step["request_id"] = request_id
             step["task_id"] = request_id
             step["correlation_id"] = "corr-safe-home-1"
+
+            proof_requirements, proof_chain_complete, reason = mim_arm._step_proof_from_telemetry(
+                step,
+                shared_root=root,
+            )
+
+        self.assertTrue(proof_chain_complete)
+        self.assertEqual(step["status"], "proved")
+        self.assertEqual(reason, "safe_home_completed")
+        self.assertTrue(proof_requirements["tod_ack_result_aligned"])
+        self.assertTrue(proof_requirements["explicit_host_attribution_present"])
+
+    def test_composed_step_proof_accepts_result_with_ack_lineage_when_latest_ack_is_stale(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            request_id = "objective-111-task-mim-arm-safe-home-2"
+            telemetry_dir = root / "mim_arm_dispatch_telemetry"
+            telemetry_dir.mkdir(parents=True, exist_ok=True)
+            (telemetry_dir / f"{request_id}.json").write_text(
+                json.dumps(
+                    {
+                        "request_id": request_id,
+                        "task_id": request_id,
+                        "correlation_id": "corr-safe-home-2",
+                        "dispatch_status": "published_remote",
+                        "completion_status": "pending",
+                        "evidence_sources": [
+                            {"kind": "publication_boundary", "matched": True},
+                        ],
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (root / mim_arm.TOD_TASK_RESULT_ARTIFACT).write_text(
+                json.dumps(
+                    {
+                        "request_id": request_id,
+                        "task_id": request_id,
+                        "correlation_id": "corr-safe-home-2",
+                        "generated_at": "2026-04-07T01:05:03Z",
+                        "message_kind": "result",
+                        "ack_sequence": 42,
+                        "acknowledged_trigger_sequence": 84,
+                        "status": "success",
+                        "reason": "safe_home_completed",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (root / "TOD_MIM_TASK_ACK.latest.json").write_text(
+                json.dumps(
+                    {
+                        "request_id": "objective-111-task-mim-arm-safe-home-stale",
+                        "task_id": "objective-111-task-mim-arm-safe-home-stale",
+                        "correlation_id": "corr-safe-home-stale",
+                        "generated_at": "2026-04-07T01:05:01Z",
+                        "status": "accepted",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (root / mim_arm.ARM_HOST_STATE_ARTIFACT).write_text(
+                json.dumps(
+                    {
+                        "last_request_id": request_id,
+                        "last_task_id": request_id,
+                        "last_correlation_id": "corr-safe-home-2",
+                        "last_command_result": {
+                            "request_id": request_id,
+                            "task_id": request_id,
+                            "correlation_id": "corr-safe-home-2",
+                        },
+                        "command_evidence": {
+                            "request_id": request_id,
+                            "task_id": request_id,
+                            "correlation_id": "corr-safe-home-2",
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            step = mim_arm._new_composed_step(0, "safe_home")
+            step["request_id"] = request_id
+            step["task_id"] = request_id
+            step["correlation_id"] = "corr-safe-home-2"
 
             proof_requirements, proof_chain_complete, reason = mim_arm._step_proof_from_telemetry(
                 step,

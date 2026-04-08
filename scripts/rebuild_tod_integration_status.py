@@ -12,6 +12,9 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SHARED_DIR = ROOT / "runtime" / "shared"
+CANONICAL_COMMUNICATION_HOST = "192.168.1.120"
+CANONICAL_COMMUNICATION_ROOT = str(DEFAULT_SHARED_DIR.resolve())
+CANONICAL_COMMUNICATION_SURFACE = "mim_runtime_shared"
 LOCAL_ONLY_REQUEST_SOURCES = {"objective75_overnight", "continuous_task_dispatch"}
 REMOTE_PUBLISH_REQUEST_SOURCES = {
     "mim_tod_auto_reissue",
@@ -118,7 +121,7 @@ def build_payload(shared_dir: Path, output_path: Path) -> dict[str, Any]:
     handshake = read_json(handshake_path)
     request = read_json(request_path)
     boundary_status = read_json(boundary_status_path)
-    boundary_request = boundary_status.get("remote_request") if isinstance(boundary_status.get("remote_request"), dict) else {}
+    boundary_request = boundary_status.get("authoritative_request") if isinstance(boundary_status.get("authoritative_request"), dict) else {}
     effective_request = boundary_request if boundary_request else request
 
     manifest_payload = manifest.get("manifest") if isinstance(manifest.get("manifest"), dict) else {}
@@ -276,11 +279,16 @@ def build_payload(shared_dir: Path, output_path: Path) -> dict[str, Any]:
             ),
         },
         "publication_boundary": {
-            "authoritative_surface": str(boundary_status.get("authoritative_surface") or "remote_raspberry_pi"),
-            "authoritative_path": str(boundary_request.get("path") or "/home/testpilot/mim/runtime/shared/MIM_TOD_TASK_REQUEST.latest.json"),
+            "authoritative_surface": CANONICAL_COMMUNICATION_SURFACE,
+            "authoritative_host": CANONICAL_COMMUNICATION_HOST,
+            "authoritative_root": CANONICAL_COMMUNICATION_ROOT,
+            "authoritative_path": str(boundary_request.get("path") or f"{CANONICAL_COMMUNICATION_ROOT}/MIM_TOD_TASK_REQUEST.latest.json"),
             "local_surface": str(request_path),
-            "local_surface_role": "mirror_or_staging_only",
+            "local_surface_role": str(boundary_status.get("local_surface_role") or "authoritative_communication_root"),
             "local_only_writer_active": publication_lane == "local_only",
+            "observed_boundary_authoritative_surface": str(boundary_status.get("authoritative_surface") or ""),
+            "observed_boundary_authoritative_host": str(boundary_status.get("authoritative_host") or ""),
+            "observed_boundary_authoritative_root": str(boundary_status.get("authoritative_root") or ""),
             "status_artifact": str(boundary_status_path),
             "status_generated_at": str(boundary_status.get("generated_at") or ""),
         },

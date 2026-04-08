@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pull TOD-owned response artifacts from the remote shared root into local runtime/shared."""
+"""Pull TOD-owned response artifacts from the canonical communication shared root into local runtime/shared."""
 
 from __future__ import annotations
 
@@ -41,22 +41,21 @@ DEFAULT_ARTIFACTS = [
     CONTRACT_RECEIPT_ARTIFACT,
 ]
 OPTIONAL_ARTIFACTS = {CONTRACT_RECEIPT_ARTIFACT}
+DEFAULT_CANONICAL_SSH_USER = os.getenv("MIM_TOD_SSH_USER", os.getenv("MIM_TOD_SSH_HOST_USER", "testpilot"))
+DEFAULT_CANONICAL_SSH_PORT = int(os.getenv("MIM_TOD_SSH_PORT", "22") or "22")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--host", default=os.getenv("MIM_TOD_SSH_HOST", os.getenv("MIM_ARM_SSH_HOST", "192.168.1.90")))
+    parser.add_argument("--host", default=os.getenv("MIM_TOD_SSH_HOST", "192.168.1.120"))
     parser.add_argument(
         "--ssh-user",
-        default=os.getenv(
-            "MIM_TOD_SSH_USER",
-            os.getenv("MIM_TOD_SSH_HOST_USER", os.getenv("MIM_ARM_SSH_HOST_USER", os.getenv("MIM_ARM_SSH_USER", "testpilot"))),
-        ),
+        default=DEFAULT_CANONICAL_SSH_USER,
     )
     parser.add_argument(
         "--ssh-port",
         type=int,
-        default=int(os.getenv("MIM_TOD_SSH_PORT", os.getenv("MIM_ARM_SSH_HOST_PORT", "22")) or "22"),
+        default=DEFAULT_CANONICAL_SSH_PORT,
     )
     parser.add_argument("--password-env", default="MIM_TOD_SSH_PASS")
     parser.add_argument(
@@ -92,8 +91,6 @@ def _resolve_password(password_env: str) -> str:
         os.getenv(password_env, "")
         or os.getenv("MIM_TOD_SSH_PASSWORD", "")
         or os.getenv("MIM_TOD_SSH_PASS", "")
-        or os.getenv("MIM_ARM_SSH_HOST_PASS", "")
-        or os.getenv("MIM_ARM_SSH_PASSWORD", "")
     )
 
 

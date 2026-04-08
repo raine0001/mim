@@ -8,6 +8,7 @@ USER_UNIT_DIR="$HOME/.config/systemd/user"
 UNITS=(
   mim-watch-shared-triggers.service
   mim-watch-tod-liveness.service
+  mim-watch-tod-console-probe.service
   mim-watch-tod-bridge-artifacts-remote.service
   mim-watch-tod-catchup-status.service
   mim-watch-tod-task-status-review.service
@@ -28,6 +29,7 @@ mkdir -p "$USER_UNIT_DIR"
 for script in \
   "$ROOT_DIR/scripts/watch_shared_triggers.sh" \
   "$ROOT_DIR/scripts/watch_tod_liveness.sh" \
+  "$ROOT_DIR/scripts/watch_tod_console_probe.sh" \
   "$ROOT_DIR/scripts/watch_tod_bridge_artifacts_remote.sh" \
   "$ROOT_DIR/scripts/watch_tod_catchup_status.sh" \
   "$ROOT_DIR/scripts/watch_tod_task_status_review.sh" \
@@ -60,6 +62,7 @@ echo "Stopping manually launched duplicates (if any)..."
 pkill -f '/home/testpilot/mim/scripts/run_objective75_overnight_loop.sh' 2>/dev/null || true
 pkill -f '/home/testpilot/mim/scripts/watch_shared_triggers.sh' 2>/dev/null || true
 pkill -f '/home/testpilot/mim/scripts/watch_tod_liveness.sh' 2>/dev/null || true
+pkill -f '/home/testpilot/mim/scripts/watch_tod_console_probe.sh' 2>/dev/null || true
 pkill -f '/home/testpilot/mim/scripts/watch_tod_bridge_artifacts_remote.sh' 2>/dev/null || true
 pkill -f '/home/testpilot/mim/scripts/watch_tod_catchup_status.sh' 2>/dev/null || true
 pkill -f '/home/testpilot/mim/scripts/watch_tod_task_status_review.sh' 2>/dev/null || true

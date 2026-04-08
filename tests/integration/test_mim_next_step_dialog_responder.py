@@ -157,7 +157,166 @@ class MimNextStepDialogResponderTest(unittest.TestCase):
             self.assertEqual(next_steps["execution_lane"], "tod_bridge_request")
 
             status = json.loads((logs / "mim_next_step_dialog_responder.latest.json").read_text(encoding="utf-8"))
-            self.assertEqual(status["state"], "handoff_response_appended")
+            self.assertEqual(status["state"], "response_appended")
+            self.assertEqual(int(status["processed_count"]), 1)
+
+    def test_appends_status_response_and_closes_session_index(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            shared = root / "shared"
+            dialog = shared / "dialog"
+            logs = root / "logs"
+            shared.mkdir(parents=True, exist_ok=True)
+            dialog.mkdir(parents=True, exist_ok=True)
+            logs.mkdir(parents=True, exist_ok=True)
+
+            session_id = "tod-operator-chat-explain-bridge-status-test"
+            session_path = dialog / f"MIM_TOD_DIALOG.session-{session_id}.jsonl"
+            index_path = dialog / "MIM_TOD_DIALOG.sessions.latest.json"
+            index_path.write_text(
+                json.dumps(
+                    {
+                        "sessions": [
+                            {
+                                "session_id": session_id,
+                                "status": "awaiting_reply",
+                                "timed_out": False,
+                                "message_count": 1,
+                                "updated_at": iso_now(),
+                                "session_path": str(session_path),
+                                "open_reply": {
+                                    "turn_id": 1,
+                                    "from": "TOD",
+                                    "to": "MIM",
+                                    "message_type": "status_request",
+                                    "summary": "TOD operator chat asks MIM: What is the current bridge mismatch?",
+                                    "timestamp": iso_now(),
+                                },
+                                "last_message": {
+                                    "turn_id": 1,
+                                    "from": "TOD",
+                                    "to": "MIM",
+                                    "message_type": "status_request",
+                                    "summary": "TOD operator chat asks MIM: What is the current bridge mismatch?",
+                                    "task_id": "objective-115-task-mim-arm-capture-frame-20260407033825",
+                                    "correlation_id": "",
+                                    "timestamp": iso_now(),
+                                },
+                            }
+                        ]
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            session_path.write_text(
+                json.dumps(
+                    {
+                        "session_id": session_id,
+                        "turn_id": 1,
+                        "timestamp": iso_now(),
+                        "from": "TOD",
+                        "to": "MIM",
+                        "message_type": "status_request",
+                        "intent": "explain_bridge_status",
+                        "task_id": "objective-115-task-mim-arm-capture-frame-20260407033825",
+                        "summary": "TOD operator chat asks MIM: What is the current bridge mismatch?",
+                        "payload": {
+                            "objective_id": "objective-115",
+                            "request_kind": "operator_chat",
+                            "query": "What is the current bridge mismatch?",
+                            "intent": "explain_bridge_status",
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            (shared / "TOD_INTEGRATION_STATUS.latest.json").write_text(
+                json.dumps(
+                    {
+                        "objective_alignment": {"status": "in_sync", "mim_objective_active": "141"},
+                        "failure_signals": ["listener_task_request_missing"],
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (shared / "MIM_TASK_STATUS_REVIEW.latest.json").write_text(
+                json.dumps(
+                    {
+                        "task": {"active_task_id": "coordination-objective-141-publication_surface_divergence"},
+                        "state": "idle_blocked",
+                        "state_reason": "task_stream_drift",
+                        "blocking_reason_codes": ["task_stream_drift", "task_ack_request_mismatch"],
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (shared / "MIM_TASK_STATUS_NEXT_ACTION.latest.json").write_text(
+                json.dumps(
+                    {
+                        "selected_action": {
+                            "code": "stabilize_task_stream",
+                            "detail": "Stop rotating publishers from overwriting the active task packet and reissue one authoritative task_id.",
+                        }
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (shared / "MIM_CONTEXT_EXPORT.latest.json").write_text(
+                json.dumps({"objective_active": "141"}) + "\n",
+                encoding="utf-8",
+            )
+
+            completed = subprocess.run(
+                ["bash", str(RESPONDER_SCRIPT)],
+                cwd=ROOT,
+                env={
+                    **os.environ,
+                    "SHARED_DIR": str(shared),
+                    "DIALOG_ROOT": str(dialog),
+                    "LOG_DIR": str(logs),
+                    "RUN_ONCE": "1",
+                    "POLL_SECONDS": "1",
+                },
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+
+            rows = [json.loads(line) for line in session_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            response = rows[-1]
+            self.assertEqual(response["message_type"], "status_response")
+            self.assertEqual(response["intent"], "explain_bridge_status")
+            self.assertEqual(response["reply_to_turn"], 1)
+            self.assertIn("stale task-stream artifacts", response["summary"])
+            self.assertEqual(response["payload"]["objective_id"], "141")
+            self.assertIn("task_stream_drift", response["payload"]["flags"])
+
+            updated_index = json.loads(index_path.read_text(encoding="utf-8"))
+            session_entry = updated_index["sessions"][0]
+            self.assertEqual(session_entry["status"], "replied")
+            self.assertEqual(session_entry["open_reply"], {})
+            self.assertEqual(session_entry["last_message"]["message_type"], "status_response")
+
+            latest_snapshot = json.loads(
+                (dialog / f"MIM_TOD_DIALOG.session-{session_id}.latest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(latest_snapshot["status"], "replied")
+            self.assertEqual(latest_snapshot["open_reply"], {})
+            self.assertEqual(
+                latest_snapshot["last_message"]["message_type"], "status_response"
+            )
+
+            status = json.loads((logs / "mim_next_step_dialog_responder.latest.json").read_text(encoding="utf-8"))
+            self.assertEqual(status["state"], "response_appended")
             self.assertEqual(int(status["processed_count"]), 1)
 
     def test_does_not_duplicate_existing_handoff_response(self) -> None:
