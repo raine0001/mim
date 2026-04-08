@@ -132,6 +132,7 @@ This registry indexes objective evidence and promotion artifacts so objective hi
 | 165 | Self-Evolution Next Action | implemented | not recorded | objective-165 | core/self_evolution_service.py; core/routers/improvement.py; tests/integration/test_objective165_self_evolution_next_action.py; docs/objective-165-self-evolution-next-action.md | docs/objective-165-promotion-readiness-report.md | — | self_evolution_next_action |
 | 166 | Self-Evolution Briefing Packet | implemented | not recorded | objective-166 | core/self_evolution_service.py; core/routers/improvement.py; tests/integration/test_objective166_self_evolution_briefing.py; docs/objective-166-self-evolution-briefing-packet.md | docs/objective-166-promotion-readiness-report.md | — | self_evolution_briefing |
 | 167 | Self-Evolution Operator Visibility | implemented | not recorded | objective-167 | core/routers/mim_ui.py; tests/integration/test_objective167_self_evolution_operator_visibility.py; docs/objective-167-self-evolution-operator-visibility.md | docs/objective-167-promotion-readiness-report.md | — | self_evolution_operator_visibility |
+| 168 | Self-Evolution Operator Actionability | implemented | not recorded | objective-168 | core/routers/mim_ui.py; tests/integration/test_objective168_self_evolution_operator_actionability.py; docs/objective-168-self-evolution-operator-actionability.md | docs/objective-168-promotion-readiness-report.md | — | self_evolution_operator_actionability |
 
 ## Notes
 

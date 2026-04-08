@@ -183,6 +183,13 @@ Current self-evolution operator-visibility checkpoint after Objective 167:
 - This slice stays non-destructive: the MIM UI reads the existing self-evolution briefing contract with `refresh=false` and does not create a parallel recommendation path.
 - The authoritative focused lane passed on the fresh current-source runtime on `:18001` across Objectives 54, 55, 164, 165, 166, and 167.
 
+Current self-evolution operator-actionability checkpoint after Objective 168:
+
+- Objective 168 normalizes the bounded self-evolution next action into an operator-ready UI contract so `/mim/ui/state` exposes the exact method, path, and concise action summary for the recommended follow-up call.
+- The action contract is mirrored into `conversation_context` for downstream conversational surfaces and rendered in the system reasoning panel as the explicit next step.
+- This slice stays non-destructive: it reuses the existing Objective 166 action packet and does not introduce a new mutation or approval path.
+- The authoritative focused lane passed on the fresh current-source runtime on `:18001` across Objectives 54, 55, 164, 165, 166, 167, and 168.
+
 ## Future Objectives
 
 - Objective 58 — Adaptive autonomy boundaries (experience-conditioned autonomy limits)
@@ -203,7 +210,7 @@ Current self-evolution operator-visibility checkpoint after Objective 167:
 - 123–130: Recovery-commitment lifecycle, conflict handling, propagation, rollout preview, admission control, and operator rollup
 - 131–141: Strategy planning, intent understanding, explainability, confidence, refinement, environment awareness, context persistence, coordination, and safety envelope
 - 142–153: Conversation reliability, TOD dialog convergence, action confirmation, interrupt/control continuity, error clarity, system awareness, consistency enforcement, trust signals, lightweight autonomy, human feedback capture, stability guards, and session continuity bridging
-- 164–167: Self-evolution core snapshot, bounded next-action guidance, resolved briefing packets, and operator-visible UI integration over proposals, recommendations, and backlog governance
+- 164–168: Self-evolution core snapshot, bounded next-action guidance, resolved briefing packets, operator-visible UI integration, and operator-ready action contracts over proposals, recommendations, and backlog governance
 
 ## Governance Notes
 
