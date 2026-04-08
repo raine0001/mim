@@ -1,9 +1,9 @@
 # Objectives 123-130 Promotion Readiness Report
 
-Date: 2026-04-07
+Date: 2026-04-08
 Objectives: 123-130
 Title: Recovery Governance Lifecycle Batch
-Status: ready_for_promotion_review
+Status: promoted_verified
 Target Release Tag: objective-130
 
 ## Scope Delivered
@@ -61,18 +61,34 @@ That validation proves:
 - recovery-derived commitments remain visible as conflict sources in both execution-control and UI rollups
 - Objective 121 commitment creation and Objective 122 commitment evaluation continue to pass unchanged
 
-## Promotion Gate Attempt
+## Promotion Execution
 
-The required host promotion workflow from `docs/deployment-policy.md` was re-run from this workspace:
+The required host promotion workflow from `docs/deployment-policy.md` completed from this workspace:
 
 - `bash ./scripts/verify_isolation.sh`
 - `./scripts/smoke_test.sh test`
+- `./scripts/promote_test_to_prod.sh objective-130`
+- `./scripts/smoke_test.sh prod`
 
 Observed result on this host:
 
-- both commands reached a `sudo` password prompt before the compose-backed verification and smoke flow could complete unattended
-- the host privilege boundary prevents completing the remaining mandatory promotion commands from the current chat session
-- this is a host-access constraint, not a feature-readiness failure in Objectives 123-130
+- `verify_isolation.sh`: PASS (`compose definitions keep prod/test runtime paths isolated`)
+- `smoke_test.sh test`: PASS
+- `promote_test_to_prod.sh objective-130`: PASS
+- `smoke_test.sh prod`: PASS
+
+## Production Evidence
+
+Live production manifest confirmed after the promotion:
+
+- `environment = prod`
+- `release_tag = objective-130`
+- `git_sha = 27f62bbea643061717e4303b3829602bfce2a6aa`
+- `build_timestamp = 2026-04-08T00:33:46Z`
+- `schema_version = 2026-03-24-70`
+
+Shared export truth required a follow-up reconciliation because the objective index still marked Objectives 123-130 as pre-promotion at the time the promotion script refreshed `runtime/shared/MIM_CONTEXT_EXPORT.latest.*`.
+That exporter behavior was consistent with the repository state and not a deployment failure.
 
 ## Readiness Assessment
 
@@ -84,10 +100,11 @@ Observed result on this host:
 - rollout preview: ready
 - admission-control integration: ready
 - operator-facing governance rollup: ready
-- promotion host gate: blocked on privilege boundary
+- promotion host gate: cleared
+- production runtime manifest: objective-130 live
 
 ## Readiness Decision
 
-- Objectives 123-130 feature slice: READY_FOR_PROMOTION_REVIEW
-- Production promotion state in this session: NOT_EXECUTED
-- Recommendation: complete the privileged host promotion flow for release tag `objective-130`, then record the production outcome in an Objective 130 production promotion report.
+- Objectives 123-130 feature slice: EXECUTED_AND_VERIFIED
+- Production promotion state in this session: EXECUTED
+- Recommendation: treat Objectives 123-130 as production-promoted and use the Objective 130 production report plus refreshed shared exports as the operational source of truth.

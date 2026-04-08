@@ -1,7 +1,7 @@
 # Objective 128 - Recovery Commitment Rollout Preview
 
-Date: 2026-04-07
-Status: ready_for_promotion_review
+Date: 2026-04-08
+Status: promoted_verified
 Depends On: Objective 121, Objective 122, Objective 126, Objective 127
 Target Release Tag: objective-130
 
