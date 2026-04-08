@@ -203,6 +203,7 @@ def to_execution_trace_out(
     intent: dict | None = None,
     orchestration: dict | None = None,
     stability: dict | None = None,
+    strategy_plan: dict | None = None,
 ) -> dict[str, Any]:
     return {
         "trace_id": row.trace_id,
@@ -219,4 +220,5 @@ def to_execution_trace_out(
         "intent": intent,
         "orchestration": orchestration,
         "stability": stability,
+        "strategy_plan": strategy_plan,
     }

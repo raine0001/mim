@@ -23,6 +23,13 @@ from core.execution_recovery_service import (
     to_execution_recovery_outcome_out,
 )
 from core.execution_policy_gate import build_intent_key, sync_execution_control_state
+from core.execution_strategy_service import (
+    advance_execution_strategy_plan,
+    ensure_execution_strategy_plan,
+    get_execution_strategy_plan,
+    list_execution_strategy_plans,
+    to_execution_strategy_plan_out,
+)
 from core.execution_trace_service import (
     get_execution_trace,
     list_execution_trace_events,
@@ -36,6 +43,7 @@ from core.models import (
     ExecutionIntent,
     ExecutionOverride,
     ExecutionRecoveryAttempt,
+    ExecutionStrategyPlan,
     ExecutionStabilityProfile,
     ExecutionTaskOrchestration,
     WorkspaceAutonomousChain,
@@ -75,6 +83,8 @@ from core.schemas import (
     ExecutionRecoveryPolicyCommitmentPreviewRequest,
     ExecutionRecoveryPolicyCommitmentEvaluateRequest,
     ExecutionRecoveryPolicyTuningApplyRequest,
+    ExecutionStrategyPlanAdvanceRequest,
+    ExecutionStrategyPlanCreateRequest,
     ExecutionStabilityEvaluateRequest,
 )
 from core.stability_monitor import evaluate_execution_stability, to_execution_stability_out
@@ -427,6 +437,18 @@ async def get_execution_trace_endpoint(
         .scalars()
         .first()
     )
+    strategy_plan = (
+        (
+            await db.execute(
+                select(ExecutionStrategyPlan)
+                .where(ExecutionStrategyPlan.trace_id == trace_id)
+                .order_by(ExecutionStrategyPlan.id.desc())
+                .limit(1)
+            )
+        )
+        .scalars()
+        .first()
+    )
     return {
         "trace": to_execution_trace_out(
             trace,
@@ -438,6 +460,11 @@ async def get_execution_trace_endpoint(
                 else None
             ),
             stability=to_execution_stability_out(stability) if stability is not None else None,
+            strategy_plan=(
+                to_execution_strategy_plan_out(strategy_plan)
+                if strategy_plan is not None
+                else None
+            ),
         )
     }
 
@@ -478,6 +505,130 @@ async def get_execution_orchestration_endpoint(
     if row is None:
         raise HTTPException(status_code=404, detail="execution_orchestration_not_found")
     return {"orchestration": to_execution_task_orchestration_out(row)}
+
+
+@router.get("/execution/strategy-plans")
+async def list_execution_strategy_plans_endpoint(
+    managed_scope: str = Query(default=""),
+    trace_id: str = Query(default=""),
+    limit: int = Query(default=20, ge=1, le=200),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    rows = await list_execution_strategy_plans(
+        db=db,
+        managed_scope=managed_scope,
+        trace_id=trace_id,
+        limit=limit,
+    )
+    return {"strategy_plans": [to_execution_strategy_plan_out(row) for row in rows]}
+
+
+@router.get("/execution/strategy-plans/{plan_id}")
+async def get_execution_strategy_plan_endpoint(
+    plan_id: int,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    row = await get_execution_strategy_plan(plan_id=plan_id, db=db)
+    if row is None:
+        raise HTTPException(status_code=404, detail="execution_strategy_plan_not_found")
+    return {"strategy_plan": to_execution_strategy_plan_out(row)}
+
+
+@router.post("/execution/strategy-plans")
+async def create_execution_strategy_plan_endpoint(
+    payload: ExecutionStrategyPlanCreateRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    execution = None
+    if payload.execution_id is not None:
+        execution = await db.get(CapabilityExecution, payload.execution_id)
+        if execution is None:
+            raise HTTPException(status_code=404, detail="capability_execution_not_found")
+    intent = None
+    if payload.intent_id is not None:
+        intent = await db.get(ExecutionIntent, payload.intent_id)
+    if intent is None and execution is not None:
+        intent = (
+            (
+                await db.execute(
+                    select(ExecutionIntent)
+                    .where(ExecutionIntent.trace_id == str(execution.trace_id or "").strip())
+                    .order_by(ExecutionIntent.id.desc())
+                    .limit(1)
+                )
+            )
+            .scalars()
+            .first()
+        )
+    if intent is None and str(payload.trace_id or "").strip():
+        intent = (
+            (
+                await db.execute(
+                    select(ExecutionIntent)
+                    .where(ExecutionIntent.trace_id == str(payload.trace_id).strip())
+                    .order_by(ExecutionIntent.id.desc())
+                    .limit(1)
+                )
+            )
+            .scalars()
+            .first()
+        )
+    if intent is None:
+        raise HTTPException(status_code=404, detail="execution_intent_not_found")
+
+    orchestration = None
+    if payload.orchestration_id is not None:
+        orchestration = await db.get(ExecutionTaskOrchestration, payload.orchestration_id)
+    if orchestration is None:
+        orchestration = (
+            (
+                await db.execute(
+                    select(ExecutionTaskOrchestration)
+                    .where(ExecutionTaskOrchestration.trace_id == str(intent.trace_id or payload.trace_id or "").strip())
+                    .order_by(ExecutionTaskOrchestration.id.desc())
+                    .limit(1)
+                )
+            )
+            .scalars()
+            .first()
+        )
+    if orchestration is None:
+        raise HTTPException(status_code=404, detail="execution_orchestration_not_found")
+
+    row = await ensure_execution_strategy_plan(
+        db=db,
+        trace_id=str(payload.trace_id or intent.trace_id or "").strip(),
+        intent=intent,
+        orchestration=orchestration,
+        execution_id=(int(execution.id) if execution is not None else payload.execution_id),
+        actor=payload.actor,
+        source=payload.source,
+    )
+    await db.commit()
+    return {"strategy_plan": to_execution_strategy_plan_out(row)}
+
+
+@router.post("/execution/strategy-plans/{plan_id}/advance")
+async def advance_execution_strategy_plan_endpoint(
+    plan_id: int,
+    payload: ExecutionStrategyPlanAdvanceRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    row = await get_execution_strategy_plan(plan_id=plan_id, db=db)
+    if row is None:
+        raise HTTPException(status_code=404, detail="execution_strategy_plan_not_found")
+    row = await advance_execution_strategy_plan(
+        plan=row,
+        actor=payload.actor,
+        source=payload.source,
+        completed_step_key=payload.completed_step_key,
+        outcome=payload.outcome,
+        observed_confidence=payload.observed_confidence,
+        metadata_json=payload.metadata_json,
+        db=db,
+    )
+    await db.commit()
+    return {"strategy_plan": to_execution_strategy_plan_out(row)}
 
 
 @router.post("/execution/overrides")

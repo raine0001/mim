@@ -490,6 +490,35 @@ class ExecutionTaskOrchestration(Base, TimestampMixin):
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
+class ExecutionStrategyPlan(Base, TimestampMixin):
+    __tablename__ = "execution_strategy_plans"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    trace_id: Mapped[str] = mapped_column(String(120), default="", index=True)
+    intent_id: Mapped[int | None] = mapped_column(nullable=True, index=True)
+    orchestration_id: Mapped[int | None] = mapped_column(nullable=True, index=True)
+    execution_id: Mapped[int | None] = mapped_column(
+        ForeignKey("capability_executions.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    source: Mapped[str] = mapped_column(String(80), default="objective131", index=True)
+    actor: Mapped[str] = mapped_column(String(120), default="system")
+    managed_scope: Mapped[str] = mapped_column(String(120), default="global", index=True)
+    status: Mapped[str] = mapped_column(String(40), default="planned", index=True)
+    plan_family: Mapped[str] = mapped_column(String(80), default="goal_driven_sequence")
+    canonical_intent: Mapped[str] = mapped_column(String(120), default="", index=True)
+    goal_summary: Mapped[str] = mapped_column(Text, default="")
+    primary_plan_json: Mapped[list[dict]] = mapped_column(JSON, default=list)
+    alternative_plans_json: Mapped[list[dict]] = mapped_column(JSON, default=list)
+    contingency_rules_json: Mapped[list[dict]] = mapped_column(JSON, default=list)
+    coordination_domains_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    continuation_state_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    explainability_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    confidence: Mapped[float] = mapped_column(default=0.0)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
 class ExecutionOverride(Base, TimestampMixin):
     __tablename__ = "execution_overrides"
 

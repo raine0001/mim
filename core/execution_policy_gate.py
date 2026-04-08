@@ -26,6 +26,10 @@ from core.execution_trace_service import (
     append_execution_trace_event,
 )
 from core.execution_truth_governance_service import latest_execution_truth_governance_snapshot
+from core.execution_strategy_service import (
+    ensure_execution_strategy_plan,
+    to_execution_strategy_plan_out,
+)
 from core.intent_store import ensure_execution_intent
 from core.models import CapabilityExecution, ExecutionOverride, ExecutionStabilityProfile
 from core.operator_resolution_service import (
@@ -509,6 +513,15 @@ async def sync_execution_control_state(
             "policy_gate_status": execution.status,
         },
     )
+    strategy_plan = await ensure_execution_strategy_plan(
+        db=db,
+        trace_id=trace.trace_id,
+        intent=intent,
+        orchestration=orchestration,
+        execution_id=int(execution.id),
+        actor=actor,
+        source=source,
+    )
     stability = await evaluate_execution_stability(
         db=db,
         managed_scope=managed_scope,
@@ -549,6 +562,7 @@ async def sync_execution_control_state(
         "root_intent_id": intent.id,
         "orchestration_id": orchestration.id,
         "latest_stability_id": stability.id,
+        "strategy_plan_id": strategy_plan.id,
     }
     execution.feedback_json = {
         **feedback,
@@ -561,6 +575,7 @@ async def sync_execution_control_state(
         "readiness_state_bus": _json_safe(
             gate_result.get("readiness_state_bus", {}) if isinstance(gate_result, dict) else {}
         ),
+        "strategy_plan": _json_safe(to_execution_strategy_plan_out(strategy_plan)),
         "stability": _json_safe(to_execution_stability_out(stability)),
     }
     await db.flush()
@@ -569,5 +584,6 @@ async def sync_execution_control_state(
         "managed_scope": managed_scope,
         "intent_id": int(intent.id),
         "orchestration": to_execution_task_orchestration_out(orchestration),
+        "strategy_plan": to_execution_strategy_plan_out(strategy_plan),
         "stability": to_execution_stability_out(stability),
     }

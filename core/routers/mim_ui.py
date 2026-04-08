@@ -21,9 +21,11 @@ from core.execution_readiness_service import (
   execution_readiness_summary,
   load_latest_execution_readiness,
 )
+from core.execution_strategy_service import latest_execution_strategy_plan, to_execution_strategy_plan_out
 from core.models import (
     Actor,
     CapabilityExecution,
+    ExecutionStrategyPlan,
     InputEvent,
     InputEventResolution,
     MemoryEntry,
@@ -1291,7 +1293,48 @@ def _operator_current_recommendation(
     execution_recovery: dict,
     commitment_monitoring: dict,
     commitment_outcome: dict,
+    strategy_plan: dict,
 ) -> dict:
+    continuation = (
+      strategy_plan.get("continuation_state", {})
+      if isinstance(strategy_plan.get("continuation_state", {}), dict)
+      else {}
+    )
+    explainability = (
+      strategy_plan.get("explainability", {})
+      if isinstance(strategy_plan.get("explainability", {}), dict)
+      else {}
+    )
+    if strategy_plan and bool(continuation.get("should_stop", False)):
+      return {
+        "source": "strategy_plan",
+        "decision": str(strategy_plan.get("status") or "blocked").strip() or "blocked",
+        "managed_scope": str(strategy_plan.get("managed_scope") or "").strip(),
+        "summary": _compact_sentence(
+          str(
+            continuation.get("stop_reason")
+            or explainability.get("what_it_will_do_next")
+            or explainability.get("summary")
+            or "strategy plan requested stop"
+          ).strip(),
+          max_len=180,
+        ),
+      }
+    if strategy_plan and bool(continuation.get("can_continue", False)):
+      return {
+        "source": "strategy_plan",
+        "decision": "continue_plan",
+        "managed_scope": str(strategy_plan.get("managed_scope") or "").strip(),
+        "summary": _compact_sentence(
+          str(
+            explainability.get("what_it_will_do_next")
+            or explainability.get("summary")
+            or strategy_plan.get("goal_summary")
+            or "continue bounded strategy plan"
+          ).strip(),
+          max_len=180,
+        ),
+      }
     if str(commitment_monitoring.get("governance_decision") or "").strip() and str(
         commitment_monitoring.get("governance_decision") or ""
     ).strip() != "maintain_commitment":
@@ -1821,6 +1864,38 @@ def _operator_recovery_governance_rollup_snapshot(
   }
 
 
+def _operator_strategy_plan_snapshot(row: ExecutionStrategyPlan | None) -> dict:
+  if row is None:
+    return {}
+  payload = to_execution_strategy_plan_out(row)
+  continuation = payload.get("continuation_state", {}) if isinstance(payload.get("continuation_state", {}), dict) else {}
+  explainability = payload.get("explainability", {}) if isinstance(payload.get("explainability", {}), dict) else {}
+  payload["summary"] = _compact_sentence(
+    str(explainability.get("summary") or payload.get("goal_summary") or "strategy plan available").strip(),
+    max_len=180,
+  )
+  payload["next_step_key"] = str(continuation.get("current_step_key") or "").strip()
+  return payload
+
+
+def _operator_trust_explainability_snapshot(strategy_plan: dict) -> dict:
+  if not strategy_plan:
+    return {}
+  explainability = strategy_plan.get("explainability", {}) if isinstance(strategy_plan.get("explainability", {}), dict) else {}
+  continuation = strategy_plan.get("continuation_state", {}) if isinstance(strategy_plan.get("continuation_state", {}), dict) else {}
+  return {
+    "managed_scope": str(strategy_plan.get("managed_scope") or "").strip(),
+    "confidence": float(strategy_plan.get("confidence") or 0.0),
+    "what_it_did": _compact_sentence(str(explainability.get("what_it_did") or "").strip(), max_len=180),
+    "why_it_did_it": _compact_sentence(str(explainability.get("why_it_did_it") or "").strip(), max_len=180),
+    "what_it_will_do_next": _compact_sentence(str(explainability.get("what_it_will_do_next") or "").strip(), max_len=180),
+    "confidence_reasoning": _compact_sentence(str(explainability.get("confidence_reasoning") or "").strip(), max_len=180),
+    "can_continue": bool(continuation.get("can_continue", False)),
+    "should_stop": bool(continuation.get("should_stop", False)),
+    "stop_reason": str(continuation.get("stop_reason") or "").strip(),
+  }
+
+
 def _build_operator_reasoning_payload(
     *,
     goal_row: WorkspaceStrategyGoal | None,
@@ -1847,6 +1922,7 @@ def _build_operator_reasoning_payload(
     tod_decision_process: dict,
     runtime_health: dict,
     runtime_recovery: dict,
+    strategy_plan_row: ExecutionStrategyPlan | None,
 ) -> dict:
     goal = _operator_goal_snapshot(goal_row)
     inquiry = _operator_inquiry_snapshot(inquiry_row)
@@ -1876,6 +1952,8 @@ def _build_operator_reasoning_payload(
     recovery = _operator_execution_recovery_snapshot(execution_recovery)
     recovery_learning = _operator_execution_recovery_learning_snapshot(execution_recovery)
     recovery_policy_tuning = _operator_execution_recovery_policy_tuning_snapshot(execution_recovery)
+    strategy_plan = _operator_strategy_plan_snapshot(strategy_plan_row)
+    trust_explainability = _operator_trust_explainability_snapshot(strategy_plan)
     recovery_governance_rollup = _operator_recovery_governance_rollup_snapshot(
       execution_recovery=execution_recovery,
       recovery_commitment=recovery_commitment,
@@ -1893,6 +1971,7 @@ def _build_operator_reasoning_payload(
         execution_recovery=recovery,
         commitment_monitoring=commitment_monitoring,
         commitment_outcome=commitment_outcome,
+        strategy_plan=strategy_plan,
     )
     return {
         "summary": _build_operator_reasoning_summary(
@@ -1930,6 +2009,8 @@ def _build_operator_reasoning_payload(
         "execution_recovery_policy_commitment_monitoring": recovery_commitment_monitoring,
         "execution_recovery_policy_commitment_outcome": recovery_commitment_outcome,
         "execution_recovery_governance_rollup": recovery_governance_rollup,
+        "strategy_plan": strategy_plan,
+        "trust_explainability": trust_explainability,
         "current_recommendation": recommendation,
         "resolution_commitment": commitment,
         "commitment_monitoring": commitment_monitoring,
@@ -7158,6 +7239,7 @@ async def mim_ui_state(db: AsyncSession = Depends(get_db)) -> dict:
     latest_recovery_policy_commitment_monitoring = None
     latest_recovery_policy_commitment_outcome = None
     latest_execution_recovery: dict = {}
+    latest_strategy_plan = None
     learned_preferences: list[dict] = []
     proposal_policy_preferences: list[dict] = []
     policy_conflict_profiles: list[dict] = []
@@ -7462,6 +7544,20 @@ async def mim_ui_state(db: AsyncSession = Depends(get_db)) -> dict:
         managed_scope=str(latest_recovery_execution.managed_scope or "").strip(),
         db=db,
       ) or {}
+      latest_strategy_plan = await latest_execution_strategy_plan(
+        db=db,
+        trace_id=str(latest_recovery_execution.trace_id or "").strip(),
+      )
+      if latest_strategy_plan is None:
+        latest_strategy_plan = await latest_execution_strategy_plan(
+          db=db,
+          managed_scope=(operator_reasoning_scope or str(latest_recovery_execution.managed_scope or "").strip()),
+        )
+    elif operator_reasoning_scope:
+      latest_strategy_plan = await latest_execution_strategy_plan(
+        db=db,
+        managed_scope=operator_reasoning_scope,
+      )
 
     latest_memory = (
         (await db.execute(select(MemoryEntry).order_by(MemoryEntry.id.desc()).limit(1)))
@@ -7952,6 +8048,7 @@ async def mim_ui_state(db: AsyncSession = Depends(get_db)) -> dict:
         tod_decision_process=tod_decision_process,
         runtime_health=runtime_health,
         runtime_recovery=runtime_recovery,
+        strategy_plan_row=latest_strategy_plan,
     )
 
     return {

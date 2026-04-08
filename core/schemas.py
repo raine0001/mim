@@ -822,6 +822,49 @@ class ExecutionRecoveryPolicyCommitmentPreviewRequest(BaseModel):
         return normalized
 
 
+class ExecutionStrategyPlanCreateRequest(BaseModel):
+    actor: str = "system"
+    source: str = "objective131"
+    trace_id: str = ""
+    intent_id: int | None = Field(default=None, ge=1)
+    orchestration_id: int | None = Field(default=None, ge=1)
+    execution_id: int | None = Field(default=None, ge=1)
+    managed_scope: str = ""
+
+
+class ExecutionStrategyPlanAdvanceRequest(BaseModel):
+    actor: str = "system"
+    source: str = "objective134"
+    completed_step_key: str = Field(min_length=1, max_length=120)
+    outcome: Literal["completed", "failed", "blocked", "skipped"] = "completed"
+    observed_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class ExecutionStrategyPlanOut(BaseModel):
+    strategy_plan_id: int
+    trace_id: str
+    intent_id: int | None = None
+    orchestration_id: int | None = None
+    execution_id: int | None = None
+    source: str
+    actor: str
+    managed_scope: str
+    status: str
+    plan_family: str
+    canonical_intent: str
+    goal_summary: str
+    primary_plan: list[dict] = Field(default_factory=list)
+    alternative_plans: list[dict] = Field(default_factory=list)
+    contingency_rules: list[dict] = Field(default_factory=list)
+    coordination_domains: list[str] = Field(default_factory=list)
+    continuation_state: dict = Field(default_factory=dict)
+    explainability: dict = Field(default_factory=dict)
+    confidence: float
+    metadata_json: dict = Field(default_factory=dict)
+    created_at: datetime
+
+
 class ExecutionRecoveryLearningOut(BaseModel):
     recovery_learning_profile_id: int
     managed_scope: str

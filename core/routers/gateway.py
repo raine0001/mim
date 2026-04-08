@@ -32,6 +32,7 @@ from core.camera_scene import (
 )
 from core.db import get_db
 from core.config import settings
+from core.execution_strategy_service import understand_intent
 from core.execution_policy_gate import (
     build_intent_key,
     evaluate_execution_policy_gate,
@@ -3729,6 +3730,7 @@ def _to_resolution_out(row: InputEventResolution) -> dict:
 
 def _to_execution_out(row: CapabilityExecution) -> dict:
     feedback = row.feedback_json if isinstance(row.feedback_json, dict) else {}
+    strategy_plan = feedback.get("strategy_plan", {}) if isinstance(feedback.get("strategy_plan", {}), dict) else {}
     return {
         "execution_id": row.id,
         "input_event_id": row.input_event_id,
@@ -3744,6 +3746,7 @@ def _to_execution_out(row: CapabilityExecution) -> dict:
         "status": row.status,
         "reason": row.reason,
         "feedback_json": feedback,
+        "strategy_plan": strategy_plan,
         "execution_readiness": (
             feedback.get("execution_readiness", {})
             if isinstance(feedback.get("execution_readiness", {}), dict)
@@ -6188,6 +6191,28 @@ def _goal_description(event: InputEvent, internal_intent: str) -> str:
     return f"{internal_intent}: {event.raw_input.strip()}"
 
 
+def _requested_domains_for_event(event: InputEvent, internal_intent: str, capability_name: str) -> list[str]:
+    domains: list[str] = []
+    raw_input = " ".join(str(event.raw_input or "").strip().lower().split())
+    metadata = event.metadata_json if isinstance(event.metadata_json, dict) else {}
+    if capability_name in {"workspace_check", "capture_frame"} or internal_intent == "observe_workspace":
+        domains.append("robot")
+    if metadata.get("web_research_enabled") or any(token in raw_input for token in {"research", "web", "search", "look up"}):
+        domains.append("web")
+    if any(token in raw_input for token in {"memory", "history", "context", "data"}):
+        domains.append("data")
+    domains.append("decision")
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for item in domains:
+        normalized = str(item or "").strip().lower()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        ordered.append(normalized)
+    return ordered
+
+
 def _parse_observed_at(raw_value: object) -> datetime | None:
     if not isinstance(raw_value, str) or not raw_value.strip():
         return None
@@ -7545,6 +7570,36 @@ async def _resolve_event(event: InputEvent, db: AsyncSession) -> InputEventResol
 
     goal_id: int | None = None
     goal_description = _goal_description(event, internal_intent)
+    requested_domains = _requested_domains_for_event(event, internal_intent, capability_name)
+    intent_understanding = understand_intent(
+        raw_text=event.raw_input,
+        internal_intent=internal_intent,
+        requested_goal=goal_description,
+        capability_name=capability_name,
+        metadata_json={
+            **metadata,
+            "requested_domains": requested_domains,
+        },
+    )
+    proposed_actions = _proposed_actions(
+        internal_intent, capability_name, goal_description
+    )
+    suggested_steps = (
+        intent_understanding.get("suggested_steps", [])
+        if isinstance(intent_understanding.get("suggested_steps", []), list)
+        else []
+    )
+    if suggested_steps:
+        proposed_actions = [
+            {
+                "step": int(item.get("step") or index),
+                "action_type": str(item.get("action_type") or "decision_review").strip(),
+                "capability": str(item.get("capability") or "").strip(),
+                "domain": str(item.get("domain") or "decision").strip(),
+                "details": str(item.get("details") or "").strip(),
+            }
+            for index, item in enumerate(suggested_steps, start=1)
+        ]
     if (
         outcome not in {"blocked", "store_only"}
         and internal_intent != "request_clarification"
@@ -7579,9 +7634,7 @@ async def _resolve_event(event: InputEvent, db: AsyncSession) -> InputEventResol
         capability_enabled=capability_enabled,
         goal_id=goal_id,
         proposed_goal_description=goal_description,
-        proposed_actions=_proposed_actions(
-            internal_intent, capability_name, goal_description
-        ),
+        proposed_actions=proposed_actions,
         metadata_json={
             "source": event.source,
             "confidence": event.confidence,
@@ -7595,6 +7648,8 @@ async def _resolve_event(event: InputEvent, db: AsyncSession) -> InputEventResol
             "conversation_topic": conversation_topic,
             "object_inquiry": object_inquiry,
             "web_research": web_research,
+            "requested_domains": requested_domains,
+            "intent_understanding": intent_understanding,
             "user_action_safety": user_action_safety,
             "governance": governance,
             "last_technical_research": _compact_technical_research_context(
