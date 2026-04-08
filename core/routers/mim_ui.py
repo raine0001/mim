@@ -1305,6 +1305,26 @@ def _operator_current_recommendation(
       if isinstance(strategy_plan.get("explainability", {}), dict)
       else {}
     )
+    safety_envelope = (
+      strategy_plan.get("safety_envelope", {})
+      if isinstance(strategy_plan.get("safety_envelope", {}), dict)
+      else {}
+    )
+    if strategy_plan and bool(safety_envelope.get("operator_review_required", False)):
+      return {
+        "source": "strategy_safety_envelope",
+        "decision": str(strategy_plan.get("status") or "pending_review").strip() or "pending_review",
+        "managed_scope": str(strategy_plan.get("managed_scope") or "").strip(),
+        "summary": _compact_sentence(
+          str(
+            safety_envelope.get("stop_reason")
+            or safety_envelope.get("governance_decision")
+            or explainability.get("why_it_did_it")
+            or "strategy safety envelope requested operator review"
+          ).strip(),
+          max_len=180,
+        ),
+      }
     if strategy_plan and bool(continuation.get("should_stop", False)):
       return {
         "source": "strategy_plan",
@@ -1883,13 +1903,22 @@ def _operator_trust_explainability_snapshot(strategy_plan: dict) -> dict:
     return {}
   explainability = strategy_plan.get("explainability", {}) if isinstance(strategy_plan.get("explainability", {}), dict) else {}
   continuation = strategy_plan.get("continuation_state", {}) if isinstance(strategy_plan.get("continuation_state", {}), dict) else {}
+  confidence_assessment = strategy_plan.get("confidence_assessment", {}) if isinstance(strategy_plan.get("confidence_assessment", {}), dict) else {}
+  environment_awareness = strategy_plan.get("environment_awareness", {}) if isinstance(strategy_plan.get("environment_awareness", {}), dict) else {}
+  coordination_state = strategy_plan.get("coordination_state", {}) if isinstance(strategy_plan.get("coordination_state", {}), dict) else {}
+  safety_envelope = strategy_plan.get("safety_envelope", {}) if isinstance(strategy_plan.get("safety_envelope", {}), dict) else {}
   return {
     "managed_scope": str(strategy_plan.get("managed_scope") or "").strip(),
     "confidence": float(strategy_plan.get("confidence") or 0.0),
+    "confidence_tier": str(confidence_assessment.get("tier") or "").strip(),
     "what_it_did": _compact_sentence(str(explainability.get("what_it_did") or "").strip(), max_len=180),
     "why_it_did_it": _compact_sentence(str(explainability.get("why_it_did_it") or "").strip(), max_len=180),
     "what_it_will_do_next": _compact_sentence(str(explainability.get("what_it_will_do_next") or "").strip(), max_len=180),
     "confidence_reasoning": _compact_sentence(str(explainability.get("confidence_reasoning") or "").strip(), max_len=180),
+    "environment_status": str(environment_awareness.get("status") or "").strip(),
+    "coordination_mode": str(coordination_state.get("mode") or "").strip(),
+    "safe_to_continue": bool(safety_envelope.get("safe_to_continue", False)),
+    "operator_review_required": bool(safety_envelope.get("operator_review_required", False)),
     "can_continue": bool(continuation.get("can_continue", False)),
     "should_stop": bool(continuation.get("should_stop", False)),
     "stop_reason": str(continuation.get("stop_reason") or "").strip(),

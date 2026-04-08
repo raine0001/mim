@@ -170,6 +170,15 @@ class Objective131135StrategyIntentExplainabilityTest(unittest.TestCase):
         self.assertEqual(strategy_plan.get("managed_scope"), scope, strategy_plan)
         self.assertEqual(strategy_plan.get("canonical_intent"), "inspect_object", strategy_plan)
         self.assertIn("robot", strategy_plan.get("coordination_domains", []), strategy_plan)
+        confidence_assessment = strategy_plan.get("confidence_assessment", {}) if isinstance(strategy_plan.get("confidence_assessment", {}), dict) else {}
+        environment_awareness = strategy_plan.get("environment_awareness", {}) if isinstance(strategy_plan.get("environment_awareness", {}), dict) else {}
+        coordination_state = strategy_plan.get("coordination_state", {}) if isinstance(strategy_plan.get("coordination_state", {}), dict) else {}
+        safety_envelope = strategy_plan.get("safety_envelope", {}) if isinstance(strategy_plan.get("safety_envelope", {}), dict) else {}
+        self.assertTrue(str(confidence_assessment.get("tier") or "").strip(), confidence_assessment)
+        self.assertEqual(environment_awareness.get("managed_scope"), scope, environment_awareness)
+        self.assertEqual(coordination_state.get("mode"), "multi_agent", coordination_state)
+        self.assertIn("robot", coordination_state.get("domains", []), coordination_state)
+        self.assertIn("operator_review_required", safety_envelope, safety_envelope)
 
         status, trace_payload = get_json(f"/execution/traces/{trace_id}")
         self.assertEqual(status, 200, trace_payload)
@@ -221,8 +230,14 @@ class Objective131135StrategyIntentExplainabilityTest(unittest.TestCase):
         self.assertEqual(status, 200, advanced_payload)
         advanced_plan = advanced_payload.get("strategy_plan", {}) if isinstance(advanced_payload.get("strategy_plan", {}), dict) else {}
         continuation = advanced_plan.get("continuation_state", {}) if isinstance(advanced_plan.get("continuation_state", {}), dict) else {}
+        confidence_assessment = advanced_plan.get("confidence_assessment", {}) if isinstance(advanced_plan.get("confidence_assessment", {}), dict) else {}
+        refinement_state = advanced_plan.get("refinement_state", {}) if isinstance(advanced_plan.get("refinement_state", {}), dict) else {}
+        context_persistence = advanced_plan.get("context_persistence", {}) if isinstance(advanced_plan.get("context_persistence", {}), dict) else {}
         self.assertIn(first_step_key, continuation.get("completed_steps", []), continuation)
         self.assertTrue(bool(continuation.get("recommended_next_step")), continuation)
+        self.assertGreaterEqual(float(confidence_assessment.get("score", 0.0) or 0.0), 0.0, confidence_assessment)
+        self.assertIn("needs_refinement", refinement_state, refinement_state)
+        self.assertEqual(context_persistence.get("managed_scope"), scope, context_persistence)
 
         status, ui_state = get_json("/mim/ui/state")
         self.assertEqual(status, 200, ui_state)
@@ -234,6 +249,8 @@ class Objective131135StrategyIntentExplainabilityTest(unittest.TestCase):
         self.assertTrue(str(trust.get("what_it_did") or "").strip(), trust)
         self.assertTrue(str(trust.get("why_it_did_it") or "").strip(), trust)
         self.assertTrue(str(trust.get("what_it_will_do_next") or "").strip(), trust)
+        self.assertTrue(str(trust.get("confidence_tier") or "").strip(), trust)
+        self.assertIn("safe_to_continue", trust, trust)
 
 
 if __name__ == "__main__":

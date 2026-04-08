@@ -861,6 +861,12 @@ class ExecutionStrategyPlanOut(BaseModel):
     continuation_state: dict = Field(default_factory=dict)
     explainability: dict = Field(default_factory=dict)
     confidence: float
+    confidence_assessment: dict = Field(default_factory=dict)
+    refinement_state: dict = Field(default_factory=dict)
+    environment_awareness: dict = Field(default_factory=dict)
+    context_persistence: dict = Field(default_factory=dict)
+    coordination_state: dict = Field(default_factory=dict)
+    safety_envelope: dict = Field(default_factory=dict)
     metadata_json: dict = Field(default_factory=dict)
     created_at: datetime
 
