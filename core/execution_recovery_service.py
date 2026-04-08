@@ -6,6 +6,13 @@ from datetime import datetime, timezone
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from core.autonomy_boundary_service import (
+    autonomy_level_rank,
+    build_autonomy_decision_context,
+    build_boundary_profile_snapshot,
+    canonical_autonomy_level,
+    get_latest_autonomy_boundary_for_scope,
+)
 from core.execution_readiness_service import (
     execution_readiness_confidence,
     execution_readiness_policy_effects,
@@ -28,6 +35,9 @@ from core.models import (
 from core.operator_resolution_service import (
     commitment_downstream_effects,
     commitment_is_active,
+    commitment_is_recovery_policy_tuning_derived,
+    commitment_policy_source,
+    commitment_scope_application,
     commitment_snapshot,
     latest_active_operator_resolution_commitment,
 )
@@ -42,6 +52,12 @@ from core.state_bus_service import (
 
 RECOVERY_SOURCE = "objective96"
 RECOVERY_DECISION_FAMILY = "execution_recovery"
+RECOVERY_TUNING_LEVELS = [
+    "manual_only",
+    "operator_required",
+    "bounded_auto",
+    "strategy_auto",
+]
 
 
 def _env_positive_int(name: str, fallback: int) -> int:
@@ -116,6 +132,204 @@ def _recovery_summary(recovery: dict) -> str:
     if decision and reason:
         return f"{decision}: {reason}"
     return decision or reason
+
+
+def _recovery_boundary_requires_operator(boundary_profile: dict) -> bool:
+    level = canonical_autonomy_level(boundary_profile.get("current_level"))
+    confidence = float(boundary_profile.get("confidence", 0.0) or 0.0)
+    return level in {"manual_only", "operator_required"} and confidence >= 0.5
+
+
+def _recovery_taxonomy(
+    *,
+    recovery_decision: str,
+    execution_status: str,
+    operator_action_required: bool,
+    recovery_allowed: bool,
+    recommended_attempt_decision: str,
+    boundary_profile: dict | None,
+) -> dict:
+    decision = str(recovery_decision or "").strip()
+    recommended = str(recommended_attempt_decision or "").strip()
+    status = str(execution_status or "").strip()
+    boundary = boundary_profile if isinstance(boundary_profile, dict) else {}
+    boundary_level = canonical_autonomy_level(boundary.get("current_level"))
+
+    classification = "recovery_unavailable"
+    family = "unavailable"
+    checkpoint_strategy = "none"
+    terminality = "terminal"
+
+    if decision == "retry_current_step":
+        classification = "bounded_retry"
+        family = "retry"
+        checkpoint_strategy = "current_step"
+        terminality = "recoverable"
+    elif decision == "resume_from_checkpoint":
+        classification = "checkpoint_resume"
+        family = "resume"
+        checkpoint_strategy = "checkpoint"
+        terminality = "recoverable"
+    elif decision == "restart_execution":
+        classification = "bounded_restart"
+        family = "restart"
+        checkpoint_strategy = "fresh_start"
+        terminality = "recoverable"
+    elif decision == "rollback_and_replan":
+        classification = "rollback_replan"
+        family = "replan"
+        checkpoint_strategy = "rollback"
+        terminality = "operator_mediated"
+    elif decision == "require_operator_resume":
+        classification = "operator_resume_gate"
+        family = "operator_gate"
+        checkpoint_strategy = (
+            "checkpoint" if recommended == "resume_from_checkpoint" else "fresh_start"
+        )
+        terminality = "operator_mediated"
+    elif decision == "hard_stop_persisted":
+        classification = "hard_stop"
+        family = "hard_stop"
+        checkpoint_strategy = "none"
+        terminality = "terminal"
+    elif decision == "no_recovery_available":
+        classification = "recovery_unavailable"
+        family = "unavailable"
+        checkpoint_strategy = "none"
+        terminality = "terminal"
+
+    return {
+        "classification": classification,
+        "family": family,
+        "operator_mode": (
+            "operator_required"
+            if operator_action_required
+            else ("bounded_auto" if recovery_allowed else "blocked")
+        ),
+        "checkpoint_strategy": checkpoint_strategy,
+        "terminality": terminality,
+        "execution_status": status,
+        "recommended_attempt_decision": recommended,
+        "boundary_level": boundary_level,
+        "boundary_scope": str(boundary.get("scope") or "").strip(),
+        "recovery_allowed": bool(recovery_allowed),
+        "operator_action_required": bool(operator_action_required),
+    }
+
+
+def _recovery_outcome_taxonomy(*, outcome_status: str, recovery_decision: str) -> dict:
+    status = str(outcome_status or "").strip()
+    decision = str(recovery_decision or "").strip()
+    classification = "recovery_outcome_unknown"
+    terminality = "unknown"
+    if status == "recovered":
+        classification = "recovered_after_recovery"
+        terminality = "successful"
+    elif status == "failed_again":
+        classification = "recovery_failed_again"
+        terminality = "failed"
+    elif status == "operator_required":
+        classification = "operator_intervention_still_required"
+        terminality = "operator_mediated"
+    return {
+        "classification": classification,
+        "outcome_status": status,
+        "source_decision": decision,
+        "terminality": terminality,
+    }
+
+
+def _lower_recovery_boundary_level(current_level: object) -> str:
+    level = canonical_autonomy_level(current_level)
+    if level == "manual_only":
+        return "manual_only"
+    current_rank = autonomy_level_rank(level)
+    floor_rank = autonomy_level_rank("operator_required")
+    next_rank = max(floor_rank, current_rank - 1)
+    return RECOVERY_TUNING_LEVELS[next_rank]
+
+
+def _operator_takeover_boundary_level(current_level: object) -> str:
+    level = canonical_autonomy_level(current_level)
+    if level == "manual_only":
+        return "manual_only"
+    if autonomy_level_rank(level) <= autonomy_level_rank("operator_required"):
+        return level
+    return "operator_required"
+
+
+def _recovery_policy_tuning(
+    *,
+    boundary_profile: dict | None,
+    recovery_learning: dict | None,
+    recovery_taxonomy: dict | None,
+    recovery_decision: str,
+    recommended_attempt_decision: str,
+) -> dict:
+    boundary = boundary_profile if isinstance(boundary_profile, dict) else {}
+    learning = recovery_learning if isinstance(recovery_learning, dict) else {}
+    taxonomy = recovery_taxonomy if isinstance(recovery_taxonomy, dict) else {}
+    current_level = canonical_autonomy_level(boundary.get("current_level"))
+    escalation_decision = str(learning.get("escalation_decision") or "continue_bounded_recovery").strip()
+    if not escalation_decision:
+        escalation_decision = "continue_bounded_recovery"
+
+    recommended_level = current_level
+    policy_action = "maintain_current_recovery_autonomy"
+    operator_review_required = False
+
+    if escalation_decision == "lower_scope_autonomy_for_recovery":
+        policy_action = "lower_scope_autonomy_for_recovery"
+        recommended_level = _lower_recovery_boundary_level(current_level)
+        operator_review_required = True
+    elif escalation_decision == "require_operator_takeover":
+        policy_action = "require_operator_takeover"
+        recommended_level = _operator_takeover_boundary_level(current_level)
+        operator_review_required = True
+
+    rationale = str(
+        learning.get("why_recovery_escalated_before_retry")
+        or learning.get("rationale")
+        or ""
+    ).strip()
+    if not rationale and policy_action == "maintain_current_recovery_autonomy":
+        rationale = (
+            f"Recovery learning has not found a repeated pattern that requires changing the {current_level} boundary for future recovery attempts."
+        )
+    elif not rationale and policy_action == "require_operator_takeover":
+        rationale = "Recovery learning requires operator takeover before repeating this recovery path."
+    elif not rationale:
+        rationale = "Recovery learning recommends lowering recovery autonomy before repeating this path."
+
+    if policy_action == "maintain_current_recovery_autonomy":
+        summary = f"Maintain {current_level} recovery autonomy for future attempts."
+    elif recommended_level == current_level:
+        summary = f"Keep recovery autonomy at {current_level}; the scope is already at the lowest recovery floor."
+    else:
+        summary = f"Lower future recovery autonomy from {current_level} to {recommended_level}."
+
+    return {
+        "policy_action": policy_action,
+        "recommended_boundary_level": recommended_level,
+        "current_boundary_level": current_level,
+        "operator_review_required": operator_review_required,
+        "boundary_floor_applied": bool(recommended_level == current_level and policy_action != "maintain_current_recovery_autonomy"),
+        "source": "recovery_learning" if learning else "recovery_evaluation",
+        "applies_to": "future_recovery_attempts",
+        "recovery_decision": str(recovery_decision or "").strip(),
+        "recommended_attempt_decision": str(recommended_attempt_decision or recovery_decision or "").strip(),
+        "recovery_classification": str(taxonomy.get("classification") or "").strip(),
+        "summary": summary,
+        "rationale": rationale,
+        "evidence": {
+            "sample_count": _safe_int(learning.get("sample_count"), 0),
+            "operator_required_count": _safe_int(learning.get("operator_required_count"), 0),
+            "failed_again_count": _safe_int(learning.get("failed_again_count"), 0),
+            "recovered_count": _safe_int(learning.get("recovered_count"), 0),
+            "success_rate": float(learning.get("success_rate") or 0.0),
+            "confidence": float(learning.get("confidence") or 0.0),
+        },
+    }
 
 
 async def _latest_execution(*, trace_id: str, execution_id: int | None, db: AsyncSession) -> CapabilityExecution | None:
@@ -238,6 +452,7 @@ async def get_latest_execution_recovery_attempt(
 
 
 def to_execution_recovery_attempt_out(row: ExecutionRecoveryAttempt) -> dict:
+    metadata_json = _safe_dict(row.metadata_json)
     return {
         "recovery_attempt_id": int(row.id),
         "trace_id": row.trace_id,
@@ -251,7 +466,16 @@ def to_execution_recovery_attempt_out(row: ExecutionRecoveryAttempt) -> dict:
         "actor": row.actor,
         "status": row.status,
         "result_json": _safe_dict(row.result_json),
-        "metadata_json": _safe_dict(row.metadata_json),
+        "metadata_json": metadata_json,
+        "recovery_classification": str(metadata_json.get("recovery_classification") or "").strip(),
+        "recovery_taxonomy": _safe_dict(metadata_json.get("recovery_taxonomy", {})),
+        "recovery_policy_tuning": _safe_dict(metadata_json.get("recovery_policy_tuning", {})),
+        "boundary_profile": _safe_dict(metadata_json.get("boundary_profile", {})),
+        "decision_basis": _safe_dict(metadata_json.get("decision_basis", {})),
+        "allowed_actions": metadata_json.get("allowed_actions", []),
+        "approval_required": bool(metadata_json.get("approval_required", False)),
+        "retry_policy": _safe_dict(metadata_json.get("retry_policy", {})),
+        "risk_level": str(metadata_json.get("risk_level") or "").strip(),
         "created_at": row.created_at,
     }
 
@@ -284,6 +508,7 @@ async def get_latest_execution_recovery_outcome(
 
 
 def to_execution_recovery_outcome_out(row: ExecutionRecoveryOutcome) -> dict:
+    metadata_json = _safe_dict(row.metadata_json)
     return {
         "recovery_outcome_id": int(row.id),
         "attempt_id": row.attempt_id,
@@ -295,7 +520,22 @@ def to_execution_recovery_outcome_out(row: ExecutionRecoveryOutcome) -> dict:
         "learning_bias_json": _safe_dict(row.learning_bias_json),
         "outcome_score": float(row.outcome_score or 0.0),
         "result_json": _safe_dict(row.result_json),
-        "metadata_json": _safe_dict(row.metadata_json),
+        "metadata_json": metadata_json,
+        "recovery_classification": str(metadata_json.get("recovery_classification") or "").strip(),
+        "recovery_taxonomy": _safe_dict(metadata_json.get("recovery_taxonomy", {})),
+        "recovery_policy_tuning": _safe_dict(metadata_json.get("recovery_policy_tuning", {})),
+        "recovery_outcome_classification": str(
+            metadata_json.get("recovery_outcome_classification") or ""
+        ).strip(),
+        "recovery_outcome_taxonomy": _safe_dict(
+            metadata_json.get("recovery_outcome_taxonomy", {})
+        ),
+        "boundary_profile": _safe_dict(metadata_json.get("boundary_profile", {})),
+        "decision_basis": _safe_dict(metadata_json.get("decision_basis", {})),
+        "allowed_actions": metadata_json.get("allowed_actions", []),
+        "approval_required": bool(metadata_json.get("approval_required", False)),
+        "retry_policy": _safe_dict(metadata_json.get("retry_policy", {})),
+        "risk_level": str(metadata_json.get("risk_level") or "").strip(),
         "created_at": row.created_at,
     }
 
@@ -322,6 +562,7 @@ def to_execution_recovery_learning_out(row: ExecutionRecoveryLearningProfile) ->
         "success_rate": float(row.success_rate or 0.0),
         "evidence_json": _safe_dict(row.evidence_json),
         "policy_effects_json": _safe_dict(row.policy_effects_json),
+        "recovery_policy_tuning": _safe_dict(metadata_json.get("recovery_policy_tuning", {})),
         "metadata_json": metadata_json,
         "created_at": row.created_at,
     }
@@ -605,6 +846,17 @@ async def evaluate_execution_recovery_learning(
             "trace_id": str(trace_id or "").strip(),
             "execution_id": execution_id,
             "why_recovery_escalated_before_retry": why_recovery_escalated_before_retry,
+            "recovery_policy_tuning": {
+                "policy_action": (
+                    "lower_scope_autonomy_for_recovery"
+                    if escalation_decision == "lower_scope_autonomy_for_recovery"
+                    else (
+                        "require_operator_takeover"
+                        if escalation_decision == "require_operator_takeover"
+                        else "maintain_current_recovery_autonomy"
+                    )
+                ),
+            },
             "decayed_outcome_count": int(decayed_outcome_count),
             "decay_days": int(RECOVERY_LEARNING_DECAY_DAYS),
             "environment_shift_detected": bool(environment_shift_detected),
@@ -934,20 +1186,35 @@ async def _resolve_execution_recovery_conflict(
         )
     )
 
-    commitment = await latest_active_operator_resolution_commitment(scope=scope, db=db, limit=20)
+    commitment = await latest_active_operator_resolution_commitment(
+        scope=scope,
+        db=db,
+        include_inherited=True,
+        limit=20,
+    )
     if commitment is not None and commitment_is_active(commitment):
         candidates.append(
             _candidate_payload(
-                source="operator_commitment",
+                source=commitment_policy_source(commitment),
                 posture="caution" if _commitment_requires_recovery_review(commitment) else "promote",
                 precedence_rank=100.0,
                 confidence=float(getattr(commitment, "confidence", 0.0) or 0.0),
                 freshness_weight=1.0,
                 rationale=str(getattr(commitment, "reason", "") or "").strip(),
-                snapshot=commitment_snapshot(commitment),
+                snapshot={
+                    **commitment_snapshot(commitment),
+                    "scope_application": commitment_scope_application(
+                        commitment,
+                        requested_scope=scope,
+                    ),
+                },
                 policy_effects_json=_conflict_recovery_effects(
                     recovery_decision="require_operator_resume" if _commitment_requires_recovery_review(commitment) else base_decision,
-                    recovery_reason="Active operator commitment requires bounded operator-mediated recovery.",
+                    recovery_reason=(
+                        "Active recovery-derived commitment requires bounded operator-mediated recovery."
+                        if commitment_is_recovery_policy_tuning_derived(commitment)
+                        else "Active operator commitment requires bounded operator-mediated recovery."
+                    ),
                     recommended_attempt_decision=base_recommended_attempt_decision,
                     recovery_allowed=not _commitment_requires_recovery_review(commitment) and base_recovery_allowed,
                     operator_action_required=_commitment_requires_recovery_review(commitment),
@@ -993,6 +1260,30 @@ async def _resolve_execution_recovery_conflict(
                 policy_effects_json=_conflict_recovery_effects(
                     recovery_decision="require_operator_resume",
                     recovery_reason="Active pause override requires explicit operator resume.",
+                    recommended_attempt_decision=base_recommended_attempt_decision,
+                    recovery_allowed=False,
+                    operator_action_required=True,
+                ),
+            )
+        )
+
+    boundary_row = await get_latest_autonomy_boundary_for_scope(scope=scope, db=db)
+    boundary_profile = build_boundary_profile_snapshot(boundary_row)
+    if boundary_profile and _recovery_boundary_requires_operator(boundary_profile):
+        level = canonical_autonomy_level(boundary_profile.get("current_level"))
+        candidates.append(
+            _candidate_payload(
+                source="autonomy_boundary",
+                posture="caution",
+                precedence_rank=88.0,
+                confidence=float(boundary_profile.get("confidence", 0.0) or 0.0),
+                freshness_weight=1.0,
+                rationale=str(boundary_profile.get("adjustment_reason") or "").strip()
+                or f"Autonomy boundary is {level} for this scope.",
+                snapshot=boundary_profile,
+                policy_effects_json=_conflict_recovery_effects(
+                    recovery_decision="require_operator_resume",
+                    recovery_reason=f"Current autonomy boundary is {level} for this scope.",
                     recommended_attempt_decision=base_recommended_attempt_decision,
                     recovery_allowed=False,
                     operator_action_required=True,
@@ -1281,6 +1572,31 @@ async def evaluate_execution_recovery(
         recovery_allowed = bool(conflict_effects.get("recovery_allowed", False))
     if "operator_action_required" in conflict_effects:
         operator_action_required = bool(conflict_effects.get("operator_action_required", False))
+    boundary_row = await get_latest_autonomy_boundary_for_scope(scope=scope, db=db)
+    boundary_profile = build_boundary_profile_snapshot(boundary_row)
+    autonomy_context = build_autonomy_decision_context(
+        boundary_profile=boundary_profile,
+        requested_action="execution_recovery",
+        policy_source=str(conflict_resolution.get("winning_policy_source") or "").strip() or "execution_recovery",
+        auto_execution_allowed=bool(recovery_allowed and not operator_action_required),
+        reason=str(conflict_effects.get("recovery_reason") or recovery_reason or "").strip(),
+        policy_conflict=conflict_resolution,
+    )
+    recovery_taxonomy = _recovery_taxonomy(
+        recovery_decision=recovery_decision,
+        execution_status=execution_status,
+        operator_action_required=operator_action_required,
+        recovery_allowed=recovery_allowed,
+        recommended_attempt_decision=recommended_attempt_decision,
+        boundary_profile=autonomy_context.get("boundary_profile", {}),
+    )
+    recovery_policy_tuning = _recovery_policy_tuning(
+        boundary_profile=autonomy_context.get("boundary_profile", {}),
+        recovery_learning=recovery_learning,
+        recovery_taxonomy=recovery_taxonomy,
+        recovery_decision=recovery_decision,
+        recommended_attempt_decision=recommended_attempt_decision,
+    )
 
     return {
         "trace_id": normalized_trace,
@@ -1309,6 +1625,17 @@ async def evaluate_execution_recovery(
             recovery_learning.get("why_recovery_escalated_before_retry") or ""
         ).strip(),
         "conflict_resolution": conflict_resolution,
+        "recovery_classification": str(
+            recovery_taxonomy.get("classification") or ""
+        ).strip(),
+        "recovery_taxonomy": recovery_taxonomy,
+        "recovery_policy_tuning": recovery_policy_tuning,
+        "boundary_profile": autonomy_context.get("boundary_profile", {}),
+        "decision_basis": autonomy_context.get("decision_basis", {}),
+        "allowed_actions": autonomy_context.get("allowed_actions", []),
+        "approval_required": bool(autonomy_context.get("approval_required", False)),
+        "retry_policy": autonomy_context.get("retry_policy", {}),
+        "risk_level": str(autonomy_context.get("risk_level") or "").strip(),
         "summary": _recovery_summary(
             {
                 "recovery_decision": recovery_decision,
@@ -1406,7 +1733,36 @@ async def evaluate_execution_recovery_outcome(
         "execution_reason": str(execution.reason or "").strip(),
         "attempt": to_execution_recovery_attempt_out(accepted_attempt),
     })
-    existing.metadata_json = _safe_dict(_json_safe(metadata_json if isinstance(metadata_json, dict) else {}))
+    latest_attempt_payload = to_execution_recovery_attempt_out(accepted_attempt)
+    decision_taxonomy = _safe_dict(latest_attempt_payload.get("recovery_taxonomy", {}))
+    outcome_taxonomy = _recovery_outcome_taxonomy(
+        outcome_status=outcome_status,
+        recovery_decision=str(accepted_attempt.recovery_decision or "").strip(),
+    )
+    existing.metadata_json = _safe_dict(
+        _json_safe(
+            {
+                **(metadata_json if isinstance(metadata_json, dict) else {}),
+                "recovery_classification": str(
+                    latest_attempt_payload.get("recovery_classification") or ""
+                ).strip(),
+                "recovery_taxonomy": decision_taxonomy,
+                "recovery_policy_tuning": _safe_dict(
+                    latest_attempt_payload.get("recovery_policy_tuning", {})
+                ),
+                "recovery_outcome_classification": str(
+                    outcome_taxonomy.get("classification") or ""
+                ).strip(),
+                "recovery_outcome_taxonomy": outcome_taxonomy,
+                "boundary_profile": _safe_dict(latest_attempt_payload.get("boundary_profile", {})),
+                "decision_basis": _safe_dict(latest_attempt_payload.get("decision_basis", {})),
+                "allowed_actions": latest_attempt_payload.get("allowed_actions", []),
+                "approval_required": bool(latest_attempt_payload.get("approval_required", False)),
+                "retry_policy": _safe_dict(latest_attempt_payload.get("retry_policy", {})),
+                "risk_level": str(latest_attempt_payload.get("risk_level") or "").strip(),
+            }
+        )
+    )
     await db.flush()
     return existing
 
@@ -1589,7 +1945,28 @@ async def record_execution_recovery_attempt(
             "operator_ack": bool(operator_ack),
             "requested_decision": selected_decision,
         },
-        metadata_json=_safe_dict(_json_safe(metadata_json if isinstance(metadata_json, dict) else {})),
+        metadata_json=_safe_dict(
+            _json_safe(
+                {
+                    **(metadata_json if isinstance(metadata_json, dict) else {}),
+                    "recovery_classification": str(
+                        evaluation.get("recovery_classification") or ""
+                    ).strip(),
+                    "recovery_taxonomy": _safe_dict(
+                        evaluation.get("recovery_taxonomy", {})
+                    ),
+                    "boundary_profile": evaluation.get("boundary_profile", {}),
+                    "decision_basis": evaluation.get("decision_basis", {}),
+                    "allowed_actions": evaluation.get("allowed_actions", []),
+                    "recovery_policy_tuning": _safe_dict(
+                        evaluation.get("recovery_policy_tuning", {})
+                    ),
+                    "approval_required": bool(evaluation.get("approval_required", False)),
+                    "retry_policy": evaluation.get("retry_policy", {}),
+                    "risk_level": str(evaluation.get("risk_level") or "").strip(),
+                }
+            )
+        ),
     )
     db.add(row)
     await db.flush()
@@ -1674,6 +2051,16 @@ async def record_execution_recovery_attempt(
         payload_json={
             "recovery_attempt_id": int(row.id),
             "recovery_decision": row.recovery_decision,
+            "recovery_classification": str(
+                evaluation.get("recovery_classification") or ""
+            ).strip(),
+            "recovery_taxonomy": _safe_dict(evaluation.get("recovery_taxonomy", {})),
+            "boundary_profile": _safe_dict(evaluation.get("boundary_profile", {})),
+            "decision_basis": _safe_dict(evaluation.get("decision_basis", {})),
+            "allowed_actions": evaluation.get("allowed_actions", []),
+            "approval_required": bool(evaluation.get("approval_required", False)),
+            "retry_policy": _safe_dict(evaluation.get("retry_policy", {})),
+            "risk_level": str(evaluation.get("risk_level") or "").strip(),
             "status": row.status,
             "operator_ack": bool(operator_ack),
             "evaluation": _json_safe(evaluation),

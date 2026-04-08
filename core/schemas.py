@@ -779,6 +779,49 @@ class ExecutionRecoveryLearningResetRequest(BaseModel):
     metadata_json: dict = Field(default_factory=dict)
 
 
+class ExecutionRecoveryPolicyTuningApplyRequest(BaseModel):
+    actor: str = "operator"
+    source: str = "execution_control"
+    trace_id: str = ""
+    execution_id: int | None = Field(default=None, ge=1)
+    managed_scope: str = ""
+    reason: str = ""
+    duration_seconds: int | None = Field(default=1800, ge=1, le=604800)
+    authority_level: str = "operator_required"
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class ExecutionRecoveryPolicyCommitmentEvaluateRequest(BaseModel):
+    actor: str = "workspace"
+    source: str = "objective122"
+    trace_id: str = ""
+    execution_id: int | None = Field(default=None, ge=1)
+    managed_scope: str = ""
+    lookback_hours: int = Field(default=168, ge=1, le=720)
+    target_status: str = ""
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class ExecutionRecoveryPolicyCommitmentPreviewRequest(BaseModel):
+    actor: str = "operator"
+    source: str = "objective128"
+    action: str = Field(default="apply", min_length=1, max_length=40)
+    managed_scope: str = ""
+    commitment_id: int | None = Field(default=None, ge=1)
+    trace_id: str = ""
+    execution_id: int | None = Field(default=None, ge=1)
+    metadata_json: dict = Field(default_factory=dict)
+
+    @field_validator("action")
+    @classmethod
+    def validate_preview_action(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        allowed = {"apply", "reapply", "expire", "revoke", "reset"}
+        if normalized not in allowed:
+            raise ValueError("unsupported recovery commitment preview action")
+        return normalized
+
+
 class ExecutionRecoveryLearningOut(BaseModel):
     recovery_learning_profile_id: int
     managed_scope: str
@@ -823,6 +866,7 @@ class ExecutionRecoveryDecisionOut(BaseModel):
     why_recovery_escalated_before_retry: str = ""
     conflict_resolution: dict = Field(default_factory=dict)
     checkpoint_json: dict = Field(default_factory=dict)
+    recovery_policy_tuning: dict = Field(default_factory=dict)
 
 
 class ExecutionTraceEventOut(BaseModel):
@@ -914,6 +958,7 @@ class ExecutionRecoveryAttemptOut(BaseModel):
     status: str
     result_json: dict
     metadata_json: dict
+    recovery_policy_tuning: dict = Field(default_factory=dict)
     created_at: datetime
 
 
@@ -929,6 +974,7 @@ class ExecutionRecoveryOutcomeOut(BaseModel):
     outcome_score: float
     result_json: dict
     metadata_json: dict
+    recovery_policy_tuning: dict = Field(default_factory=dict)
     created_at: datetime
 
 

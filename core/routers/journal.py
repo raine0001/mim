@@ -10,6 +10,27 @@ from core.schemas import JournalCreate
 router = APIRouter()
 
 
+def _journal_entry_out(entry: ExecutionJournal) -> dict:
+    metadata = entry.metadata_json if isinstance(entry.metadata_json, dict) else {}
+    return {
+        "entry_id": entry.id,
+        "actor": entry.actor,
+        "action": entry.action,
+        "target_type": entry.target_type,
+        "target_id": entry.target_id,
+        "idempotency_key": entry.idempotency_key,
+        "summary": entry.result,
+        "metadata_json": metadata,
+        "boundary_profile": metadata.get("boundary_profile", {}),
+        "decision_basis": metadata.get("decision_basis", {}),
+        "allowed_actions": metadata.get("allowed_actions", []),
+        "approval_required": bool(metadata.get("approval_required", False)),
+        "retry_policy": metadata.get("retry_policy", {}),
+        "risk_level": str(metadata.get("risk_level") or "").strip(),
+        "timestamp": entry.created_at,
+    }
+
+
 @router.post("")
 async def create_journal(payload: JournalCreate, db: AsyncSession = Depends(get_db)) -> dict:
     if payload.idempotency_key:
@@ -19,16 +40,7 @@ async def create_journal(payload: JournalCreate, db: AsyncSession = Depends(get_
             )
         ).scalars().first()
         if existing:
-            return {
-                "entry_id": existing.id,
-                "actor": existing.actor,
-                "action": existing.action,
-                "target_type": existing.target_type,
-                "target_id": existing.target_id,
-                "idempotency_key": existing.idempotency_key,
-                "summary": existing.result,
-                "timestamp": existing.created_at,
-            }
+            return _journal_entry_out(existing)
 
     entry = ExecutionJournal(
         actor=payload.actor,
@@ -52,29 +64,11 @@ async def create_journal(payload: JournalCreate, db: AsyncSession = Depends(get_
                 )
             ).scalars().first()
             if existing:
-                return {
-                    "entry_id": existing.id,
-                    "actor": existing.actor,
-                    "action": existing.action,
-                    "target_type": existing.target_type,
-                    "target_id": existing.target_id,
-                    "idempotency_key": existing.idempotency_key,
-                    "summary": existing.result,
-                    "timestamp": existing.created_at,
-                }
+                return _journal_entry_out(existing)
         raise
 
     await db.refresh(entry)
-    return {
-        "entry_id": entry.id,
-        "actor": entry.actor,
-        "action": entry.action,
-        "target_type": entry.target_type,
-        "target_id": entry.target_id,
-        "idempotency_key": entry.idempotency_key,
-        "summary": entry.result,
-        "timestamp": entry.created_at,
-    }
+    return _journal_entry_out(entry)
 
 
 @router.get("")
@@ -89,16 +83,4 @@ async def list_journal(
             .limit(limit)
         )
     ).scalars().all()
-    return [
-        {
-            "entry_id": row.id,
-            "actor": row.actor,
-            "action": row.action,
-            "target_type": row.target_type,
-            "target_id": row.target_id,
-            "idempotency_key": row.idempotency_key,
-            "summary": row.result,
-            "timestamp": row.created_at,
-        }
-        for row in rows
-    ]
+    return [_journal_entry_out(row) for row in rows]

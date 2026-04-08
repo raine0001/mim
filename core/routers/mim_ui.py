@@ -10,6 +10,7 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from core.autonomy_boundary_service import build_boundary_action_controls, build_boundary_decision_basis, build_boundary_profile_snapshot
 from core.camera_scene import (
     collect_fresh_camera_observations,
     summarize_camera_observations,
@@ -53,7 +54,13 @@ from core.operator_preference_convergence_service import (
   list_learned_preferences,
   preference_conflicts,
 )
-from core.operator_resolution_service import choose_operator_resolution_commitment, commitment_effect_labels, commitment_snapshot
+from core.operator_resolution_service import (
+  choose_operator_resolution_commitment,
+  commitment_effect_labels,
+  commitment_is_recovery_policy_tuning_derived,
+  commitment_scope_application,
+  commitment_snapshot,
+)
 from core.policy_conflict_resolution_service import list_workspace_policy_conflict_profiles
 from core.proposal_policy_convergence_service import list_workspace_proposal_policy_preferences
 from core.runtime_recovery_service import RuntimeRecoveryService
@@ -816,53 +823,74 @@ def _operator_governance_snapshot(
 def _operator_autonomy_snapshot(
     row: WorkspaceAutonomyBoundaryProfile | None,
 ) -> dict:
-    if row is None:
-        return {}
-    reasoning = (
-        row.adaptation_reasoning_json
-        if isinstance(row.adaptation_reasoning_json, dict)
-        else {}
-    )
-    governance = (
-        reasoning.get("execution_truth_governance", {})
-        if isinstance(reasoning.get("execution_truth_governance", {}), dict)
-        else {}
-    )
-    proposal_arbitration_review = (
-      reasoning.get("proposal_arbitration_autonomy_review", {})
-      if isinstance(reasoning.get("proposal_arbitration_autonomy_review", {}), dict)
-      else {}
-    )
-    return {
-        "boundary_id": int(row.id),
-        "scope": str(row.scope or "").strip(),
-        "current_level": str(row.current_level or "").strip(),
-        "profile_status": str(row.profile_status or "").strip(),
-        "adaptation_summary": _compact_sentence(row.adaptation_summary, max_len=180),
-        "decision": str(reasoning.get("decision") or "").strip(),
-        "governance_decision": str(
-            governance.get("governance_decision") or ""
-        ).strip(),
-        "confidence": round(float(row.confidence or 0.0), 6),
-        "proposal_arbitration_review": {
-          "applied": bool(proposal_arbitration_review.get("applied", False)),
-          "review_weight": round(
-            float(proposal_arbitration_review.get("review_weight", 0.0) or 0.0),
-            6,
-          ),
-          "target_level_cap": str(
-            proposal_arbitration_review.get("target_level_cap") or ""
-          ).strip(),
-          "related_zone": str(
-            proposal_arbitration_review.get("related_zone") or ""
-          ).strip(),
-          "proposal_types": (
-            proposal_arbitration_review.get("proposal_types", [])
-            if isinstance(proposal_arbitration_review.get("proposal_types", []), list)
-            else []
-          ),
-        },
-    }
+  if row is None:
+    return {}
+  boundary_profile = build_boundary_profile_snapshot(row)
+  action_controls = build_boundary_action_controls(boundary_profile)
+  reasoning = (
+    row.adaptation_reasoning_json
+    if isinstance(row.adaptation_reasoning_json, dict)
+    else {}
+  )
+  governance = (
+    reasoning.get("execution_truth_governance", {})
+    if isinstance(reasoning.get("execution_truth_governance", {}), dict)
+    else {}
+  )
+  proposal_arbitration_review = (
+    reasoning.get("proposal_arbitration_autonomy_review", {})
+    if isinstance(reasoning.get("proposal_arbitration_autonomy_review", {}), dict)
+    else {}
+  )
+  policy_conflict = (
+    reasoning.get("policy_conflict_resolution", {})
+    if isinstance(reasoning.get("policy_conflict_resolution", {}), dict)
+    else {}
+  )
+  decision_basis = build_boundary_decision_basis(
+    boundary_profile=boundary_profile,
+    requested_action="automatic_execution",
+    policy_source=str(policy_conflict.get("winning_policy_source") or "").strip() or "autonomy_boundary",
+    auto_execution_allowed=boundary_profile.get("current_level") not in {"manual_only", "operator_required"},
+    reason=str(row.adjustment_reason or row.adaptation_summary or "").strip(),
+    policy_conflict=policy_conflict,
+  )
+  return {
+    "boundary_id": int(row.id),
+    "scope": str(row.scope or "").strip(),
+    "current_level": str(boundary_profile.get("current_level") or "").strip(),
+    "profile_status": str(row.profile_status or "").strip(),
+    "adaptation_summary": _compact_sentence(row.adaptation_summary, max_len=180),
+    "decision": str(reasoning.get("decision") or "").strip(),
+    "governance_decision": str(
+      governance.get("governance_decision") or ""
+    ).strip(),
+    "confidence": round(float(row.confidence or 0.0), 6),
+    "decision_basis": decision_basis,
+    "why_not_automatic": str(decision_basis.get("why_not_automatic") or "").strip(),
+    "allowed_actions": action_controls.get("allowed_actions", []),
+    "approval_required": bool(action_controls.get("approval_required", True)),
+    "retry_policy": action_controls.get("retry_policy", {}),
+    "risk_level": str(action_controls.get("risk_level") or "").strip(),
+    "proposal_arbitration_review": {
+      "applied": bool(proposal_arbitration_review.get("applied", False)),
+      "review_weight": round(
+        float(proposal_arbitration_review.get("review_weight", 0.0) or 0.0),
+        6,
+      ),
+      "target_level_cap": str(
+        proposal_arbitration_review.get("target_level_cap") or ""
+      ).strip(),
+      "related_zone": str(
+        proposal_arbitration_review.get("related_zone") or ""
+      ).strip(),
+      "proposal_types": (
+        proposal_arbitration_review.get("proposal_types", [])
+        if isinstance(proposal_arbitration_review.get("proposal_types", []), list)
+        else []
+      ),
+    },
+  }
 
 
 def _operator_stewardship_snapshot(
@@ -935,6 +963,7 @@ def _build_operator_reasoning_summary(
     conflict_resolution: dict,
     collaboration_progress: dict | None = None,
     dispatch_telemetry: dict | None = None,
+    tod_decision_process: dict | None = None,
     runtime_health: dict | None = None,
     runtime_recovery: dict | None = None,
 ) -> str:
@@ -944,9 +973,13 @@ def _build_operator_reasoning_summary(
     dispatch_telemetry = (
       dispatch_telemetry if isinstance(dispatch_telemetry, dict) else {}
     )
+    tod_decision_process = tod_decision_process if isinstance(tod_decision_process, dict) else {}
     runtime_health = runtime_health if isinstance(runtime_health, dict) else {}
     runtime_recovery = runtime_recovery if isinstance(runtime_recovery, dict) else {}
     parts: list[str] = []
+    decision_summary = str(tod_decision_process.get("summary") or "").strip()
+    if decision_summary:
+      parts.append(f"TOD decision: {decision_summary}")
     if str(goal.get("reasoning_summary") or "").strip():
         parts.append(f"Goal: {str(goal.get('reasoning_summary') or '').strip()}")
     if str(inquiry.get("decision_state") or "").strip():
@@ -981,10 +1014,14 @@ def _build_operator_reasoning_summary(
     if recovery_summary and recovery_status and recovery_status != "healthy":
       parts.append(f"Runtime recovery: {recovery_summary}")
     if str(autonomy.get("current_level") or "").strip():
-        parts.append(
-            "Autonomy: "
-            f"{str(autonomy.get('current_level') or '').strip().replace('_', ' ')}"
-        )
+      autonomy_summary = (
+        "Autonomy: "
+        f"{str(autonomy.get('current_level') or '').strip().replace('_', ' ')}"
+      )
+      why_not_automatic = str(autonomy.get("why_not_automatic") or "").strip()
+      if why_not_automatic:
+        autonomy_summary = f"{autonomy_summary}. {why_not_automatic}"
+      parts.append(autonomy_summary)
     if str(stewardship.get("followup_status") or "").strip():
         status = str(stewardship.get("followup_status") or "").strip().replace("_", " ")
         scope = str(stewardship.get("managed_scope") or "").strip()
@@ -1112,6 +1149,9 @@ def _operator_execution_recovery_snapshot(recovery: dict) -> dict:
         "managed_scope": str(recovery.get("managed_scope") or "").strip(),
         "execution_status": str(recovery.get("execution_status") or "").strip(),
         "recovery_decision": decision,
+        "recovery_classification": str(recovery.get("recovery_classification") or "").strip(),
+        "recovery_taxonomy": recovery.get("recovery_taxonomy", {}) if isinstance(recovery.get("recovery_taxonomy", {}), dict) else {},
+        "recovery_policy_tuning": recovery.get("recovery_policy_tuning", {}) if isinstance(recovery.get("recovery_policy_tuning", {}), dict) else {},
         "recommended_attempt_decision": str(recovery.get("recommended_attempt_decision") or "").strip(),
         "recovery_reason": reason,
         "operator_action_required": bool(recovery.get("operator_action_required", False)),
@@ -1123,6 +1163,34 @@ def _operator_execution_recovery_snapshot(recovery: dict) -> dict:
         "recovery_learning": recovery.get("recovery_learning", {}) if isinstance(recovery.get("recovery_learning", {}), dict) else {},
         "why_recovery_escalated_before_retry": str(recovery.get("why_recovery_escalated_before_retry") or "").strip(),
         "conflict_resolution": recovery.get("conflict_resolution", {}) if isinstance(recovery.get("conflict_resolution", {}), dict) else {},
+    }
+
+
+def _operator_execution_recovery_policy_tuning_snapshot(recovery: dict) -> dict:
+    if not isinstance(recovery, dict):
+        return {}
+    tuning = (
+        recovery.get("recovery_policy_tuning", {})
+        if isinstance(recovery.get("recovery_policy_tuning", {}), dict)
+        else {}
+    )
+    if not tuning:
+        return {}
+    return {
+        "managed_scope": str(recovery.get("managed_scope") or "").strip(),
+        "policy_action": str(tuning.get("policy_action") or "").strip(),
+        "current_boundary_level": str(tuning.get("current_boundary_level") or "").strip(),
+        "recommended_boundary_level": str(tuning.get("recommended_boundary_level") or "").strip(),
+        "operator_review_required": bool(tuning.get("operator_review_required", False)),
+        "boundary_floor_applied": bool(tuning.get("boundary_floor_applied", False)),
+        "summary": _compact_sentence(str(tuning.get("summary") or "").strip(), max_len=180),
+        "rationale": _compact_sentence(str(tuning.get("rationale") or "").strip(), max_len=180),
+        "recovery_decision": str(tuning.get("recovery_decision") or "").strip(),
+        "recommended_attempt_decision": str(tuning.get("recommended_attempt_decision") or "").strip(),
+        "recovery_classification": str(tuning.get("recovery_classification") or "").strip(),
+        "applies_to": str(tuning.get("applies_to") or "").strip(),
+        "source": str(tuning.get("source") or "").strip(),
+        "evidence": tuning.get("evidence", {}) if isinstance(tuning.get("evidence", {}), dict) else {},
     }
 
 
@@ -1219,20 +1287,11 @@ def _operator_current_recommendation(
     autonomy: dict,
     stewardship: dict,
     commitment: dict,
+  recovery_commitment: dict,
     execution_recovery: dict,
     commitment_monitoring: dict,
     commitment_outcome: dict,
 ) -> dict:
-    if bool(commitment.get("active", False)) and str(commitment.get("decision_type") or "").strip():
-        return {
-            "source": "governance",
-            "decision": str(commitment.get("decision_type") or "").strip(),
-            "managed_scope": str(commitment.get("managed_scope") or "").strip(),
-            "summary": _compact_sentence(
-                str(commitment.get("reason") or commitment.get("summary") or "").strip(),
-                max_len=180,
-            ),
-        }
     if str(commitment_monitoring.get("governance_decision") or "").strip() and str(
         commitment_monitoring.get("governance_decision") or ""
     ).strip() != "maintain_commitment":
@@ -1260,6 +1319,23 @@ def _operator_current_recommendation(
             ),
         }
 
+    active_commitment = commitment
+    if not (
+        bool(active_commitment.get("active", False))
+        and str(active_commitment.get("decision_type") or "").strip()
+    ):
+        active_commitment = recovery_commitment if isinstance(recovery_commitment, dict) else {}
+    if bool(active_commitment.get("active", False)) and str(active_commitment.get("decision_type") or "").strip():
+        return {
+            "source": "governance",
+            "decision": str(active_commitment.get("decision_type") or "").strip(),
+            "managed_scope": str(active_commitment.get("managed_scope") or "").strip(),
+            "summary": _compact_sentence(
+                str(active_commitment.get("reason") or active_commitment.get("summary") or "").strip(),
+                max_len=180,
+            ),
+        }
+
     if str(governance.get("governance_decision") or "").strip():
         decision = str(governance.get("governance_decision") or "").strip()
         scope = str(governance.get("managed_scope") or "").strip()
@@ -1281,6 +1357,48 @@ def _operator_current_recommendation(
         if isinstance(execution_recovery.get("recovery_learning", {}), dict)
         else {}
     )
+    recovery_conflict_resolution = (
+        execution_recovery.get("conflict_resolution", {})
+        if isinstance(execution_recovery.get("conflict_resolution", {}), dict)
+        else {}
+    )
+    recovery_policy_tuning = (
+      execution_recovery.get("recovery_policy_tuning", {})
+      if isinstance(execution_recovery.get("recovery_policy_tuning", {}), dict)
+      else {}
+    )
+    if str(recovery_conflict_resolution.get("winning_policy_source") or "").strip() in {"operator_commitment", "execution_recovery_commitment"} and str(
+      recovery_policy_tuning.get("policy_action") or ""
+    ).strip():
+      return {
+        "source": "governance",
+        "decision": "lower_autonomy_for_scope",
+        "managed_scope": str(execution_recovery.get("managed_scope") or recovery_learning.get("managed_scope") or "").strip(),
+        "summary": _compact_sentence(
+          str(
+            recovery_policy_tuning.get("summary")
+            or recovery_policy_tuning.get("rationale")
+            or ""
+          ).strip(),
+          max_len=180,
+        ),
+      }
+    if str(recovery_policy_tuning.get("policy_action") or "").strip() and str(
+      recovery_policy_tuning.get("policy_action") or ""
+    ).strip() != "maintain_current_recovery_autonomy":
+      return {
+        "source": "execution_recovery_policy_tuning",
+        "decision": str(recovery_policy_tuning.get("policy_action") or "").strip(),
+        "managed_scope": str(execution_recovery.get("managed_scope") or recovery_learning.get("managed_scope") or "").strip(),
+        "summary": _compact_sentence(
+          str(
+            recovery_policy_tuning.get("summary")
+            or recovery_policy_tuning.get("rationale")
+            or ""
+          ).strip(),
+          max_len=180,
+        ),
+      }
     if str(recovery_learning.get("escalation_decision") or "").strip() and str(
         recovery_learning.get("escalation_decision") or ""
     ).strip() != "continue_bounded_recovery":
@@ -1540,12 +1658,167 @@ def _operator_dispatch_telemetry_snapshot(
   }
 
 
+def _operator_tod_decision_process_snapshot(
+    shared_root: Path = SHARED_RUNTIME_ROOT,
+) -> dict:
+  payload = _load_json_artifact(shared_root / "MIM_DECISION_TASK.latest.json")
+  if not payload:
+    return {}
+
+  decision_process = payload.get("decision_process") if isinstance(payload.get("decision_process"), dict) else {}
+  questions = decision_process.get("questions") if isinstance(decision_process.get("questions"), dict) else {}
+  tod_knows = questions.get("tod_knows_what_mim_did") if isinstance(questions.get("tod_knows_what_mim_did"), dict) else {}
+  mim_knows = questions.get("mim_knows_what_tod_did") if isinstance(questions.get("mim_knows_what_tod_did"), dict) else {}
+  tod_work = questions.get("tod_current_work") if isinstance(questions.get("tod_current_work"), dict) else {}
+  tod_liveness = questions.get("tod_liveness") if isinstance(questions.get("tod_liveness"), dict) else {}
+  escalation = decision_process.get("communication_escalation") if isinstance(decision_process.get("communication_escalation"), dict) else {}
+  if not escalation:
+    escalation = payload.get("communication_escalation") if isinstance(payload.get("communication_escalation"), dict) else {}
+  selected_action = decision_process.get("selected_action") if isinstance(decision_process.get("selected_action"), dict) else {}
+
+  summary_parts = [
+    f"TOD {'knows' if bool(tod_knows.get('known')) else 'does not know'} what MIM did",
+    f"MIM {'knows' if bool(mim_knows.get('known')) else 'does not know'} what TOD did",
+  ]
+  work_phase = str(tod_work.get("phase") or "").strip().replace("_", " ")
+  if work_phase:
+    summary_parts.append(f"TOD work {work_phase}")
+  liveness_status = str(tod_liveness.get("status") or "").strip().replace("_", " ")
+  if liveness_status:
+    summary_parts.append(f"liveness {liveness_status}")
+  if escalation.get("required") is True:
+    summary_parts.append("escalation required")
+
+  return {
+    "generated_at": str(decision_process.get("generated_at") or payload.get("generated_at") or "").strip(),
+    "state": str(decision_process.get("state") or payload.get("state") or "").strip(),
+    "state_reason": str(decision_process.get("state_reason") or payload.get("state_reason") or "").strip(),
+    "active_task_id": str(decision_process.get("active_task_id") or payload.get("active_task_id") or "").strip(),
+    "objective_id": str(decision_process.get("objective_id") or payload.get("objective_id") or "").strip(),
+    "tod_knows_what_mim_did": {
+      "known": bool(tod_knows.get("known")),
+      "detail": str(tod_knows.get("detail") or "").strip(),
+      "evidence": tod_knows.get("evidence") if isinstance(tod_knows.get("evidence"), list) else [],
+    },
+    "mim_knows_what_tod_did": {
+      "known": bool(mim_knows.get("known")),
+      "detail": str(mim_knows.get("detail") or "").strip(),
+      "evidence": mim_knows.get("evidence") if isinstance(mim_knows.get("evidence"), list) else [],
+    },
+    "tod_current_work": {
+      "known": bool(tod_work.get("known")),
+      "task_id": str(tod_work.get("task_id") or "").strip(),
+      "objective_id": str(tod_work.get("objective_id") or "").strip(),
+      "phase": str(tod_work.get("phase") or "").strip(),
+      "detail": str(tod_work.get("detail") or "").strip(),
+    },
+    "tod_liveness": {
+      "status": str(tod_liveness.get("status") or "").strip(),
+      "ask_required": bool(tod_liveness.get("ask_required") is True),
+      "latest_progress_age_seconds": tod_liveness.get("latest_progress_age_seconds"),
+      "ping_response_age_seconds": tod_liveness.get("ping_response_age_seconds"),
+      "console_probe_age_seconds": tod_liveness.get("console_probe_age_seconds"),
+      "console_probe_status": str(tod_liveness.get("console_probe_status") or "").strip(),
+      "primary_alert_code": str(tod_liveness.get("primary_alert_code") or "").strip(),
+    },
+    "communication_escalation": {
+      "required": bool(escalation.get("required") is True),
+      "code": str(escalation.get("code") or "monitor_only").strip(),
+      "detail": str(escalation.get("detail") or "").strip(),
+      "required_cycle_count": int(escalation.get("required_cycle_count", 0) or 0),
+      "block_dispatch_threshold_cycles": int(escalation.get("block_dispatch_threshold_cycles", 0) or 0),
+      "console_url": str(escalation.get("console_url") or "").strip(),
+      "kick_hint": str(escalation.get("kick_hint") or "").strip(),
+    },
+    "selected_action": {
+      "code": str(selected_action.get("code") or "monitor_only").strip(),
+      "detail": str(selected_action.get("detail") or "").strip(),
+    },
+    "blocking_reason_codes": payload.get("blocking_reason_codes") if isinstance(payload.get("blocking_reason_codes"), list) else [],
+    "summary": "; ".join(part for part in summary_parts if part),
+  }
+
+
 def _choose_operator_resolution_commitment(
     rows: list[WorkspaceOperatorResolutionCommitment],
     *,
     scope: str,
 ) -> WorkspaceOperatorResolutionCommitment | None:
     return choose_operator_resolution_commitment(rows, scope=scope)
+
+
+def _choose_recovery_policy_commitment(
+  rows: list[WorkspaceOperatorResolutionCommitment],
+  *,
+  scope: str,
+) -> WorkspaceOperatorResolutionCommitment | None:
+  filtered = [row for row in rows if commitment_is_recovery_policy_tuning_derived(row)]
+  return choose_operator_resolution_commitment(filtered, scope=scope)
+
+
+def _operator_recovery_governance_rollup_snapshot(
+  *,
+  execution_recovery: dict,
+  recovery_commitment: dict,
+  recovery_commitment_monitoring: dict,
+  recovery_commitment_outcome: dict,
+  conflict_resolution: dict,
+) -> dict:
+  commitment = recovery_commitment if isinstance(recovery_commitment, dict) else {}
+  monitoring = recovery_commitment_monitoring if isinstance(recovery_commitment_monitoring, dict) else {}
+  outcome = recovery_commitment_outcome if isinstance(recovery_commitment_outcome, dict) else {}
+  recovery = execution_recovery if isinstance(execution_recovery, dict) else {}
+  conflict = conflict_resolution if isinstance(conflict_resolution, dict) else {}
+  tuning = recovery.get("recovery_policy_tuning", {}) if isinstance(recovery.get("recovery_policy_tuning", {}), dict) else {}
+  expiry_signal = monitoring.get("expiry_signal", {}) if isinstance(monitoring.get("expiry_signal", {}), dict) else {}
+  reapply_signal = monitoring.get("reapply_signal", {}) if isinstance(monitoring.get("reapply_signal", {}), dict) else {}
+  downstream = commitment.get("downstream_effects_json", {}) if isinstance(commitment.get("downstream_effects_json", {}), dict) else {}
+  admission_posture = "open"
+  if commitment and bool(commitment.get("active", False)):
+    requested_level = str(
+      downstream.get("autonomy_level") or downstream.get("autonomy_level_cap") or ""
+    ).strip()
+    if requested_level in {"operator_required", "manual_only"}:
+      admission_posture = "operator_required"
+    elif requested_level:
+      admission_posture = "advisory"
+  recommended_next_action = "monitor_only"
+  if str(expiry_signal.get("state") or "").strip() == "ready_to_expire":
+    recommended_next_action = "expire_commitment"
+  elif str(reapply_signal.get("state") or "").strip() == "recommended":
+    recommended_next_action = "reapply_commitment"
+  elif str(conflict.get("conflict_state") or "").strip() in {"active_conflict", "cooldown_held"}:
+    recommended_next_action = "review_conflict"
+  elif admission_posture == "operator_required":
+    recommended_next_action = "operator_review_required"
+  elif commitment:
+    recommended_next_action = "maintain_commitment"
+  return {
+    "managed_scope": str(
+      commitment.get("managed_scope")
+      or recovery.get("managed_scope")
+      or tuning.get("recovery_boundary_scope")
+      or ""
+    ).strip(),
+    "tuning": tuning,
+    "commitment": commitment,
+    "monitoring": monitoring,
+    "outcome": outcome,
+    "conflict": conflict,
+    "expiry_signal": expiry_signal,
+    "reapply_signal": reapply_signal,
+    "admission_posture": admission_posture,
+    "recommended_next_action": recommended_next_action,
+    "scope_application": (
+      commitment.get("scope_application")
+      if isinstance(commitment.get("scope_application"), dict)
+      else {}
+    ),
+    "summary": (
+      f"recovery commitment={str(commitment.get('lifecycle_state') or 'inactive')}; "
+      f"admission={admission_posture}; next={recommended_next_action}"
+    ),
+  }
 
 
 def _build_operator_reasoning_payload(
@@ -1559,6 +1832,9 @@ def _build_operator_reasoning_payload(
     commitment_row: WorkspaceOperatorResolutionCommitment | None,
     commitment_monitoring_row: WorkspaceOperatorResolutionCommitmentMonitoringProfile | None,
     commitment_outcome_row: WorkspaceOperatorResolutionCommitmentOutcomeProfile | None,
+    recovery_commitment_row: WorkspaceOperatorResolutionCommitment | None,
+    recovery_commitment_monitoring_row: WorkspaceOperatorResolutionCommitmentMonitoringProfile | None,
+    recovery_commitment_outcome_row: WorkspaceOperatorResolutionCommitmentOutcomeProfile | None,
     gateway_governance_snapshot: dict,
     execution_recovery: dict,
     learned_preferences: list[dict],
@@ -1568,6 +1844,7 @@ def _build_operator_reasoning_payload(
     execution_readiness: dict,
     collaboration_progress: dict,
     dispatch_telemetry: dict,
+    tod_decision_process: dict,
     runtime_health: dict,
     runtime_recovery: dict,
 ) -> dict:
@@ -1583,6 +1860,13 @@ def _build_operator_reasoning_payload(
     commitment_outcome = _operator_resolution_commitment_outcome_snapshot(
       commitment_outcome_row
     )
+    recovery_commitment = _operator_resolution_commitment_snapshot(recovery_commitment_row)
+    recovery_commitment_monitoring = _operator_resolution_commitment_monitoring_snapshot(
+      recovery_commitment_monitoring_row
+    )
+    recovery_commitment_outcome = _operator_resolution_commitment_outcome_snapshot(
+      recovery_commitment_outcome_row
+    )
     gateway_governance = _operator_gateway_governance_snapshot(
         gateway_governance_snapshot
     )
@@ -1591,12 +1875,21 @@ def _build_operator_reasoning_payload(
     readiness = _operator_execution_readiness_snapshot(execution_readiness)
     recovery = _operator_execution_recovery_snapshot(execution_recovery)
     recovery_learning = _operator_execution_recovery_learning_snapshot(execution_recovery)
+    recovery_policy_tuning = _operator_execution_recovery_policy_tuning_snapshot(execution_recovery)
+    recovery_governance_rollup = _operator_recovery_governance_rollup_snapshot(
+      execution_recovery=execution_recovery,
+      recovery_commitment=recovery_commitment,
+      recovery_commitment_monitoring=recovery_commitment_monitoring,
+      recovery_commitment_outcome=recovery_commitment_outcome,
+      conflict_resolution=conflict_resolution,
+    )
     recommendation = _operator_current_recommendation(
         inquiry=inquiry,
         governance=governance,
         autonomy=autonomy,
         stewardship=stewardship,
       commitment=commitment,
+        recovery_commitment=recovery_commitment,
         execution_recovery=recovery,
         commitment_monitoring=commitment_monitoring,
         commitment_outcome=commitment_outcome,
@@ -1619,6 +1912,7 @@ def _build_operator_reasoning_payload(
             conflict_resolution=conflict_resolution,
             collaboration_progress=collaboration_progress,
             dispatch_telemetry=dispatch_telemetry,
+            tod_decision_process=tod_decision_process,
             runtime_health=runtime_health,
             runtime_recovery=runtime_recovery,
         ),
@@ -1631,6 +1925,11 @@ def _build_operator_reasoning_payload(
         "execution_readiness": readiness,
         "execution_recovery": recovery,
         "execution_recovery_learning": recovery_learning,
+        "execution_recovery_policy_tuning": recovery_policy_tuning,
+        "execution_recovery_policy_commitment": recovery_commitment,
+        "execution_recovery_policy_commitment_monitoring": recovery_commitment_monitoring,
+        "execution_recovery_policy_commitment_outcome": recovery_commitment_outcome,
+        "execution_recovery_governance_rollup": recovery_governance_rollup,
         "current_recommendation": recommendation,
         "resolution_commitment": commitment,
         "commitment_monitoring": commitment_monitoring,
@@ -1641,6 +1940,7 @@ def _build_operator_reasoning_payload(
         "conflict_resolution": conflict_resolution,
         "collaboration_progress": collaboration_progress,
         "dispatch_telemetry": dispatch_telemetry,
+        "tod_decision_process": tod_decision_process,
         "runtime_health": runtime_health,
         "runtime_recovery": runtime_recovery,
     }
@@ -2894,6 +3194,43 @@ async def mim_ui_page() -> str:
           title: 'TOD collaboration',
           meta,
           note,
+        });
+      }
+
+      const todDecision = (reasoning && typeof reasoning.tod_decision_process === 'object') ? reasoning.tod_decision_process : {};
+      if (String(todDecision.summary || '').trim()) {
+        const todKnows = (todDecision.tod_knows_what_mim_did && typeof todDecision.tod_knows_what_mim_did === 'object')
+          ? todDecision.tod_knows_what_mim_did
+          : {};
+        const mimKnows = (todDecision.mim_knows_what_tod_did && typeof todDecision.mim_knows_what_tod_did === 'object')
+          ? todDecision.mim_knows_what_tod_did
+          : {};
+        const todWork = (todDecision.tod_current_work && typeof todDecision.tod_current_work === 'object')
+          ? todDecision.tod_current_work
+          : {};
+        const todLiveness = (todDecision.tod_liveness && typeof todDecision.tod_liveness === 'object')
+          ? todDecision.tod_liveness
+          : {};
+        const escalation = (todDecision.communication_escalation && typeof todDecision.communication_escalation === 'object')
+          ? todDecision.communication_escalation
+          : {};
+        const meta = [
+          todDecision.state && String(todDecision.state || '').trim().replaceAll('_', ' '),
+          todLiveness.status && `liveness ${String(todLiveness.status || '').trim().replaceAll('_', ' ')}`,
+          escalation.required_cycle_count ? `cycles ${Number(escalation.required_cycle_count)}` : '',
+          escalation.required ? 'escalation required' : 'no escalation',
+        ].filter(Boolean).join(' | ');
+        const noteParts = [
+          `TOD ${todKnows.known ? 'knows' : 'does not know'} what MIM did`,
+          `MIM ${mimKnows.known ? 'knows' : 'does not know'} what TOD did`,
+          todWork.phase ? `TOD work: ${String(todWork.phase || '').trim().replaceAll('_', ' ')}` : '',
+          escalation.code ? `Escalation: ${String(escalation.code || '').trim().replaceAll('_', ' ')}` : '',
+          escalation.block_dispatch_threshold_cycles ? `Dispatch block threshold: ${Number(escalation.block_dispatch_threshold_cycles)} cycles` : '',
+        ].filter(Boolean).join('. ');
+        entries.push({
+          title: 'TOD decision process',
+          meta,
+          note: noteParts || String(todDecision.summary || '').trim(),
         });
       }
 
@@ -6812,8 +7149,14 @@ async def mim_ui_state(db: AsyncSession = Depends(get_db)) -> dict:
       commitment_rows,
       scope="",
     )
+    latest_recovery_policy_commitment = _choose_recovery_policy_commitment(
+      commitment_rows,
+      scope="",
+    )
     latest_commitment_monitoring = None
     latest_commitment_outcome = None
+    latest_recovery_policy_commitment_monitoring = None
+    latest_recovery_policy_commitment_outcome = None
     latest_execution_recovery: dict = {}
     learned_preferences: list[dict] = []
     proposal_policy_preferences: list[dict] = []
@@ -6827,6 +7170,15 @@ async def mim_ui_state(db: AsyncSession = Depends(get_db)) -> dict:
       )
       latest_commitment_outcome = await latest_commitment_outcome_profile(
         commitment_id=int(latest_resolution_commitment.id),
+        db=db,
+      )
+    if latest_recovery_policy_commitment is not None:
+      latest_recovery_policy_commitment_monitoring = await latest_commitment_monitoring_profile(
+        commitment_id=int(latest_recovery_policy_commitment.id),
+        db=db,
+      )
+      latest_recovery_policy_commitment_outcome = await latest_commitment_outcome_profile(
+        commitment_id=int(latest_recovery_policy_commitment.id),
         db=db,
       )
     if latest_stewardship_state is not None:
@@ -6986,8 +7338,14 @@ async def mim_ui_state(db: AsyncSession = Depends(get_db)) -> dict:
             commitment_rows,
             scope=operator_reasoning_scope if 'operator_reasoning_scope' in locals() else "",
           )
+          latest_recovery_policy_commitment = _choose_recovery_policy_commitment(
+            commitment_rows,
+            scope=operator_reasoning_scope if 'operator_reasoning_scope' in locals() else "",
+          )
           latest_commitment_monitoring = None
           latest_commitment_outcome = None
+          latest_recovery_policy_commitment_monitoring = None
+          latest_recovery_policy_commitment_outcome = None
           if latest_resolution_commitment is not None:
             latest_commitment_monitoring = await latest_commitment_monitoring_profile(
               commitment_id=int(latest_resolution_commitment.id),
@@ -6995,6 +7353,15 @@ async def mim_ui_state(db: AsyncSession = Depends(get_db)) -> dict:
             )
             latest_commitment_outcome = await latest_commitment_outcome_profile(
               commitment_id=int(latest_resolution_commitment.id),
+              db=db,
+            )
+          if latest_recovery_policy_commitment is not None:
+            latest_recovery_policy_commitment_monitoring = await latest_commitment_monitoring_profile(
+              commitment_id=int(latest_recovery_policy_commitment.id),
+              db=db,
+            )
+            latest_recovery_policy_commitment_outcome = await latest_commitment_outcome_profile(
+              commitment_id=int(latest_recovery_policy_commitment.id),
               db=db,
             )
 
@@ -7551,6 +7918,7 @@ async def mim_ui_state(db: AsyncSession = Depends(get_db)) -> dict:
     )
     collaboration_progress = _operator_collaboration_progress_snapshot()
     dispatch_telemetry = _operator_dispatch_telemetry_snapshot()
+    tod_decision_process = _operator_tod_decision_process_snapshot()
     runtime_recovery = runtime_recovery_service.get_summary()
 
     operator_reasoning = _build_operator_reasoning_payload(
@@ -7563,6 +7931,9 @@ async def mim_ui_state(db: AsyncSession = Depends(get_db)) -> dict:
         commitment_row=latest_resolution_commitment,
         commitment_monitoring_row=latest_commitment_monitoring,
         commitment_outcome_row=latest_commitment_outcome,
+        recovery_commitment_row=latest_recovery_policy_commitment,
+        recovery_commitment_monitoring_row=latest_recovery_policy_commitment_monitoring,
+        recovery_commitment_outcome_row=latest_recovery_policy_commitment_outcome,
       gateway_governance_snapshot=gateway_governance_snapshot,
         learned_preferences=learned_preferences,
         preference_conflicts_items=preference_conflict_items,
@@ -7578,6 +7949,7 @@ async def mim_ui_state(db: AsyncSession = Depends(get_db)) -> dict:
         ),
         collaboration_progress=collaboration_progress,
         dispatch_telemetry=dispatch_telemetry,
+        tod_decision_process=tod_decision_process,
         runtime_health=runtime_health,
         runtime_recovery=runtime_recovery,
     )
@@ -7602,8 +7974,10 @@ async def mim_ui_state(db: AsyncSession = Depends(get_db)) -> dict:
             "operator_preference_convergence",
             "cross_policy_conflict_resolution",
             "execution_readiness_integration",
+            "recovery_governance_rollup",
             "tod_collaboration_progress",
             "mim_arm_dispatch_telemetry",
+            "tod_decision_process_visibility",
             "runtime_health_visibility",
         ],
         "inquiry_prompt": inquiry_prompt,

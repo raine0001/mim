@@ -25,12 +25,28 @@ PROFILE_STATUSES = {
     "applied",
     "rejected",
 }
+LEGACY_AUTONOMY_LEVEL_ALIASES = {
+    "trusted_auto": "strategy_auto",
+}
 AUTONOMY_LEVELS = [
     "manual_only",
     "operator_required",
     "bounded_auto",
-    "trusted_auto",
+    "strategy_auto",
 ]
+
+
+def canonical_autonomy_level(level: object) -> str:
+    normalized = str(level or "").strip() or "operator_required"
+    return LEGACY_AUTONOMY_LEVEL_ALIASES.get(normalized, normalized)
+
+
+def autonomy_level_rank(level: object) -> int:
+    normalized = canonical_autonomy_level(level)
+    try:
+        return AUTONOMY_LEVELS.index(normalized)
+    except ValueError:
+        return AUTONOMY_LEVELS.index("operator_required")
 
 
 def _bounded(value: float, *, lo: float = 0.0, hi: float = 1.0) -> float:
@@ -84,10 +100,11 @@ def _current_level_from_autonomy(boundaries: dict) -> str:
     low_risk = float(boundaries.get("low_risk_score_max", 0.3) or 0.3)
     if max_auto <= 5 or low_risk <= 0.32:
         return "bounded_auto"
-    return "trusted_auto"
+    return "strategy_auto"
 
 
 def _autonomy_for_level(current: dict, level: str) -> dict:
+    level = canonical_autonomy_level(level)
     out = {
         **current,
     }
@@ -123,12 +140,177 @@ def _autonomy_for_level(current: dict, level: str) -> dict:
 
 
 def _shift_level(level: str, delta: int) -> str:
-    try:
-        index = AUTONOMY_LEVELS.index(level)
-    except ValueError:
-        index = AUTONOMY_LEVELS.index("operator_required")
+    index = autonomy_level_rank(level)
     next_index = max(0, min(len(AUTONOMY_LEVELS) - 1, index + int(delta)))
     return AUTONOMY_LEVELS[next_index]
+
+
+def build_boundary_profile_snapshot(row: WorkspaceAutonomyBoundaryProfile | dict | None) -> dict:
+    if row is None:
+        return {}
+    if isinstance(row, dict):
+        reasoning = row.get("adaptation_reasoning", {}) if isinstance(row.get("adaptation_reasoning", {}), dict) else {}
+        confidence = float(row.get("confidence", 0.0) or 0.0)
+        return {
+            "boundary_id": int(row.get("boundary_id") or row.get("profile_id") or 0) or None,
+            "scope": str(row.get("scope") or "").strip(),
+            "current_level": canonical_autonomy_level(row.get("current_level")),
+            "profile_status": str(row.get("profile_status") or "").strip(),
+            "confidence": round(confidence, 6),
+            "adjustment_reason": str(row.get("adjustment_reason") or row.get("adaptation_summary") or "").strip(),
+            "decision": str(reasoning.get("decision") or row.get("decision") or "").strip(),
+            "target_level": canonical_autonomy_level(reasoning.get("target_level") or row.get("target_level") or row.get("current_level")),
+        }
+    reasoning = row.adaptation_reasoning_json if isinstance(row.adaptation_reasoning_json, dict) else {}
+    return {
+        "boundary_id": int(row.id),
+        "scope": str(row.scope or "").strip(),
+        "current_level": canonical_autonomy_level(row.current_level),
+        "profile_status": str(row.profile_status or "").strip(),
+        "confidence": round(float(row.confidence or 0.0), 6),
+        "adjustment_reason": str(row.adjustment_reason or row.adaptation_summary or "").strip(),
+        "decision": str(reasoning.get("decision") or "").strip(),
+        "target_level": canonical_autonomy_level(reasoning.get("target_level") or row.current_level),
+    }
+
+
+def build_boundary_decision_basis(
+    *,
+    boundary_profile: dict | None,
+    requested_action: str,
+    policy_source: str,
+    auto_execution_allowed: bool | None,
+    reason: str,
+    policy_conflict: dict | None = None,
+) -> dict:
+    profile = boundary_profile if isinstance(boundary_profile, dict) else {}
+    current_level = canonical_autonomy_level(profile.get("current_level")) if profile else "operator_required"
+    conflict = policy_conflict if isinstance(policy_conflict, dict) else {}
+    winning_source = str(conflict.get("winning_policy_source") or policy_source or "").strip()
+    why_policy_prevailed = ""
+    if isinstance(conflict.get("policy_effects_json", {}), dict):
+        why_policy_prevailed = str(conflict.get("policy_effects_json", {}).get("why_policy_prevailed") or "").strip()
+    detail = str(reason or why_policy_prevailed or profile.get("adjustment_reason") or "").strip()
+    blocked_by_boundary = current_level in {"manual_only", "operator_required"}
+    if auto_execution_allowed is None:
+        auto_execution_allowed = not blocked_by_boundary
+    explanation = ""
+    if not auto_execution_allowed and blocked_by_boundary:
+        explanation = f"Automatic action stayed blocked because boundary = {current_level} at that moment."
+    elif auto_execution_allowed:
+        explanation = f"Automatic action remained allowed because boundary = {current_level} at that moment."
+    elif detail:
+        explanation = detail
+    return {
+        "requested_action": str(requested_action or "").strip(),
+        "policy_source": winning_source or "autonomy_boundary",
+        "boundary_level": current_level,
+        "auto_execution_allowed": bool(auto_execution_allowed),
+        "automation_blocked": not bool(auto_execution_allowed),
+        "reason": detail,
+        "why_not_automatic": explanation if not auto_execution_allowed else "",
+        "why_automatic_was_allowed": explanation if auto_execution_allowed else "",
+    }
+
+
+def build_boundary_action_controls(boundary_profile: dict | None) -> dict:
+    profile = boundary_profile if isinstance(boundary_profile, dict) else {}
+    level = canonical_autonomy_level(profile.get("current_level")) if profile else "operator_required"
+    if level == "manual_only":
+        return {
+            "boundary_profile": level,
+            "allowed_actions": ["plan", "inspect", "explain"],
+            "approval_required": True,
+            "retry_policy": {"max_attempts": 0, "strategy": "no_automatic_retry"},
+            "risk_level": "high",
+        }
+    if level == "operator_required":
+        return {
+            "boundary_profile": level,
+            "allowed_actions": ["plan", "simulate", "queue", "execute_with_operator_approval", "resume_with_operator_approval"],
+            "approval_required": True,
+            "retry_policy": {"max_attempts": 0, "strategy": "operator_driven_only"},
+            "risk_level": "medium",
+        }
+    if level == "bounded_auto":
+        return {
+            "boundary_profile": level,
+            "allowed_actions": ["plan", "simulate", "execute_low_risk", "retry_once", "recover_bounded", "advance_task"],
+            "approval_required": False,
+            "retry_policy": {"max_attempts": 1, "strategy": "single_bounded_retry"},
+            "risk_level": "low",
+        }
+    return {
+        "boundary_profile": "strategy_auto",
+        "allowed_actions": ["plan", "simulate", "execute_bounded", "retry_once", "recover_bounded", "advance_task", "replan_within_scope"],
+        "approval_required": False,
+        "retry_policy": {"max_attempts": 1, "strategy": "bounded_strategy_retry"},
+        "risk_level": "low",
+    }
+
+
+def build_autonomy_decision_context(
+    *,
+    boundary_profile: dict | None,
+    requested_action: str,
+    policy_source: str,
+    auto_execution_allowed: bool | None,
+    reason: str,
+    policy_conflict: dict | None = None,
+) -> dict:
+    snapshot = boundary_profile if isinstance(boundary_profile, dict) else {}
+    controls = build_boundary_action_controls(snapshot)
+    return {
+        "boundary_profile": snapshot,
+        "decision_basis": build_boundary_decision_basis(
+            boundary_profile=snapshot,
+            requested_action=requested_action,
+            policy_source=policy_source,
+            auto_execution_allowed=auto_execution_allowed,
+            reason=reason,
+            policy_conflict=policy_conflict,
+        ),
+        "allowed_actions": controls.get("allowed_actions", []),
+        "approval_required": bool(controls.get("approval_required", True)),
+        "retry_policy": controls.get("retry_policy", {}),
+        "risk_level": str(controls.get("risk_level") or "medium").strip(),
+    }
+
+
+async def get_latest_autonomy_boundary_for_scope(
+    *,
+    scope: str,
+    db: AsyncSession,
+) -> WorkspaceAutonomyBoundaryProfile | None:
+    normalized_scope = str(scope or "").strip() or "global"
+    exact = (
+        await db.execute(
+            select(WorkspaceAutonomyBoundaryProfile)
+            .where(WorkspaceAutonomyBoundaryProfile.scope == normalized_scope)
+            .order_by(WorkspaceAutonomyBoundaryProfile.id.desc())
+            .limit(1)
+        )
+    ).scalars().first()
+    if exact is not None:
+        return exact
+    if normalized_scope != "global":
+        fallback = (
+            await db.execute(
+                select(WorkspaceAutonomyBoundaryProfile)
+                .where(WorkspaceAutonomyBoundaryProfile.scope == "global")
+                .order_by(WorkspaceAutonomyBoundaryProfile.id.desc())
+                .limit(1)
+            )
+        ).scalars().first()
+        if fallback is not None:
+            return fallback
+    return (
+        await db.execute(
+            select(WorkspaceAutonomyBoundaryProfile)
+            .order_by(WorkspaceAutonomyBoundaryProfile.id.desc())
+            .limit(1)
+        )
+    ).scalars().first()
 
 
 def _effective_hard_ceiling(overrides: dict) -> dict:
@@ -271,7 +453,8 @@ def _apply_execution_truth_governance_to_boundaries(
         updated_level = _shift_level(target_level, -1)
     elif decision == "escalate_to_operator":
         updated_level = "operator_required"
-    if capped_level and AUTONOMY_LEVELS.index(updated_level) > AUTONOMY_LEVELS.index(capped_level):
+    capped_level = canonical_autonomy_level(capped_level)
+    if capped_level and autonomy_level_rank(updated_level) > autonomy_level_rank(capped_level):
         updated_level = capped_level
 
     updated_recommended = _autonomy_for_level(recommended, updated_level)
@@ -316,7 +499,7 @@ def _apply_operator_resolution_commitment_to_boundaries(
         updated_reasoning["operator_resolution_commitment_applied"] = False
         return recommended, target_level, summary, confidence, updated_reasoning
 
-    if AUTONOMY_LEVELS.index(requested_level) > AUTONOMY_LEVELS.index(target_level):
+    if autonomy_level_rank(requested_level) > autonomy_level_rank(target_level):
         updated_reasoning["operator_resolution_commitment_applied"] = False
         return recommended, target_level, summary, confidence, updated_reasoning
 
@@ -361,9 +544,10 @@ def _apply_operator_resolution_outcome_to_boundaries(
     if outcome_status == "harmful":
         updated_level = "operator_required"
     elif outcome_status in {"ineffective", "abandoned"}:
-        if AUTONOMY_LEVELS.index(target_level) > AUTONOMY_LEVELS.index("operator_required"):
+        if autonomy_level_rank(target_level) > autonomy_level_rank("operator_required"):
             updated_level = "operator_required"
-    if cap in AUTONOMY_LEVELS and AUTONOMY_LEVELS.index(updated_level) > AUTONOMY_LEVELS.index(cap):
+    cap = canonical_autonomy_level(cap)
+    if cap in AUTONOMY_LEVELS and autonomy_level_rank(updated_level) > autonomy_level_rank(cap):
         updated_level = cap
     if updated_level == target_level:
         updated_reasoning["operator_resolution_outcome_applied"] = False
@@ -416,7 +600,7 @@ def _apply_operator_learned_preference_to_boundaries(
     if preferred_level not in AUTONOMY_LEVELS:
         updated_reasoning["operator_learned_preference_applied"] = False
         return recommended, target_level, summary, confidence, updated_reasoning
-    if AUTONOMY_LEVELS.index(preferred_level) > AUTONOMY_LEVELS.index(target_level):
+    if autonomy_level_rank(preferred_level) > autonomy_level_rank(target_level):
         updated_reasoning["operator_learned_preference_applied"] = False
         return recommended, target_level, summary, confidence, updated_reasoning
     if preferred_level == target_level:
@@ -461,7 +645,7 @@ async def _proposal_arbitration_autonomy_review(
     )
     applied = bool(influence.get("applied", False)) and review_weight >= 0.01
     target_level_cap = ""
-    if applied and AUTONOMY_LEVELS.index(target_level) > AUTONOMY_LEVELS.index("bounded_auto"):
+    if applied and autonomy_level_rank(target_level) > autonomy_level_rank("bounded_auto"):
         target_level_cap = "bounded_auto"
     rationale = ""
     if applied:
@@ -511,7 +695,8 @@ def _apply_proposal_arbitration_to_boundaries(
 
     capped_level = str(review.get("target_level_cap", "") or "").strip()
     updated_level = target_level
-    if capped_level in AUTONOMY_LEVELS and AUTONOMY_LEVELS.index(updated_level) > AUTONOMY_LEVELS.index(capped_level):
+    capped_level = canonical_autonomy_level(capped_level)
+    if capped_level in AUTONOMY_LEVELS and autonomy_level_rank(updated_level) > autonomy_level_rank(capped_level):
         updated_level = capped_level
 
     updated_reasoning["proposal_arbitration_autonomy_review_applied"] = True
@@ -765,6 +950,7 @@ async def evaluate_adaptive_autonomy_boundaries(
     operator_resolution_commitment = await latest_active_operator_resolution_commitment(
         scope=scope,
         db=db,
+        include_inherited=True,
     )
     operator_resolution_outcome = await latest_scope_commitment_outcome_profile(
         managed_scope=scope,
@@ -850,7 +1036,7 @@ async def evaluate_adaptive_autonomy_boundaries(
             if isinstance(policy_conflict_resolution.get("policy_effects_json", {}), dict)
             else {}
         )
-        resolved_level = str(policy_effects.get("target_level") or "").strip()
+        resolved_level = canonical_autonomy_level(policy_effects.get("target_level"))
         if resolved_level in AUTONOMY_LEVELS:
             current_level = resolved_level
             recommended = _autonomy_for_level(recommended, current_level)
@@ -1010,7 +1196,7 @@ def to_autonomy_boundary_profile_out(row: WorkspaceAutonomyBoundaryProfile) -> d
         "source": row.source,
         "actor": row.actor,
         "profile_status": row.profile_status,
-        "current_level": row.current_level,
+        "current_level": canonical_autonomy_level(row.current_level),
         "confidence": float(row.confidence or 0.0),
         "evidence_inputs": row.evidence_inputs_json if isinstance(row.evidence_inputs_json, dict) else {},
         "last_adjusted": row.last_adjusted,
@@ -1027,6 +1213,30 @@ def to_autonomy_boundary_profile_out(row: WorkspaceAutonomyBoundaryProfile) -> d
         "applied_boundaries": row.applied_boundaries_json if isinstance(row.applied_boundaries_json, dict) else {},
         "adaptation_summary": row.adaptation_summary,
         "adaptation_reasoning": adaptation_reasoning,
+        "boundary_profile": build_boundary_profile_snapshot(row),
+        "decision_basis": build_boundary_decision_basis(
+            boundary_profile=build_boundary_profile_snapshot(row),
+            requested_action="adaptive_autonomy_boundary",
+            policy_source=str(
+                (
+                    adaptation_reasoning.get("policy_conflict_resolution", {})
+                    if isinstance(adaptation_reasoning.get("policy_conflict_resolution", {}), dict)
+                    else {}
+                ).get("winning_policy_source")
+                or "autonomy_boundary"
+            ).strip(),
+            auto_execution_allowed=canonical_autonomy_level(row.current_level) not in {"manual_only", "operator_required"},
+            reason=str(row.adjustment_reason or row.adaptation_summary or "").strip(),
+            policy_conflict=(
+                adaptation_reasoning.get("policy_conflict_resolution", {})
+                if isinstance(adaptation_reasoning.get("policy_conflict_resolution", {}), dict)
+                else {}
+            ),
+        ),
+        "allowed_actions": build_boundary_action_controls(build_boundary_profile_snapshot(row)).get("allowed_actions", []),
+        "approval_required": bool(build_boundary_action_controls(build_boundary_profile_snapshot(row)).get("approval_required", True)),
+        "retry_policy": build_boundary_action_controls(build_boundary_profile_snapshot(row)).get("retry_policy", {}),
+        "risk_level": str(build_boundary_action_controls(build_boundary_profile_snapshot(row)).get("risk_level") or "medium").strip(),
         "execution_truth_influence": (
             adaptation_reasoning.get("execution_truth_influence", {})
             if isinstance(adaptation_reasoning.get("execution_truth_influence", {}), dict)

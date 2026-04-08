@@ -5,6 +5,12 @@ from datetime import datetime, timezone
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from core.autonomy_boundary_service import (
+    build_autonomy_decision_context,
+    build_boundary_profile_snapshot,
+    canonical_autonomy_level,
+    get_latest_autonomy_boundary_for_scope,
+)
 from core.execution_readiness_service import (
     execution_readiness_confidence,
     execution_readiness_policy_effects,
@@ -25,6 +31,9 @@ from core.models import CapabilityExecution, ExecutionOverride, ExecutionStabili
 from core.operator_resolution_service import (
     commitment_downstream_effects,
     commitment_is_active,
+    commitment_is_recovery_policy_tuning_derived,
+    commitment_policy_source,
+    commitment_scope_application,
     commitment_snapshot,
     latest_active_operator_resolution_commitment,
 )
@@ -144,6 +153,23 @@ def _override_policy_effects(row: ExecutionOverride) -> dict:
     }
 
 
+def _boundary_requires_review(boundary_profile: dict) -> bool:
+    level = canonical_autonomy_level(boundary_profile.get("current_level"))
+    confidence = float(boundary_profile.get("confidence", 0.0) or 0.0)
+    return level in {"manual_only", "operator_required"} and confidence >= 0.5
+
+
+def _boundary_policy_effects(boundary_profile: dict) -> dict:
+    level = canonical_autonomy_level(boundary_profile.get("current_level"))
+    return {
+        "require_operator_confirmation": True,
+        "target_status": "pending_confirmation",
+        "target_dispatch_decision": "requires_confirmation",
+        "reason": "autonomy_boundary_requires_operator",
+        "why_policy_prevailed": f"Current autonomy boundary is {level} for this scope.",
+    }
+
+
 async def evaluate_execution_policy_gate(
     *,
     db: AsyncSession,
@@ -180,8 +206,15 @@ async def evaluate_execution_policy_gate(
             "managed_scope": scope,
         },
     )
-    commitment = await latest_active_operator_resolution_commitment(scope=scope, db=db, limit=20)
+    commitment = await latest_active_operator_resolution_commitment(
+        scope=scope,
+        db=db,
+        include_inherited=True,
+        limit=20,
+    )
     governance = await latest_execution_truth_governance_snapshot(managed_scope=scope, db=db)
+    boundary_row = await get_latest_autonomy_boundary_for_scope(scope=scope, db=db)
+    boundary_profile = build_boundary_profile_snapshot(boundary_row)
     overrides = await list_active_execution_overrides(
         db=db,
         managed_scope=scope,
@@ -231,19 +264,44 @@ async def evaluate_execution_policy_gate(
         )
     )
     if commitment is not None and commitment_is_active(commitment):
+        commitment_source = commitment_policy_source(commitment)
+        commitment_reason = (
+            "Active recovery-derived commitment gated execution for this scope."
+            if commitment_is_recovery_policy_tuning_derived(commitment)
+            else "Active operator commitment gated execution for this scope."
+        )
         candidates.append(
             _candidate_payload(
-                source="operator_commitment",
+                source=commitment_source,
                 posture="caution" if _commitment_requires_review(commitment) else "promote",
                 precedence_rank=100.0,
                 confidence=float(getattr(commitment, "confidence", 0.0) or 0.0),
                 freshness_weight=1.0,
                 rationale=str(getattr(commitment, "reason", "") or "").strip(),
-                snapshot=commitment_snapshot(commitment),
+                snapshot={
+                    **commitment_snapshot(commitment),
+                    "scope_application": commitment_scope_application(
+                        commitment,
+                        requested_scope=scope,
+                    ),
+                },
                 policy_effects_json={
                     "require_operator_confirmation": _commitment_requires_review(commitment),
-                    "reason": "operator_commitment_requires_review",
-                    "why_policy_prevailed": "Active operator commitment gated execution for this scope.",
+                    "reason": (
+                        "execution_recovery_commitment_requires_review"
+                        if commitment_is_recovery_policy_tuning_derived(commitment)
+                        else "operator_commitment_requires_review"
+                    ),
+                    "why_policy_prevailed": commitment_reason,
+                    "scope_application": commitment_scope_application(
+                        commitment,
+                        requested_scope=scope,
+                    ),
+                    "admission_posture": (
+                        "recovery_governed"
+                        if commitment_is_recovery_policy_tuning_derived(commitment)
+                        else "operator_governed"
+                    ),
                 },
             )
         )
@@ -262,6 +320,20 @@ async def evaluate_execution_policy_gate(
                     "reason": "execution_truth_governance_requires_review",
                     "why_policy_prevailed": "Execution-truth governance requested slower execution in this scope.",
                 },
+            )
+        )
+    if boundary_profile and _boundary_requires_review(boundary_profile):
+        candidates.append(
+            _candidate_payload(
+                source="autonomy_boundary",
+                posture="caution",
+                precedence_rank=90.0,
+                confidence=float(boundary_profile.get("confidence", 0.0) or 0.0),
+                freshness_weight=1.0,
+                rationale=str(boundary_profile.get("adjustment_reason") or "").strip()
+                or f"Autonomy boundary is {boundary_profile.get('current_level')} for this scope.",
+                snapshot=boundary_profile,
+                policy_effects_json=_boundary_policy_effects(boundary_profile),
             )
         )
     for override in overrides:
@@ -322,6 +394,18 @@ async def evaluate_execution_policy_gate(
     redirected = str(effects.get("redirect_executor") or "").strip()
     if redirected:
         final_executor = redirected
+    auto_execution_allowed = final_decision not in {"blocked", "requires_confirmation"} and final_status not in {
+        "blocked",
+        "pending_confirmation",
+    }
+    autonomy_context = build_autonomy_decision_context(
+        boundary_profile=boundary_profile,
+        requested_action=str(capability_name or requested_executor or "execution").strip(),
+        policy_source=str(conflict.get("winning_policy_source") or "").strip() or "execution_policy_gate",
+        auto_execution_allowed=auto_execution_allowed,
+        reason=str(effects.get("why_policy_prevailed") or final_reason or "").strip(),
+        policy_conflict=conflict,
+    )
 
     return {
         "managed_scope": scope,
@@ -334,6 +418,12 @@ async def evaluate_execution_policy_gate(
         "readiness_state_bus": readiness_state,
         "operator_commitment": commitment_snapshot(commitment) if commitment is not None else {},
         "execution_truth_governance": governance if isinstance(governance, dict) else {},
+        "boundary_profile": autonomy_context.get("boundary_profile", {}),
+        "decision_basis": autonomy_context.get("decision_basis", {}),
+        "allowed_actions": autonomy_context.get("allowed_actions", []),
+        "approval_required": bool(autonomy_context.get("approval_required", False)),
+        "retry_policy": autonomy_context.get("retry_policy", {}),
+        "risk_level": str(autonomy_context.get("risk_level") or "").strip(),
         "active_overrides": [
             {
                 "override_id": int(row.id),

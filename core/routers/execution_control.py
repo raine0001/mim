@@ -1,5 +1,7 @@
+from datetime import datetime, timedelta, timezone
+
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.db import get_db
@@ -36,6 +38,33 @@ from core.models import (
     ExecutionRecoveryAttempt,
     ExecutionStabilityProfile,
     ExecutionTaskOrchestration,
+    WorkspaceAutonomousChain,
+    WorkspaceOperatorResolutionCommitment,
+    WorkspaceCapabilityChain,
+    WorkspacePolicyConflictProfile,
+)
+from core.operator_commitment_monitoring_service import (
+    evaluate_operator_resolution_commitment_monitoring,
+    latest_commitment_monitoring_profile,
+    to_operator_resolution_commitment_monitoring_out,
+)
+from core.operator_commitment_outcome_service import (
+    evaluate_operator_resolution_commitment_outcome,
+    latest_commitment_outcome_profile,
+    to_operator_resolution_commitment_outcome_out,
+)
+from core.operator_resolution_service import (
+    commitment_is_active,
+    commitment_manual_reset,
+    commitment_is_recovery_policy_tuning_derived,
+    commitment_policy_source,
+    commitment_reapplication_source_id,
+    commitment_scope_application,
+    create_operator_resolution_commitment_record,
+    latest_recovery_policy_commitment,
+    operator_resolution_commitment_out,
+    recovery_commitment_lifecycle_state,
+    scope_hierarchy,
 )
 from core.schemas import (
     ExecutionOverrideRequest,
@@ -43,12 +72,295 @@ from core.schemas import (
     ExecutionRecoveryEvaluateRequest,
     ExecutionRecoveryLearningResetRequest,
     ExecutionRecoveryOutcomeEvaluateRequest,
+    ExecutionRecoveryPolicyCommitmentPreviewRequest,
+    ExecutionRecoveryPolicyCommitmentEvaluateRequest,
+    ExecutionRecoveryPolicyTuningApplyRequest,
     ExecutionStabilityEvaluateRequest,
 )
 from core.stability_monitor import evaluate_execution_stability, to_execution_stability_out
 from core.task_orchestrator import to_execution_task_orchestration_out
 
 router = APIRouter()
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _json_dict(raw: object) -> dict:
+    return raw if isinstance(raw, dict) else {}
+
+
+def _json_list(raw: object) -> list:
+    return raw if isinstance(raw, list) else []
+
+
+def _normalized_scope(raw: object) -> str:
+    value = str(raw or "").strip()
+    return value or "global"
+
+
+def _commitment_payload_for_scope(
+    commitment: WorkspaceOperatorResolutionCommitment | None,
+    *,
+    requested_scope: str,
+) -> dict:
+    if commitment is None:
+        return {}
+    payload = operator_resolution_commitment_out(commitment)
+    payload["scope_application"] = commitment_scope_application(
+        commitment,
+        requested_scope=requested_scope,
+    )
+    payload["policy_source"] = commitment_policy_source(commitment)
+    payload["lifecycle_state"] = recovery_commitment_lifecycle_state(commitment)
+    return payload
+
+
+def _policy_conflict_out(row: WorkspacePolicyConflictProfile | None) -> dict:
+    if row is None:
+        return {}
+    return {
+        "conflict_id": int(row.id),
+        "managed_scope": str(row.managed_scope or "").strip(),
+        "decision_family": str(row.decision_family or "").strip(),
+        "proposal_type": str(row.proposal_type or "").strip(),
+        "conflict_state": str(row.conflict_state or "").strip(),
+        "winning_policy_source": str(row.winning_policy_source or "").strip(),
+        "losing_policy_sources": [
+            str(item).strip() for item in _json_list(row.losing_policy_sources_json) if str(item).strip()
+        ],
+        "precedence_rule": str(row.precedence_rule or "").strip(),
+        "conflict_confidence": round(float(row.conflict_confidence or 0.0), 6),
+        "resolution_reason": _json_dict(row.resolution_reason_json),
+        "evidence_summary": _json_dict(row.evidence_summary_json),
+        "policy_effects_json": _json_dict(row.policy_effects_json),
+        "metadata_json": _json_dict(row.metadata_json),
+        "created_at": row.created_at,
+    }
+
+
+async def _latest_recovery_commitment_conflict(
+    *,
+    managed_scope: str,
+    db: AsyncSession,
+) -> dict:
+    scope = _normalized_scope(managed_scope)
+    rows = (
+        (
+            await db.execute(
+                select(WorkspacePolicyConflictProfile)
+                .where(WorkspacePolicyConflictProfile.managed_scope == scope)
+                .order_by(WorkspacePolicyConflictProfile.id.desc())
+                .limit(20)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for row in rows:
+        losing_sources = [
+            str(item).strip() for item in _json_list(row.losing_policy_sources_json) if str(item).strip()
+        ]
+        winner = str(row.winning_policy_source or "").strip()
+        if "execution_recovery_commitment" == winner or "execution_recovery_commitment" in losing_sources:
+            return _policy_conflict_out(row)
+    return {}
+
+
+async def _count_active_scope_executions(*, managed_scope: str, db: AsyncSession) -> int:
+    scope = _normalized_scope(managed_scope)
+    rows = (
+        (
+            await db.execute(
+                select(CapabilityExecution)
+                .where(
+                    or_(
+                        CapabilityExecution.managed_scope == scope,
+                        CapabilityExecution.managed_scope.like(f"{scope}/%"),
+                    )
+                )
+                .order_by(CapabilityExecution.id.desc())
+                .limit(100)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return sum(
+        1
+        for row in rows
+        if str(row.status or "").strip() in {"pending_confirmation", "dispatched", "accepted", "running", "blocked"}
+    )
+
+
+def _row_managed_scope(row: object) -> str:
+    metadata = getattr(row, "metadata_json", {}) if isinstance(getattr(row, "metadata_json", {}), dict) else {}
+    return _normalized_scope(metadata.get("managed_scope") or getattr(row, "managed_scope", ""))
+
+
+async def _count_active_scope_chains(*, managed_scope: str, db: AsyncSession) -> dict:
+    scope = _normalized_scope(managed_scope)
+    task_rows = (
+        (
+            await db.execute(
+                select(WorkspaceAutonomousChain)
+                .order_by(WorkspaceAutonomousChain.id.desc())
+                .limit(80)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    capability_rows = (
+        (
+            await db.execute(
+                select(WorkspaceCapabilityChain)
+                .order_by(WorkspaceCapabilityChain.id.desc())
+                .limit(80)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    task_count = sum(
+        1
+        for row in task_rows
+        if _row_managed_scope(row) in scope_hierarchy(scope)[:1] or _row_managed_scope(row).startswith(f"{scope}/") or scope.startswith(f"{_row_managed_scope(row)}/")
+        if str(getattr(row, "status", "") or "").strip() in {"pending_approval", "active", "pending_confirmation"}
+    )
+    capability_count = sum(
+        1
+        for row in capability_rows
+        if _row_managed_scope(row) in scope_hierarchy(scope)[:1] or _row_managed_scope(row).startswith(f"{scope}/") or scope.startswith(f"{_row_managed_scope(row)}/")
+        if str(getattr(row, "status", "") or "").strip() in {"pending", "active", "pending_confirmation", "confirmed"}
+    )
+    return {
+        "active_task_chain_count": task_count,
+        "active_capability_chain_count": capability_count,
+    }
+
+
+def _recommended_recovery_governance_action(
+    *,
+    commitment: dict,
+    monitoring: dict,
+    conflict: dict,
+    admission_posture: str,
+) -> dict:
+    expiry_signal = _json_dict(monitoring.get("expiry_signal", {}))
+    reapply_signal = _json_dict(monitoring.get("reapply_signal", {}))
+    if str(expiry_signal.get("state") or "").strip() == "ready_to_expire":
+        return {
+            "action": "expire_commitment",
+            "reason": str(expiry_signal.get("reason") or "").strip(),
+        }
+    if str(reapply_signal.get("state") or "").strip() == "recommended":
+        return {
+            "action": "reapply_commitment",
+            "reason": str(reapply_signal.get("reason") or "").strip(),
+        }
+    if str(conflict.get("conflict_state") or "").strip() in {"active_conflict", "cooldown_held"}:
+        return {
+            "action": "review_conflict",
+            "reason": str(_json_dict(conflict.get("resolution_reason", {})).get("why_policy_a_overrode_policy_b") or "").strip(),
+        }
+    if admission_posture == "operator_required":
+        return {
+            "action": "operator_review_required",
+            "reason": "Admission control currently requires operator confirmation in this scope.",
+        }
+    if commitment:
+        return {
+            "action": "maintain_commitment",
+            "reason": "Recovery governance is active and stable for this scope.",
+        }
+    return {
+        "action": "monitor_only",
+        "reason": "No active recovery-derived commitment is currently shaping this scope.",
+    }
+
+
+async def _build_recovery_governance_rollup(
+    *,
+    managed_scope: str,
+    execution_recovery: dict,
+    commitment: WorkspaceOperatorResolutionCommitment | None,
+    db: AsyncSession,
+) -> dict:
+    scope = _normalized_scope(managed_scope or execution_recovery.get("managed_scope") or "global")
+    monitoring_row = None
+    outcome_row = None
+    if commitment is not None:
+        monitoring_row = await latest_commitment_monitoring_profile(
+            commitment_id=int(commitment.id),
+            db=db,
+        )
+        outcome_row = await latest_commitment_outcome_profile(
+            commitment_id=int(commitment.id),
+            db=db,
+        )
+    commitment_payload = _commitment_payload_for_scope(commitment, requested_scope=scope)
+    monitoring_payload = (
+        to_operator_resolution_commitment_monitoring_out(monitoring_row)
+        if monitoring_row is not None
+        else {}
+    )
+    outcome_payload = (
+        to_operator_resolution_commitment_outcome_out(outcome_row)
+        if outcome_row is not None
+        else {}
+    )
+    conflict_payload = await _latest_recovery_commitment_conflict(
+        managed_scope=scope,
+        db=db,
+    )
+    active_execution_count = await _count_active_scope_executions(managed_scope=scope, db=db)
+    chain_counts = await _count_active_scope_chains(managed_scope=scope, db=db)
+    scope_application = _json_dict(commitment_payload.get("scope_application", {}))
+    downstream_effects = _json_dict(commitment_payload.get("downstream_effects_json", {}))
+    admission_posture = "open"
+    if commitment_payload and bool(commitment_payload.get("active", False)):
+        requested_level = str(
+            downstream_effects.get("autonomy_level") or downstream_effects.get("autonomy_level_cap") or ""
+        ).strip()
+        if requested_level in {"operator_required", "manual_only"}:
+            admission_posture = "operator_required"
+        elif requested_level:
+            admission_posture = "advisory"
+    preview = {
+        "scope_hierarchy": scope_hierarchy(scope),
+        "impacted_scope_count": len(scope_hierarchy(scope)),
+        "active_execution_count": active_execution_count,
+        **chain_counts,
+        "rollout_risk": (
+            "high"
+            if active_execution_count > 0 or chain_counts.get("active_task_chain_count", 0) > 0 or chain_counts.get("active_capability_chain_count", 0) > 0
+            else "low"
+        ),
+    }
+    recommended_next_action = _recommended_recovery_governance_action(
+        commitment=commitment_payload,
+        monitoring=monitoring_payload,
+        conflict=conflict_payload,
+        admission_posture=admission_posture,
+    )
+    return {
+        "managed_scope": scope,
+        "tuning": _json_dict(execution_recovery.get("recovery_policy_tuning", {})),
+        "commitment": commitment_payload,
+        "monitoring": monitoring_payload,
+        "outcome": outcome_payload,
+        "conflict": conflict_payload,
+        "preview": preview,
+        "scope_application": scope_application,
+        "admission_posture": admission_posture,
+        "recommended_next_action": recommended_next_action,
+        "summary": (
+            f"scope={scope}; commitment={str(commitment_payload.get('lifecycle_state') or 'inactive')}; "
+            f"admission={admission_posture}; next={str(recommended_next_action.get('action') or 'monitor_only')}"
+        ),
+    }
 
 
 def _to_execution_override_out(row: ExecutionOverride) -> dict:
@@ -396,6 +708,37 @@ async def attempt_execution_recovery_endpoint(
             "managed_scope": row.managed_scope,
             "recovery_decision": row.recovery_decision,
             "status": row.status,
+            "recovery_classification": str(
+                (row.metadata_json if isinstance(row.metadata_json, dict) else {}).get(
+                    "recovery_classification", ""
+                )
+                or ""
+            ).strip(),
+            "recovery_taxonomy": (
+                (row.metadata_json if isinstance(row.metadata_json, dict) else {}).get(
+                    "recovery_taxonomy", {}
+                )
+                if isinstance(
+                    (row.metadata_json if isinstance(row.metadata_json, dict) else {}).get(
+                        "recovery_taxonomy", {}
+                    ),
+                    dict,
+                )
+                else {}
+            ),
+            "recovery_policy_tuning": (
+                (row.metadata_json if isinstance(row.metadata_json, dict) else {}).get(
+                    "recovery_policy_tuning", {}
+                )
+                if isinstance(
+                    (row.metadata_json if isinstance(row.metadata_json, dict) else {}).get(
+                        "recovery_policy_tuning", {}
+                    ),
+                    dict,
+                )
+                else {}
+            ),
+            **(payload.metadata_json if isinstance(payload.metadata_json, dict) else {}),
         },
     )
     await db.commit()
@@ -461,6 +804,55 @@ async def evaluate_execution_recovery_outcome_endpoint(
             "execution_id": row.execution_id,
             "managed_scope": row.managed_scope,
             "outcome_status": row.outcome_status,
+            "recovery_classification": str(
+                (row.metadata_json if isinstance(row.metadata_json, dict) else {}).get(
+                    "recovery_classification", ""
+                )
+                or ""
+            ).strip(),
+            "recovery_taxonomy": (
+                (row.metadata_json if isinstance(row.metadata_json, dict) else {}).get(
+                    "recovery_taxonomy", {}
+                )
+                if isinstance(
+                    (row.metadata_json if isinstance(row.metadata_json, dict) else {}).get(
+                        "recovery_taxonomy", {}
+                    ),
+                    dict,
+                )
+                else {}
+            ),
+            "recovery_policy_tuning": (
+                (row.metadata_json if isinstance(row.metadata_json, dict) else {}).get(
+                    "recovery_policy_tuning", {}
+                )
+                if isinstance(
+                    (row.metadata_json if isinstance(row.metadata_json, dict) else {}).get(
+                        "recovery_policy_tuning", {}
+                    ),
+                    dict,
+                )
+                else {}
+            ),
+            "recovery_outcome_classification": str(
+                (row.metadata_json if isinstance(row.metadata_json, dict) else {}).get(
+                    "recovery_outcome_classification", ""
+                )
+                or ""
+            ).strip(),
+            "recovery_outcome_taxonomy": (
+                (row.metadata_json if isinstance(row.metadata_json, dict) else {}).get(
+                    "recovery_outcome_taxonomy", {}
+                )
+                if isinstance(
+                    (row.metadata_json if isinstance(row.metadata_json, dict) else {}).get(
+                        "recovery_outcome_taxonomy", {}
+                    ),
+                    dict,
+                )
+                else {}
+            ),
+            **(payload.metadata_json if isinstance(payload.metadata_json, dict) else {}),
         },
     )
     await db.commit()
@@ -541,6 +933,318 @@ async def reset_execution_recovery_learning_profiles_endpoint(
     )
     await db.commit()
     return result
+
+
+@router.post("/execution/recovery/policy-tuning/apply")
+async def apply_execution_recovery_policy_tuning_endpoint(
+    payload: ExecutionRecoveryPolicyTuningApplyRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    evaluation = await evaluate_execution_recovery(
+        trace_id=payload.trace_id,
+        execution_id=payload.execution_id,
+        managed_scope=payload.managed_scope,
+        db=db,
+    )
+    if evaluation is None:
+        raise HTTPException(status_code=404, detail="execution_recovery_target_not_found")
+
+    tuning = (
+        evaluation.get("recovery_policy_tuning", {})
+        if isinstance(evaluation.get("recovery_policy_tuning", {}), dict)
+        else {}
+    )
+    policy_action = str(tuning.get("policy_action") or "").strip()
+    if not policy_action or policy_action == "maintain_current_recovery_autonomy":
+        raise HTTPException(
+            status_code=422,
+            detail="execution_recovery_policy_tuning_not_actionable",
+        )
+
+    managed_scope = str(evaluation.get("managed_scope") or payload.managed_scope or "global").strip() or "global"
+    recommended_boundary_level = str(
+        tuning.get("recommended_boundary_level") or tuning.get("current_boundary_level") or "operator_required"
+    ).strip() or "operator_required"
+    recovery_learning = (
+        evaluation.get("recovery_learning", {})
+        if isinstance(evaluation.get("recovery_learning", {}), dict)
+        else {}
+    )
+    recommendation_snapshot = {
+        "source": "execution_recovery_policy_tuning",
+        "trace_id": str(evaluation.get("trace_id") or payload.trace_id or "").strip(),
+        "execution_id": evaluation.get("execution_id"),
+        "managed_scope": managed_scope,
+        "policy_action": policy_action,
+        "current_boundary_level": str(tuning.get("current_boundary_level") or "").strip(),
+        "recommended_boundary_level": recommended_boundary_level,
+        "boundary_floor_applied": bool(tuning.get("boundary_floor_applied", False)),
+        "summary": str(tuning.get("summary") or "").strip(),
+        "rationale": str(tuning.get("rationale") or "").strip(),
+        "recovery_decision": str(tuning.get("recovery_decision") or evaluation.get("recovery_decision") or "").strip(),
+        "recommended_attempt_decision": str(
+            tuning.get("recommended_attempt_decision") or evaluation.get("recommended_attempt_decision") or ""
+        ).strip(),
+        "recovery_classification": str(tuning.get("recovery_classification") or evaluation.get("recovery_classification") or "").strip(),
+        "escalation_decision": str(recovery_learning.get("escalation_decision") or "").strip(),
+    }
+    downstream_effects = {
+        "autonomy_level": recommended_boundary_level,
+        "recovery_policy_action": policy_action,
+        "recovery_boundary_scope": managed_scope,
+    }
+    expires_at = None
+    if payload.duration_seconds is not None:
+        expires_at = _utcnow() + timedelta(seconds=int(payload.duration_seconds))
+
+    prior_recovery_commitment = await latest_recovery_policy_commitment(
+        scope=managed_scope,
+        db=db,
+        include_inherited=False,
+        require_active=False,
+        limit=20,
+    )
+    reapplication_source_id = None
+    if prior_recovery_commitment is not None and not commitment_is_active(prior_recovery_commitment):
+        reapplication_source_id = int(prior_recovery_commitment.id)
+
+    result = await create_operator_resolution_commitment_record(
+        actor=payload.actor,
+        source=str(payload.source or "execution_control").strip() or "execution_control",
+        managed_scope=managed_scope,
+        decision_type="lower_autonomy_for_scope",
+        reason=str(payload.reason or tuning.get("rationale") or tuning.get("summary") or evaluation.get("recovery_reason") or "").strip(),
+        recommendation_snapshot_json=recommendation_snapshot,
+        authority_level=str(payload.authority_level or "operator_required").strip() or "operator_required",
+        confidence=float(recovery_learning.get("confidence") or 0.0),
+        provenance_json={
+            "source": str(payload.source or "execution_control").strip() or "execution_control",
+            "trace_id": str(evaluation.get("trace_id") or payload.trace_id or "").strip(),
+            "execution_id": evaluation.get("execution_id"),
+            "policy_action": policy_action,
+        },
+        downstream_effects_json=downstream_effects,
+        metadata_json={
+            **(payload.metadata_json if isinstance(payload.metadata_json, dict) else {}),
+            "objective121_recovery_policy_commitment": True,
+            "commitment_family": "autonomy_posture",
+            "policy_action": policy_action,
+            **(
+                {"reapplied_from_commitment_id": reapplication_source_id}
+                if reapplication_source_id is not None
+                else {}
+            ),
+        },
+        expires_at=expires_at,
+        db=db,
+    )
+    commitment = result.get("commitment", {}) if isinstance(result.get("commitment", {}), dict) else {}
+    await write_journal(
+        db,
+        actor=payload.actor,
+        action="execution_recovery_policy_tuning_applied",
+        target_type="workspace_operator_resolution_commitment",
+        target_id=str(commitment.get("commitment_id") or ""),
+        summary=f"Applied recovery policy tuning for scope {managed_scope}",
+        metadata_json={
+            "trace_id": str(evaluation.get("trace_id") or payload.trace_id or "").strip(),
+            "execution_id": evaluation.get("execution_id"),
+            "managed_scope": managed_scope,
+            "policy_action": policy_action,
+            "recommended_boundary_level": recommended_boundary_level,
+            "duplicate_suppressed": bool(result.get("duplicate_suppressed", False)),
+            "reapplied_from_commitment_id": reapplication_source_id,
+            **(payload.metadata_json if isinstance(payload.metadata_json, dict) else {}),
+        },
+    )
+    await db.commit()
+    commitment_id = int(commitment.get("commitment_id", 0) or 0)
+    row = await db.get(WorkspaceOperatorResolutionCommitment, commitment_id) if commitment_id > 0 else None
+    rollup = await _build_recovery_governance_rollup(
+        managed_scope=managed_scope,
+        execution_recovery=evaluation,
+        commitment=row,
+        db=db,
+    )
+    return {
+        "recovery": evaluation,
+        "applied_tuning": tuning,
+        "reapplication": {
+            "reapplied": reapplication_source_id is not None and not bool(result.get("duplicate_suppressed", False)),
+            "source_commitment_id": reapplication_source_id,
+        },
+        "recovery_governance": rollup,
+        **result,
+    }
+
+
+@router.post("/execution/recovery/policy-tuning/commitment/evaluate")
+async def evaluate_execution_recovery_policy_commitment_endpoint(
+    payload: ExecutionRecoveryPolicyCommitmentEvaluateRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    evaluation = await evaluate_execution_recovery(
+        trace_id=payload.trace_id,
+        execution_id=payload.execution_id,
+        managed_scope=payload.managed_scope,
+        db=db,
+    )
+    if evaluation is None:
+        raise HTTPException(status_code=404, detail="execution_recovery_target_not_found")
+
+    managed_scope = str(evaluation.get("managed_scope") or payload.managed_scope or "global").strip() or "global"
+    commitment = await latest_recovery_policy_commitment(
+        scope=managed_scope,
+        db=db,
+        include_inherited=True,
+        require_active=False,
+        limit=40,
+    )
+    if commitment is None:
+        raise HTTPException(status_code=404, detail="execution_recovery_policy_commitment_not_found")
+
+    monitoring = await evaluate_operator_resolution_commitment_monitoring(
+        commitment=commitment,
+        actor=payload.actor,
+        source=payload.source,
+        lookback_hours=payload.lookback_hours,
+        metadata_json={
+            **(payload.metadata_json if isinstance(payload.metadata_json, dict) else {}),
+            "objective122_recovery_commitment_monitoring": True,
+        },
+        db=db,
+    )
+    outcome = await evaluate_operator_resolution_commitment_outcome(
+        commitment=commitment,
+        actor=payload.actor,
+        source=payload.source,
+        lookback_hours=payload.lookback_hours,
+        target_status=payload.target_status,
+        outcome_reason=str(payload.metadata_json.get("outcome_reason", "") or ""),
+        metadata_json={
+            **(payload.metadata_json if isinstance(payload.metadata_json, dict) else {}),
+            "objective122_recovery_commitment_outcome": True,
+        },
+        db=db,
+    )
+    await write_journal(
+        db,
+        actor=payload.actor,
+        action="execution_recovery_policy_commitment_evaluated",
+        target_type="workspace_operator_resolution_commitment",
+        target_id=str(commitment.id),
+        summary=f"Evaluated recovery policy commitment {commitment.id} for scope {managed_scope}",
+        metadata_json={
+            "commitment_id": int(commitment.id),
+            "managed_scope": managed_scope,
+            "monitoring_id": int(monitoring.id),
+            "outcome_id": int(outcome.id),
+            **(payload.metadata_json if isinstance(payload.metadata_json, dict) else {}),
+        },
+    )
+    await db.commit()
+    await db.refresh(commitment)
+    await db.refresh(monitoring)
+    await db.refresh(outcome)
+    rollup = await _build_recovery_governance_rollup(
+        managed_scope=managed_scope,
+        execution_recovery=evaluation,
+        commitment=commitment,
+        db=db,
+    )
+    return {
+        "recovery": evaluation,
+        "commitment": operator_resolution_commitment_out(commitment),
+        "monitoring": to_operator_resolution_commitment_monitoring_out(monitoring),
+        "outcome": to_operator_resolution_commitment_outcome_out(outcome),
+        "recovery_governance": rollup,
+    }
+
+
+@router.post("/execution/recovery/policy-tuning/commitment/preview")
+async def preview_execution_recovery_policy_commitment_endpoint(
+    payload: ExecutionRecoveryPolicyCommitmentPreviewRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    evaluation = await evaluate_execution_recovery(
+        trace_id=payload.trace_id,
+        execution_id=payload.execution_id,
+        managed_scope=payload.managed_scope,
+        db=db,
+    ) or {}
+    managed_scope = _normalized_scope(
+        payload.managed_scope or evaluation.get("managed_scope") or "global"
+    )
+    commitment = None
+    if payload.commitment_id is not None:
+        candidate = await db.get(WorkspaceOperatorResolutionCommitment, int(payload.commitment_id))
+        if candidate is not None and commitment_is_recovery_policy_tuning_derived(candidate):
+            commitment = candidate
+    if commitment is None:
+        commitment = await latest_recovery_policy_commitment(
+            scope=managed_scope,
+            db=db,
+            include_inherited=True,
+            require_active=payload.action == "apply",
+            limit=40,
+        )
+    rollup = await _build_recovery_governance_rollup(
+        managed_scope=managed_scope,
+        execution_recovery=evaluation,
+        commitment=commitment,
+        db=db,
+    )
+    preview = _json_dict(rollup.get("preview", {}))
+    preview.update(
+        {
+            "action": payload.action,
+            "managed_scope": managed_scope,
+            "commitment": _json_dict(rollup.get("commitment", {})),
+            "admission_posture": str(rollup.get("admission_posture") or "open").strip(),
+        }
+    )
+    if payload.action in {"revoke", "reset"}:
+        preview["expected_transition"] = "inactive"
+    elif payload.action == "expire":
+        preview["expected_transition"] = "expired"
+    elif payload.action == "reapply":
+        preview["expected_transition"] = "reapplied"
+    else:
+        preview["expected_transition"] = "active"
+    return {
+        "preview": preview,
+        "recovery_governance": rollup,
+    }
+
+
+@router.get("/execution/recovery/policy-tuning/governance")
+async def get_execution_recovery_governance_rollup_endpoint(
+    managed_scope: str = Query(default=""),
+    trace_id: str = Query(default=""),
+    execution_id: int | None = Query(default=None, ge=1),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    evaluation = await evaluate_execution_recovery(
+        trace_id=trace_id,
+        execution_id=execution_id,
+        managed_scope=managed_scope,
+        db=db,
+    ) or {}
+    scope = _normalized_scope(managed_scope or evaluation.get("managed_scope") or "global")
+    commitment = await latest_recovery_policy_commitment(
+        scope=scope,
+        db=db,
+        include_inherited=True,
+        require_active=False,
+        limit=40,
+    )
+    rollup = await _build_recovery_governance_rollup(
+        managed_scope=scope,
+        execution_recovery=evaluation,
+        commitment=commitment,
+        db=db,
+    )
+    return {"recovery_governance": rollup}
 
 
 @router.get("/execution/recovery/learning/telemetry")

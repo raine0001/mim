@@ -53,8 +53,15 @@ AUTONOMY_LEVELS = [
     "manual_only",
     "operator_required",
     "bounded_auto",
-    "trusted_auto",
+    "strategy_auto",
 ]
+
+
+def _canonical_autonomy_level(level: object) -> str:
+    normalized = str(level or "").strip() or "operator_required"
+    if normalized == "trusted_auto":
+        return "strategy_auto"
+    return normalized
 
 
 def _utcnow() -> datetime:
@@ -1244,18 +1251,18 @@ async def resolve_workspace_proposal_policy_conflict(
 
 
 def _stewardship_boundary_effects(*, autonomy_level: str, boundary_confidence: float) -> dict:
-    level = _type_value(autonomy_level)
+    level = _canonical_autonomy_level(autonomy_level)
     if level in {"manual_only", "operator_required"} and _bounded(boundary_confidence) >= 0.5:
         return {
             "allow_auto_execution": False,
             "last_decision_summary": "defer_to_operator_boundary",
             "why_policy_prevailed": "Current autonomy boundary keeps this scope below unattended stewardship execution.",
         }
-    if level == "trusted_auto" and _bounded(boundary_confidence) >= 0.65:
+    if level == "strategy_auto" and _bounded(boundary_confidence) >= 0.65:
         return {
             "allow_auto_execution": True,
             "last_decision_summary": "respect_autonomy_boundary",
-            "why_policy_prevailed": "Current autonomy boundary allows trusted automatic stewardship in this scope.",
+            "why_policy_prevailed": "Current autonomy boundary allows strategy-level automatic stewardship in this scope.",
         }
     return {}
 

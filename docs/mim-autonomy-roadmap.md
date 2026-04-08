@@ -96,6 +96,23 @@ Next planned slice after the green 95 checkpoint:
 
 - Objective 96 extends the control plane into recovery and safe resume so failed, blocked, paused, and degraded executions can be evaluated and retried through one bounded recovery contract instead of ad hoc follow-up.
 
+Current recovery-governance checkpoint after Objective 130:
+
+- Objective 116 propagates one autonomy-boundary envelope through planning, execution, recovery, journal, and UI surfaces.
+- Objectives 117 and 118 extend that envelope into task chains and capability chains.
+- Objective 119 adds stable recovery taxonomy.
+- Objective 120 adds inspectable recovery-policy tuning.
+- Objective 121 bridges that tuning into a durable operator-governed commitment.
+- Objective 122 evaluates that recovery-derived commitment against future recovery evidence.
+- Objective 123 adds explicit expiry pressure and expiry-ready signaling for recovery-derived commitments.
+- Objective 124 adds bounded reapplication of expired recovery-derived commitments with lineage back to the prior commitment.
+- Objective 125 adds explicit manual reset semantics distinct from passive expiry or generic revocation.
+- Objective 126 makes recovery-derived commitments a first-class conflict source inside existing governance arbitration.
+- Objective 127 defines deterministic inherited scope propagation across parent, child, chain, and execution scopes.
+- Objective 128 adds rollout preview before recovery-governance transitions are applied.
+- Objective 129 applies recovery-derived posture to live admission-control decisions.
+- Objective 130 consolidates the full recovery-governance story into one operator-facing rollup.
+
 Current bounded MIM ARM execution trust checkpoint:
 
 - Objective 107 closed the bounded remote attribution gap with an explicit readiness-surface boundary.
@@ -120,6 +137,8 @@ Current bounded MIM ARM execution trust checkpoint:
 - 80–84: Runtime governance, inquiry control, and operator-visible reasoning
 - 85–87: Durable operator resolution commitments, enforcement, and outcome learning
 - 88–90: Preference convergence, proposal arbitration propagation, proposal policy stabilization, and cross-policy conflict resolution across stacked governance surfaces
+- 116–122: Boundary-envelope propagation plus recovery taxonomy, tuning, recovery-derived commitments, and recovery-aware commitment evaluation
+- 123–130: Recovery-commitment lifecycle, conflict handling, propagation, rollout preview, admission control, and operator rollup
 
 ## Governance Notes
 

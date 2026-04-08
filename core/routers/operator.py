@@ -31,6 +31,11 @@ from core.operator_preference_convergence_service import (
     list_learned_preferences,
 )
 from core.operator_resolution_service import commitment_is_expired, commitment_snapshot, sync_commitment_expiration
+from core.operator_resolution_service import (
+    create_operator_resolution_commitment_record,
+    normalize_commitment_family,
+    operator_resolution_commitment_out,
+)
 from core.preferences import apply_learning_signal
 from core.schemas import (
     OperatorLearnedPreferenceConvergeRequest,
@@ -47,39 +52,6 @@ router = APIRouter(tags=["operator"])
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
-
-
-def _normalize_commitment_family(*, commitment_family: str, decision_type: str) -> str:
-    normalized = str(commitment_family or "").strip().lower()
-    if normalized:
-        return normalized
-    decision = str(decision_type or "").strip().lower()
-    family_map = {
-        "approve_current_path": "path_disposition",
-        "override_recommendation": "path_disposition",
-        "defer_action": "action_timing",
-        "require_additional_evidence": "evidence_gate",
-        "lower_autonomy_for_scope": "autonomy_posture",
-        "elevate_remediation_priority": "remediation_priority",
-    }
-    return family_map.get(decision, decision or "general")
-
-
-def _to_operator_resolution_commitment(
-    row: WorkspaceOperatorResolutionCommitment,
-) -> dict:
-    snapshot = commitment_snapshot(row)
-    return {
-        **snapshot,
-        "source": row.source,
-        "created_by": row.created_by,
-        "reason": row.reason,
-        "recommendation_snapshot_json": row.recommendation_snapshot_json if isinstance(row.recommendation_snapshot_json, dict) else {},
-        "provenance_json": row.provenance_json if isinstance(row.provenance_json, dict) else {},
-        "downstream_effects_json": row.downstream_effects_json if isinstance(row.downstream_effects_json, dict) else {},
-        "metadata_json": row.metadata_json if isinstance(row.metadata_json, dict) else {},
-        "created_at": row.created_at,
-    }
 
 
 async def _apply_due_commitment_expirations(*, db: AsyncSession) -> int:
@@ -392,92 +364,35 @@ async def create_operator_resolution_commitment(
     expires_at = payload.expires_at
     if expires_at is None and payload.duration_seconds is not None:
         expires_at = _utcnow() + timedelta(seconds=int(payload.duration_seconds))
-
-    commitment_family = _normalize_commitment_family(
-        commitment_family=payload.commitment_family,
-        decision_type=payload.decision_type,
-    )
-
-    await _apply_due_commitment_expirations(db=db)
-
-    active_rows = (
-        await db.execute(
-            select(WorkspaceOperatorResolutionCommitment)
-            .where(WorkspaceOperatorResolutionCommitment.managed_scope == payload.managed_scope.strip())
-            .where(WorkspaceOperatorResolutionCommitment.commitment_family == commitment_family)
-            .where(WorkspaceOperatorResolutionCommitment.status == "active")
-            .order_by(WorkspaceOperatorResolutionCommitment.id.desc())
-        )
-    ).scalars().all()
-
-    for existing in active_rows:
-        if (
-            str(existing.decision_type or "") == payload.decision_type.strip()
-            and str(existing.reason or "") == str(payload.reason or "")
-            and (existing.recommendation_snapshot_json if isinstance(existing.recommendation_snapshot_json, dict) else {})
-            == payload.recommendation_snapshot_json
-            and str(existing.authority_level or "") == payload.authority_level.strip()
-        ):
-            if existing.status != "active":
-                existing.status = "active"
-            await db.commit()
-            await db.refresh(existing)
-            return {
-                "commitment": _to_operator_resolution_commitment(existing),
-                "duplicate_suppressed": True,
-                "superseded_commitment_ids": [],
-            }
-
-    row = WorkspaceOperatorResolutionCommitment(
+    result = await create_operator_resolution_commitment_record(
+        actor=payload.actor,
         source="objective85",
-        created_by=payload.actor,
-        managed_scope=payload.managed_scope.strip(),
-        commitment_family=commitment_family,
-        decision_type=payload.decision_type.strip(),
-        status="active",
+        managed_scope=payload.managed_scope,
+        decision_type=payload.decision_type,
         reason=payload.reason,
         recommendation_snapshot_json=payload.recommendation_snapshot_json,
-        authority_level=payload.authority_level.strip(),
-        confidence=float(payload.confidence or 0.0),
+        authority_level=payload.authority_level,
+        confidence=payload.confidence,
         provenance_json=payload.provenance_json,
-        expires_at=expires_at,
         downstream_effects_json=payload.downstream_effects_json,
         metadata_json={
             **payload.metadata_json,
+            "commitment_family": normalize_commitment_family(
+                commitment_family=payload.commitment_family,
+                decision_type=payload.decision_type,
+            ),
             "objective85_resolution_commitment": True,
         },
-    )
-    db.add(row)
-    await db.flush()
-
-    superseded_ids: list[int] = []
-    for existing in active_rows:
-        existing.status = "superseded"
-        existing.superseded_by_commitment_id = row.id
-        superseded_ids.append(int(existing.id))
-
-    await write_journal(
-        db,
-        actor=payload.actor,
-        action="operator_resolution_commitment_created",
-        target_type="workspace_operator_resolution_commitment",
-        target_id=str(row.id),
-        summary=f"Created operator resolution commitment {row.id} for {row.managed_scope}",
-        metadata_json={
-            "managed_scope": row.managed_scope,
-            "decision_type": row.decision_type,
-            "commitment_family": row.commitment_family,
-            "superseded_commitment_ids": superseded_ids,
-            **payload.metadata_json,
-        },
+        expires_at=expires_at,
+        db=db,
     )
     await db.commit()
-    await db.refresh(row)
-    return {
-        "commitment": _to_operator_resolution_commitment(row),
-        "duplicate_suppressed": False,
-        "superseded_commitment_ids": superseded_ids,
-    }
+    commitment_id = int(result.get("commitment", {}).get("commitment_id", 0) or 0)
+    if commitment_id > 0:
+        row = await db.get(WorkspaceOperatorResolutionCommitment, commitment_id)
+        if row is not None:
+            result["commitment"] = operator_resolution_commitment_out(row)
+    return result
 
 
 @router.get("/resolution-commitments")
@@ -517,7 +432,7 @@ async def list_operator_resolution_commitments(
         if len(filtered) >= limit:
             break
 
-    return {"commitments": [_to_operator_resolution_commitment(item) for item in filtered]}
+    return {"commitments": [operator_resolution_commitment_out(item) for item in filtered]}
 
 
 @router.get("/resolution-commitments/{commitment_id}")
@@ -526,7 +441,7 @@ async def get_operator_resolution_commitment(
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     row = await _get_resolution_commitment_or_404(commitment_id=commitment_id, db=db)
-    return {"commitment": _to_operator_resolution_commitment(row)}
+    return {"commitment": operator_resolution_commitment_out(row)}
 
 
 @router.post("/preferences/converge")
@@ -636,7 +551,7 @@ async def evaluate_operator_resolution_commitment_monitoring_endpoint(
     await db.refresh(row)
     return {
         "monitoring": to_operator_resolution_commitment_monitoring_out(row),
-        "commitment": _to_operator_resolution_commitment(commitment),
+        "commitment": operator_resolution_commitment_out(commitment),
     }
 
 
@@ -718,7 +633,7 @@ async def evaluate_operator_resolution_commitment_outcome_endpoint(
     await db.refresh(row)
     return {
         "outcome": to_operator_resolution_commitment_outcome_out(row),
-        "commitment": _to_operator_resolution_commitment(commitment),
+        "commitment": operator_resolution_commitment_out(commitment),
     }
 
 
@@ -799,7 +714,7 @@ async def resolve_operator_resolution_commitment(
     await db.refresh(row)
     return {
         "outcome": to_operator_resolution_commitment_outcome_out(row),
-        "commitment": _to_operator_resolution_commitment(commitment),
+        "commitment": operator_resolution_commitment_out(commitment),
     }
 
 
@@ -829,7 +744,37 @@ async def revoke_operator_resolution_commitment(
     )
     await db.commit()
     await db.refresh(row)
-    return {"commitment": _to_operator_resolution_commitment(row)}
+    return {"commitment": operator_resolution_commitment_out(row)}
+
+
+@router.post("/resolution-commitments/{commitment_id}/reset")
+async def reset_operator_resolution_commitment(
+    commitment_id: int,
+    payload: OperatorExecutionActionRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    row = await _get_resolution_commitment_or_404(commitment_id=commitment_id, db=db)
+    prior_status = row.status
+    row.status = "revoked"
+    row.metadata_json = {
+        **(row.metadata_json if isinstance(row.metadata_json, dict) else {}),
+        "manual_reset": True,
+        "reset_by": payload.actor,
+        "reset_reason": payload.reason,
+        **payload.metadata_json,
+    }
+    await write_journal(
+        db,
+        actor=payload.actor,
+        action="operator_resolution_commitment_reset",
+        target_type="workspace_operator_resolution_commitment",
+        target_id=str(row.id),
+        summary=f"Reset operator resolution commitment {row.id}: {prior_status}->revoked",
+        metadata_json={"prior_status": prior_status, **payload.metadata_json},
+    )
+    await db.commit()
+    await db.refresh(row)
+    return {"commitment": operator_resolution_commitment_out(row)}
 
 
 @router.post("/resolution-commitments/{commitment_id}/expire")
@@ -859,7 +804,7 @@ async def expire_operator_resolution_commitment(
     )
     await db.commit()
     await db.refresh(row)
-    return {"commitment": _to_operator_resolution_commitment(row)}
+    return {"commitment": operator_resolution_commitment_out(row)}
 
 
 @router.get("/executions")

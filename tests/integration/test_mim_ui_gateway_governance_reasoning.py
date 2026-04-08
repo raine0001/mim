@@ -1,5 +1,7 @@
 import unittest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 
 from core.routers import mim_ui
@@ -59,6 +61,100 @@ class MimUiGatewayGovernanceReasoningTest(unittest.TestCase):
         )
         self.assertIn("Gateway governance", summary)
         self.assertIn("degraded", summary)
+
+        def test_summary_includes_tod_decision_process(self):
+                summary = mim_ui._build_operator_reasoning_summary(
+                        goal={},
+                        inquiry={},
+                        governance={},
+                        gateway_governance={},
+                        autonomy={},
+                        stewardship={},
+                        execution_readiness={},
+                        execution_recovery={},
+                        commitment={},
+                        commitment_monitoring={},
+                        commitment_outcome={},
+                        learned_preferences=[],
+                        proposal_policy={},
+                        conflict_resolution={},
+                        tod_decision_process={
+                                "summary": "TOD does not know what MIM did; escalation required",
+                        },
+                        runtime_health={},
+                        runtime_recovery={},
+                )
+
+                self.assertIn("TOD decision", summary)
+                self.assertIn("escalation required", summary)
+
+        def test_tod_decision_process_snapshot_normalizes_latest_decision_artifact(self):
+                with TemporaryDirectory() as tmpdir:
+                        shared_root = Path(tmpdir)
+                        (shared_root / "MIM_DECISION_TASK.latest.json").write_text(
+                                """{
+    "generated_at": "2026-04-07T12:00:00+00:00",
+    "state": "watching",
+    "decision_process": {
+        "generated_at": "2026-04-07T12:00:00+00:00",
+        "state": "watching",
+        "questions": {
+            "tod_knows_what_mim_did": {
+                "known": false,
+                "detail": "No TOD acknowledgement yet",
+                "evidence": ["pending_ack"]
+            },
+            "mim_knows_what_tod_did": {
+                "known": true,
+                "detail": "TOD reported it is reviewing the task",
+                "evidence": ["task_status"]
+            },
+            "tod_current_work": {
+                "known": true,
+                "task_id": "task-42",
+                "objective_id": "objective-9",
+                "phase": "reviewing_request",
+                "detail": "TOD is checking the latest request"
+            },
+            "tod_liveness": {
+                "status": "degraded",
+                "ask_required": true,
+                "latest_progress_age_seconds": 91,
+                "ping_response_age_seconds": 31,
+                "console_probe_age_seconds": null,
+                "console_probe_status": "",
+                "primary_alert_code": "tod_silent"
+            }
+        },
+        "communication_escalation": {
+            "required": true,
+            "code": "tod_silent",
+            "detail": "TOD has not responded in time",
+            "console_url": "http://192.168.1.161:8844",
+            "kick_hint": "ask_loudly"
+        },
+        "selected_action": {
+            "code": "ask_loudly",
+            "detail": "Ask TOD loudly for status"
+        }
+    },
+    "blocking_reason_codes": ["communication_escalation"]
+}
+""",
+                                encoding="utf-8",
+                        )
+
+                        snapshot = mim_ui._operator_tod_decision_process_snapshot(shared_root)
+
+                self.assertEqual(snapshot["state"], "watching")
+                self.assertFalse(snapshot["tod_knows_what_mim_did"]["known"])
+                self.assertTrue(snapshot["mim_knows_what_tod_did"]["known"])
+                self.assertEqual(snapshot["tod_current_work"]["task_id"], "task-42")
+                self.assertEqual(snapshot["tod_liveness"]["status"], "degraded")
+                self.assertTrue(snapshot["communication_escalation"]["required"])
+                self.assertEqual(snapshot["selected_action"]["code"], "ask_loudly")
+                self.assertIn("TOD does not know what MIM did", snapshot["summary"])
+                self.assertIn("escalation required", snapshot["summary"])
 
     def test_perception_lane_treats_long_idle_gap_as_idle_not_stale(self):
         now = datetime.now(timezone.utc)

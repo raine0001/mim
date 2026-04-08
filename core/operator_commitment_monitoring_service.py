@@ -6,6 +6,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.models import (
+    ExecutionRecoveryAttempt,
+    ExecutionRecoveryOutcome,
     WorkspaceExecutionTruthGovernanceProfile,
     WorkspaceInquiryQuestion,
     WorkspaceMaintenanceRun,
@@ -17,8 +19,13 @@ from core.operator_resolution_service import (
     commitment_downstream_effects,
     commitment_is_active,
     commitment_is_expired,
+    commitment_manual_reset,
+    commitment_reapplication_source_id,
+    commitment_is_recovery_policy_tuning_derived,
+    commitment_scope_application,
     commitment_snapshot,
     normalize_scope,
+    recovery_commitment_lifecycle_state,
     scope_value,
     sync_commitment_expiration,
 )
@@ -114,6 +121,53 @@ def _inquiry_question_matches(
     return False
 
 
+def _recovery_context(commitment: WorkspaceOperatorResolutionCommitment) -> dict:
+    recommendation = (
+        commitment.recommendation_snapshot_json
+        if isinstance(commitment.recommendation_snapshot_json, dict)
+        else {}
+    )
+    provenance = commitment.provenance_json if isinstance(commitment.provenance_json, dict) else {}
+    return {
+        "trace_id": str(recommendation.get("trace_id") or provenance.get("trace_id") or "").strip(),
+        "execution_id": _safe_int(
+            recommendation.get("execution_id") or provenance.get("execution_id") or 0
+        ),
+    }
+
+
+def _recovery_attempt_matches(
+    row: ExecutionRecoveryAttempt,
+    *,
+    managed_scope: str,
+    trace_id: str,
+    execution_id: int,
+) -> bool:
+    if normalize_scope(row.managed_scope) != normalize_scope(managed_scope):
+        return False
+    if trace_id and str(row.trace_id or "").strip() == trace_id:
+        return True
+    if execution_id > 0 and int(row.execution_id or 0) == execution_id:
+        return True
+    return True
+
+
+def _recovery_outcome_matches(
+    row: ExecutionRecoveryOutcome,
+    *,
+    managed_scope: str,
+    trace_id: str,
+    execution_id: int,
+) -> bool:
+    if normalize_scope(row.managed_scope) != normalize_scope(managed_scope):
+        return False
+    if trace_id and str(row.trace_id or "").strip() == trace_id:
+        return True
+    if execution_id > 0 and int(row.execution_id or 0) == execution_id:
+        return True
+    return True
+
+
 def _latest_governance_conflict(
     row: WorkspaceExecutionTruthGovernanceProfile | None,
     *,
@@ -144,6 +198,8 @@ def _recommended_actions(
     governance_state: str,
     governance_decision: str,
     commitment: WorkspaceOperatorResolutionCommitment,
+    expiry_signal: dict | None = None,
+    reapply_signal: dict | None = None,
 ) -> list[dict]:
     commitment_id = int(commitment.id)
     actions: list[dict] = []
@@ -166,6 +222,19 @@ def _recommended_actions(
                 "params": {"commitment_id": commitment_id},
             }
         )
+        signal = reapply_signal if isinstance(reapply_signal, dict) else {}
+        if str(signal.get("state") or "").strip() in {"watch", "recommended"}:
+            actions.append(
+                {
+                    "action": "reapply_commitment",
+                    "label": "Reapply this recovery commitment with fresh evidence",
+                    "effect_type": "reapply_commitment",
+                    "params": {
+                        "commitment_id": commitment_id,
+                        "source_commitment_id": commitment_id,
+                    },
+                }
+            )
         return actions
     actions.append(
         {
@@ -191,6 +260,19 @@ def _recommended_actions(
             {
                 "action": "expire_commitment",
                 "label": "Expire commitment now and request fresh operator guidance",
+                "effect_type": "update_commitment_status",
+                "params": {
+                    "commitment_id": commitment_id,
+                    "target_status": "expired",
+                },
+            }
+        )
+    signal = expiry_signal if isinstance(expiry_signal, dict) else {}
+    if str(signal.get("state") or "").strip() == "ready_to_expire":
+        actions.append(
+            {
+                "action": "expire_commitment",
+                "label": "Expire the commitment because recent evidence suggests it has served its purpose",
                 "effect_type": "update_commitment_status",
                 "params": {
                     "commitment_id": commitment_id,
@@ -277,6 +359,7 @@ async def _proposal_arbitration_commitment_expectation(
 def to_operator_resolution_commitment_monitoring_out(
     row: WorkspaceOperatorResolutionCommitmentMonitoringProfile,
 ) -> dict:
+    reasoning = _json_dict(row.reasoning_json)
     return {
         "monitoring_id": int(row.id),
         "source": row.source,
@@ -302,7 +385,10 @@ def to_operator_resolution_commitment_monitoring_out(
         "trigger_counts": _json_dict(row.trigger_counts_json),
         "trigger_evidence": _json_dict(row.trigger_evidence_json),
         "recommended_actions": _json_list(row.recommended_actions_json),
-        "reasoning": _json_dict(row.reasoning_json),
+        "reasoning": reasoning,
+        "expiry_signal": _json_dict(reasoning.get("expiry_signal", {})),
+        "reapply_signal": _json_dict(reasoning.get("reapply_signal", {})),
+        "scope_application": _json_dict(reasoning.get("scope_application", {})),
         "metadata_json": _json_dict(row.metadata_json),
         "created_at": row.created_at,
     }
@@ -462,6 +548,55 @@ async def evaluate_operator_resolution_commitment_monitoring(
     )
     latest_governance = governance_rows[0] if governance_rows else None
 
+    recovery_attempt_rows: list[ExecutionRecoveryAttempt] = []
+    recovery_outcome_rows: list[ExecutionRecoveryOutcome] = []
+    if commitment_is_recovery_policy_tuning_derived(commitment):
+        recovery_context = _recovery_context(commitment)
+        recovery_attempt_rows = (
+            (
+                await db.execute(
+                    select(ExecutionRecoveryAttempt)
+                    .where(ExecutionRecoveryAttempt.created_at >= since)
+                    .order_by(ExecutionRecoveryAttempt.id.desc())
+                    .limit(300)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        recovery_attempt_rows = [
+            row
+            for row in recovery_attempt_rows
+            if _recovery_attempt_matches(
+                row,
+                managed_scope=managed_scope,
+                trace_id=str(recovery_context.get("trace_id") or ""),
+                execution_id=_safe_int(recovery_context.get("execution_id", 0)),
+            )
+        ]
+        recovery_outcome_rows = (
+            (
+                await db.execute(
+                    select(ExecutionRecoveryOutcome)
+                    .where(ExecutionRecoveryOutcome.created_at >= since)
+                    .order_by(ExecutionRecoveryOutcome.id.desc())
+                    .limit(300)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        recovery_outcome_rows = [
+            row
+            for row in recovery_outcome_rows
+            if _recovery_outcome_matches(
+                row,
+                managed_scope=managed_scope,
+                trace_id=str(recovery_context.get("trace_id") or ""),
+                execution_id=_safe_int(recovery_context.get("execution_id", 0)),
+            )
+        ]
+
     stewardship_blocked = sum(
         1
         for row in stewardship_rows
@@ -481,6 +616,16 @@ async def evaluate_operator_resolution_commitment_monitoring(
         )
     )
     blocked_auto_execution_count = stewardship_blocked + maintenance_blocked
+    recovery_operator_required_count = sum(
+        1
+        for row in recovery_outcome_rows
+        if scope_value(row.outcome_status) in {"operator_required", "failed_again"}
+    )
+    recovery_recovered_count = sum(
+        1
+        for row in recovery_outcome_rows
+        if scope_value(row.outcome_status) == "recovered"
+    )
 
     stewardship_actions_executed = sum(
         _safe_int(_json_dict(row.metadata_json).get("verification", {}).get("actions_executed", 0))
@@ -513,7 +658,13 @@ async def evaluate_operator_resolution_commitment_monitoring(
         potential_violation_count += stewardship_actions_executed
         potential_violation_count += maintenance_actions_executed
 
-    evidence_count = len(stewardship_rows) + len(maintenance_rows) + len(inquiry_rows)
+    evidence_count = (
+        len(stewardship_rows)
+        + len(maintenance_rows)
+        + len(inquiry_rows)
+        + len(recovery_attempt_rows)
+        + len(recovery_outcome_rows)
+    )
     pressure_count = sum(
         1
         for row in stewardship_rows
@@ -527,6 +678,7 @@ async def evaluate_operator_resolution_commitment_monitoring(
         _safe_int(_json_dict(row.maintenance_outcomes_json).get("execution_truth_signal_count", 0))
         for row in maintenance_rows
     )
+    pressure_count += recovery_operator_required_count
     governance_conflict = _latest_governance_conflict(
         latest_governance,
         commitment=commitment,
@@ -561,6 +713,7 @@ async def evaluate_operator_resolution_commitment_monitoring(
     drift_score = _bounded(
         drift_score
         - float(proposal_arbitration_expectation.get("expectation_weight", 0.0) or 0.0)
+        - min(0.18, recovery_recovered_count * 0.06)
     )
 
     freshness_score = 1.0 if evidence_count > 0 else 0.45
@@ -569,6 +722,72 @@ async def evaluate_operator_resolution_commitment_monitoring(
     )
 
     commitment_status = scope_value(commitment.status) or "active"
+    lifecycle_state = recovery_commitment_lifecycle_state(commitment)
+    scope_application = commitment_scope_application(
+        commitment,
+        requested_scope=managed_scope,
+    )
+    expiry_signal_strength = 0.0
+    if commitment_is_recovery_policy_tuning_derived(commitment) and commitment_status == "active":
+        expiry_signal_strength = _bounded(
+            (recovery_recovered_count * 0.24)
+            + (max(0.0, compliance_score - 0.5) * 0.5)
+            + (max(0.0, health_score - 0.55) * 0.35)
+            - (recovery_operator_required_count * 0.18)
+            - (potential_violation_count * 0.22)
+            - governance_conflict
+        )
+    expiry_signal_state = "none"
+    if commitment_status == "active":
+        if expiry_signal_strength >= 0.6:
+            expiry_signal_state = "ready_to_expire"
+        elif expiry_signal_strength >= 0.25:
+            expiry_signal_state = "watch"
+
+    reapply_signal_strength = 0.0
+    if commitment_is_recovery_policy_tuning_derived(commitment) and commitment_status in {"expired", "revoked"}:
+        reapply_signal_strength = _bounded(
+            (pressure_count * 0.14)
+            + (recovery_operator_required_count * 0.18)
+            + (blocked_auto_execution_count * 0.08)
+            + governance_conflict
+            + (0.08 if commitment_manual_reset(commitment) else 0.0)
+        )
+    reapply_signal_state = "none"
+    if commitment_status in {"expired", "revoked"}:
+        if reapply_signal_strength >= 0.58:
+            reapply_signal_state = "recommended"
+        elif reapply_signal_strength >= 0.32:
+            reapply_signal_state = "watch"
+
+    expiry_signal = {
+        "state": expiry_signal_state,
+        "strength": round(expiry_signal_strength, 6),
+        "reason": (
+            "Recent recovered outcomes suggest the active recovery commitment can retire."
+            if expiry_signal_state == "ready_to_expire"
+            else (
+                "Recent evidence is reducing the need for this active recovery commitment."
+                if expiry_signal_state == "watch"
+                else ""
+            )
+        ),
+    }
+    reapply_signal = {
+        "state": reapply_signal_state,
+        "strength": round(reapply_signal_strength, 6),
+        "source_commitment_id": commitment_reapplication_source_id(commitment) or int(commitment.id),
+        "reason": (
+            "Fresh recovery pressure suggests reapplying this commitment."
+            if reapply_signal_state == "recommended"
+            else (
+                "Recovery pressure is rising again for this inactive commitment."
+                if reapply_signal_state == "watch"
+                else ""
+            )
+        ),
+    }
+
     if commitment_status in {"revoked", "superseded"}:
         governance_state = "inactive"
         governance_decision = "monitor_only"
@@ -577,6 +796,10 @@ async def evaluate_operator_resolution_commitment_monitoring(
         governance_state = "expired"
         governance_decision = "operator_review_required"
         governance_reason = "Commitment expired and should be reviewed before it continues shaping downstream behavior."
+    elif expiry_signal_state == "ready_to_expire":
+        governance_state = "expiry_ready"
+        governance_decision = "expire_commitment"
+        governance_reason = "Commitment has produced enough stable recovery evidence to recommend passive expiry."
     elif potential_violation_count > 0:
         governance_state = "violating"
         governance_decision = "replace_commitment"
@@ -598,6 +821,10 @@ async def evaluate_operator_resolution_commitment_monitoring(
         "stewardship_cycles": len(stewardship_rows),
         "maintenance_runs": len(maintenance_rows),
         "inquiry_questions": len(inquiry_rows),
+        "recovery_attempts": len(recovery_attempt_rows),
+        "recovery_outcomes": len(recovery_outcome_rows),
+        "recovery_recovered": recovery_recovered_count,
+        "recovery_operator_required": recovery_operator_required_count,
         "blocked_auto_execution": blocked_auto_execution_count,
         "allowed_auto_execution": allowed_auto_execution_count,
         "potential_violations": potential_violation_count,
@@ -615,15 +842,34 @@ async def evaluate_operator_resolution_commitment_monitoring(
         "stewardship_cycle_ids": [int(row.id) for row in stewardship_rows[:20]],
         "maintenance_run_ids": [int(row.id) for row in maintenance_rows[:20]],
         "inquiry_question_ids": [int(row.id) for row in inquiry_rows[:20]],
+        "recovery_attempt_ids": [int(row.id) for row in recovery_attempt_rows[:20]],
+        "recovery_outcome_ids": [int(row.id) for row in recovery_outcome_rows[:20]],
+        "latest_recovery_outcome": {
+            "outcome_id": int(recovery_outcome_rows[0].id),
+            "outcome_status": scope_value(recovery_outcome_rows[0].outcome_status),
+            "trace_id": scope_value(recovery_outcome_rows[0].trace_id),
+        }
+        if recovery_outcome_rows
+        else {},
+        "scope_application": scope_application,
     }
     reasoning = {
         "block_expected": block_expected,
+        "recovery_commitment": commitment_is_recovery_policy_tuning_derived(commitment),
+        "lifecycle_state": lifecycle_state,
+        "scope_application": scope_application,
+        "recovery_attempt_count": len(recovery_attempt_rows),
+        "recovery_outcome_count": len(recovery_outcome_rows),
+        "recovery_recovered_count": recovery_recovered_count,
+        "recovery_operator_required_count": recovery_operator_required_count,
         "governance_conflict": round(governance_conflict, 6),
         "stewardship_actions_executed": stewardship_actions_executed,
         "maintenance_actions_executed": maintenance_actions_executed,
         "freshness_score": round(freshness_score, 6),
         "raw_drift_score": round(raw_drift_score, 6),
         "proposal_arbitration_expectation": proposal_arbitration_expectation,
+        "expiry_signal": expiry_signal,
+        "reapply_signal": reapply_signal,
     }
 
     row = WorkspaceOperatorResolutionCommitmentMonitoringProfile(
@@ -653,6 +899,8 @@ async def evaluate_operator_resolution_commitment_monitoring(
             governance_state=governance_state,
             governance_decision=governance_decision,
             commitment=commitment,
+            expiry_signal=expiry_signal,
+            reapply_signal=reapply_signal,
         ),
         reasoning_json=reasoning,
         metadata_json={

@@ -33,6 +33,10 @@ def cleanup_objective88_rows() -> None:
     asyncio.run(_cleanup_objective85_rows_async())
 
 
+def cleanup_objective122_rows() -> None:
+    asyncio.run(_cleanup_objective85_rows_async())
+
+
 def age_objective88_preferences(*, managed_scope: str, hours: int) -> None:
     asyncio.run(_age_objective88_preferences_async(managed_scope=managed_scope, hours=hours))
 
@@ -52,12 +56,14 @@ async def _cleanup_objective85_rows_async() -> None:
                     WHERE managed_scope LIKE 'objective85-%'
                        OR managed_scope LIKE 'objective86-%'
                        OR managed_scope LIKE 'objective87-%'
+                           OR managed_scope LIKE 'objective122-%'
                        OR commitment_id IN (
                             SELECT id
                             FROM workspace_operator_resolution_commitments
                             WHERE managed_scope LIKE 'objective85-%'
                                OR managed_scope LIKE 'objective86-%'
                                OR managed_scope LIKE 'objective87-%'
+                               OR managed_scope LIKE 'objective122-%'
                        );
                 END IF;
             END $$
@@ -72,12 +78,14 @@ async def _cleanup_objective85_rows_async() -> None:
                     WHERE managed_scope LIKE 'objective85-%'
                        OR managed_scope LIKE 'objective86-%'
                        OR managed_scope LIKE 'objective87-%'
+                           OR managed_scope LIKE 'objective122-%'
                        OR commitment_id IN (
                             SELECT id
                             FROM workspace_operator_resolution_commitments
                             WHERE managed_scope LIKE 'objective85-%'
                                OR managed_scope LIKE 'objective86-%'
                                OR managed_scope LIKE 'objective87-%'
+                               OR managed_scope LIKE 'objective122-%'
                        );
                 END IF;
             END $$
@@ -91,31 +99,32 @@ async def _cleanup_objective85_rows_async() -> None:
                 WHERE managed_scope LIKE 'objective85-%'
                    OR managed_scope LIKE 'objective86-%'
                    OR managed_scope LIKE 'objective87-%'
+                   OR managed_scope LIKE 'objective122-%'
             )
             DELETE FROM workspace_stewardship_cycles
             WHERE stewardship_id IN (SELECT id FROM target_states)
             """
         )
         await conn.execute(
-            "DELETE FROM workspace_stewardship_states WHERE managed_scope LIKE 'objective85-%' OR managed_scope LIKE 'objective86-%' OR managed_scope LIKE 'objective87-%'"
+            "DELETE FROM workspace_stewardship_states WHERE managed_scope LIKE 'objective85-%' OR managed_scope LIKE 'objective86-%' OR managed_scope LIKE 'objective87-%' OR managed_scope LIKE 'objective122-%'"
         )
         await conn.execute(
-            "DELETE FROM workspace_desired_environment_states WHERE scope_ref LIKE 'objective85-%' OR scope_ref LIKE 'objective86-%' OR scope_ref LIKE 'objective87-%'"
+            "DELETE FROM workspace_desired_environment_states WHERE scope_ref LIKE 'objective85-%' OR scope_ref LIKE 'objective86-%' OR scope_ref LIKE 'objective87-%' OR scope_ref LIKE 'objective122-%'"
         )
         await conn.execute(
-            "DELETE FROM workspace_execution_truth_governance_profiles WHERE managed_scope LIKE 'objective85-%' OR managed_scope LIKE 'objective86-%' OR managed_scope LIKE 'objective87-%'"
+            "DELETE FROM workspace_execution_truth_governance_profiles WHERE managed_scope LIKE 'objective85-%' OR managed_scope LIKE 'objective86-%' OR managed_scope LIKE 'objective87-%' OR managed_scope LIKE 'objective122-%'"
         )
         await conn.execute(
-            "DELETE FROM workspace_autonomy_boundary_profiles WHERE scope LIKE 'objective85-%' OR scope LIKE 'objective86-%' OR scope LIKE 'objective87-%'"
+            "DELETE FROM workspace_autonomy_boundary_profiles WHERE scope LIKE 'objective85-%' OR scope LIKE 'objective86-%' OR scope LIKE 'objective87-%' OR scope LIKE 'objective122-%'"
         )
         await conn.execute(
-            "DELETE FROM workspace_operator_resolution_commitments WHERE managed_scope LIKE 'objective85-%' OR managed_scope LIKE 'objective86-%' OR managed_scope LIKE 'objective87-%'"
+            "DELETE FROM workspace_operator_resolution_commitments WHERE managed_scope LIKE 'objective85-%' OR managed_scope LIKE 'objective86-%' OR managed_scope LIKE 'objective87-%' OR managed_scope LIKE 'objective122-%'"
         )
         await conn.execute(
-            "DELETE FROM workspace_inquiry_questions WHERE trigger_evidence_json->>'managed_scope' LIKE 'objective85-%' OR trigger_evidence_json->>'managed_scope' LIKE 'objective86-%' OR trigger_evidence_json->>'managed_scope' LIKE 'objective87-%'"
+            "DELETE FROM workspace_inquiry_questions WHERE trigger_evidence_json->>'managed_scope' LIKE 'objective85-%' OR trigger_evidence_json->>'managed_scope' LIKE 'objective86-%' OR trigger_evidence_json->>'managed_scope' LIKE 'objective87-%' OR trigger_evidence_json->>'managed_scope' LIKE 'objective122-%'"
         )
         await conn.execute(
-            "DELETE FROM workspace_strategy_goals WHERE source LIKE 'objective85-%' OR source LIKE 'objective86-%' OR source LIKE 'objective87-%'"
+            "DELETE FROM workspace_strategy_goals WHERE source LIKE 'objective85-%' OR source LIKE 'objective86-%' OR source LIKE 'objective87-%' OR source LIKE 'objective122-%'"
         )
         await conn.execute(
             "DELETE FROM user_preferences WHERE source = 'objective88' OR preference_type LIKE 'operator_learned_preference:%'"

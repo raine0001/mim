@@ -5,6 +5,12 @@ from datetime import datetime, timezone
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from core.autonomy_boundary_service import (
+    build_autonomy_decision_context,
+    build_boundary_action_controls,
+    build_boundary_profile_snapshot,
+    get_latest_autonomy_boundary_for_scope,
+)
 from core.horizon_planning import DEFAULT_WEIGHTS, PlanningContext, build_staged_action_graph, score_goal_candidate
 from core.environment_strategy_service import (
     get_active_environment_strategies,
@@ -65,6 +71,18 @@ async def create_horizon_plan(
     metadata_json: dict,
     db: AsyncSession,
 ) -> tuple[WorkspaceHorizonPlan, list[WorkspaceHorizonCheckpoint]]:
+    managed_scope = str((metadata_json if isinstance(metadata_json, dict) else {}).get("managed_scope") or "").strip() or "global"
+    boundary_row = await get_latest_autonomy_boundary_for_scope(scope=managed_scope, db=db)
+    boundary_profile = build_boundary_profile_snapshot(boundary_row)
+    autonomy_context = build_autonomy_decision_context(
+        boundary_profile=boundary_profile,
+        requested_action="horizon_planning",
+        policy_source="horizon_planning",
+        auto_execution_allowed=False,
+        reason=f"Planning horizon evaluated for scope {managed_scope}.",
+        policy_conflict=None,
+    )
+    action_controls = build_boundary_action_controls(boundary_profile)
     learned_factor = await _learned_constraint_factor(db)
     weights = _normalized_weights(priority_policy)
     map_limit = int(priority_policy.get("map_freshness_limit_seconds", 900) or 900)
@@ -155,6 +173,18 @@ async def create_horizon_plan(
 
     ranked = sorted(scored, key=lambda item: (bool(item.get("deferred", False)), -float(item.get("score", 0.0))))
     stages = build_staged_action_graph(ranked_goals=ranked, context=context)
+    stages = [
+        {
+            **stage,
+            "boundary_profile": str(boundary_profile.get("current_level") or action_controls.get("boundary_profile") or "").strip(),
+            "decision_basis": autonomy_context.get("decision_basis", {}),
+            "allowed_actions": action_controls.get("allowed_actions", []),
+            "approval_required": bool(action_controls.get("approval_required", True)),
+            "retry_policy": action_controls.get("retry_policy", {}),
+            "risk_level": str(action_controls.get("risk_level") or "medium").strip(),
+        }
+        for stage in stages
+    ]
 
     expected_constraints = list(expected_future_constraints if isinstance(expected_future_constraints, list) else [])
     if not expected_constraints:
@@ -181,6 +211,12 @@ async def create_horizon_plan(
         "replan_triggers": expected_constraints,
         "strategy_context": strategy_context_rows,
         "influenced_strategy_ids": sorted(influenced_strategy_ids),
+        "boundary_profile": autonomy_context.get("boundary_profile", {}),
+        "decision_basis": autonomy_context.get("decision_basis", {}),
+        "allowed_actions": action_controls.get("allowed_actions", []),
+        "approval_required": bool(action_controls.get("approval_required", True)),
+        "retry_policy": action_controls.get("retry_policy", {}),
+        "risk_level": str(action_controls.get("risk_level") or "medium").strip(),
     }
 
     plan = WorkspaceHorizonPlan(
@@ -202,7 +238,16 @@ async def create_horizon_plan(
             "strategy_context": strategy_context_rows,
         },
         explanation_json=explanation,
-        metadata_json=metadata_json if isinstance(metadata_json, dict) else {},
+        metadata_json={
+            **(metadata_json if isinstance(metadata_json, dict) else {}),
+            "managed_scope": managed_scope,
+            "boundary_profile": autonomy_context.get("boundary_profile", {}),
+            "decision_basis": autonomy_context.get("decision_basis", {}),
+            "allowed_actions": action_controls.get("allowed_actions", []),
+            "approval_required": bool(action_controls.get("approval_required", True)),
+            "retry_policy": action_controls.get("retry_policy", {}),
+            "risk_level": str(action_controls.get("risk_level") or "medium").strip(),
+        },
     )
     db.add(plan)
     await db.flush()
@@ -427,6 +472,10 @@ def to_horizon_checkpoint_out(row: WorkspaceHorizonCheckpoint) -> dict:
 
 def to_horizon_plan_out(row: WorkspaceHorizonPlan, checkpoints: list[WorkspaceHorizonCheckpoint]) -> dict:
     next_checkpoint = next((item for item in checkpoints if item.status == "active"), None)
+    metadata_json = row.metadata_json if isinstance(row.metadata_json, dict) else {}
+    explanation_json = row.explanation_json if isinstance(row.explanation_json, dict) else {}
+    boundary_profile = explanation_json.get("boundary_profile", {}) if isinstance(explanation_json.get("boundary_profile", {}), dict) else {}
+    decision_basis = explanation_json.get("decision_basis", {}) if isinstance(explanation_json.get("decision_basis", {}), dict) else {}
     return {
         "plan_id": row.id,
         "actor": row.actor,
@@ -437,9 +486,16 @@ def to_horizon_plan_out(row: WorkspaceHorizonPlan, checkpoints: list[WorkspaceHo
         "staged_action_graph": row.staged_action_graph_json if isinstance(row.staged_action_graph_json, list) else [],
         "expected_future_constraints": row.expected_future_constraints_json if isinstance(row.expected_future_constraints_json, list) else [],
         "scoring_context": row.scoring_context_json if isinstance(row.scoring_context_json, dict) else {},
-        "explanation": row.explanation_json if isinstance(row.explanation_json, dict) else {},
+        "explanation": explanation_json,
+        "boundary_profile": str(boundary_profile.get("current_level") or decision_basis.get("boundary_level") or "").strip(),
+        "boundary_context": boundary_profile,
+        "decision_basis": decision_basis,
+        "allowed_actions": metadata_json.get("allowed_actions", []),
+        "approval_required": bool(metadata_json.get("approval_required", False)),
+        "retry_policy": metadata_json.get("retry_policy", {}),
+        "risk_level": str(metadata_json.get("risk_level") or "").strip(),
         "checkpoints": [to_horizon_checkpoint_out(item) for item in checkpoints],
         "next_checkpoint": to_horizon_checkpoint_out(next_checkpoint) if next_checkpoint else None,
-        "metadata_json": row.metadata_json if isinstance(row.metadata_json, dict) else {},
+        "metadata_json": metadata_json,
         "created_at": row.created_at,
     }

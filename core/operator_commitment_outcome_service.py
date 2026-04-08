@@ -8,6 +8,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from core.execution_truth_service import execution_truth_scope_matches
 from core.models import (
     CapabilityExecution,
+    ExecutionRecoveryAttempt,
+    ExecutionRecoveryOutcome,
     WorkspaceInquiryQuestion,
     WorkspaceMaintenanceRun,
     WorkspaceOperatorResolutionCommitment,
@@ -15,7 +17,11 @@ from core.models import (
     WorkspaceOperatorResolutionCommitmentOutcomeProfile,
     WorkspaceStewardshipCycle,
 )
-from core.operator_resolution_service import normalize_scope, sync_commitment_expiration
+from core.operator_resolution_service import (
+    commitment_is_recovery_policy_tuning_derived,
+    normalize_scope,
+    sync_commitment_expiration,
+)
 
 
 TERMINAL_COMMITMENT_STATUSES = {
@@ -110,6 +116,53 @@ def _inquiry_question_matches(
         if _scope_matches(managed_scope=managed_scope, payload=bucket):
             return True
     return False
+
+
+def _recovery_context(commitment: WorkspaceOperatorResolutionCommitment) -> dict:
+    recommendation = (
+        commitment.recommendation_snapshot_json
+        if isinstance(commitment.recommendation_snapshot_json, dict)
+        else {}
+    )
+    provenance = commitment.provenance_json if isinstance(commitment.provenance_json, dict) else {}
+    return {
+        "trace_id": str(recommendation.get("trace_id") or provenance.get("trace_id") or "").strip(),
+        "execution_id": _safe_int(
+            recommendation.get("execution_id") or provenance.get("execution_id") or 0
+        ),
+    }
+
+
+def _recovery_attempt_matches(
+    row: ExecutionRecoveryAttempt,
+    *,
+    managed_scope: str,
+    trace_id: str,
+    execution_id: int,
+) -> bool:
+    if normalize_scope(row.managed_scope) != normalize_scope(managed_scope):
+        return False
+    if trace_id and str(row.trace_id or "").strip() == trace_id:
+        return True
+    if execution_id > 0 and int(row.execution_id or 0) == execution_id:
+        return True
+    return True
+
+
+def _recovery_outcome_matches(
+    row: ExecutionRecoveryOutcome,
+    *,
+    managed_scope: str,
+    trace_id: str,
+    execution_id: int,
+) -> bool:
+    if normalize_scope(row.managed_scope) != normalize_scope(managed_scope):
+        return False
+    if trace_id and str(row.trace_id or "").strip() == trace_id:
+        return True
+    if execution_id > 0 and int(row.execution_id or 0) == execution_id:
+        return True
+    return True
 
 
 def _retry_count_for_execution(row: CapabilityExecution) -> int:
@@ -485,6 +538,55 @@ async def evaluate_operator_resolution_commitment_outcome(
         if execution_truth_scope_matches(row=row, managed_scope=managed_scope)
     ]
 
+    recovery_attempt_rows: list[ExecutionRecoveryAttempt] = []
+    recovery_outcome_rows: list[ExecutionRecoveryOutcome] = []
+    if commitment_is_recovery_policy_tuning_derived(commitment):
+        recovery_context = _recovery_context(commitment)
+        recovery_attempt_rows = (
+            (
+                await db.execute(
+                    select(ExecutionRecoveryAttempt)
+                    .where(ExecutionRecoveryAttempt.created_at >= since)
+                    .order_by(ExecutionRecoveryAttempt.id.desc())
+                    .limit(300)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        recovery_attempt_rows = [
+            row
+            for row in recovery_attempt_rows
+            if _recovery_attempt_matches(
+                row,
+                managed_scope=managed_scope,
+                trace_id=str(recovery_context.get("trace_id") or ""),
+                execution_id=_safe_int(recovery_context.get("execution_id", 0)),
+            )
+        ]
+        recovery_outcome_rows = (
+            (
+                await db.execute(
+                    select(ExecutionRecoveryOutcome)
+                    .where(ExecutionRecoveryOutcome.created_at >= since)
+                    .order_by(ExecutionRecoveryOutcome.id.desc())
+                    .limit(300)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        recovery_outcome_rows = [
+            row
+            for row in recovery_outcome_rows
+            if _recovery_outcome_matches(
+                row,
+                managed_scope=managed_scope,
+                trace_id=str(recovery_context.get("trace_id") or ""),
+                execution_id=_safe_int(recovery_context.get("execution_id", 0)),
+            )
+        ]
+
     prior_outcomes = (
         (
             await db.execute(
@@ -545,6 +647,22 @@ async def evaluate_operator_resolution_commitment_outcome(
     )
     retry_count = sum(_retry_count_for_execution(row) for row in execution_rows)
     execution_count = len(execution_rows)
+    recovery_outcome_count = len(recovery_outcome_rows)
+    recovery_recovered_count = sum(
+        1
+        for row in recovery_outcome_rows
+        if str(row.outcome_status or "").strip() == "recovered"
+    )
+    recovery_failed_again_count = sum(
+        1
+        for row in recovery_outcome_rows
+        if str(row.outcome_status or "").strip() == "failed_again"
+    )
+    recovery_operator_required_count = sum(
+        1
+        for row in recovery_outcome_rows
+        if str(row.outcome_status or "").strip() == "operator_required"
+    )
     retry_pressure_score = _bounded(
         float(retry_count) / float(max(1, execution_count * 2)),
     )
@@ -563,12 +681,29 @@ async def evaluate_operator_resolution_commitment_outcome(
         + ((1.0 - avg_drift) * 0.20)
         + ((1.0 - retry_pressure_score) * 0.20)
     )
+    if recovery_outcome_count > 0:
+        recovery_success_rate = float(recovery_recovered_count) / float(recovery_outcome_count)
+        recovery_escalation_rate = float(
+            recovery_failed_again_count + recovery_operator_required_count
+        ) / float(recovery_outcome_count)
+        effectiveness_score = _bounded(
+            effectiveness_score + (recovery_success_rate * 0.20) - (recovery_escalation_rate * 0.20)
+        )
+        stability_score = _bounded(
+            stability_score + (recovery_success_rate * 0.15) - (recovery_escalation_rate * 0.15)
+        )
 
     derived_status = str(target_status or "").strip().lower()
     commitment_status = str(commitment.status or "").strip().lower()
     if not derived_status:
         if commitment_status == "superseded":
             derived_status = "superseded"
+        elif recovery_failed_again_count >= 2:
+            derived_status = "harmful"
+        elif recovery_operator_required_count >= 2 and recovery_recovered_count == 0:
+            derived_status = "ineffective"
+        elif recovery_recovered_count > 0 and recovery_failed_again_count == 0:
+            derived_status = "satisfied"
         elif violation_count >= 2 and (avg_health <= 0.45 or conflict_count >= 1):
             derived_status = "harmful"
         elif commitment_status in {"revoked", "expired"}:
@@ -605,6 +740,12 @@ async def evaluate_operator_resolution_commitment_outcome(
         final_reason = "Commitment was replaced by a newer commitment for the same scope."
     else:
         final_reason = "Commitment improved scope stability without sustained runtime conflict."
+    if commitment_is_recovery_policy_tuning_derived(commitment) and recovery_outcome_count > 0:
+        final_reason = (
+            f"Recovery evidence recorded {recovery_recovered_count} recovered, "
+            f"{recovery_failed_again_count} failed-again, and {recovery_operator_required_count} "
+            f"operator-required outcomes while this commitment was active."
+        )
 
     recommended_actions = _recommended_actions(
         commitment=commitment,
@@ -614,9 +755,24 @@ async def evaluate_operator_resolution_commitment_outcome(
     learning_confidence = _bounded(
         min(1.0, (0.25 * monitoring_count) + (0.15 * len(stewardship_rows)) + (0.1 * len(maintenance_rows)) + (0.1 * execution_count)),
     )
-    evidence_count = monitoring_count + len(stewardship_rows) + len(maintenance_rows) + len(inquiry_rows) + execution_count
+    evidence_count = (
+        monitoring_count
+        + len(stewardship_rows)
+        + len(maintenance_rows)
+        + len(inquiry_rows)
+        + execution_count
+        + len(recovery_attempt_rows)
+        + recovery_outcome_count
+    )
 
-    if derived_status in TERMINAL_COMMITMENT_STATUSES and commitment_status != derived_status:
+    should_update_commitment_status = (
+        derived_status in TERMINAL_COMMITMENT_STATUSES
+        and commitment_status != derived_status
+    )
+    if commitment_is_recovery_policy_tuning_derived(commitment) and derived_status == "satisfied":
+        should_update_commitment_status = False
+
+    if should_update_commitment_status:
         commitment.status = derived_status
         commitment.metadata_json = {
             **(_json_dict(commitment.metadata_json)),
@@ -672,12 +828,18 @@ async def evaluate_operator_resolution_commitment_outcome(
                 "maintenance_runs": len(maintenance_rows),
                 "inquiry_questions": len(inquiry_rows),
                 "executions": execution_count,
+                "recovery_attempts": len(recovery_attempt_rows),
+                "recovery_outcomes": recovery_outcome_count,
+                "recovery_recovered": recovery_recovered_count,
+                "recovery_failed_again": recovery_failed_again_count,
+                "recovery_operator_required": recovery_operator_required_count,
                 "retries": retry_count,
                 "blocked_auto_executions": blocked_count,
                 "allowed_auto_executions": allowed_count,
                 "potential_violations": violation_count,
                 "governance_conflicts": conflict_count,
             },
+            "recovery_commitment": commitment_is_recovery_policy_tuning_derived(commitment),
         },
         metadata_json={
             **(_json_dict(metadata_json)),

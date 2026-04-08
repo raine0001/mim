@@ -36,8 +36,12 @@ from core.policy_conflict_resolution_service import (
     resolve_workspace_proposal_policy_conflict,
 )
 from core.autonomy_boundary_service import (
+    build_autonomy_decision_context,
+    build_boundary_action_controls,
+    build_boundary_profile_snapshot,
     evaluate_adaptive_autonomy_boundaries,
     get_autonomy_boundary_profile,
+    get_latest_autonomy_boundary_for_scope,
     list_autonomy_boundary_profiles,
     to_autonomy_boundary_profile_out,
 )
@@ -1986,7 +1990,120 @@ def _monitoring_state_payload(row: WorkspaceMonitoringState) -> dict:
     }
 
 
+def _managed_scope_from_autonomous_chain_metadata(metadata: dict | None) -> str:
+    payload = metadata if isinstance(metadata, dict) else {}
+    for key in ("managed_scope", "related_zone", "target_zone", "zone", "scan_area"):
+        value = str(payload.get(key) or "").strip()
+        if value:
+            return value
+    return "global"
+
+
+def _managed_scope_from_autonomous_chain_proposals(
+    *,
+    proposals: list[WorkspaceProposal],
+    metadata: dict | None,
+) -> str:
+    from_metadata = _managed_scope_from_autonomous_chain_metadata(metadata)
+    if from_metadata != "global":
+        return from_metadata
+    proposal_scopes: set[str] = set()
+    for proposal in proposals:
+        zone = str(getattr(proposal, "related_zone", "") or "").strip()
+        if zone:
+            proposal_scopes.add(zone)
+            continue
+        proposal_metadata = (
+            proposal.metadata_json if isinstance(proposal.metadata_json, dict) else {}
+        )
+        zone = _managed_scope_from_autonomous_chain_metadata(proposal_metadata)
+        if zone != "global":
+            proposal_scopes.add(zone)
+    if len(proposal_scopes) == 1:
+        return next(iter(proposal_scopes))
+    return "global"
+
+
+async def _autonomous_chain_boundary_envelope(
+    *,
+    db: AsyncSession,
+    managed_scope: str,
+    requested_action: str,
+    policy_source: str,
+    reason: str,
+) -> dict:
+    scope = str(managed_scope or "").strip() or "global"
+    boundary_row = await get_latest_autonomy_boundary_for_scope(scope=scope, db=db)
+    boundary_profile = build_boundary_profile_snapshot(boundary_row)
+    autonomy_context = build_autonomy_decision_context(
+        boundary_profile=boundary_profile,
+        requested_action=requested_action,
+        policy_source=policy_source,
+        auto_execution_allowed=False,
+        reason=reason,
+        policy_conflict=None,
+    )
+    action_controls = build_boundary_action_controls(boundary_profile)
+    return {
+        "managed_scope": scope,
+        "boundary_profile": autonomy_context.get("boundary_profile", {}),
+        "decision_basis": autonomy_context.get("decision_basis", {}),
+        "allowed_actions": action_controls.get("allowed_actions", []),
+        "approval_required": bool(action_controls.get("approval_required", False)),
+        "retry_policy": action_controls.get("retry_policy", {}),
+        "risk_level": str(action_controls.get("risk_level") or "").strip(),
+        "boundary_enforced": bool(boundary_profile.get("boundary_id")),
+    }
+
+
+def _apply_autonomous_chain_boundary_metadata(
+    metadata: dict | None,
+    envelope: dict | None,
+) -> dict:
+    payload = dict(metadata) if isinstance(metadata, dict) else {}
+    context = envelope if isinstance(envelope, dict) else {}
+    payload["managed_scope"] = str(
+        context.get("managed_scope")
+        or payload.get("managed_scope")
+        or "global"
+    ).strip() or "global"
+    payload["boundary_profile"] = (
+        context.get("boundary_profile", {})
+        if isinstance(context.get("boundary_profile", {}), dict)
+        else {}
+    )
+    payload["decision_basis"] = (
+        context.get("decision_basis", {})
+        if isinstance(context.get("decision_basis", {}), dict)
+        else {}
+    )
+    payload["allowed_actions"] = (
+        context.get("allowed_actions", [])
+        if isinstance(context.get("allowed_actions", []), list)
+        else []
+    )
+    payload["approval_required"] = bool(context.get("approval_required", False))
+    payload["retry_policy"] = (
+        context.get("retry_policy", {})
+        if isinstance(context.get("retry_policy", {}), dict)
+        else {}
+    )
+    payload["risk_level"] = str(context.get("risk_level") or "").strip()
+    return payload
+
+
 def _to_workspace_autonomous_chain_out(row: WorkspaceAutonomousChain) -> dict:
+    metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
+    boundary_profile = (
+        metadata.get("boundary_profile", {})
+        if isinstance(metadata.get("boundary_profile", {}), dict)
+        else {}
+    )
+    decision_basis = (
+        metadata.get("decision_basis", {})
+        if isinstance(metadata.get("decision_basis", {}), dict)
+        else {}
+    )
     return {
         "chain_id": row.id,
         "chain_type": row.chain_type,
@@ -2002,6 +2119,20 @@ def _to_workspace_autonomous_chain_out(row: WorkspaceAutonomousChain) -> dict:
         "stop_on_failure": bool(row.stop_on_failure),
         "cooldown_seconds": int(row.cooldown_seconds),
         "requires_approval": bool(row.requires_approval),
+        "managed_scope": str(metadata.get("managed_scope") or "global").strip() or "global",
+        "boundary_profile": str(
+            boundary_profile.get("current_level")
+            or decision_basis.get("boundary_level")
+            or ""
+        ).strip(),
+        "boundary_context": boundary_profile,
+        "decision_basis": decision_basis,
+        "allowed_actions": metadata.get("allowed_actions", []),
+        "approval_required": bool(
+            metadata.get("approval_required", row.requires_approval)
+        ),
+        "retry_policy": metadata.get("retry_policy", {}),
+        "risk_level": str(metadata.get("risk_level") or "").strip(),
         "approved_by": row.approved_by,
         "approved_at": row.approved_at,
         "last_advanced_at": row.last_advanced_at,
@@ -2013,9 +2144,7 @@ def _to_workspace_autonomous_chain_out(row: WorkspaceAutonomousChain) -> dict:
         if isinstance(row.failed_step_ids, list)
         else [],
         "audit_trail": _coerced_json_list(row.audit_trail_json),
-        "metadata_json": row.metadata_json
-        if isinstance(row.metadata_json, dict)
-        else {},
+        "metadata_json": metadata,
         "created_at": row.created_at,
     }
 
@@ -2221,6 +2350,17 @@ def _append_chain_audit(
 
 
 def _to_workspace_capability_chain_out(row: WorkspaceCapabilityChain) -> dict:
+    metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
+    boundary_profile = (
+        metadata.get("boundary_profile", {})
+        if isinstance(metadata.get("boundary_profile", {}), dict)
+        else {}
+    )
+    decision_basis = (
+        metadata.get("decision_basis", {})
+        if isinstance(metadata.get("decision_basis", {}), dict)
+        else {}
+    )
     return {
         "chain_id": row.id,
         "chain_name": row.chain_name,
@@ -2229,6 +2369,19 @@ def _to_workspace_capability_chain_out(row: WorkspaceCapabilityChain) -> dict:
         "source": row.source,
         "policy": row.policy_json if isinstance(row.policy_json, dict) else {},
         "steps": row.steps_json if isinstance(row.steps_json, list) else [],
+        "managed_scope": str(metadata.get("managed_scope") or "global").strip()
+        or "global",
+        "boundary_profile": str(
+            boundary_profile.get("current_level")
+            or decision_basis.get("boundary_level")
+            or ""
+        ).strip(),
+        "boundary_context": boundary_profile,
+        "decision_basis": decision_basis,
+        "allowed_actions": metadata.get("allowed_actions", []),
+        "approval_required": bool(metadata.get("approval_required", False)),
+        "retry_policy": metadata.get("retry_policy", {}),
+        "risk_level": str(metadata.get("risk_level") or "").strip(),
         "current_step_index": int(row.current_step_index),
         "completed_step_ids": row.completed_step_ids
         if isinstance(row.completed_step_ids, list)
@@ -2240,9 +2393,7 @@ def _to_workspace_capability_chain_out(row: WorkspaceCapabilityChain) -> dict:
         "escalate_on_failure": bool(row.escalate_on_failure),
         "last_advanced_at": row.last_advanced_at,
         "audit_trail": _coerced_json_list(row.audit_trail_json),
-        "metadata_json": row.metadata_json
-        if isinstance(row.metadata_json, dict)
-        else {},
+        "metadata_json": metadata,
         "created_at": row.created_at,
     }
 
@@ -2267,6 +2418,51 @@ def _append_capability_chain_audit(
     )
     row.audit_trail_json = trail[-300:]
     flag_modified(row, "audit_trail_json")
+
+
+def _managed_scope_from_capability_chain_steps(
+    *,
+    steps: list[dict],
+    metadata: dict | None,
+) -> str:
+    from_metadata = _managed_scope_from_autonomous_chain_metadata(metadata)
+    if from_metadata != "global":
+        return from_metadata
+    step_scopes: set[str] = set()
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        params = step.get("params", {}) if isinstance(step.get("params", {}), dict) else {}
+        scope = _managed_scope_from_autonomous_chain_metadata(params)
+        if scope != "global":
+            step_scopes.add(scope)
+    if len(step_scopes) == 1:
+        return next(iter(step_scopes))
+    return "global"
+
+
+def _capability_chain_boundary_requires_confirmation(
+    *,
+    envelope: dict | None,
+    capability: str,
+) -> bool:
+    context = envelope if isinstance(envelope, dict) else {}
+    managed_scope = str(context.get("managed_scope") or "global").strip() or "global"
+    if managed_scope == "global":
+        return False
+    boundary_profile = (
+        context.get("boundary_profile", {})
+        if isinstance(context.get("boundary_profile", {}), dict)
+        else {}
+    )
+    boundary_scope = str(boundary_profile.get("scope") or "").strip()
+    if boundary_scope != managed_scope:
+        return False
+    if not _is_physical_capability_step(str(capability or "").strip()):
+        return False
+    return bool(context.get("boundary_enforced", False)) and bool(
+        context.get("approval_required", False)
+    )
 
 
 def _normalized_capability_chain_steps(raw_steps: list[dict]) -> list[dict]:
@@ -3434,6 +3630,8 @@ def _action_plan_policy(
 
 def _to_workspace_action_plan_out(row: WorkspaceActionPlan) -> dict:
     metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
+    boundary_profile = metadata.get("boundary_profile", {}) if isinstance(metadata.get("boundary_profile", {}), dict) else {}
+    decision_basis = metadata.get("decision_basis", {}) if isinstance(metadata.get("decision_basis", {}), dict) else {}
     return {
         "plan_id": row.id,
         "target_resolution_id": row.target_resolution_id,
@@ -3461,6 +3659,13 @@ def _to_workspace_action_plan_out(row: WorkspaceActionPlan) -> dict:
         "abort_reason": row.abort_reason,
         "queued_task_id": row.queued_task_id,
         "source": row.source,
+        "boundary_profile": str(boundary_profile.get("current_level") or decision_basis.get("boundary_level") or "").strip(),
+        "boundary_context": boundary_profile,
+        "decision_basis": decision_basis,
+        "allowed_actions": metadata.get("allowed_actions", []),
+        "approval_required": bool(metadata.get("approval_required", False)),
+        "retry_policy": metadata.get("retry_policy", {}),
+        "risk_level": str(metadata.get("risk_level") or "").strip(),
         "metadata_json": metadata,
         "replan_history": _coerced_json_list(metadata.get("replan_history", [])),
         "created_at": row.created_at,
@@ -4690,6 +4895,19 @@ async def create_workspace_capability_chain(
         "combination": [steps[0].get("capability"), steps[1].get("capability")],
         **(payload.policy_json if isinstance(payload.policy_json, dict) else {}),
     }
+    managed_scope = _managed_scope_from_capability_chain_steps(
+        steps=steps,
+        metadata=payload.metadata_json,
+    )
+    boundary_envelope = await _autonomous_chain_boundary_envelope(
+        db=db,
+        managed_scope=managed_scope,
+        requested_action=payload.chain_type,
+        policy_source="workspace_capability_chain",
+        reason=(
+            f"Creating workspace capability chain {payload.chain_name} for scope {managed_scope}."
+        ),
+    )
 
     row = WorkspaceCapabilityChain(
         chain_name=payload.chain_name,
@@ -4704,11 +4922,14 @@ async def create_workspace_capability_chain(
         stop_on_failure=payload.stop_on_failure,
         escalate_on_failure=payload.escalate_on_failure,
         audit_trail_json=[],
-        metadata_json={
-            "created_by": payload.actor,
-            "reason": payload.reason,
-            **payload.metadata_json,
-        },
+        metadata_json=_apply_autonomous_chain_boundary_metadata(
+            {
+                "created_by": payload.actor,
+                "reason": payload.reason,
+                **payload.metadata_json,
+            },
+            boundary_envelope,
+        ),
     )
     db.add(row)
     await db.flush()
@@ -4721,6 +4942,12 @@ async def create_workspace_capability_chain(
         metadata_json={
             "policy_version": CAPABILITY_CHAIN_POLICY_VERSION,
             "steps": steps,
+            **payload.metadata_json,
+            **{
+                key: value
+                for key, value in boundary_envelope.items()
+                if key != "boundary_enforced"
+            },
         },
     )
 
@@ -4731,7 +4958,16 @@ async def create_workspace_capability_chain(
         target_type="workspace_capability_chain",
         target_id=str(row.id),
         summary=f"Created workspace capability chain {row.id}",
-        metadata_json={"chain_name": row.chain_name, "policy": policy},
+        metadata_json={
+            "chain_name": row.chain_name,
+            "policy": policy,
+            **payload.metadata_json,
+            **{
+                key: value
+                for key, value in boundary_envelope.items()
+                if key != "boundary_enforced"
+            },
+        },
     )
     await db.commit()
     await db.refresh(row)
@@ -4795,6 +5031,92 @@ async def advance_workspace_capability_chain(
         else {}
     )
     step_id = str(step.get("step_id", f"step-{row.current_step_index + 1}")).strip()
+    capability = str(step.get("capability", "")).strip()
+    boundary_envelope = await _autonomous_chain_boundary_envelope(
+        db=db,
+        managed_scope=_managed_scope_from_autonomous_chain_metadata(
+            row.metadata_json if isinstance(row.metadata_json, dict) else {}
+        ),
+        requested_action=capability or row.chain_type,
+        policy_source="workspace_capability_chain_advance",
+        reason=(
+            f"Advancing workspace capability chain {row.id} step {step_id} ({capability or row.chain_type})."
+        ),
+    )
+    if _capability_chain_boundary_requires_confirmation(
+        envelope=boundary_envelope,
+        capability=capability,
+    ) and not payload.force:
+        row.status = "pending_confirmation"
+        row.metadata_json = _apply_autonomous_chain_boundary_metadata(
+            {
+                **(
+                    row.metadata_json if isinstance(row.metadata_json, dict) else {}
+                ),
+                "last_boundary_hold": {
+                    "actor": payload.actor,
+                    "reason": payload.reason,
+                    "step_id": step_id,
+                    "capability": capability,
+                    **payload.metadata_json,
+                },
+            },
+            boundary_envelope,
+        )
+        _append_capability_chain_audit(
+            row,
+            actor=payload.actor,
+            event="capability_step_blocked_boundary_policy",
+            reason=payload.reason,
+            metadata_json={
+                "step_id": step_id,
+                "capability": capability,
+                "result": "operator_confirmation_required",
+                "status": row.status,
+                **payload.metadata_json,
+                **{
+                    key: value
+                    for key, value in boundary_envelope.items()
+                    if key != "boundary_enforced"
+                },
+            },
+        )
+        await write_journal(
+            db,
+            actor=payload.actor,
+            action="workspace_capability_chain_boundary_policy",
+            target_type="workspace_capability_chain",
+            target_id=str(row.id),
+            summary=f"Boundary policy gated workspace capability chain {row.id}",
+            metadata_json={
+                "step_id": step_id,
+                "capability": capability,
+                "status": row.status,
+                "result": "operator_confirmation_required",
+                **payload.metadata_json,
+                **{
+                    key: value
+                    for key, value in boundary_envelope.items()
+                    if key != "boundary_enforced"
+                },
+            },
+        )
+        await db.commit()
+        await db.refresh(row)
+        return {
+            **_to_workspace_capability_chain_out(row),
+            "last_step": {
+                "step_id": step_id,
+                "capability": capability,
+                "result": "operator_confirmation_required",
+                "success": False,
+                "verification": {
+                    "policy_outcome": "require_operator_confirmation",
+                    "policy_reason": "autonomy_boundary_operator_required",
+                    "boundary_context": boundary_envelope.get("boundary_profile", {}),
+                },
+            },
+        }
 
     monitoring = await _get_or_create_monitoring_state(db)
     human_aware = _human_aware_state_from_monitoring(monitoring)
@@ -4845,7 +5167,27 @@ async def advance_workspace_capability_chain(
                 "step_id": step_id,
                 "constraint_result": chain_constraint_result,
                 **payload.metadata_json,
+                **{
+                    key: value
+                    for key, value in boundary_envelope.items()
+                    if key != "boundary_enforced"
+                },
             },
+        )
+        row.metadata_json = _apply_autonomous_chain_boundary_metadata(
+            {
+                **(
+                    row.metadata_json if isinstance(row.metadata_json, dict) else {}
+                ),
+                "last_constraint_block": {
+                    "actor": payload.actor,
+                    "reason": payload.reason,
+                    "step_id": step_id,
+                    "constraint_result": chain_constraint_result,
+                    **payload.metadata_json,
+                },
+            },
+            boundary_envelope,
         )
         await db.commit()
         await db.refresh(row)
@@ -4899,6 +5241,11 @@ async def advance_workspace_capability_chain(
                 "outcome": human_outcome,
                 "result": result,
                 **payload.metadata_json,
+                **{
+                    key: value
+                    for key, value in boundary_envelope.items()
+                    if key != "boundary_enforced"
+                },
             },
         )
         human_aware["last_policy_decision"] = {
@@ -4907,6 +5254,22 @@ async def advance_workspace_capability_chain(
             "at": datetime.now(timezone.utc).isoformat(),
         }
         _store_human_aware_state(monitoring, human_aware)
+        row.metadata_json = _apply_autonomous_chain_boundary_metadata(
+            {
+                **(
+                    row.metadata_json if isinstance(row.metadata_json, dict) else {}
+                ),
+                "last_human_policy": {
+                    "actor": payload.actor,
+                    "reason": payload.reason,
+                    "step_id": step_id,
+                    "outcome": human_outcome,
+                    "policy_reason": human_reason,
+                    **payload.metadata_json,
+                },
+            },
+            boundary_envelope,
+        )
 
         await write_journal(
             db,
@@ -4921,6 +5284,11 @@ async def advance_workspace_capability_chain(
                 "reason": human_reason,
                 "status": row.status,
                 **payload.metadata_json,
+                **{
+                    key: value
+                    for key, value in boundary_envelope.items()
+                    if key != "boundary_enforced"
+                },
             },
         )
         await db.commit()
@@ -4993,6 +5361,11 @@ async def advance_workspace_capability_chain(
                 "step_id": step_id,
                 "verification": verification,
                 **payload.metadata_json,
+                **{
+                    key: value
+                    for key, value in boundary_envelope.items()
+                    if key != "boundary_enforced"
+                },
             },
         )
     else:
@@ -5028,8 +5401,32 @@ async def advance_workspace_capability_chain(
                 "verification": verification,
                 "escalated": row.escalate_on_failure,
                 **payload.metadata_json,
+                **{
+                    key: value
+                    for key, value in boundary_envelope.items()
+                    if key != "boundary_enforced"
+                },
             },
         )
+
+    row.metadata_json = _apply_autonomous_chain_boundary_metadata(
+        {
+            **(
+                row.metadata_json if isinstance(row.metadata_json, dict) else {}
+            ),
+            "last_advance": {
+                "actor": payload.actor,
+                "reason": payload.reason,
+                "step_id": step_id,
+                "capability": capability,
+                "force": payload.force,
+                "result": result,
+                "success": success,
+                **payload.metadata_json,
+            },
+        },
+        boundary_envelope,
+    )
 
     await write_journal(
         db,
@@ -5045,6 +5442,11 @@ async def advance_workspace_capability_chain(
             "status": row.status,
             "verification": verification,
             **payload.metadata_json,
+            **{
+                key: value
+                for key, value in boundary_envelope.items()
+                if key != "boundary_enforced"
+            },
         },
     )
     await db.commit()
@@ -5073,10 +5475,12 @@ async def create_workspace_autonomous_chain(
         )
 
     valid_ids: list[int] = []
+    matched_proposals: list[WorkspaceProposal] = []
     for proposal_id in proposal_ids:
         proposal = await db.get(WorkspaceProposal, proposal_id)
         if proposal and proposal.status in {"pending", "accepted"}:
             valid_ids.append(proposal_id)
+            matched_proposals.append(proposal)
 
     if not valid_ids:
         raise HTTPException(
@@ -5084,25 +5488,46 @@ async def create_workspace_autonomous_chain(
         )
 
     step_policy = _normalized_chain_step_policy(payload.step_policy_json)
+    managed_scope = _managed_scope_from_autonomous_chain_proposals(
+        proposals=matched_proposals,
+        metadata=payload.metadata_json,
+    )
+    boundary_envelope = await _autonomous_chain_boundary_envelope(
+        db=db,
+        managed_scope=managed_scope,
+        requested_action=payload.chain_type,
+        policy_source="workspace_autonomous_chain",
+        reason=(
+            f"Creating workspace autonomous chain for scope {managed_scope}."
+        ),
+    )
+    requires_approval = bool(payload.requires_approval)
+    if bool(boundary_envelope.get("boundary_enforced", False)) and bool(
+        boundary_envelope.get("approval_required", False)
+    ):
+        requires_approval = True
 
     row = WorkspaceAutonomousChain(
         chain_type=payload.chain_type,
-        status="pending_approval" if payload.requires_approval else "active",
+        status="pending_approval" if requires_approval else "active",
         source=payload.source,
         trigger_reason=payload.reason,
         step_proposal_ids=valid_ids,
         step_policy_json=step_policy,
         stop_on_failure=payload.stop_on_failure,
         cooldown_seconds=payload.cooldown_seconds,
-        requires_approval=payload.requires_approval,
+        requires_approval=requires_approval,
         current_step_index=0,
         completed_step_ids=[],
         failed_step_ids=[],
         audit_trail_json=[],
-        metadata_json={
-            "created_by": payload.actor,
-            **payload.metadata_json,
-        },
+        metadata_json=_apply_autonomous_chain_boundary_metadata(
+            {
+                "created_by": payload.actor,
+                **payload.metadata_json,
+            },
+            boundary_envelope,
+        ),
     )
     db.add(row)
     await db.flush()
@@ -5118,10 +5543,16 @@ async def create_workspace_autonomous_chain(
             "proposal_ids": valid_ids,
             "chain_type": payload.chain_type,
             "reason": payload.reason,
-            "requires_approval": payload.requires_approval,
+            "requires_approval": requires_approval,
             "cooldown_seconds": payload.cooldown_seconds,
             "stop_on_failure": payload.stop_on_failure,
             "step_policy_json": step_policy,
+            **payload.metadata_json,
+            **{
+                key: value
+                for key, value in boundary_envelope.items()
+                if key != "boundary_enforced"
+            },
         },
     )
 
@@ -5131,10 +5562,16 @@ async def create_workspace_autonomous_chain(
         event="chain_created",
         reason=payload.reason,
         metadata_json={
-            "requires_approval": payload.requires_approval,
+            "requires_approval": requires_approval,
             "cooldown_seconds": payload.cooldown_seconds,
             "stop_on_failure": payload.stop_on_failure,
             "step_policy_json": step_policy,
+            **payload.metadata_json,
+            **{
+                key: value
+                for key, value in boundary_envelope.items()
+                if key != "boundary_enforced"
+            },
         },
     )
 
@@ -5192,13 +5629,44 @@ async def approve_workspace_autonomous_chain(
     row.approved_at = datetime.now(timezone.utc)
     if row.status == "pending_approval":
         row.status = "active"
+    boundary_envelope = await _autonomous_chain_boundary_envelope(
+        db=db,
+        managed_scope=_managed_scope_from_autonomous_chain_metadata(
+            row.metadata_json if isinstance(row.metadata_json, dict) else {}
+        ),
+        requested_action=row.chain_type,
+        policy_source="workspace_autonomous_chain_approve",
+        reason=(
+            f"Approving workspace autonomous chain {row.id} for active execution."
+        ),
+    )
+    row.metadata_json = _apply_autonomous_chain_boundary_metadata(
+        {
+            **(
+                row.metadata_json if isinstance(row.metadata_json, dict) else {}
+            ),
+            "last_approval": {
+                "actor": payload.actor,
+                "reason": payload.reason,
+                **payload.metadata_json,
+            },
+        },
+        boundary_envelope,
+    )
 
     _append_chain_audit(
         row,
         actor=payload.actor,
         event="chain_approved",
         reason=payload.reason,
-        metadata_json=payload.metadata_json,
+        metadata_json={
+            **payload.metadata_json,
+            **{
+                key: value
+                for key, value in boundary_envelope.items()
+                if key != "boundary_enforced"
+            },
+        },
     )
 
     await write_journal(
@@ -5211,6 +5679,11 @@ async def approve_workspace_autonomous_chain(
         metadata_json={
             "reason": payload.reason,
             **payload.metadata_json,
+            **{
+                key: value
+                for key, value in boundary_envelope.items()
+                if key != "boundary_enforced"
+            },
         },
     )
 
@@ -5234,6 +5707,18 @@ async def advance_workspace_autonomous_chain(
         raise HTTPException(
             status_code=422, detail="workspace autonomous chain is not advanceable"
         )
+
+    boundary_envelope = await _autonomous_chain_boundary_envelope(
+        db=db,
+        managed_scope=_managed_scope_from_autonomous_chain_metadata(
+            row.metadata_json if isinstance(row.metadata_json, dict) else {}
+        ),
+        requested_action=row.chain_type,
+        policy_source="workspace_autonomous_chain_advance",
+        reason=(
+            f"Advancing workspace autonomous chain {row.id} through its current proposal step."
+        ),
+    )
 
     if row.requires_approval and not row.approved_at:
         raise HTTPException(
@@ -5331,6 +5816,11 @@ async def advance_workspace_autonomous_chain(
             "proposal_id": current_proposal_id,
             "current_step_index": row.current_step_index,
             **payload.metadata_json,
+            **{
+                key: value
+                for key, value in boundary_envelope.items()
+                if key != "boundary_enforced"
+            },
         },
     )
 
@@ -5344,15 +5834,20 @@ async def advance_workspace_autonomous_chain(
             completed.append(current_proposal_id)
             row.completed_step_ids = completed
 
-    row.metadata_json = {
-        **(row.metadata_json if isinstance(row.metadata_json, dict) else {}),
-        "last_advance": {
-            "actor": payload.actor,
-            "reason": payload.reason,
-            "force": payload.force,
-            **payload.metadata_json,
+    row.metadata_json = _apply_autonomous_chain_boundary_metadata(
+        {
+            **(
+                row.metadata_json if isinstance(row.metadata_json, dict) else {}
+            ),
+            "last_advance": {
+                "actor": payload.actor,
+                "reason": payload.reason,
+                "force": payload.force,
+                **payload.metadata_json,
+            },
         },
-    }
+        boundary_envelope,
+    )
 
     await write_journal(
         db,
@@ -5366,6 +5861,12 @@ async def advance_workspace_autonomous_chain(
             "status": row.status,
             "proposal_id": current_proposal_id,
             "force": payload.force,
+            **payload.metadata_json,
+            **{
+                key: value
+                for key, value in boundary_envelope.items()
+                if key != "boundary_enforced"
+            },
         },
     )
 
@@ -6192,6 +6693,30 @@ async def create_workspace_action_plan(
     planning_outcome, steps, status = _action_plan_policy(
         target=target, action_type=payload.action_type
     )
+    managed_scope = str(target.requested_zone or "").strip() or "global"
+    boundary_row = await get_latest_autonomy_boundary_for_scope(scope=managed_scope, db=db)
+    boundary_profile = build_boundary_profile_snapshot(boundary_row)
+    autonomy_context = build_autonomy_decision_context(
+        boundary_profile=boundary_profile,
+        requested_action=payload.action_type,
+        policy_source="workspace_action_plan",
+        auto_execution_allowed=False,
+        reason=f"Planning action {payload.action_type} for scope {managed_scope}.",
+        policy_conflict=None,
+    )
+    action_controls = build_boundary_action_controls(boundary_profile)
+    steps = [
+        {
+            **step,
+            "boundary_profile": str(boundary_profile.get("current_level") or action_controls.get("boundary_profile") or "").strip(),
+            "decision_basis": autonomy_context.get("decision_basis", {}),
+            "allowed_actions": action_controls.get("allowed_actions", []),
+            "approval_required": bool(action_controls.get("approval_required", True)),
+            "retry_policy": action_controls.get("retry_policy", {}),
+            "risk_level": str(action_controls.get("risk_level") or "medium").strip(),
+        }
+        for step in steps
+    ]
 
     row = WorkspaceActionPlan(
         target_resolution_id=target.id,
@@ -6219,6 +6744,13 @@ async def create_workspace_action_plan(
             "target_policy_outcome": target.policy_outcome,
             "target_match_outcome": target.match_outcome,
             "notes": payload.notes,
+            "managed_scope": managed_scope,
+            "boundary_profile": autonomy_context.get("boundary_profile", {}),
+            "decision_basis": autonomy_context.get("decision_basis", {}),
+            "allowed_actions": action_controls.get("allowed_actions", []),
+            "approval_required": bool(action_controls.get("approval_required", True)),
+            "retry_policy": action_controls.get("retry_policy", {}),
+            "risk_level": str(action_controls.get("risk_level") or "medium").strip(),
             **payload.metadata_json,
         },
     )
@@ -6251,6 +6783,12 @@ async def create_workspace_action_plan(
             "target_resolution_id": target.id,
             "planning_outcome": planning_outcome,
             "status": status,
+            "boundary_profile": autonomy_context.get("boundary_profile", {}),
+            "decision_basis": autonomy_context.get("decision_basis", {}),
+            "allowed_actions": action_controls.get("allowed_actions", []),
+            "approval_required": bool(action_controls.get("approval_required", True)),
+            "retry_policy": action_controls.get("retry_policy", {}),
+            "risk_level": str(action_controls.get("risk_level") or "medium").strip(),
         },
     )
 
@@ -6300,7 +6838,15 @@ async def approve_workspace_action_plan(
         target_type="workspace_action_plan",
         target_id=str(row.id),
         summary=f"Approved workspace action plan {row.id}: {prior}->approved",
-        metadata_json={"prior_status": prior},
+        metadata_json={
+            "prior_status": prior,
+            "boundary_profile": (row.metadata_json if isinstance(row.metadata_json, dict) else {}).get("boundary_profile", {}),
+            "decision_basis": (row.metadata_json if isinstance(row.metadata_json, dict) else {}).get("decision_basis", {}),
+            "allowed_actions": (row.metadata_json if isinstance(row.metadata_json, dict) else {}).get("allowed_actions", []),
+            "approval_required": bool((row.metadata_json if isinstance(row.metadata_json, dict) else {}).get("approval_required", False)),
+            "retry_policy": (row.metadata_json if isinstance(row.metadata_json, dict) else {}).get("retry_policy", {}),
+            "risk_level": str((row.metadata_json if isinstance(row.metadata_json, dict) else {}).get("risk_level") or "").strip(),
+        },
     )
     await db.commit()
     await db.refresh(row)
@@ -6338,7 +6884,15 @@ async def reject_workspace_action_plan(
         target_type="workspace_action_plan",
         target_id=str(row.id),
         summary=f"Rejected workspace action plan {row.id}: {prior}->rejected",
-        metadata_json={"prior_status": prior},
+        metadata_json={
+            "prior_status": prior,
+            "boundary_profile": (row.metadata_json if isinstance(row.metadata_json, dict) else {}).get("boundary_profile", {}),
+            "decision_basis": (row.metadata_json if isinstance(row.metadata_json, dict) else {}).get("decision_basis", {}),
+            "allowed_actions": (row.metadata_json if isinstance(row.metadata_json, dict) else {}).get("allowed_actions", []),
+            "approval_required": bool((row.metadata_json if isinstance(row.metadata_json, dict) else {}).get("approval_required", False)),
+            "retry_policy": (row.metadata_json if isinstance(row.metadata_json, dict) else {}).get("retry_policy", {}),
+            "risk_level": str((row.metadata_json if isinstance(row.metadata_json, dict) else {}).get("risk_level") or "").strip(),
+        },
     )
     await db.commit()
     await db.refresh(row)
@@ -6405,6 +6959,12 @@ async def queue_workspace_action_plan(
         metadata_json={
             "task_id": task.id,
             "requested_executor": payload.requested_executor,
+            "boundary_profile": (row.metadata_json if isinstance(row.metadata_json, dict) else {}).get("boundary_profile", {}),
+            "decision_basis": (row.metadata_json if isinstance(row.metadata_json, dict) else {}).get("decision_basis", {}),
+            "allowed_actions": (row.metadata_json if isinstance(row.metadata_json, dict) else {}).get("allowed_actions", []),
+            "approval_required": bool((row.metadata_json if isinstance(row.metadata_json, dict) else {}).get("approval_required", False)),
+            "retry_policy": (row.metadata_json if isinstance(row.metadata_json, dict) else {}).get("retry_policy", {}),
+            "risk_level": str((row.metadata_json if isinstance(row.metadata_json, dict) else {}).get("risk_level") or "").strip(),
         },
     )
 
@@ -6625,6 +7185,8 @@ async def execute_workspace_action_plan(
         source="workspace_action_plan_execute",
         metadata_json=payload.metadata_json,
     )
+    boundary_profile = gate_result.get("boundary_profile", {}) if isinstance(gate_result.get("boundary_profile", {}), dict) else {}
+    decision_basis = gate_result.get("decision_basis", {}) if isinstance(gate_result.get("decision_basis", {}), dict) else {}
 
     execution = CapabilityExecution(
         input_event_id=event.id,
@@ -6657,6 +7219,12 @@ async def execute_workspace_action_plan(
                 "target_confidence_minimum": payload.target_confidence_minimum,
             },
             "health_gate": health_gate,
+            "boundary_profile": boundary_profile,
+            "decision_basis": decision_basis,
+            "allowed_actions": gate_result.get("allowed_actions", []),
+            "approval_required": bool(gate_result.get("approval_required", False)),
+            "retry_policy": gate_result.get("retry_policy", {}),
+            "risk_level": str(gate_result.get("risk_level") or "").strip(),
             "execution_policy_gate": json.loads(json.dumps(gate_result, default=str)),
         },
     )
@@ -6700,6 +7268,12 @@ async def execute_workspace_action_plan(
         "managed_scope": control_state["managed_scope"],
         "task_id": task.id,
         "health_gate": health_gate,
+        "boundary_profile": boundary_profile,
+        "decision_basis": decision_basis,
+        "allowed_actions": gate_result.get("allowed_actions", []),
+        "approval_required": bool(gate_result.get("approval_required", False)),
+        "retry_policy": gate_result.get("retry_policy", {}),
+        "risk_level": str(gate_result.get("risk_level") or "").strip(),
     }
     row.status = "executing" if str(execution.status or "") == "dispatched" else "approved"
     row.planning_outcome = (
@@ -6709,6 +7283,12 @@ async def execute_workspace_action_plan(
     )
     row.metadata_json = {
         **(row.metadata_json if isinstance(row.metadata_json, dict) else {}),
+        "boundary_profile": boundary_profile,
+        "decision_basis": decision_basis,
+        "allowed_actions": gate_result.get("allowed_actions", []),
+        "approval_required": bool(gate_result.get("approval_required", False)),
+        "retry_policy": gate_result.get("retry_policy", {}),
+        "risk_level": str(gate_result.get("risk_level") or "").strip(),
         "execution": {
             "queued_by": payload.actor,
             "queue_reason": payload.reason,
@@ -6733,6 +7313,12 @@ async def execute_workspace_action_plan(
             "task_id": task.id,
             "requested_executor": payload.requested_executor,
             "safety_score": safety_score,
+            "boundary_profile": boundary_profile,
+            "decision_basis": decision_basis,
+            "allowed_actions": gate_result.get("allowed_actions", []),
+            "approval_required": bool(gate_result.get("approval_required", False)),
+            "retry_policy": gate_result.get("retry_policy", {}),
+            "risk_level": str(gate_result.get("risk_level") or "").strip(),
         },
     )
 
