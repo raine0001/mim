@@ -11,14 +11,12 @@ REMOTE_PUBLISH="${REMOTE_PUBLISH:-0}"
 ENV_FILE="${ENV_FILE:-${ROOT_DIR}/env/.env}"
 AUDIT_SCRIPT="${AUDIT_SCRIPT:-${ROOT_DIR}/scripts/tod_bridge_audit.py}"
 CONTRACT_TOOL="${CONTRACT_TOOL:-${ROOT_DIR}/scripts/tod_mim_contract_tools.py}"
+ENV_TOOLS="${ENV_TOOLS:-${ROOT_DIR}/scripts/env_file_tools.py}"
 
 mkdir -p "${SHARED_DIR}"
 
-if [[ ( -z "${MIM_ARM_SSH_HOST:-}" || -z "${MIM_ARM_SSH_HOST_USER:-}" ) && -f "${ENV_FILE}" ]]; then
-  set -a
-  # shellcheck disable=SC1090
-  source "${ENV_FILE}" >/dev/null 2>&1 || true
-  set +a
+if [[ ( -z "${MIM_TOD_SSH_HOST:-}" || -z "${MIM_TOD_SSH_HOST_USER:-}" ) && -f "${ENV_FILE}" ]]; then
+  eval "$(python3 "${ENV_TOOLS}" export --file "${ENV_FILE}" --keys MIM_TOD_SSH_HOST MIM_TOD_SSH_USER MIM_TOD_SSH_HOST_USER MIM_TOD_SSH_PORT MIM_TOD_SSH_PASS MIM_TOD_SSH_PASSWORD MIM_TOD_SSH_REMOTE_ROOT REMOTE_ROOT)"
 fi
 
 next_bridge_meta() {
@@ -38,9 +36,9 @@ record_bridge_audit() {
     --service-name "${SERVICE_NAME}" \
     --task-id "${TASK_ID:-}" \
     --objective-id "${OBJECTIVE_ID:-}" \
-    --publish-target "/home/testpilot/mim/runtime/shared -> ${MIM_ARM_SSH_HOST:-${MIM_ARM_SSH_HOST_USER:-remote-unset}}:${REMOTE_ROOT:-/home/testpilot/mim/runtime/shared}" \
-    --remote-host "${MIM_ARM_SSH_HOST:-}" \
-    --remote-root "${REMOTE_ROOT:-/home/testpilot/mim/runtime/shared}" \
+    --publish-target "/home/testpilot/mim/runtime/shared -> ${MIM_TOD_SSH_HOST:-192.168.1.120}:${REMOTE_ROOT:-${MIM_TOD_SSH_REMOTE_ROOT:-/home/testpilot/mim/runtime/shared}}" \
+    --remote-host "${MIM_TOD_SSH_HOST:-192.168.1.120}" \
+    --remote-root "${REMOTE_ROOT:-${MIM_TOD_SSH_REMOTE_ROOT:-/home/testpilot/mim/runtime/shared}}" \
     --publish-attempted "${publish_attempted}" \
     --publish-succeeded "${publish_succeeded}" \
     --publish-returncode "${publish_returncode}" \

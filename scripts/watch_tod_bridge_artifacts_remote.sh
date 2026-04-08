@@ -11,15 +11,9 @@ RUN_ONCE="${RUN_ONCE:-0}"
 PYTHON_BIN="${PYTHON_BIN:-${ROOT_DIR}/.venv/bin/python}"
 SUMMARY_FILE="${SUMMARY_FILE:-${LOG_DIR}/tod_bridge_artifacts_remote_sync.latest.json}"
 BACKUP_ROOT="${BACKUP_ROOT:-}"
+ENV_TOOLS="${ENV_TOOLS:-${ROOT_DIR}/scripts/env_file_tools.py}"
 
 mkdir -p "${SHARED_DIR}" "${LOG_DIR}"
-
-if [[ -f "${ENV_FILE}" ]]; then
-  set -a
-  # shellcheck disable=SC1090
-  source "${ENV_FILE}"
-  set +a
-fi
 
 if [[ ! -x "${PYTHON_BIN}" ]]; then
   PYTHON_BIN="$(command -v python3 || true)"
@@ -28,6 +22,10 @@ fi
 if [[ -z "${PYTHON_BIN}" ]]; then
   echo "[tod-bridge-sync] WARN no python interpreter available" >&2
   exit 0
+fi
+
+if [[ -f "${ENV_FILE}" ]]; then
+  eval "$("${PYTHON_BIN}" "${ENV_TOOLS}" export --file "${ENV_FILE}" --keys MIM_TOD_SSH_HOST MIM_TOD_SSH_USER MIM_TOD_SSH_HOST_USER MIM_TOD_SSH_PORT MIM_TOD_SSH_PASS MIM_TOD_SSH_PASSWORD MIM_TOD_SSH_REMOTE_ROOT REMOTE_ROOT)"
 fi
 
 write_summary() {
