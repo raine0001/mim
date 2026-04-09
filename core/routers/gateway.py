@@ -45,6 +45,11 @@ from core.execution_truth_service import (
     canonicalize_execution_truth,
     derive_execution_truth_signals,
 )
+from core.interface_service import (
+    append_interface_message,
+    get_interface_session,
+    upsert_interface_session,
+)
 from core.journal import write_journal
 from core.mim_arm_dispatch_telemetry import update_dispatch_telemetry_from_feedback
 from core.preferences import (
@@ -5710,7 +5715,60 @@ async def _get_recent_text_conversation_context(
             "last_topic": "",
             "last_object_inquiry": {},
             "last_technical_research": {},
+            "last_action_request": "",
+            "pending_action_request": "",
+            "last_action_result": {},
+            "last_failure": {},
+            "last_control_state": "active",
+            "clarification_state": {},
         }
+
+    interface_session = await get_interface_session(
+        session_key=normalized_session,
+        db=db,
+    )
+    if interface_session is not None:
+        session_context = _normalize_conversation_session_context(
+            normalized_session,
+            interface_session.context_json
+            if isinstance(interface_session.context_json, dict)
+            else {},
+        )
+        if exclude_event_id is None or int(session_context.get("last_input_event_id") or 0) != int(exclude_event_id):
+            return {
+                "turn_count": int(session_context.get("turn_count") or 0),
+                "last_user_input": str(session_context.get("last_user_input") or "").strip(),
+                "last_prompt": str(session_context.get("last_prompt") or "").strip(),
+                "last_topic": str(session_context.get("last_topic") or "").strip().lower(),
+                "last_object_inquiry": (
+                    session_context.get("last_object_inquiry")
+                    if isinstance(session_context.get("last_object_inquiry"), dict)
+                    else {}
+                ),
+                "last_technical_research": (
+                    session_context.get("last_technical_research")
+                    if isinstance(session_context.get("last_technical_research"), dict)
+                    else {}
+                ),
+                "last_action_request": str(session_context.get("last_action_request") or "").strip(),
+                "pending_action_request": str(session_context.get("pending_action_request") or "").strip(),
+                "last_action_result": (
+                    session_context.get("last_action_result")
+                    if isinstance(session_context.get("last_action_result"), dict)
+                    else {}
+                ),
+                "last_failure": (
+                    session_context.get("last_failure")
+                    if isinstance(session_context.get("last_failure"), dict)
+                    else {}
+                ),
+                "last_control_state": str(session_context.get("last_control_state") or "active").strip().lower() or "active",
+                "clarification_state": (
+                    session_context.get("clarification_state")
+                    if isinstance(session_context.get("clarification_state"), dict)
+                    else {}
+                ),
+            }
 
     rows = (
         await db.execute(
@@ -5749,6 +5807,12 @@ async def _get_recent_text_conversation_context(
             "last_topic": "",
             "last_object_inquiry": {},
             "last_technical_research": {},
+            "last_action_request": "",
+            "pending_action_request": "",
+            "last_action_result": {},
+            "last_failure": {},
+            "last_control_state": "active",
+            "clarification_state": {},
         }
 
     last_event, last_resolution = matched[0]
@@ -5810,7 +5874,582 @@ async def _get_recent_text_conversation_context(
         "last_topic": last_topic,
         "last_object_inquiry": last_object_inquiry,
         "last_technical_research": last_technical_research,
+        "last_action_request": "",
+        "pending_action_request": "",
+        "last_action_result": {},
+        "last_failure": {},
+        "last_control_state": "active",
+        "clarification_state": {},
     }
+
+
+def _default_conversation_session_context(session_id: str) -> dict[str, object]:
+    return {
+        "session_id": str(session_id or "").strip(),
+        "turn_count": 0,
+        "last_user_input": "",
+        "last_parsed_intent": "",
+        "last_internal_intent": "",
+        "last_prompt": "",
+        "last_assistant_output": "",
+        "last_topic": "",
+        "last_goal_description": "",
+        "last_proposed_actions": [],
+        "last_object_inquiry": {},
+        "last_technical_research": {},
+        "last_action_request": "",
+        "pending_action_request": "",
+        "last_action_result": {},
+        "last_failure": {},
+        "last_control_state": "active",
+        "last_resolution_outcome": "",
+        "last_resolution_reason": "",
+        "clarification_state": {},
+        "last_input_event_id": 0,
+        "last_resolution_id": 0,
+        "last_execution_id": 0,
+    }
+
+
+def _normalize_conversation_session_context(
+    session_id: str,
+    context: dict[str, object] | None = None,
+) -> dict[str, object]:
+    normalized = _default_conversation_session_context(session_id)
+    raw_context = context if isinstance(context, dict) else {}
+    for key, default in normalized.items():
+        value = raw_context.get(key, default)
+        if isinstance(default, int):
+            try:
+                normalized[key] = max(0, int(value or 0))
+            except (TypeError, ValueError):
+                normalized[key] = default
+        elif isinstance(default, str):
+            normalized[key] = str(value or "").strip()
+        elif isinstance(default, dict):
+            normalized[key] = value if isinstance(value, dict) else {}
+        elif isinstance(default, list):
+            normalized[key] = value if isinstance(value, list) else []
+        else:
+            normalized[key] = value
+    normalized["session_id"] = str(session_id or "").strip()
+    return normalized
+
+
+def _conversation_control_state_from_query(
+    normalized_query: str,
+    *,
+    prior_state: str,
+) -> str:
+    query = str(normalized_query or "").strip().lower()
+    current = str(prior_state or "active").strip().lower() or "active"
+    if not query:
+        return current
+    if query in {"confirm", "yes confirm", "confirmed", "approve", "yes proceed"}:
+        if current in {"paused", "cancelled", "stopped"}:
+            return current
+        return "confirmed"
+    if _is_pause_control_query(query):
+        return "paused"
+    if _is_resume_control_query(query):
+        return "active"
+    if _is_cancel_control_query(query):
+        return "cancelled"
+    if any(
+        query.startswith(prefix)
+        for prefix in (
+            "revise ",
+            "revise it",
+            "change it",
+            "change that",
+            "update it",
+            "update that",
+        )
+    ):
+        return "active"
+    if "stop" in query and any(
+        token in query for token in {"again", "retry", "slower", "faster"}
+    ):
+        return "stopped"
+    if _is_interruption_query(query):
+        return "stopped"
+    return current
+
+
+def _interface_session_status_for_control_state(control_state: str) -> str:
+    normalized = str(control_state or "active").strip().lower()
+    if normalized == "paused":
+        return "paused"
+    if normalized in {"cancelled", "closed"}:
+        return "closed"
+    return "active"
+
+
+def _is_conversation_action_confirmation_query(normalized_query: str) -> bool:
+    query = str(normalized_query or "").strip().lower()
+    return query in {"confirm", "yes confirm", "confirmed", "approve", "yes proceed"}
+
+
+def _is_conversation_action_approval_query(normalized_query: str) -> bool:
+    query = str(normalized_query or "").strip().lower()
+    if not query:
+        return False
+    if _is_conversation_action_confirmation_query(query):
+        return True
+    return query in {
+        "yes",
+        "yes do it",
+        "do it",
+        "okay do it",
+        "ok do it",
+        "sounds good",
+        "that works",
+        "go ahead",
+    }
+
+
+def _conversation_revised_action_request(
+    normalized_query: str,
+    *,
+    prior_action_request: str,
+) -> str:
+    query = str(normalized_query or "").strip()
+    if not query or not str(prior_action_request or "").strip():
+        return ""
+
+    lowered = query.lower()
+    rewrite_prefixes = (
+        "revise it to ",
+        "revise that to ",
+        "revise to ",
+        "change it to ",
+        "change that to ",
+        "change to ",
+        "update it to ",
+        "update that to ",
+        "update to ",
+    )
+    for prefix in rewrite_prefixes:
+        if lowered.startswith(prefix):
+            revised = query[len(prefix) :].strip()
+            return _compact_text(revised, 240) if revised else ""
+
+    return ""
+
+
+def _clarification_followup_query(
+    normalized_query: str,
+    *,
+    clarification_state: dict[str, object] | None,
+    context: dict[str, object] | None = None,
+) -> str:
+    query = str(normalized_query or "").strip().lower()
+    state = clarification_state if isinstance(clarification_state, dict) else {}
+    reason = str(state.get("reason") or "").strip().lower()
+    if reason not in {"conversation_precision_prompt", "conversation_precision_limit"}:
+        return ""
+
+    topic = str((context or {}).get("last_topic") or "").strip().lower()
+    direct_map = {
+        "status": "status now",
+        "help": "help",
+        "priorities": "what should we prioritize next?",
+        "priority": "what should we prioritize next?",
+        "checklist": "checklist",
+        "recap": "short final recap",
+        "summary": "short final recap",
+        "one line": "one line",
+        "short recap": "short final recap",
+        "shorter": "shorter version",
+    }
+    if query in direct_map:
+        return direct_map[query]
+
+    if query in {"after", "after that", "then", "next"} and topic:
+        return "and after that"
+
+    return ""
+
+
+def _conversation_pending_action_request(
+    normalized_query: str,
+    *,
+    prior_action_request: str,
+) -> str:
+    query = str(normalized_query or "").strip().lower()
+    base_action = _compact_text(str(prior_action_request or "").strip(), 240)
+    if not query or not base_action:
+        return ""
+    if _is_conversation_action_confirmation_query(query):
+        return base_action
+
+    retry_markers = {
+        "retry",
+        "try again",
+        "do that again",
+        "do it again",
+        "again",
+        "slower",
+        "faster",
+    }
+    stop_and_retry = "stop" in query and any(
+        token in query for token in {"again", "retry", "slower", "faster"}
+    )
+    if not stop_and_retry and not any(token in query for token in retry_markers):
+        return ""
+
+    modifiers: list[str] = []
+    if "slower" in query:
+        modifiers.append("at a slower pace")
+    if "faster" in query:
+        modifiers.append("at a faster pace")
+    if "careful" in query or "carefully" in query:
+        modifiers.append("more carefully")
+    if "safe" in query or "safely" in query:
+        modifiers.append("more safely")
+
+    pending = f"retry {base_action}"
+    if modifiers:
+        pending = f"{pending} {' and '.join(modifiers)}"
+    return _compact_text(pending, 240)
+
+
+async def _store_conversation_interface_state(
+    *,
+    db: AsyncSession,
+    event: InputEvent,
+    resolution: InputEventResolution,
+    execution: CapabilityExecution | None = None,
+) -> None:
+    if str(event.source or "").strip().lower() != "text":
+        return
+
+    event_meta = event.metadata_json if isinstance(event.metadata_json, dict) else {}
+    resolution_meta = (
+        resolution.metadata_json if isinstance(resolution.metadata_json, dict) else {}
+    )
+    session_key = str(event_meta.get("conversation_session_id", "")).strip()
+    if not session_key:
+        return
+
+    actor = str(event_meta.get("user_id", "")).strip() or "operator"
+    existing_session = await get_interface_session(session_key=session_key, db=db)
+    existing_context = _normalize_conversation_session_context(
+        session_key,
+        existing_session.context_json
+        if existing_session and isinstance(existing_session.context_json, dict)
+        else {},
+    )
+    existing_metadata = (
+        existing_session.metadata_json
+        if existing_session and isinstance(existing_session.metadata_json, dict)
+        else {}
+    )
+
+    normalized_query = _normalize_conversation_query(event.raw_input)
+    control_state = _conversation_control_state_from_query(
+        normalized_query,
+        prior_state=str(existing_context.get("last_control_state") or "active"),
+    )
+    session_status = _interface_session_status_for_control_state(control_state)
+    turn_count = int(existing_context.get("turn_count") or 0)
+    user_turn_index = turn_count + 1
+
+    session = await upsert_interface_session(
+        session_key=session_key,
+        actor=actor,
+        source="gateway",
+        channel="text",
+        status=session_status,
+        context_json=existing_context,
+        metadata_json={
+            **existing_metadata,
+            "conversation_session_id": session_key,
+            "user_id": actor,
+            "last_input_source": "gateway_text",
+        },
+        db=db,
+    )
+
+    await append_interface_message(
+        session_key=session_key,
+        actor=actor,
+        source="gateway",
+        direction="inbound",
+        role="operator",
+        content=str(event.raw_input or "").strip(),
+        parsed_intent=str(event.parsed_intent or "").strip(),
+        confidence=float(event.confidence or 0.0),
+        requires_approval=False,
+        metadata_json={
+            "input_event_id": int(event.id),
+            "turn_index": user_turn_index,
+            "conversation_topic": str(
+                resolution_meta.get("conversation_topic") or ""
+            ).strip(),
+            "conversation_override": bool(
+                resolution_meta.get("conversation_override")
+            ),
+            "route_preference": str(
+                resolution_meta.get("route_preference") or ""
+            ).strip(),
+        },
+        db=db,
+    )
+
+    assistant_text = str(resolution.clarification_prompt or "").strip()
+    assistant_turn_index = user_turn_index
+    if assistant_text:
+        assistant_turn_index = user_turn_index + 1
+        await append_interface_message(
+            session_key=session_key,
+            actor="mim",
+            source="gateway",
+            direction="outbound",
+            role="mim",
+            content=assistant_text,
+            parsed_intent=str(resolution.internal_intent or "").strip(),
+            confidence=float(event.confidence or 0.0),
+            requires_approval=False,
+            metadata_json={
+                "input_event_id": int(event.id),
+                "resolution_id": int(resolution.id),
+                "turn_index": assistant_turn_index,
+                "conversation_topic": str(
+                    resolution_meta.get("conversation_topic") or ""
+                ).strip(),
+                "outcome": str(resolution.outcome or "").strip(),
+                "reason": str(resolution.reason or "").strip(),
+                "execution_id": int(execution.id) if execution is not None else 0,
+            },
+            db=db,
+        )
+
+    updated_context = _normalize_conversation_session_context(session_key, existing_context)
+    conversation_topic = str(resolution_meta.get("conversation_topic") or "").strip().lower()
+    prior_topic = str(updated_context.get("last_topic") or "").strip().lower()
+    if conversation_topic in {"", "general"} and str(
+        resolution.reason or ""
+    ).strip().lower() in {
+        "conversation_precision_prompt",
+        "conversation_precision_limit",
+    }:
+        conversation_topic = prior_topic
+    last_action_request = str(updated_context.get("last_action_request") or "").strip()
+    pending_action_request = str(updated_context.get("pending_action_request") or "").strip()
+    revised_action_request = _conversation_revised_action_request(
+        normalized_query,
+        prior_action_request=pending_action_request or last_action_request,
+    )
+    if revised_action_request:
+        last_action_request = revised_action_request
+        pending_action_request = revised_action_request
+    elif _looks_like_action_request(event.raw_input):
+        last_action_request = _compact_text(str(event.raw_input or "").strip(), 240)
+        pending_action_request = last_action_request
+    elif _is_conversation_action_confirmation_query(normalized_query):
+        pending_action_request = pending_action_request
+    else:
+        followup_pending_action = _conversation_pending_action_request(
+            normalized_query,
+            prior_action_request=pending_action_request or last_action_request,
+        )
+        if followup_pending_action:
+            pending_action_request = followup_pending_action
+        elif _is_cancel_control_query(normalized_query) or (
+            _is_interruption_query(normalized_query)
+            and not _is_pause_control_query(normalized_query)
+            and not _is_resume_control_query(normalized_query)
+        ):
+            pending_action_request = ""
+
+    last_action_result: dict[str, object] = {}
+    if execution is not None:
+        last_action_result = {
+            "execution_id": int(execution.id),
+            "capability_name": str(execution.capability_name or "").strip(),
+            "status": str(execution.status or "").strip(),
+            "dispatch_decision": str(execution.dispatch_decision or "").strip(),
+            "reason": str(execution.reason or "").strip(),
+        }
+    elif assistant_text:
+        last_action_result = {
+            "response": _compact_text(assistant_text, 240),
+            "outcome": str(resolution.outcome or "").strip(),
+            "reason": str(resolution.reason or "").strip(),
+            "topic": conversation_topic,
+        }
+
+    last_failure: dict[str, object] = {}
+    if execution is not None and str(execution.status or "").strip().lower() in {
+        "failed",
+        "blocked",
+        "error",
+    }:
+        last_failure = {
+            "reason": str(execution.reason or resolution.reason or "").strip(),
+            "status": str(execution.status or "").strip(),
+            "execution_id": int(execution.id),
+        }
+    elif str(resolution.outcome or "").strip().lower() == "blocked" or bool(
+        resolution.escalation_reasons
+    ):
+        last_failure = {
+            "reason": str(resolution.reason or "").strip(),
+            "outcome": str(resolution.outcome or "").strip(),
+            "prompt": _compact_text(assistant_text, 240) if assistant_text else "",
+        }
+
+    updated_context.update(
+        {
+            "turn_count": assistant_turn_index,
+            "last_user_input": str(event.raw_input or "").strip(),
+            "last_parsed_intent": str(event.parsed_intent or "").strip(),
+            "last_internal_intent": str(resolution.internal_intent or "").strip(),
+            "last_prompt": assistant_text,
+            "last_assistant_output": assistant_text,
+            "last_topic": conversation_topic,
+            "last_goal_description": str(
+                resolution.proposed_goal_description or ""
+            ).strip(),
+            "last_proposed_actions": (
+                resolution.proposed_actions
+                if isinstance(resolution.proposed_actions, list)
+                else []
+            ),
+            "last_object_inquiry": (
+                resolution_meta.get("object_inquiry")
+                if isinstance(resolution_meta.get("object_inquiry"), dict)
+                else {}
+            ),
+            "last_technical_research": (
+                resolution_meta.get("last_technical_research")
+                if isinstance(resolution_meta.get("last_technical_research"), dict)
+                else {}
+            ),
+            "last_action_request": last_action_request,
+            "pending_action_request": pending_action_request,
+            "last_action_result": last_action_result,
+            "last_failure": last_failure,
+            "last_control_state": control_state,
+            "last_resolution_outcome": str(resolution.outcome or "").strip(),
+            "last_resolution_reason": str(resolution.reason or "").strip(),
+            "clarification_state": {
+                "active": bool(assistant_text),
+                "prompt": _compact_text(assistant_text, 240) if assistant_text else "",
+                "outcome": str(resolution.outcome or "").strip(),
+                "reason": str(resolution.reason or "").strip(),
+                "pending_action_request": pending_action_request,
+            },
+            "last_input_event_id": int(event.id),
+            "last_resolution_id": int(resolution.id),
+            "last_execution_id": int(execution.id) if execution is not None else 0,
+        }
+    )
+
+    await upsert_interface_session(
+        session_key=session_key,
+        actor=actor,
+        source="gateway",
+        channel="text",
+        status=session_status,
+        context_json=updated_context,
+        metadata_json={
+            **existing_metadata,
+            "conversation_session_id": session_key,
+            "user_id": actor,
+            "last_input_source": "gateway_text",
+        },
+        db=db,
+    )
+
+
+def _conversation_action_followup_response(
+    normalized_query: str,
+    context: dict[str, object] | None = None,
+) -> str:
+    query = str(normalized_query or "").strip().lower()
+    session_context = context or {}
+    last_action_request = str(session_context.get("last_action_request") or "").strip()
+    last_action_result = (
+        session_context.get("last_action_result")
+        if isinstance(session_context.get("last_action_result"), dict)
+        else {}
+    )
+    last_failure = (
+        session_context.get("last_failure")
+        if isinstance(session_context.get("last_failure"), dict)
+        else {}
+    )
+    if not query:
+        return ""
+
+    retry_markers = {
+        "retry",
+        "try again",
+        "do that again",
+        "do it again",
+        "again",
+        "slower",
+        "faster",
+    }
+    stop_and_retry = "stop" in query and any(
+        token in query for token in {"again", "retry", "slower", "faster"}
+    )
+    if stop_and_retry or any(token in query for token in retry_markers):
+        if not last_action_request:
+            return "I do not have enough session state to safely reuse the last action yet. Restate the action in one sentence."
+
+        adjustment_parts: list[str] = []
+        if "slower" in query:
+            adjustment_parts.append("with a slower pace")
+        if "faster" in query:
+            adjustment_parts.append("with a faster pace")
+        if "careful" in query or "carefully" in query:
+            adjustment_parts.append("more carefully")
+        if "safe" in query or "safely" in query:
+            adjustment_parts.append("more safely")
+        adjustment_text = ""
+        if adjustment_parts:
+            adjustment_text = " " + " and ".join(adjustment_parts)
+
+        if stop_and_retry:
+            return (
+                f"Understood. I marked the prior action thread '{_compact_text(last_action_request, 96)}' as stopped. "
+                f"If you want a retry{adjustment_text}, say confirm and I will treat that as the revised action request."
+            )
+
+        failure_reason = str(last_failure.get("reason") or "").strip()
+        if failure_reason:
+            return (
+                f"I still have the last action '{_compact_text(last_action_request, 96)}' and the last failure reason "
+                f"'{_compact_text(failure_reason, 96)}'. If you want a retry{adjustment_text}, say confirm and I will treat that as the revised action request."
+            )
+        return (
+            f"I still have the last action '{_compact_text(last_action_request, 96)}'. "
+            f"If you want a retry{adjustment_text}, say confirm and I will treat that as the revised action request."
+        )
+
+    if any(
+        token in query
+        for token in {"what happened last time", "what was the result", "what happened"}
+    ):
+        summary = str(last_action_result.get("response") or last_action_result.get("reason") or "").strip()
+        if summary:
+            return f"Last result in this session: {_compact_text(summary, 140)}"
+        if last_action_request:
+            return (
+                f"I still have the last action '{_compact_text(last_action_request, 96)}', "
+                "but I do not have a richer stored result summary yet."
+            )
+
+    if any(token in query for token in {"what failed", "why did that fail", "why did it fail"}):
+        failure_reason = str(last_failure.get("reason") or "").strip()
+        if failure_reason:
+            return f"The last recorded failure reason is: {_compact_text(failure_reason, 140)}"
+        return "I do not have a recorded failure for the current session."
+
+    return ""
 
 
 def _conversation_followup_response(
@@ -5821,6 +6460,10 @@ def _conversation_followup_response(
     session_context = context or {}
     last_topic = str(session_context.get("last_topic") or "").strip().lower()
     last_prompt = str(session_context.get("last_prompt") or "").strip()
+    last_control_state = (
+        str(session_context.get("last_control_state") or "active").strip().lower()
+        or "active"
+    )
 
     if not query:
         return ""
@@ -5832,27 +6475,67 @@ def _conversation_followup_response(
     if boundary_response:
         return boundary_response
 
+    action_followup = _conversation_action_followup_response(query, session_context)
+    if action_followup:
+        return action_followup
+
     if _is_pause_control_query(query):
+        last_action_request = str(session_context.get("last_action_request") or "").strip()
         if last_topic == "action_confirmation":
             return "Paused. The pending action stays on hold until you say confirm, revise it, or cancel it."
+        if last_action_request:
+            return (
+                f"Paused. The current action thread '{_compact_text(last_action_request, 96)}' stays on hold until you say resume, confirm, revise it, or cancel it."
+            )
         return "Paused at the conversation layer. Tell me when you want to resume."
 
     if _is_resume_control_query(query):
+        last_action_request = str(session_context.get("last_action_request") or "").strip()
         if last_topic == "action_confirmation":
             return "Resumed at the conversation layer. If the pending action is still correct, say confirm."
+        if last_action_request:
+            return (
+                f"Resumed. The current action thread is still '{_compact_text(last_action_request, 96)}'. "
+                "Say confirm to approve it, revise it, or cancel it."
+            )
         return "Resumed at the conversation layer. Restate the one question or action you want next."
 
     if _is_cancel_control_query(query):
+        last_action_request = str(session_context.get("last_action_request") or "").strip()
         if last_topic == "action_confirmation":
             return "Cancelled. I will not treat the pending action as approved."
+        if last_action_request:
+            return (
+                f"Cancelled. I will not treat the prior action '{_compact_text(last_action_request, 96)}' as approved."
+            )
         return "Cancelled at the conversation layer."
 
     if _is_interruption_query(query):
         return "Understood. I stopped the prior thread. Tell me the one thing you want next."
 
-    if last_topic == "action_confirmation":
-        if query in {"confirm", "yes confirm", "confirmed", "approve", "yes proceed"}:
+    pending_action_request = str(
+        session_context.get("pending_action_request")
+        or session_context.get("last_action_request")
+        or ""
+    ).strip()
+
+    if last_topic == "action_confirmation" or pending_action_request:
+        if (
+            _is_conversation_action_approval_query(query)
+            and last_control_state == "paused"
+        ):
+            return "The pending action is paused. Say resume before you confirm it."
+        if _is_conversation_action_approval_query(query):
             return "Confirmed. I will treat that as an explicit action request and keep the execution step separate from this conversation reply."
+        revised_action = _conversation_revised_action_request(
+            query,
+            prior_action_request=pending_action_request,
+        )
+        if revised_action:
+            return (
+                f"Understood. I updated the pending action to '{_compact_text(revised_action, 96)}'. "
+                "Say confirm when you want me to create the goal."
+            )
         if any(token in query for token in {"revise", "change it", "update it"}):
             return "Understood. Replace the pending action with the revised one in a single sentence."
 
@@ -6042,6 +6725,18 @@ def _is_conversation_followup_query(normalized_query: str) -> bool:
         "revise",
         "change it",
         "update it",
+        "retry",
+        "try again",
+        "do that again",
+        "do it again",
+        "again but slower",
+        "retry slower",
+        "slower",
+        "faster",
+        "what happened last time",
+        "what was the result",
+        "what failed",
+        "why did that fail",
     }
     return any(marker in query for marker in followup_markers) or bool(
         re.search(r"\bstep\s+\d+\b", query)
@@ -6063,18 +6758,6 @@ def _conversation_response(
     boundary_response = _conversation_boundary_response(normalized_query)
     if boundary_response:
         return boundary_response
-
-    if _is_pause_control_query(normalized_query):
-        return "Paused at the conversation layer. Tell me when you want to resume."
-
-    if _is_resume_control_query(normalized_query):
-        return "Resumed at the conversation layer. Restate the one question or action you want next."
-
-    if _is_cancel_control_query(normalized_query):
-        return "Cancelled at the conversation layer."
-
-    if _is_interruption_query(normalized_query):
-        return "Understood. I stopped the prior thread. Tell me the one thing you want next."
 
     correction_query = ""
     if int(context.get("correction_depth", 0) or 0) < 1:
@@ -7576,10 +8259,58 @@ async def _resolve_event(event: InputEvent, db: AsyncSession) -> InputEventResol
     conversation_override = route_preference == "conversation_layer"
     conversation_session_id = str(metadata.get("conversation_session_id", "")).strip()
     optional_escalation = ""
+    conversation_context: dict[str, object] = {}
+    normalized_conversation_query = ""
+    session_confirmed_action_request = ""
+    session_pending_action_request = ""
+    session_control_state = "active"
+    clarification_state: dict[str, object] = {}
+    clarification_followup_query = ""
 
     if conversation_override:
-        internal_intent = "speak_response"
-        capability_name = ""
+        if conversation_session_id:
+            conversation_context = await _get_recent_text_conversation_context(
+                db,
+                session_id=conversation_session_id,
+                exclude_event_id=event.id,
+            )
+        normalized_conversation_query = _normalize_conversation_query(event.raw_input)
+        session_pending_action_request = str(
+            conversation_context.get("pending_action_request") or ""
+        ).strip()
+        session_control_state = (
+            str(conversation_context.get("last_control_state") or "active")
+            .strip()
+            .lower()
+            or "active"
+        )
+        clarification_state = (
+            conversation_context.get("clarification_state")
+            if isinstance(conversation_context.get("clarification_state"), dict)
+            else {}
+        )
+        clarification_followup_query = _clarification_followup_query(
+            normalized_conversation_query,
+            clarification_state=clarification_state,
+            context=conversation_context,
+        )
+        if (
+            _is_conversation_action_approval_query(normalized_conversation_query)
+            and session_pending_action_request
+            and session_control_state not in {"paused", "cancelled", "stopped"}
+            and (
+                str(conversation_context.get("last_topic") or "").strip().lower()
+                == "action_confirmation"
+                or bool(clarification_state.get("active"))
+            )
+        ):
+            session_confirmed_action_request = session_pending_action_request
+            conversation_override = False
+            internal_intent = "create_goal"
+            capability_name = ""
+        else:
+            internal_intent = "speak_response"
+            capability_name = ""
     else:
         capability_name = _intent_capability(event, internal_intent)
     capability_registered = False
@@ -7653,15 +8384,56 @@ async def _resolve_event(event: InputEvent, db: AsyncSession) -> InputEventResol
     }
 
     if conversation_override:
-        conversation_context = {}
-        if conversation_session_id:
-            conversation_context = await _get_recent_text_conversation_context(
-                db,
-                session_id=conversation_session_id,
-                exclude_event_id=event.id,
-            )
         confidence_tier = "conversation"
-        if _looks_like_action_request(event.raw_input):
+        revised_action_request = _conversation_revised_action_request(
+            normalized_conversation_query,
+            prior_action_request=session_pending_action_request,
+        )
+        if revised_action_request:
+            outcome = "store_only"
+            safety_decision = "store_only"
+            reason = "conversation_revised_action_request"
+            clarification_prompt = (
+                f"Understood. I updated the pending action to '{_compact_text(revised_action_request, 96)}'. "
+                "Say confirm when you want me to create the goal."
+            )
+            conversation_topic = "action_confirmation"
+        elif clarification_followup_query:
+            outcome = "store_only"
+            safety_decision = "store_only"
+            reason = "conversation_clarification_followup"
+            camera_context = await _latest_camera_observation_context(db)
+            object_memory_context = await _object_memory_context_for_query(
+                db, clarification_followup_query
+            )
+            response_context = {
+                "source": event.source,
+                "target_system": event.target_system,
+                **camera_context,
+                **object_memory_context,
+                **conversation_context,
+            }
+            clarification_prompt = _conversation_response(
+                clarification_followup_query,
+                context=response_context,
+            )
+            conversation_topic = _conversation_topic_key(
+                clarification_followup_query,
+                clarification_prompt,
+            )
+        elif (
+            _is_conversation_action_approval_query(normalized_conversation_query)
+            and session_pending_action_request
+            and session_control_state == "paused"
+        ):
+            outcome = "store_only"
+            safety_decision = "store_only"
+            reason = "conversation_pending_action_paused"
+            clarification_prompt = (
+                "The pending action is paused. Say resume before you confirm it."
+            )
+            conversation_topic = "action_confirmation"
+        elif _looks_like_action_request(event.raw_input):
             action_text = " ".join(str(event.raw_input or "").strip().lower().split())
             social_capability_check = (
                 "tod" in action_text
@@ -7961,6 +8733,18 @@ async def _resolve_event(event: InputEvent, db: AsyncSession) -> InputEventResol
             reason = "policy_allows_auto_execute"
         outcome = safety_decision
 
+    if session_confirmed_action_request:
+        confidence_tier = "confirmed"
+        outcome = "auto_execute"
+        safety_decision = "auto_execute"
+        reason = "conversation_confirmed_action_request"
+        clarification_prompt = (
+            "Confirmed. I created a goal for: "
+            f"{_compact_text(session_confirmed_action_request, 160)}"
+        )
+        escalation_reasons = []
+        conversation_topic = "action_confirmation"
+
     if (
         not conversation_override
         and _looks_like_action_request(event.raw_input)
@@ -8081,7 +8865,11 @@ async def _resolve_event(event: InputEvent, db: AsyncSession) -> InputEventResol
     )
 
     goal_id: int | None = None
-    goal_description = _goal_description(event, internal_intent)
+    goal_description = (
+        session_confirmed_action_request
+        if session_confirmed_action_request
+        else _goal_description(event, internal_intent)
+    )
     requested_domains = _requested_domains_for_event(event, internal_intent, capability_name)
     intent_understanding = understand_intent(
         raw_text=event.raw_input,
@@ -8410,6 +9198,13 @@ async def _store_normalized(payload: NormalizedInputCreate, db: AsyncSession) ->
                 event, resolution.capability_name
             ),
         )
+
+    await _store_conversation_interface_state(
+        db=db,
+        event=event,
+        resolution=resolution,
+        execution=execution,
+    )
 
     await db.commit()
     await db.refresh(event)
