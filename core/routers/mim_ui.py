@@ -1172,6 +1172,30 @@ def _summarize_operator_http_action(action: dict) -> dict:
     }
 
 
+def _build_self_evolution_operator_commands(*, decision: dict, target: dict, action: dict) -> list[dict]:
+    normalized_action = action if isinstance(action, dict) else {}
+    method = str(normalized_action.get("method") or "").strip().upper()
+    path = str(normalized_action.get("path") or "").strip()
+    if not method or not path:
+        return []
+    decision_type = str(decision.get("decision_type") or "").strip().replace("_", " ")
+    target_kind = str(target.get("target_kind") or "").strip().replace("_", " ")
+    purpose = "Inspect the current self-evolution follow-up route."
+    if decision_type and target_kind:
+        purpose = f"Review the self-evolution {decision_type} step for the current {target_kind}."
+    elif decision_type:
+        purpose = f"Review the self-evolution {decision_type} step."
+    elif target_kind:
+        purpose = f"Inspect the current self-evolution route for the {target_kind}."
+    return [
+        {
+            "method": method,
+            "path": path,
+            "purpose": _compact_sentence(purpose, max_len=180),
+        }
+    ]
+
+
 def _operator_self_evolution_snapshot(briefing: dict) -> dict:
     packet = briefing if isinstance(briefing, dict) else {}
     snapshot = packet.get("snapshot", {}) if isinstance(packet.get("snapshot", {}), dict) else {}
@@ -1208,6 +1232,20 @@ def _operator_self_evolution_snapshot(briefing: dict) -> dict:
 
     summary = str(decision.get("summary") or snapshot.get("summary") or "").strip()
     normalized_action = _summarize_operator_http_action(action)
+    operator_commands = _build_self_evolution_operator_commands(
+      decision=decision,
+      target=target,
+      action=normalized_action,
+    )
+    primary_operator_command = operator_commands[0] if operator_commands else {}
+    operator_command_summary = ""
+    if primary_operator_command:
+      operator_command_summary = _compact_sentence(
+        f"{str(primary_operator_command.get('method') or '').strip()} "
+        f"{str(primary_operator_command.get('path') or '').strip()}: "
+        f"{str(primary_operator_command.get('purpose') or '').strip()}",
+        max_len=220,
+      )
     return {
         "summary": _compact_sentence(summary, max_len=200),
         "status": str(snapshot.get("status") or "").strip(),
@@ -1220,6 +1258,9 @@ def _operator_self_evolution_snapshot(briefing: dict) -> dict:
       "action_summary": str(normalized_action.get("summary") or "").strip(),
       "action_method": str(normalized_action.get("method") or "").strip(),
       "action_path": str(normalized_action.get("path") or "").strip(),
+      "operator_commands": operator_commands,
+      "primary_operator_command": primary_operator_command,
+      "operator_command_summary": operator_command_summary,
         "snapshot": snapshot,
         "decision": decision,
         "target": target,
@@ -3583,6 +3624,7 @@ async def mim_ui_page() -> str:
           String(selfEvolution.summary || '').trim(),
           String(selfEvolution.target_summary || '').trim() && `Target: ${String(selfEvolution.target_summary || '').trim()}`,
           String(selfEvolution.action_summary || '').trim() && `Next: ${String(selfEvolution.action_summary || '').trim()}`,
+          String(selfEvolution.operator_command_summary || '').trim() && `Command: ${String(selfEvolution.operator_command_summary || '').trim()}`,
         ].filter(Boolean).join('. ');
         entries.push({
           title: 'Self-evolution',
@@ -8497,6 +8539,7 @@ async def mim_ui_state(db: AsyncSession = Depends(get_db)) -> dict:
             "tod_decision_process_visibility",
             "self_evolution_operator_visibility",
             "self_evolution_operator_actionability",
+            "self_evolution_operator_commands",
             "runtime_health_visibility",
         ],
         "inquiry_prompt": inquiry_prompt,
@@ -8551,6 +8594,11 @@ async def mim_ui_state(db: AsyncSession = Depends(get_db)) -> dict:
             else "",
             "self_evolution_action_path": str(
               operator_reasoning.get("self_evolution", {}).get("action_path") or ""
+            ).strip()
+            if isinstance(operator_reasoning.get("self_evolution", {}), dict)
+            else "",
+            "self_evolution_operator_command_summary": str(
+              operator_reasoning.get("self_evolution", {}).get("operator_command_summary") or ""
             ).strip()
             if isinstance(operator_reasoning.get("self_evolution", {}), dict)
             else "",
