@@ -28,6 +28,11 @@ from core.improvement_service import (
     to_improvement_proposal_out,
 )
 from core.journal import write_journal
+from core.self_evolution_service import (
+    build_self_evolution_briefing,
+    build_self_evolution_next_action,
+    build_self_evolution_snapshot,
+)
 from core.schemas import (
     ImprovementBacklogRefreshRequest,
     ImprovementProposalGenerateRequest,
@@ -433,3 +438,83 @@ async def get_improvement_backlog_item_endpoint(
     return {
         "backlog_item": to_improvement_backlog_out(row),
     }
+
+
+@router.get("/improvement/self-evolution")
+async def get_self_evolution_snapshot_endpoint(
+    refresh: bool = Query(default=False),
+    actor: str = Query(default="workspace"),
+    source: str = Query(default="objective164"),
+    lookback_hours: int = Query(default=24, ge=1, le=720),
+    min_occurrence_count: int = Query(default=2, ge=2, le=500),
+    auto_experiment_limit: int = Query(default=3, ge=0, le=50),
+    limit: int = Query(default=10, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    snapshot = await build_self_evolution_snapshot(
+        actor=actor,
+        source=source,
+        refresh=refresh,
+        lookback_hours=lookback_hours,
+        min_occurrence_count=min_occurrence_count,
+        auto_experiment_limit=auto_experiment_limit,
+        limit=limit,
+        db=db,
+    )
+    if refresh:
+        await db.commit()
+    return {
+        "snapshot": snapshot,
+    }
+
+
+@router.get("/improvement/self-evolution/next-action")
+async def get_self_evolution_next_action_endpoint(
+    refresh: bool = Query(default=False),
+    actor: str = Query(default="workspace"),
+    source: str = Query(default="objective165"),
+    lookback_hours: int = Query(default=24, ge=1, le=720),
+    min_occurrence_count: int = Query(default=2, ge=2, le=500),
+    auto_experiment_limit: int = Query(default=3, ge=0, le=50),
+    limit: int = Query(default=10, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    result = await build_self_evolution_next_action(
+        actor=actor,
+        source=source,
+        refresh=refresh,
+        lookback_hours=lookback_hours,
+        min_occurrence_count=min_occurrence_count,
+        auto_experiment_limit=auto_experiment_limit,
+        limit=limit,
+        db=db,
+    )
+    if refresh:
+        await db.commit()
+    return result
+
+
+@router.get("/improvement/self-evolution/briefing")
+async def get_self_evolution_briefing_endpoint(
+    refresh: bool = Query(default=False),
+    actor: str = Query(default="workspace"),
+    source: str = Query(default="objective166"),
+    lookback_hours: int = Query(default=24, ge=1, le=720),
+    min_occurrence_count: int = Query(default=2, ge=2, le=500),
+    auto_experiment_limit: int = Query(default=3, ge=0, le=50),
+    limit: int = Query(default=10, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    result = await build_self_evolution_briefing(
+        actor=actor,
+        source=source,
+        refresh=refresh,
+        lookback_hours=lookback_hours,
+        min_occurrence_count=min_occurrence_count,
+        auto_experiment_limit=auto_experiment_limit,
+        limit=limit,
+        db=db,
+    )
+    if refresh:
+        await db.commit()
+    return result
