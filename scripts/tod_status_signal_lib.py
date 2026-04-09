@@ -11,6 +11,7 @@ TERMINAL_SUCCESS_STATUSES = {"completed", "succeeded", "approved", "done"}
 TERMINAL_FAILURE_STATUSES = {"failed", "blocked", "rejected", "cancelled", "canceled"}
 TERMINAL_RESULT_STATUSES = TERMINAL_SUCCESS_STATUSES | TERMINAL_FAILURE_STATUSES
 ACTIVE_OPERATOR_INCIDENT_PRECEDENCE = "prefer_incident_over_latest"
+NON_TASK_STREAM_TRIGGERS = {"", "liveness_ping", "coordination_ack_posted"}
 
 
 def read_json(path: Path) -> dict | None:
@@ -161,6 +162,11 @@ def _first_text(payload: dict, *keys: str) -> str:
     return ""
 
 
+def _is_task_stream_trigger(trigger: dict) -> bool:
+    trigger_name = _first_text(trigger, "trigger").lower()
+    return trigger_name not in NON_TASK_STREAM_TRIGGERS
+
+
 def _trigger_ack_task_identity(trigger_ack: dict) -> str:
     trigger_ack = _as_dict(trigger_ack)
     if not trigger_ack:
@@ -214,7 +220,7 @@ def _sanitize_persistent_task(
         or request_task_id
     )
     trigger_name = _first_text(trigger, "trigger")
-    actionable_trigger = trigger_name not in {"", "liveness_ping"}
+    actionable_trigger = _is_task_stream_trigger(trigger)
     trigger_objective = normalize_objective(
         trigger.get("objective_id")
         or (_first_text(trigger, "task_id", "request_id") if actionable_trigger else "")
@@ -305,10 +311,11 @@ def detect_completed_stream_supersession(
     task_result = _as_dict(task_result)
 
     trigger_name = _first_text(trigger, "trigger")
-    actionable_trigger = trigger_name not in {"", "liveness_ping"}
+    actionable_trigger = _is_task_stream_trigger(trigger)
 
     request_task_id = _first_text(task_request, "task_id", "request_id")
-    trigger_task_id = _first_text(trigger, "task_id", "request_id") if actionable_trigger else ""
+    raw_trigger_task_id = _first_text(trigger, "task_id", "request_id")
+    trigger_task_id = raw_trigger_task_id if actionable_trigger else ""
     task_ack_request_id = _first_text(task_ack, "request_id", "task_id")
     result_request_id = _first_text(task_result, "request_id", "task_id")
     result_status = _first_text(task_result, "status").lower()
@@ -329,8 +336,8 @@ def detect_completed_stream_supersession(
     stale_request = _as_dict(task_result.get("stale_request"))
     stale_request_task_id = _first_text(stale_request, "request_id", "task_id")
     request_superseded = bool(request_task_id and request_task_id != authoritative_task_id)
-    trigger_superseded = bool(trigger_task_id and trigger_task_id != authoritative_task_id)
-    stale_request_matches = stale_request_task_id in {request_task_id, trigger_task_id}
+    trigger_superseded = bool(raw_trigger_task_id and raw_trigger_task_id != authoritative_task_id)
+    stale_request_matches = stale_request_task_id in {request_task_id, raw_trigger_task_id}
     active = bool((request_superseded or trigger_superseded) and stale_request_matches)
 
     return {
@@ -338,7 +345,7 @@ def detect_completed_stream_supersession(
         "authoritative_task_id": authoritative_task_id,
         "authoritative_task_reason": authoritative_task_reason,
         "request_task_id": request_task_id,
-        "trigger_task_id": trigger_task_id,
+        "trigger_task_id": raw_trigger_task_id,
         "stale_request_task_id": stale_request_task_id,
         "result_status": result_status,
         "reason": "completed_authoritative_task_supersedes_current_request"
@@ -611,7 +618,7 @@ def build_task_status_review(
     )
 
     trigger_name = _first_text(trigger, "trigger")
-    actionable_trigger = trigger_name not in {"", "liveness_ping"}
+    actionable_trigger = _is_task_stream_trigger(trigger)
 
     request_task_id = _first_text(task_request, "task_id", "request_id")
     trigger_task_id = _first_text(trigger, "task_id", "request_id") if actionable_trigger else ""
@@ -745,6 +752,18 @@ def build_task_status_review(
         add_action(
             "stabilize_publisher_after_completion",
             "MIM request/trigger artifacts were overwritten after TOD completed the authoritative task; stabilize local publishers and do not restart the TOD trigger ACK bridge for this completed lane.",
+        )
+
+    if (
+        completed_stream_superseded
+        and request_task_id
+        and _first_text(trigger, "trigger").lower() == "coordination_ack_posted"
+        and _first_text(trigger, "task_id", "request_id")
+        and _first_text(trigger, "task_id", "request_id") != request_task_id
+    ):
+        add_action(
+            "stabilize_task_stream",
+            "Stop rotating publishers from overwriting the active task packet and reissue request and trigger with one authoritative task_id.",
         )
 
     if not terminal_execution_failure and not authority_ok and access_failure_action == "no_go":

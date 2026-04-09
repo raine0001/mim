@@ -602,6 +602,78 @@ class TodTaskStatusReviewTest(unittest.TestCase):
         action_codes = [item["code"] for item in review["pending_actions"]]
         self.assertNotIn("reissue_task_with_matching_ack", action_codes)
 
+    def test_build_task_status_review_ignores_coordination_ack_sideband_trigger_drift(self) -> None:
+        module = load_module()
+        now = datetime(2026, 4, 9, 1, 19, tzinfo=timezone.utc)
+        active_task_id = "objective-152-task-mim-arm-safe-home-20260408160030"
+        coordination_task_id = "coordination-objective-152-task-mim-arm-safe-home-20260408160030-publication_surface_divergence"
+        review = module.build_task_status_review(
+            task_request={
+                "generated_at": iso_utc(now - timedelta(hours=2)),
+                "task_id": active_task_id,
+                "request_id": active_task_id,
+                "objective_id": "objective-152",
+            },
+            trigger={
+                "generated_at": iso_utc(now - timedelta(minutes=35)),
+                "trigger": "coordination_ack_posted",
+                "task_id": coordination_task_id,
+                "objective_id": "objective-170",
+            },
+            trigger_ack={
+                "generated_at": iso_utc(now - timedelta(minutes=34)),
+                "task_id": coordination_task_id,
+                "current_task_id": coordination_task_id,
+                "trigger_context": {
+                    "task_id": coordination_task_id,
+                    "request_id": coordination_task_id,
+                },
+            },
+            task_ack={
+                "generated_at": iso_utc(now - timedelta(hours=2)),
+                "request_id": active_task_id,
+                "task_id": active_task_id,
+                "status": "accepted",
+            },
+            task_result={
+                "generated_at": iso_utc(now - timedelta(hours=2)),
+                "request_id": active_task_id,
+                "task_id": active_task_id,
+                "status": "",
+            },
+            catchup_gate={
+                "generated_at": iso_utc(now - timedelta(minutes=1)),
+                "promotion_ready": True,
+                "gate_pass": True,
+            },
+            troubleshooting_authority={
+                "authority": {
+                    "mim": {"permissions": ["read", "write"]},
+                    "tod": {"permissions": ["read", "write"]},
+                },
+                "enforcement": {
+                    "access_failure_action": "no_go",
+                    "reason_code": "troubleshooting_access_denied",
+                },
+            },
+            persistent_task={},
+            system_alert_summary={
+                "active": False,
+                "highest_severity": "none",
+                "primary_alert": {},
+            },
+            idle_seconds=120,
+            now=now,
+        )
+
+        self.assertEqual(review["task"]["active_task_id"], active_task_id)
+        self.assertEqual(review["task"]["trigger_task_id"], "")
+        self.assertEqual(review["state"], "awaiting_result")
+        self.assertNotIn("task_stream_drift", review["blocking_reason_codes"])
+        self.assertNotIn("trigger_ack_not_current", review["blocking_reason_codes"])
+        self.assertNotIn("task_ack_request_mismatch", review["blocking_reason_codes"])
+        self.assertNotIn("task_result_request_mismatch", review["blocking_reason_codes"])
+
     def test_build_task_status_review_ignores_stale_persistent_task_when_live_request_advances_objective(self) -> None:
         module = load_module()
         now = datetime(2026, 4, 7, 3, 5, tzinfo=timezone.utc)
@@ -1269,10 +1341,10 @@ class TodTaskStatusReviewTest(unittest.TestCase):
                 (shared_dir / "MIM_TASK_STATUS_REVIEW.latest.json").read_text(encoding="utf-8")
             )
 
-            self.assertEqual(str(alignment_request["mim_truth"]["objective_active"]), "152")
+            self.assertEqual(str(alignment_request["mim_truth"]["objective_active"]), "170")
             self.assertEqual(
                 str(integration["objective_alignment"]["mim_objective_active"]),
-                "152",
+                "170",
             )
             self.assertEqual(review["task"]["objective_id"], "115")
 
