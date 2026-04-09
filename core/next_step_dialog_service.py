@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 from datetime import datetime, timezone
 from pathlib import Path, PureWindowsPath
 from typing import Any
@@ -11,6 +13,11 @@ from core.next_step_adjudication_service import DEFAULT_SHARED_ROOT, build_mim_a
 DEFAULT_DIALOG_ROOT = DEFAULT_SHARED_ROOT / "dialog"
 DIALOG_GLOB = "MIM_TOD_DIALOG.session-*.jsonl"
 DIALOG_INDEX_NAME = "MIM_TOD_DIALOG.sessions.latest.json"
+DEFAULT_RESPONDER_LOG_ROOT = DEFAULT_SHARED_ROOT.parent / "logs"
+DEFAULT_RESPONDER_STATUS_PATH = DEFAULT_RESPONDER_LOG_ROOT / "mim_next_step_dialog_responder.latest.json"
+DEFAULT_RESPONDER_EVENT_LOG_PATH = DEFAULT_RESPONDER_LOG_ROOT / "mim_next_step_dialog_responder.jsonl"
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _utc_now() -> str:
@@ -784,3 +791,70 @@ def process_pending_dialog_sessions(
         "processed_count": len(processed),
         "processed_sessions": processed,
     }
+
+
+def _build_responder_status(
+    result: dict[str, Any],
+    *,
+    shared_root: Path,
+    dialog_root: Path,
+    pattern: str,
+) -> dict[str, Any]:
+    return {
+        **result,
+        "type": "mim_next_step_dialog_responder_status_v1",
+        "shared_root": str(shared_root),
+        "dialog_root": str(dialog_root),
+        "dialog_glob": pattern,
+        "state": "response_appended" if int(result.get("processed_count", 0) or 0) > 0 else "idle",
+    }
+
+
+def run_next_step_dialog_responder_cycle(
+    *,
+    shared_root: Path = DEFAULT_SHARED_ROOT,
+    dialog_root: Path | None = None,
+    pattern: str = DIALOG_GLOB,
+    status_path: Path = DEFAULT_RESPONDER_STATUS_PATH,
+    event_log_path: Path = DEFAULT_RESPONDER_EVENT_LOG_PATH,
+) -> dict[str, Any]:
+    active_dialog_root = dialog_root if dialog_root is not None else shared_root / "dialog"
+    result = process_pending_dialog_sessions(
+        shared_root=shared_root,
+        dialog_root=active_dialog_root,
+        pattern=pattern,
+    )
+    status = _build_responder_status(
+        result,
+        shared_root=shared_root,
+        dialog_root=active_dialog_root,
+        pattern=pattern,
+    )
+    _write_json(status_path, status)
+    _append_jsonl(event_log_path, status)
+    return status
+
+
+async def run_next_step_dialog_responder_loop(
+    *,
+    shared_root: Path = DEFAULT_SHARED_ROOT,
+    dialog_root: Path | None = None,
+    pattern: str = DIALOG_GLOB,
+    poll_seconds: float = 3.0,
+    status_path: Path = DEFAULT_RESPONDER_STATUS_PATH,
+    event_log_path: Path = DEFAULT_RESPONDER_EVENT_LOG_PATH,
+) -> None:
+    while True:
+        try:
+            run_next_step_dialog_responder_cycle(
+                shared_root=shared_root,
+                dialog_root=dialog_root,
+                pattern=pattern,
+                status_path=status_path,
+                event_log_path=event_log_path,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            LOGGER.exception("next-step dialog responder cycle failed")
+        await asyncio.sleep(poll_seconds)

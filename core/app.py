@@ -7,6 +7,7 @@ from core import models  # noqa: F401
 from core.config import settings
 from core.db import Base, engine
 from core.logging_journal import configure_logging, journal_event
+from core.next_step_dialog_service import run_next_step_dialog_responder_loop
 from core.self_awareness_integration import mim_self_awareness_service
 from core.tod_mim_contract import ensure_runtime_contract_lock
 from core.routers.workspace import (
@@ -20,6 +21,34 @@ configure_logging()
 app = FastAPI(title=settings.app_name, version=settings.app_version)
 app.include_router(api_router)
 app.state.self_awareness_task = None
+app.state.next_step_dialog_task = None
+
+
+def _start_background_runtime_tasks() -> None:
+    if app.state.self_awareness_task is None or app.state.self_awareness_task.done():
+        app.state.self_awareness_task = asyncio.create_task(
+            mim_self_awareness_service(),
+            name="mim-self-awareness-service",
+        )
+    if app.state.next_step_dialog_task is None or app.state.next_step_dialog_task.done():
+        app.state.next_step_dialog_task = asyncio.create_task(
+            run_next_step_dialog_responder_loop(),
+            name="mim-next-step-dialog-responder",
+        )
+
+
+async def _stop_background_runtime_tasks() -> None:
+    for attribute in ("next_step_dialog_task", "self_awareness_task"):
+        task = getattr(app.state, attribute)
+        if task is None:
+            continue
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        finally:
+            setattr(app.state, attribute, None)
 
 
 @app.on_event("startup")
@@ -1105,24 +1134,12 @@ async def ensure_schema() -> None:
         )
 
     await initialize_workspace_monitoring_runtime()
-    if app.state.self_awareness_task is None:
-        app.state.self_awareness_task = asyncio.create_task(
-            mim_self_awareness_service(),
-            name="mim-self-awareness-service",
-        )
+    _start_background_runtime_tasks()
 
 
 @app.on_event("shutdown")
 async def on_shutdown() -> None:
-    task = app.state.self_awareness_task
-    if task is not None:
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-        finally:
-            app.state.self_awareness_task = None
+    await _stop_background_runtime_tasks()
     await shutdown_workspace_monitoring_runtime()
 
 
