@@ -197,6 +197,12 @@ Current self-evolution operator-command checkpoint after Objective 169:
 - This slice stays non-destructive: it derives command packaging from the existing Objective 166 action packet and does not add a new execution path.
 - The authoritative focused lane passed on the fresh current-source runtime on `:18001` across Objectives 54, 55, 164, 165, 166, 167, 168, and 169.
 
+Current self-evolution operator-command context checkpoint after Objective 170:
+
+- Objective 170 mirrors the primary self-evolution operator command into `conversation_context` as explicit `method`, `path`, and `purpose` fields so downstream conversational surfaces can route or restate the next step without reparsing the UI summary string.
+- This keeps the operator contract additive and non-destructive: `/mim/ui/state` still derives everything from the existing Objective 166 action packet plus Objective 169 command packaging.
+- The authoritative focused lane passed on the fresh current-source runtime on `:18001` across Objectives 54, 55, 164, 165, 166, 167, 168, 169, and 170.
+
 ## Future Objectives
 
 - Objective 58 — Adaptive autonomy boundaries (experience-conditioned autonomy limits)
@@ -217,7 +223,7 @@ Current self-evolution operator-command checkpoint after Objective 169:
 - 123–130: Recovery-commitment lifecycle, conflict handling, propagation, rollout preview, admission control, and operator rollup
 - 131–141: Strategy planning, intent understanding, explainability, confidence, refinement, environment awareness, context persistence, coordination, and safety envelope
 - 142–153: Conversation reliability, TOD dialog convergence, action confirmation, interrupt/control continuity, error clarity, system awareness, consistency enforcement, trust signals, lightweight autonomy, human feedback capture, stability guards, and session continuity bridging
-- 164–169: Self-evolution core snapshot, bounded next-action guidance, resolved briefing packets, operator-visible UI integration, operator-ready action contracts, and operator-command packaging over proposals, recommendations, and backlog governance
+- 164–170: Self-evolution core snapshot, bounded next-action guidance, resolved briefing packets, operator-visible UI integration, operator-ready action contracts, operator-command packaging, and structured conversation-context command mirrors over proposals, recommendations, and backlog governance
 
 ## Governance Notes
 

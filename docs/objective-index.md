@@ -134,6 +134,7 @@ This registry indexes objective evidence and promotion artifacts so objective hi
 | 167 | Self-Evolution Operator Visibility | implemented | not recorded | objective-167 | core/routers/mim_ui.py; tests/integration/test_objective167_self_evolution_operator_visibility.py; docs/objective-167-self-evolution-operator-visibility.md | docs/objective-167-promotion-readiness-report.md | — | self_evolution_operator_visibility |
 | 168 | Self-Evolution Operator Actionability | implemented | not recorded | objective-168 | core/routers/mim_ui.py; tests/integration/test_objective168_self_evolution_operator_actionability.py; docs/objective-168-self-evolution-operator-actionability.md | docs/objective-168-promotion-readiness-report.md | — | self_evolution_operator_actionability |
 | 169 | Self-Evolution Operator Commands | implemented | not recorded | objective-169 | core/routers/mim_ui.py; tests/integration/test_objective169_self_evolution_operator_commands.py; docs/objective-169-self-evolution-operator-commands.md | docs/objective-169-promotion-readiness-report.md | — | self_evolution_operator_commands |
+| 170 | Self-Evolution Operator Command Context | implemented | not recorded | objective-170 | core/routers/mim_ui.py; tests/integration/test_objective170_self_evolution_operator_command_context.py; docs/objective-170-self-evolution-operator-command-context.md | docs/objective-170-promotion-readiness-report.md | — | self_evolution_operator_command_context |
 
 ## Notes
 

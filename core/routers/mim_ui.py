@@ -8540,6 +8540,7 @@ async def mim_ui_state(db: AsyncSession = Depends(get_db)) -> dict:
             "self_evolution_operator_visibility",
             "self_evolution_operator_actionability",
             "self_evolution_operator_commands",
+            "self_evolution_operator_command_context",
             "runtime_health_visibility",
         ],
         "inquiry_prompt": inquiry_prompt,
@@ -8601,6 +8602,21 @@ async def mim_ui_state(db: AsyncSession = Depends(get_db)) -> dict:
               operator_reasoning.get("self_evolution", {}).get("operator_command_summary") or ""
             ).strip()
             if isinstance(operator_reasoning.get("self_evolution", {}), dict)
+            else "",
+            "self_evolution_operator_command_method": str(
+              operator_reasoning.get("self_evolution", {}).get("primary_operator_command", {}).get("method") or ""
+            ).strip()
+            if isinstance(operator_reasoning.get("self_evolution", {}).get("primary_operator_command", {}), dict)
+            else "",
+            "self_evolution_operator_command_path": str(
+              operator_reasoning.get("self_evolution", {}).get("primary_operator_command", {}).get("path") or ""
+            ).strip()
+            if isinstance(operator_reasoning.get("self_evolution", {}).get("primary_operator_command", {}), dict)
+            else "",
+            "self_evolution_operator_command_purpose": str(
+              operator_reasoning.get("self_evolution", {}).get("primary_operator_command", {}).get("purpose") or ""
+            ).strip()
+            if isinstance(operator_reasoning.get("self_evolution", {}).get("primary_operator_command", {}), dict)
             else "",
             "trust_signal_summary": str(operator_reasoning.get("trust_signal_summary") or "").strip(),
             "lightweight_autonomy_summary": str(operator_reasoning.get("lightweight_autonomy", {}).get("summary") or "").strip()
