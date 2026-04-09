@@ -1,13 +1,13 @@
 # Objective 90 - Cross-Policy Conflict Resolution
 
 Date: 2026-03-26
-Status: complete
+Status: implemented
 Depends On: Objective 57, Objective 58, Objective 60, Objective 80, Objective 83, Objective 84, Objective 85, Objective 86, Objective 87, Objective 88, Objective 88.2, Objective 88.3, Objective 88.4, Objective 89
 Target Release Tag: objective-90
 
 ## Completed Slice
 
-Objective 90 is complete across four bounded seams.
+Objective 90 is implemented across four bounded seams in the current repo baseline, but the broader contradictory-reopen inquiry matrix remains a deferred follow-up rather than a closed objective.
 
 The current baseline for Objective 90 now treats TOD execution readiness as a required policy input rather than a soft advisory signal.
 
@@ -79,7 +79,7 @@ Objective 90D adds:
 - dedupe-key scoped conflict profiles for inquiry families that do not carry an explicit managed scope, so cooldown and suppression outcomes do not bleed across unrelated inquiry runs
 - inspectable `decision_policy_conflict_resolution` metadata on governed inquiry decisions and question payloads
 
-Objective 90D now closes the bounded inquiry reopen matrix used by the current governance lane.
+Objective 90D closes the bounded inquiry reopen matrix used by the current governance lane.
 
 - it covers suppression and cooldown-hold semantics for governed inquiry decision creation
 - it reopens previously stabilized inquiry suppression when stronger contradictory fresh evidence arrives for low-evidence, autonomy-suppression, and cooldown-held branches
@@ -89,6 +89,22 @@ Focused Objective 90 validation is green on the full integration lane:
 
 - `/home/testpilot/mim/.venv/bin/python -m unittest -v tests.integration.test_objective90_cross_policy_conflict_resolution`
 - result: PASS (`11/11`)
+
+## Remaining Follow-Up Contract
+
+Objective 90 is not fully complete yet.
+
+The deferred remainder is the wider contradictory-reopen inquiry matrix beyond the bounded governance-lane reopen paths already covered by Objective 90D.
+
+That remaining follow-up should stay explicit until it lands in a separate bounded slice.
+
+Required follow-up contract:
+
+- broaden contradictory-fresh-evidence reopen coverage beyond the current low-evidence, autonomy-suppression, and cooldown-held governance-lane branches
+- validate that wider inquiry-family reopen behavior stays scope-local and inspectable when multiple contradictory signals arrive across adjacent inquiry runs
+- document the focused validation lane for the broader inquiry-matrix expansion instead of silently treating the current bounded seam as full closure
+
+Until that follow-up lands, Objective 90 should be treated as implemented and green in the current bounded slice, not fully complete.
 
 ## Problem Statement
 
