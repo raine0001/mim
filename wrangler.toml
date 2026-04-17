@@ -1,4 +1,4 @@
-name = "mim-travel-shell"
+name = "mim"
 main = "deploy/cloudflare/worker.mjs"
 compatibility_date = "2026-04-16"
 

@@ -3,6 +3,8 @@ const JSON_HEADERS = {
   "cache-control": "no-store",
 };
 
+const WORKER_NAME = "mim";
+
 function normalizeOrigin(value) {
   const text = String(value || "").trim();
   if (!text) {
@@ -123,7 +125,7 @@ export default {
     if (url.pathname === "/healthz") {
       return jsonResponse({
         ok: true,
-        worker: "mim-travel-shell",
+        worker: WORKER_NAME,
         remote_shell_origin_configured: Boolean(origin),
         remote_shell_origin: origin || null,
         remote_shell_path_prefix: pathPrefix || "",
@@ -149,7 +151,7 @@ export default {
     const upstreamRequest = new Request(targetUrl.toString(), request);
     upstreamRequest.headers.set("x-forwarded-host", url.host);
     upstreamRequest.headers.set("x-forwarded-proto", url.protocol.replace(":", ""));
-    upstreamRequest.headers.set("x-mim-cloudflare-worker", "mim-travel-shell");
+    upstreamRequest.headers.set("x-mim-cloudflare-worker", WORKER_NAME);
     return fetch(upstreamRequest, { redirect: "follow" });
   },
 };
