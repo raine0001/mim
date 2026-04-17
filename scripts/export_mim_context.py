@@ -12,7 +12,8 @@ from urllib.request import urlopen
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT_DIR = ROOT / "runtime" / "shared"
-WORKSPACE_RUNTIME_BASE_URLS = ["http://127.0.0.1:18001", "http://127.0.0.1:8001"]
+PUBLICATION_BOUNDARY_STATUS_PATH = DEFAULT_OUTPUT_DIR / "MIM_TOD_PUBLICATION_BOUNDARY.latest.json"
+WORKSPACE_RUNTIME_BASE_URLS = ["http://127.0.0.1:18001"]
 WORKSPACE_RUNTIME_MANIFEST_SOURCES = [
     f"{base_url}/manifest" for base_url in WORKSPACE_RUNTIME_BASE_URLS
 ]
@@ -26,6 +27,30 @@ PROMOTED_STATUSES = {
 ACTIVE_IN_FLIGHT_STATUSES = {"implemented", "in_progress"}
 DOC_COMPLETED_STATUSES = {"completed", *PROMOTED_STATUSES}
 OBJECTIVE_TARGET_STATUSES = {*ACTIVE_IN_FLIGHT_STATUSES, *DOC_COMPLETED_STATUSES}
+AUTHORITY_RESET_ARTIFACT_CANDIDATES = (
+    ROOT / "objective_authority_reset.json",
+    ROOT / "runtime" / "shared" / "objective_authority_reset.json",
+    ROOT / "runtime" / "shared" / "OBJECTIVE_AUTHORITY_RESET.latest.json",
+)
+AUTHORITY_RESET_OBJECTIVE_KEYS = (
+    "objective_ceiling",
+    "reset_ceiling",
+    "ceiling_objective",
+    "ceiling",
+    "max_objective",
+    "max_authoritative_objective",
+    "rollback_to_objective",
+    "authoritative_objective",
+    "current_objective",
+    "objective",
+    "objective_id",
+)
+AUTHORITY_RESET_REWRITE_KEYS = (
+    "rewrite_completion_history",
+    "rewrite_latest_completed",
+    "rewrite_latest_completed_objective",
+    "force_latest_completed_to_ceiling",
+)
 
 
 def _is_objective_status_source_doc(path: Path) -> bool:
@@ -62,6 +87,176 @@ def _normalize_objective_ref(value: object) -> str | None:
     return match.group(1).replace("_", ".").replace("-", ".")
 
 
+def _parse_boolish(value: object) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    text = str(value or "").strip().lower()
+    if not text:
+        return None
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return None
+
+
+def _objective_exceeds_ceiling(
+    objective_ref: str | None, ceiling_ref: str | None
+) -> bool:
+    objective = str(objective_ref or "").strip()
+    ceiling = str(ceiling_ref or "").strip()
+    if not objective or not ceiling:
+        return False
+    return _objective_sort_key(objective) > _objective_sort_key(ceiling)
+
+
+def _cap_objective_to_ceiling(
+    objective_ref: str | None, ceiling_ref: str | None
+) -> str | None:
+    objective = str(objective_ref or "").strip()
+    ceiling = str(ceiling_ref or "").strip()
+    if not objective:
+        return objective_ref
+    if _objective_exceeds_ceiling(objective, ceiling):
+        return ceiling
+    return objective
+
+
+def _authority_reset_candidate_payloads(payload: dict | None) -> list[dict]:
+    if not isinstance(payload, dict):
+        return []
+    candidates = [payload]
+    for key in (
+        "authority_reset",
+        "objective_authority_reset",
+        "rollback_authority",
+        "shared_state",
+        "metadata",
+    ):
+        nested = payload.get(key)
+        if isinstance(nested, dict):
+            candidates.append(nested)
+    return candidates
+
+
+def _parse_objective_authority_reset(payload: dict | None, source: Path) -> dict | None:
+    for candidate in _authority_reset_candidate_payloads(payload):
+        ceiling_objective = None
+        matched_key = ""
+        for key in AUTHORITY_RESET_OBJECTIVE_KEYS:
+            ceiling_objective = _normalize_objective_ref(candidate.get(key))
+            if ceiling_objective:
+                matched_key = key
+                break
+        if not ceiling_objective:
+            continue
+
+        enabled = None
+        for key in ("active", "enabled", "applied"):
+            parsed = _parse_boolish(candidate.get(key))
+            if parsed is not None:
+                enabled = parsed
+                break
+        if enabled is False:
+            continue
+
+        rewrite_completion_history = False
+        for key in AUTHORITY_RESET_REWRITE_KEYS:
+            parsed = _parse_boolish(candidate.get(key))
+            if parsed is not None:
+                rewrite_completion_history = parsed
+                break
+
+        try:
+            source_label = str(source.relative_to(ROOT))
+        except ValueError:
+            source_label = str(source)
+
+        return {
+            "objective_ceiling": ceiling_objective,
+            "rewrite_completion_history": rewrite_completion_history,
+            "source": source_label,
+            "matched_key": matched_key,
+        }
+    return None
+
+
+def _authority_reset_artifact_candidates(output_dir: Path) -> tuple[Path, ...]:
+    output_dir = output_dir.resolve()
+    deduped: list[Path] = []
+    candidates: tuple[Path, ...]
+    if output_dir == DEFAULT_OUTPUT_DIR.resolve():
+        candidates = (
+            output_dir / "objective_authority_reset.json",
+            output_dir / "OBJECTIVE_AUTHORITY_RESET.latest.json",
+            *AUTHORITY_RESET_ARTIFACT_CANDIDATES,
+        )
+    else:
+        candidates = (
+            output_dir / "objective_authority_reset.json",
+            output_dir / "OBJECTIVE_AUTHORITY_RESET.latest.json",
+        )
+    for path in candidates:
+        if path not in deduped:
+            deduped.append(path)
+    return tuple(deduped)
+
+
+def _load_objective_authority_reset(output_dir: Path) -> dict | None:
+    for path in _authority_reset_artifact_candidates(output_dir):
+        payload = _read_json_file(path)
+        details = _parse_objective_authority_reset(payload, path)
+        if details is not None:
+            return details
+    return None
+
+
+def _boundary_request_objective(boundary_payload: dict | None) -> tuple[str | None, str]:
+    if not isinstance(boundary_payload, dict):
+        return None, ""
+    for key in ("authoritative_request", "local_request", "remote_request"):
+        request_payload = boundary_payload.get(key)
+        if not isinstance(request_payload, dict):
+            continue
+        for field in ("objective_id", "task_id", "request_id"):
+            objective_ref = _normalize_objective_ref(request_payload.get(field))
+            if objective_ref:
+                return objective_ref, f"{key}.{field}"
+    return None, ""
+
+
+def _infer_publication_boundary_authority_reset(
+    *,
+    output_dir: Path,
+    latest_completed_objective: str | None,
+    objective_in_flight: str | None,
+    live_task_objective: str | None,
+) -> dict | None:
+    boundary_status_path = output_dir / "MIM_TOD_PUBLICATION_BOUNDARY.latest.json"
+    boundary_payload = _read_json_file(boundary_status_path)
+    boundary_objective, matched_key = _boundary_request_objective(boundary_payload)
+    if not boundary_objective:
+        return None
+    if latest_completed_objective and boundary_objective != latest_completed_objective:
+        return None
+    if not (
+        _objective_exceeds_ceiling(objective_in_flight, boundary_objective)
+        or _objective_exceeds_ceiling(live_task_objective, boundary_objective)
+    ):
+        return None
+    try:
+        boundary_source = str(boundary_status_path.relative_to(ROOT))
+    except ValueError:
+        boundary_source = str(boundary_status_path)
+    return {
+        "objective_ceiling": boundary_objective,
+        "rewrite_completion_history": False,
+        "source": boundary_source,
+        "matched_key": matched_key,
+        "inferred_from": "publication_boundary_authoritative_request",
+    }
+
+
 def _schema_version_sort_key(value: object) -> tuple[int, int, int, int]:
     text = str(value or "").strip()
     match = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})-(\d+)", text)
@@ -88,8 +283,12 @@ def _latest_live_task_request_signal(shared_dir: Path) -> dict:
         objective = _normalize_objective_ref(
             payload.get("objective_id") or payload.get("task_id")
         )
+    try:
+        source_label = str(request_path.relative_to(ROOT))
+    except ValueError:
+        source_label = str(request_path)
     return {
-        "source": str(request_path.relative_to(ROOT)),
+        "source": source_label,
         "objective": objective,
         "task_id": str(payload.get("task_id") or "").strip()
         if isinstance(payload, dict)
@@ -352,7 +551,7 @@ def _manifest_from_shared_snapshot(snapshot_path: Path) -> dict | None:
 
 def _clean_target_value(value: str | None) -> str | None:
     text = str(value or "").strip()
-    if not text or text.lower() == "n/a":
+    if not text or text.lower() in {"n/a", "unknown", "not recorded", "none"}:
         return None
     return re.sub(r"\s*\(target\)\s*$", "", text).strip() or None
 
@@ -626,7 +825,9 @@ def _resolve_manifest(
     }
 
 
-def build_payload_bundle(*, prefer_prod_runtime: bool = False) -> tuple[dict, dict]:
+def build_payload_bundle(
+    *, output_dir: Path = DEFAULT_OUTPUT_DIR, prefer_prod_runtime: bool = False
+) -> tuple[dict, dict]:
     (
         index_latest_completed_objective,
         index_latest_completed_status,
@@ -642,7 +843,6 @@ def build_payload_bundle(*, prefer_prod_runtime: bool = False) -> tuple[dict, di
         docs_objective_in_flight_status,
         docs_latest_row_status,
     ) = _parse_objective_docs(ROOT / "docs")
-
     latest_completed_objective = (
         _choose_newer_objective(
             index_latest_completed_objective,
@@ -663,6 +863,39 @@ def build_payload_bundle(*, prefer_prod_runtime: bool = False) -> tuple[dict, di
         objective_in_flight_status = docs_objective_in_flight_status
     else:
         objective_in_flight_status = index_objective_in_flight_status
+    live_task_signal = _latest_live_task_request_signal(output_dir)
+    live_task_objective = _normalize_objective_ref(live_task_signal.get("objective"))
+
+    objective_authority_reset = _load_objective_authority_reset(output_dir)
+    if objective_authority_reset is None:
+        objective_authority_reset = _infer_publication_boundary_authority_reset(
+            output_dir=output_dir,
+            latest_completed_objective=latest_completed_objective,
+            objective_in_flight=objective_in_flight,
+            live_task_objective=live_task_objective,
+        )
+    authority_reset_ceiling = (
+        str(objective_authority_reset.get("objective_ceiling") or "").strip()
+        if isinstance(objective_authority_reset, dict)
+        else ""
+    )
+    rewrite_completion_history = bool(
+        objective_authority_reset.get("rewrite_completion_history")
+        if isinstance(objective_authority_reset, dict)
+        else False
+    )
+    if rewrite_completion_history:
+        latest_completed_objective = _cap_objective_to_ceiling(
+            latest_completed_objective,
+            authority_reset_ceiling,
+        )
+
+    in_flight_suppressed_by_authority_reset = _objective_exceeds_ceiling(
+        objective_in_flight, authority_reset_ceiling
+    )
+    if in_flight_suppressed_by_authority_reset:
+        objective_in_flight = None
+        objective_in_flight_status = None
 
     if (
         objective_in_flight
@@ -679,8 +912,9 @@ def build_payload_bundle(*, prefer_prod_runtime: bool = False) -> tuple[dict, di
         else index_latest_row_status
     )
 
-    live_task_signal = _latest_live_task_request_signal(DEFAULT_OUTPUT_DIR)
-    live_task_objective = _normalize_objective_ref(live_task_signal.get("objective"))
+    live_task_suppressed_by_authority_reset = _objective_exceeds_ceiling(
+        live_task_objective, authority_reset_ceiling
+    )
 
     next_objective = index_next_objective
     if objective_in_flight and objective_in_flight_status in ACTIVE_IN_FLIGHT_STATUSES:
@@ -692,15 +926,31 @@ def build_payload_bundle(*, prefer_prod_runtime: bool = False) -> tuple[dict, di
             else 0
         )
         next_objective = str(major_part + 1 if major_part > 0 else 1)
+    if _objective_exceeds_ceiling(next_objective, authority_reset_ceiling):
+        next_objective = authority_reset_ceiling
 
     objective_active = latest_completed_objective
     objective_active_source = "latest_completed_objective"
     if objective_in_flight and objective_in_flight_status in ACTIVE_IN_FLIGHT_STATUSES:
         objective_active = objective_in_flight
         objective_active_source = "objective_index_or_docs"
+    if _objective_exceeds_ceiling(objective_active, authority_reset_ceiling):
+        objective_active = authority_reset_ceiling
+        objective_active_source = "objective_authority_reset"
+    elif (
+        authority_reset_ceiling
+        and objective_active == authority_reset_ceiling
+        and (
+            in_flight_suppressed_by_authority_reset
+            or live_task_suppressed_by_authority_reset
+        )
+    ):
+        objective_active_source = "objective_authority_reset"
 
-    if live_task_objective and _objective_sort_key(live_task_objective) > _objective_sort_key(
-        objective_active
+    if (
+        live_task_objective
+        and not live_task_suppressed_by_authority_reset
+        and _objective_sort_key(live_task_objective) > _objective_sort_key(objective_active)
     ):
         objective_active = live_task_objective
         next_objective = live_task_objective
@@ -711,11 +961,20 @@ def build_payload_bundle(*, prefer_prod_runtime: bool = False) -> tuple[dict, di
     if not objective_target_ref and latest_completed_objective:
         objective_target_ref = latest_completed_objective
         objective_target_status = latest_completed_status or "completed"
-    if live_task_objective and _objective_sort_key(live_task_objective) > _objective_sort_key(
-        objective_target_ref
+    if (
+        live_task_objective
+        and not live_task_suppressed_by_authority_reset
+        and _objective_sort_key(live_task_objective) > _objective_sort_key(objective_target_ref)
     ):
         objective_target_ref = live_task_objective
         objective_target_status = "implemented"
+    if _objective_exceeds_ceiling(objective_target_ref, authority_reset_ceiling):
+        if not _objective_exceeds_ceiling(latest_completed_objective, authority_reset_ceiling):
+            objective_target_ref = latest_completed_objective
+            objective_target_status = latest_completed_status or "completed"
+        else:
+            objective_target_ref = authority_reset_ceiling
+            objective_target_status = objective_target_status or "completed"
 
     if (
         objective_target_ref
@@ -748,7 +1007,7 @@ def build_payload_bundle(*, prefer_prod_runtime: bool = False) -> tuple[dict, di
         phase = "execution"
 
     health_prod = _health(["http://127.0.0.1:8000"])
-    health_test = _health(["http://127.0.0.1:8001", "http://127.0.0.1:18001"])
+    health_test = _health(["http://127.0.0.1:18001"])
 
     blockers: list[str] = []
     if not health_prod.get("reachable", False):
@@ -775,6 +1034,7 @@ def build_payload_bundle(*, prefer_prod_runtime: bool = False) -> tuple[dict, di
             "objective_target": objective_target,
             "live_task_request_signal": live_task_signal,
             "objective_active_source": objective_active_source,
+            "objective_authority_reset": objective_authority_reset,
         },
         "objective_active": objective_active,
         "objective_in_flight": objective_in_flight,
@@ -786,6 +1046,11 @@ def build_payload_bundle(*, prefer_prod_runtime: bool = False) -> tuple[dict, di
             ]
             if objective_in_flight
             and objective_in_flight_status in ACTIVE_IN_FLIGHT_STATUSES
+            else [
+                f"hold exported authority at objective {objective_active}",
+                "refresh shared exports and handshake truth",
+            ]
+            if authority_reset_ceiling and objective_active == authority_reset_ceiling
             else [
                 "finalize verification gate",
                 f"begin objective {next_objective} planning",
@@ -825,7 +1090,6 @@ def _execution_truth_projection_sources(source_of_truth: dict) -> list[str]:
 
     for candidate in [
         "http://127.0.0.1:18001",
-        "http://127.0.0.1:8001",
         "http://127.0.0.1:18003",
         "http://127.0.0.1:8000",
     ]:
@@ -1070,11 +1334,13 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
+    output_dir = Path(args.output_dir)
     payload, manifest = build_payload_bundle(
+        output_dir=output_dir,
         prefer_prod_runtime=args.prefer_prod_runtime
     )
     write_exports(
-        payload, manifest, Path(args.output_dir), mirror_root=not args.no_root_mirror
+        payload, manifest, output_dir, mirror_root=not args.no_root_mirror
     )
     print(
         json.dumps(

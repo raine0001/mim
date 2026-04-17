@@ -21,6 +21,19 @@ def load_export_module():
     return module
 
 
+def workspace_manifest_sources(export_module):
+    sources = list(export_module.WORKSPACE_RUNTIME_MANIFEST_SOURCES)
+    if not sources:
+        raise AssertionError("expected at least one workspace runtime manifest source")
+    current_runtime_manifest = sources[0]
+    workspace_runtime_manifest = (
+        sources[-1]
+        if len(sources) > 1
+        else "http://127.0.0.1:18003/manifest"
+    )
+    return current_runtime_manifest, workspace_runtime_manifest
+
+
 class Objective75InterfaceHardeningTest(unittest.TestCase):
     def _write_shared_truth_bundle(self, shared_dir: Path) -> None:
         handshake_payload = {
@@ -49,8 +62,9 @@ class Objective75InterfaceHardeningTest(unittest.TestCase):
         self,
     ) -> None:
         export_module = load_export_module()
-        current_runtime_manifest = export_module.WORKSPACE_RUNTIME_MANIFEST_SOURCES[0]
-        workspace_runtime_manifest = export_module.WORKSPACE_RUNTIME_MANIFEST_SOURCES[1]
+        current_runtime_manifest, workspace_runtime_manifest = workspace_manifest_sources(
+            export_module
+        )
         prod_runtime_manifest = export_module.PROD_RUNTIME_MANIFEST_SOURCE
 
         stale_prod_manifest = {
@@ -79,26 +93,31 @@ class Objective75InterfaceHardeningTest(unittest.TestCase):
 
         with patch.object(
             export_module,
-            "_parse_objective_index",
-            return_value=("75", "implemented", "80", "implemented", "80", "implemented"),
+            "WORKSPACE_RUNTIME_MANIFEST_SOURCES",
+            [current_runtime_manifest, workspace_runtime_manifest],
         ):
             with patch.object(
                 export_module,
-                "_parse_objective_docs",
-                return_value=("75", "implemented", "80", "implemented", "implemented"),
+                "_parse_objective_index",
+                return_value=("75", "implemented", "80", "implemented", "80", "implemented"),
             ):
                 with patch.object(
                     export_module,
-                    "_latest_live_task_request_signal",
-                    return_value={
-                        "source": "runtime/shared/MIM_TOD_TASK_REQUEST.latest.json",
-                        "objective": None,
-                        "task_id": "",
-                        "available": False,
-                    },
+                    "_parse_objective_docs",
+                    return_value=("75", "implemented", "80", "implemented", "implemented"),
                 ):
-                    with patch.object(export_module, "_fetch_json", side_effect=fake_fetch):
-                        payload, manifest = export_module.build_payload_bundle()
+                    with patch.object(
+                        export_module,
+                        "_latest_live_task_request_signal",
+                        return_value={
+                            "source": "runtime/shared/MIM_TOD_TASK_REQUEST.latest.json",
+                            "objective": None,
+                            "task_id": "",
+                            "available": False,
+                        },
+                    ):
+                        with patch.object(export_module, "_fetch_json", side_effect=fake_fetch):
+                            payload, manifest = export_module.build_payload_bundle()
 
         source_of_truth = payload["source_of_truth"]
         self.assertEqual(
@@ -121,8 +140,9 @@ class Objective75InterfaceHardeningTest(unittest.TestCase):
 
     def test_build_payload_bundle_promotes_live_task_request_when_ahead_of_docs(self) -> None:
         export_module = load_export_module()
-        current_runtime_manifest = export_module.WORKSPACE_RUNTIME_MANIFEST_SOURCES[0]
-        workspace_runtime_manifest = export_module.WORKSPACE_RUNTIME_MANIFEST_SOURCES[1]
+        current_runtime_manifest, workspace_runtime_manifest = workspace_manifest_sources(
+            export_module
+        )
 
         workspace_manifest = {
             "schema_version": "2026-03-12-67",
@@ -142,26 +162,31 @@ class Objective75InterfaceHardeningTest(unittest.TestCase):
 
         with patch.object(
             export_module,
-            "_parse_objective_index",
-            return_value=("80", "implemented", "81", "implemented", "81", "implemented"),
+            "WORKSPACE_RUNTIME_MANIFEST_SOURCES",
+            [current_runtime_manifest, workspace_runtime_manifest],
         ):
             with patch.object(
                 export_module,
-                "_parse_objective_docs",
-                return_value=("80", "implemented", "81", "implemented", "implemented"),
+                "_parse_objective_index",
+                return_value=("80", "implemented", "81", "implemented", "81", "implemented"),
             ):
                 with patch.object(
                     export_module,
-                    "_latest_live_task_request_signal",
-                    return_value={
-                        "source": "runtime/shared/MIM_TOD_TASK_REQUEST.latest.json",
-                        "objective": "88",
-                        "task_id": "objective-88-task-001",
-                        "available": True,
-                    },
+                    "_parse_objective_docs",
+                    return_value=("80", "implemented", "81", "implemented", "implemented"),
                 ):
-                    with patch.object(export_module, "_fetch_json", side_effect=fake_fetch):
-                        payload, _ = export_module.build_payload_bundle()
+                    with patch.object(
+                        export_module,
+                        "_latest_live_task_request_signal",
+                        return_value={
+                            "source": "runtime/shared/MIM_TOD_TASK_REQUEST.latest.json",
+                            "objective": "88",
+                            "task_id": "objective-88-task-001",
+                            "available": True,
+                        },
+                    ):
+                        with patch.object(export_module, "_fetch_json", side_effect=fake_fetch):
+                            payload, _ = export_module.build_payload_bundle()
 
         self.assertEqual(payload["objective_active"], "88")
         self.assertEqual(payload["current_next_objective"], "88")
@@ -170,10 +195,235 @@ class Objective75InterfaceHardeningTest(unittest.TestCase):
             "live_task_request",
         )
 
+    def test_build_payload_bundle_honors_objective_authority_reset_ceiling(self) -> None:
+        export_module = load_export_module()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            shared_dir = Path(tmp_dir)
+            authority_reset_path = shared_dir / "OBJECTIVE_AUTHORITY_RESET.latest.json"
+            authority_reset_path.write_text(
+                json.dumps(
+                    {
+                        "objective_ceiling": "152",
+                        "rewrite_completion_history": False,
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            with patch.object(
+                export_module,
+                "AUTHORITY_RESET_ARTIFACT_CANDIDATES",
+                (authority_reset_path,),
+            ):
+                with patch.object(
+                    export_module,
+                    "_parse_objective_index",
+                    return_value=(
+                        "152",
+                        "promoted_verified",
+                        "170",
+                        "implemented",
+                        "171",
+                        "implemented",
+                    ),
+                ):
+                    with patch.object(
+                        export_module,
+                        "_parse_objective_docs",
+                        return_value=(
+                            "152",
+                            "promoted_verified",
+                            "170",
+                            "implemented",
+                            "implemented",
+                        ),
+                    ):
+                        with patch.object(
+                            export_module,
+                            "_latest_live_task_request_signal",
+                            return_value={
+                                "source": "runtime/shared/MIM_TOD_TASK_REQUEST.latest.json",
+                                "objective": "170",
+                                "task_id": "objective-170-task-001",
+                                "available": True,
+                            },
+                        ):
+                            with patch.object(
+                                export_module,
+                                "_fetch_json",
+                                return_value={"status": "ok"},
+                            ):
+                                payload, manifest = export_module.build_payload_bundle()
+
+        self.assertEqual(payload["objective_active"], "152")
+        self.assertIsNone(payload["objective_in_flight"])
+        self.assertEqual(payload["current_next_objective"], "152")
+        self.assertEqual(
+            payload["source_of_truth"]["objective_active_source"],
+            "objective_authority_reset",
+        )
+        self.assertEqual(
+            payload["source_of_truth"]["objective_target"]["objective"],
+            "152",
+        )
+        self.assertEqual(manifest["release_tag"], "objective-152")
+        self.assertEqual(
+            payload["source_of_truth"]["objective_authority_reset"]["objective_ceiling"],
+            "152",
+        )
+
+    def test_build_payload_bundle_infers_authority_reset_from_publication_boundary(self) -> None:
+        export_module = load_export_module()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            shared_dir = Path(tmp_dir)
+            boundary_path = shared_dir / "MIM_TOD_PUBLICATION_BOUNDARY.latest.json"
+            boundary_path.write_text(
+                json.dumps(
+                    {
+                        "authoritative_request": {
+                            "objective_id": "objective-152",
+                            "request_id": "objective-152-task-001",
+                        }
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            with patch.object(export_module, "DEFAULT_OUTPUT_DIR", shared_dir):
+                with patch.object(
+                    export_module,
+                    "_parse_objective_index",
+                    return_value=(
+                        "152",
+                        "promoted_verified",
+                        "170",
+                        "implemented",
+                        "171",
+                        "implemented",
+                    ),
+                ):
+                    with patch.object(
+                        export_module,
+                        "_parse_objective_docs",
+                        return_value=(
+                            "152",
+                            "promoted_verified",
+                            "170",
+                            "implemented",
+                            "implemented",
+                        ),
+                    ):
+                        with patch.object(
+                            export_module,
+                            "_latest_live_task_request_signal",
+                            return_value={
+                                "source": "runtime/shared/MIM_TOD_TASK_REQUEST.latest.json",
+                                "objective": None,
+                                "task_id": "",
+                                "available": False,
+                            },
+                        ):
+                            with patch.object(
+                                export_module,
+                                "_fetch_json",
+                                return_value={"status": "ok"},
+                            ):
+                                payload, manifest = export_module.build_payload_bundle(
+                                    output_dir=shared_dir
+                                )
+
+        self.assertEqual(payload["objective_active"], "152")
+        self.assertIsNone(payload["objective_in_flight"])
+        self.assertEqual(payload["current_next_objective"], "152")
+        self.assertEqual(
+            payload["source_of_truth"]["objective_active_source"],
+            "objective_authority_reset",
+        )
+        self.assertEqual(
+            payload["source_of_truth"]["objective_authority_reset"]["objective_ceiling"],
+            "152",
+        )
+        self.assertEqual(
+            payload["source_of_truth"]["objective_authority_reset"]["inferred_from"],
+            "publication_boundary_authoritative_request",
+        )
+        self.assertEqual(manifest["release_tag"], "objective-152")
+
+    def test_build_payload_bundle_prefers_output_dir_over_fallback_authority_reset(self) -> None:
+        export_module = load_export_module()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            output_dir = root / "shared"
+            fallback_dir = root / "fallback"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            fallback_dir.mkdir(parents=True, exist_ok=True)
+
+            (fallback_dir / "OBJECTIVE_AUTHORITY_RESET.latest.json").write_text(
+                json.dumps(
+                    {
+                        "objective_ceiling": "152",
+                        "rewrite_completion_history": False,
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            with patch.object(
+                export_module,
+                "AUTHORITY_RESET_ARTIFACT_CANDIDATES",
+                (fallback_dir / "OBJECTIVE_AUTHORITY_RESET.latest.json",),
+            ):
+                with patch.object(
+                    export_module,
+                    "_parse_objective_index",
+                    return_value=(
+                        "152",
+                        "promoted_verified",
+                        "170",
+                        "implemented",
+                        "171",
+                        "implemented",
+                    ),
+                ):
+                    with patch.object(
+                        export_module,
+                        "_parse_objective_docs",
+                        return_value=(
+                            "152",
+                            "promoted_verified",
+                            "170",
+                            "implemented",
+                            "implemented",
+                        ),
+                    ):
+                        with patch.object(
+                            export_module,
+                            "_fetch_json",
+                            return_value={"status": "ok"},
+                        ):
+                            payload, _ = export_module.build_payload_bundle(
+                                output_dir=output_dir
+                            )
+
+        self.assertEqual(payload["objective_active"], "170")
+        self.assertEqual(payload["current_next_objective"], "170")
+        self.assertEqual(
+            payload["source_of_truth"]["objective_active_source"],
+            "objective_index_or_docs",
+        )
+        self.assertIsNone(payload["source_of_truth"]["objective_authority_reset"])
+
     def test_build_payload_bundle_overrides_stale_runtime_schema_with_static_schema(self) -> None:
         export_module = load_export_module()
-        current_runtime_manifest = export_module.WORKSPACE_RUNTIME_MANIFEST_SOURCES[0]
-        workspace_runtime_manifest = export_module.WORKSPACE_RUNTIME_MANIFEST_SOURCES[1]
+        current_runtime_manifest, workspace_runtime_manifest = workspace_manifest_sources(
+            export_module
+        )
         prod_runtime_manifest = export_module.PROD_RUNTIME_MANIFEST_SOURCE
 
         workspace_manifest = {
@@ -194,8 +444,13 @@ class Objective75InterfaceHardeningTest(unittest.TestCase):
                 return {"status": "ok"}
             return None
 
-        with patch.object(export_module, "_fetch_json", side_effect=fake_fetch):
-            payload, manifest = export_module.build_payload_bundle()
+        with patch.object(
+            export_module,
+            "WORKSPACE_RUNTIME_MANIFEST_SOURCES",
+            [current_runtime_manifest, workspace_runtime_manifest],
+        ):
+            with patch.object(export_module, "_fetch_json", side_effect=fake_fetch):
+                payload, manifest = export_module.build_payload_bundle()
 
         self.assertEqual(payload["schema_version"], "2026-03-24-70")
         self.assertEqual(manifest["schema_version"], "2026-03-24-70")
