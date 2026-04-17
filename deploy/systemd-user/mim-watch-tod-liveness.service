@@ -1,0 +1,17 @@
+[Unit]
+Description=MIM Watch TOD Liveness (User)
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/testpilot/mim
+Environment=POLL_SECONDS=3
+Environment=STALE_SECONDS=45
+Environment=COOLDOWN_SECONDS=30
+Environment=TRIGGER_PROTECT_SECONDS=20
+ExecStart=/home/testpilot/mim/scripts/watch_tod_liveness.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

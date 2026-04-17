@@ -1,0 +1,9 @@
+{
+  "generated_at": "2026-03-12T21:40:08Z",
+  "packet_type": "shared-trigger-ack-v1",
+  "source_actor": "MIM",
+  "target_actor": "TOD",
+  "acknowledges": "TOD_TO_MIM_TRIGGER.latest.json",
+  "status": "ready_template",
+  "notes": "MIM should update this on each processed trigger."
+}

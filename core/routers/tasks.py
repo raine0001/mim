@@ -5,6 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from core.db import get_db
 from core.journal import write_journal
 from core.models import Task
+from core.objective_lifecycle import recompute_objective_state
 from core.schemas import TaskCreate
 
 router = APIRouter()
@@ -23,6 +24,7 @@ async def create_task(payload: TaskCreate, db: AsyncSession = Depends(get_db)) -
     )
     db.add(task)
     await db.flush()
+    await recompute_objective_state(db, payload.objective_id)
     await write_journal(
         db,
         actor="tod",

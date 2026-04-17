@@ -1,0 +1,15 @@
+[Unit]
+Description=MIM Watch TOD Consume Timeout Policy (User)
+After=default.target mim-watch-tod-consume-evidence.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/testpilot/mim
+Environment=POLL_SECONDS=10
+Environment=REMOTE_PUBLISH=1
+ExecStart=/home/testpilot/mim/scripts/watch_tod_consume_timeout_policy.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

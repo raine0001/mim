@@ -1,0 +1,19 @@
+{
+    "generated_at":  "2026-03-16T16:20:23.2484775Z",
+    "source":  "tod-mim-coordination-request-v1",
+    "status":  "resolved",
+    "priority":  "none",
+    "escalation_level":  0,
+    "request_id":  "objective-75-task-3140",
+    "objective_id":  "objective-75",
+    "issue_code":  "stalled_regression_no_delta_resolved",
+    "issue_summary":  "Regression is green; prior stalled-regression escalation is closed automatically.",
+    "evidence":  {
+                     "failed":  0,
+                     "total":  77,
+                     "regression_signature":  "2026-03-16T09:22:51.3343954Z|77|0|77"
+                 },
+    "requested_action":  "none",
+    "resolution_reason":  "Regression failures are zero; stale coordination escalation has been auto-resolved.",
+    "resolved_at":  "2026-03-16T16:20:23.2484775Z"
+}

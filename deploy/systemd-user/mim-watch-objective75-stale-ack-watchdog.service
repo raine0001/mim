@@ -1,0 +1,17 @@
+[Unit]
+Description=MIM Watch Objective 75 Repeated Stale ACK Failures (User)
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/testpilot/mim
+Environment=MAX_CONSEC_STALE_FAILS=2
+Environment=POLL_SECONDS=10
+Environment=MAX_WATCH_SECONDS=0
+Environment=APPEND_JSONL=1
+ExecStart=/home/testpilot/mim/scripts/watch_objective75_stale_ack_watchdog.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

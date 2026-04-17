@@ -1,0 +1,38 @@
+{
+  "generated_at": "2026-03-23T22:02:03.841395Z",
+  "type": "tod_recoupling_baseline_v1",
+  "mode": "local",
+  "source": "objective-75-closure",
+  "notes": "Refresh evidence fixed; canonical status corrected; catchup writer aligned; recoupling streak passed.",
+  "expected_objective": 75,
+  "required_consecutive": 3,
+  "can_recouple": true,
+  "gate": {
+    "status": "pass",
+    "exit_code": 0,
+    "output": "RECOUPLING_GATE: PASS\n- sample_pass: True\n- pass_streak: 5/3\n- state_file: /home/testpilot/mim/runtime/logs/tod_recoupling_gate_state.latest.json\n- PASS: trigger_ack_fresh (status=acknowledged age_seconds=21 max=180)\n- PASS: objective_alignment (aligned=True status='in_sync' tod=75 mim=75 expected=75)\n- PASS: canonical_refresh_evidence (copied_manifest=True source_manifest='E:\\\\TOD\\\\tod\\\\out\\\\context-sync\\\\ssh-shared\\\\MIM_MANIFEST.latest.json' source_handshake_packet='E:\\\\TOD\\\\tod\\\\out\\\\context-sync\\\\ssh-shared\\\\MIM_TOD_HANDSHAKE_PACKET.latest.json' handshake_available=True published_objective='75' shared_objective='75' published_schema='2026-03-12-68' shared_schema='2026-03-12-68' published_release='objective-75' shared_release='objective-75' mim_schema='2026-03-12-68')\n- PASS: review_gate_passed (passed=True request_id=objective-75-task-3256)\n- PASS: catchup_gate_pass (gate_pass=True objective=75)"
+  },
+  "workspace": {
+    "git_branch": "feat/objectives-39-40-lifecycle",
+    "git_commit": "4793adc1930fd6e805d1bf035bf941bd238571c6"
+  },
+  "snapshot": {
+    "pass_streak": 5,
+    "last_sample_pass": true,
+    "last_ack_generated_at": "2026-03-23T22:01:42.1733757Z",
+    "objective_alignment": {
+      "status": "in_sync",
+      "aligned": true,
+      "tod_current_objective": "75",
+      "mim_objective_active": "75"
+    },
+    "review_gate": {
+      "passed": true,
+      "request_id": "objective-75-task-3256"
+    },
+    "catchup_gate": {
+      "gate_pass": true,
+      "objective": 75
+    }
+  }
+}

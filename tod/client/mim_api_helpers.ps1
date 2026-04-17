@@ -77,11 +77,15 @@ function ConvertTo-MimPayload {
 function Invoke-MimGet {
     param(
         [string]$Endpoint,
-        [pscustomobject]$Config
+        [pscustomobject]$Config,
+        [hashtable]$Headers = @{}
     )
 
     $uri = "{0}{1}" -f $Config.mim_base_url.TrimEnd('/'), $Endpoint
     Write-TodApiLog -Message "GET $uri"
+    if ($Headers.Count -gt 0) {
+        return Invoke-RestMethod -Method Get -Uri $uri -Headers $Headers -TimeoutSec ([int]$Config.timeout_seconds)
+    }
     return Invoke-RestMethod -Method Get -Uri $uri -TimeoutSec ([int]$Config.timeout_seconds)
 }
 
@@ -89,12 +93,16 @@ function Invoke-MimPost {
     param(
         [string]$Endpoint,
         [hashtable]$Payload,
-        [pscustomobject]$Config
+        [pscustomobject]$Config,
+        [hashtable]$Headers = @{}
     )
 
     $uri = "{0}{1}" -f $Config.mim_base_url.TrimEnd('/'), $Endpoint
     $body = ConvertTo-MimPayload -Payload $Payload
     Write-TodApiLog -Message "POST $uri"
+    if ($Headers.Count -gt 0) {
+        return Invoke-RestMethod -Method Post -Uri $uri -Body $body -Headers $Headers -ContentType "application/json" -TimeoutSec ([int]$Config.timeout_seconds)
+    }
     return Invoke-RestMethod -Method Post -Uri $uri -Body $body -ContentType "application/json" -TimeoutSec ([int]$Config.timeout_seconds)
 }
 

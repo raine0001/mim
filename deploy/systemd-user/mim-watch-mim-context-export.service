@@ -1,0 +1,16 @@
+[Unit]
+Description=MIM Watch Context Export Freshness (User)
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/testpilot/mim
+Environment=POLL_SECONDS=30
+Environment=MAX_EXPORT_AGE_SECONDS=300
+Environment=MIN_RUN_INTERVAL_SECONDS=60
+ExecStart=/home/testpilot/mim/scripts/watch_mim_context_export.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

@@ -5,16 +5,27 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from core.db import get_db
 from core.journal import write_journal
 from core.models import Task, TaskResult
+from core.objective_lifecycle import (
+    derive_task_state_from_result,
+    recompute_objective_state,
+)
 from core.schemas import ResultCreate
 
 router = APIRouter()
 
 
 @router.post("")
-async def create_result(payload: ResultCreate, db: AsyncSession = Depends(get_db)) -> dict:
+async def create_result(
+    payload: ResultCreate, db: AsyncSession = Depends(get_db)
+) -> dict:
     task = await db.get(Task, payload.task_id)
     if not task:
         raise HTTPException(status_code=404, detail="task not found")
+
+    task.state = derive_task_state_from_result(
+        test_results=payload.test_results,
+        failures=payload.failures,
+    )
 
     task_result = TaskResult(
         task_id=payload.task_id,
@@ -35,6 +46,7 @@ async def create_result(payload: ResultCreate, db: AsyncSession = Depends(get_db
         target_id=str(task_result.id),
         summary=f"Result recorded for task {payload.task_id}",
     )
+    await recompute_objective_state(db, task.objective_id)
     await db.commit()
     await db.refresh(task_result)
     return {
@@ -52,7 +64,11 @@ async def create_result(payload: ResultCreate, db: AsyncSession = Depends(get_db
 
 @router.get("")
 async def list_results(db: AsyncSession = Depends(get_db)) -> list[dict]:
-    rows = (await db.execute(select(TaskResult).order_by(TaskResult.id.desc()))).scalars().all()
+    rows = (
+        (await db.execute(select(TaskResult).order_by(TaskResult.id.desc())))
+        .scalars()
+        .all()
+    )
     return [
         {
             "result_id": r.id,

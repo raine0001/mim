@@ -1,0 +1,106 @@
+{
+  "artifact_name": "mim_arm_startup_diagnostic.latest.json",
+  "generated_at": "2026-03-29T00:00:00Z",
+  "project": "MIM Arm Recovery and Integration Baseline",
+  "task": {
+    "title": "Diagnose why the MIM arm UI app is not starting on 192.168.1.90",
+    "constraints": [
+      "no live motion commands",
+      "no config changes without approval",
+      "gather logs and root-cause candidates first",
+      "prefer read-only inspection before remediation",
+      "produce artifact summary and next-step recommendation"
+    ]
+  },
+  "connectivity": {
+    "host": "192.168.1.90",
+    "ping": {},
+    "ssh_tcp_probe": {},
+    "host_reachable": false
+  },
+  "process_service": {
+    "active_processes": {},
+    "service_status": {},
+    "startup_script_or_command": {
+      "declared_startup_command": "",
+      "service_name": ""
+    }
+  },
+  "logs": {
+    "recent_app_logs": {}
+  },
+  "devices": {
+    "camera_device_availability": {},
+    "serial_controller_port_availability": {}
+  },
+  "system_basics": {
+    "disk_memory_basics": {},
+    "python_env_dependency_failures": {}
+  },
+  "ports": {
+    "expected_ports": [],
+    "port_bindings": {}
+  },
+  "likely_root_cause": {
+    "summary": "",
+    "candidates": []
+  },
+  "suggested_recovery_actions": [
+    {
+      "action": "restart_service",
+      "requires_approval": true,
+      "details": ""
+    },
+    {
+      "action": "run_startup_command_manually",
+      "requires_approval": true,
+      "details": ""
+    },
+    {
+      "action": "reinstall_missing_dependency",
+      "requires_approval": true,
+      "details": ""
+    },
+    {
+      "action": "correct_path_or_env_mismatch",
+      "requires_approval": true,
+      "details": ""
+    },
+    {
+      "action": "release_occupied_port",
+      "requires_approval": true,
+      "details": ""
+    },
+    {
+      "action": "restore_config_file",
+      "requires_approval": true,
+      "details": ""
+    },
+    {
+      "action": "verify_camera_permission_and_mapping",
+      "requires_approval": true,
+      "details": ""
+    }
+  ],
+  "approval_policy": {
+    "remediation_requires_operator_approval": true,
+    "allowed_without_approval": [
+      "read_only_inspection",
+      "artifact_generation",
+      "status_ingestion_after_app_recovery"
+    ]
+  },
+  "next_phase_after_recovery": {
+    "mode": "read_only_mim_input",
+    "fields": [
+      "app_alive",
+      "arm_status",
+      "camera_status",
+      "current_pose",
+      "estop_status",
+      "active_mode",
+      "last_error",
+      "recent_command_result"
+    ]
+  }
+}

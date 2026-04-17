@@ -1,0 +1,128 @@
+{
+  "baseline_id": "MIM_TOD_SYSTEM_BASELINE.v1",
+  "recorded_at": "2026-04-04T18:03:01.605077Z",
+  "canonical_runtime": {
+    "base_url": "http://127.0.0.1:18001",
+    "contract_id": "TOD_MIM_COMMUNICATION_CONTRACT.v1",
+    "contract_version": "v1",
+    "contract_schema_version": "2026-04-02-communication-contract-v1",
+    "contract_sha256": "fca83d97a9ac490660e48fcf9fc0aa86cc93cd575b7f995ce7e8b8e45e6d33af"
+  },
+  "freeze": {
+    "validation_target": "http://127.0.0.1:18001",
+    "runtime_binding": {
+      "target": "mim_arm",
+      "execution_mode": "hardware_transport",
+      "live_transport_available": true,
+      "move_relative_transport_mode": "hardware_transport"
+    },
+    "lane_separation": {
+      "bridge_publication_lane": "/mim/arm/executions/safe-home",
+      "direct_execution_lane": "/mim/arm/execution-lane/requests",
+      "rule": "Do not treat bridge listener latest ACK/RESULT files as proof of direct execution-lane completion; those surfaces are governed independently and may classify fresh bridge requests as stale_ignored under active authoritative-task conditions."
+    },
+    "publication_path": {
+      "transport_id": "mim_server_shared_artifact_boundary",
+      "local_surface": "/home/testpilot/mim/runtime/shared",
+      "authoritative_surface": "mim_runtime_shared",
+      "authoritative_host": "192.168.1.120",
+      "authoritative_root": "/home/testpilot/mim/runtime/shared",
+      "execution_path_label": "execution_evidence_mirror_only (arm-host evidence is non-authoritative for TOD/MIM communication)"
+    },
+    "override_config": {
+      "used": false,
+      "notes": "Proof commands were executed directly against 127.0.0.1:18001 with repo defaults. No MIM_ARM_SSH_* override variables were present in the shell."
+    }
+  },
+  "golden_run": {
+    "direct_execution_lane": {
+      "proof_type": "fresh request + inline ACK + inline RESULT",
+      "request_id": "tod-mim-arm-83df0c3abcab",
+      "issued_at": "2026-04-04T18:00:15.735914Z",
+      "generated_at": "2026-04-04T18:00:15.735918Z",
+      "classification": "governed_execution",
+      "lane": "mim_arm_execution",
+      "ack_packet": {
+        "ack_status": "accepted",
+        "reason": "request_accepted"
+      },
+      "result_packet": {
+        "result_status": "succeeded",
+        "reason": "hardware_transport_succeeded"
+      },
+      "execution_path": {
+        "execution_mode": "hardware_transport",
+        "transport_surface": "/home/testpilot/mim/runtime/shared"
+      }
+    },
+    "bridge_publication_lane": {
+      "proof_type": "fresh MIM bridge publish + fresh TOD ACK",
+      "request_id": "objective-97-task-mim-arm-safe-home-1775325722",
+      "correlation_id": "obj97-mim-arm-safe-home-1775325722",
+      "generated_at": "2026-04-04T18:02:02Z",
+      "classification": "stale_ignored",
+      "request_packet": {
+        "request_path": "/home/testpilot/mim/runtime/shared/MIM_TOD_TASK_REQUEST.latest.json",
+        "trigger_path": "/home/testpilot/mim/runtime/shared/MIM_TO_TOD_TRIGGER.latest.json",
+        "request_sequence": 595576,
+        "trigger_sequence": 595577,
+        "local_written": true
+      },
+      "ack_packet": {
+        "generated_at": "2026-04-04T18:02:33.7297331Z",
+        "ack_status": "stale_ignored",
+        "ack_reason_code": "stale_request_ignored",
+        "note": "Request ignored because a higher authoritative task ordinal is already active.",
+        "request_id": "objective-97-task-mim-arm-safe-home-1775325722",
+        "task_id": "objective-97-task-mim-arm-safe-home-1775325722"
+      },
+      "result_packet": {
+        "status": "not_emitted_for_fresh_request",
+        "current_latest_request_id": "objective-97-task-mim-arm-safe-home-1775247707",
+        "reconciliation_active_task_id": "objective-97-task-mim-arm-safe-home-1775325722",
+        "review_passed": false
+      },
+      "remote_publish": {
+        "enabled": true,
+        "attempted": true,
+        "succeeded": true,
+        "returncode": 0,
+        "remote_root": "/home/testpilot/mim/runtime/shared",
+        "request_request_id": "objective-97-task-mim-arm-safe-home-1775325722",
+        "trigger_request_id": "objective-97-task-mim-arm-safe-home-1775325722",
+        "request_sha256": "8725ca50d8c980589d4f01b9c2f68e2f8ef7410a8965e13190e6cd72657d6928",
+        "trigger_sha256": "49f3b0f5be732e5d5ec8e11cefee95d0ead440707f28e75027ac0e4dad3092ad"
+      }
+    }
+  },
+  "memory_profile": {
+    "runtime_status": "healthy",
+    "uvicorn_process": {
+      "pid": 1060705,
+      "rss_kb": 157344,
+      "vsz_kb": 309116
+    },
+    "self_health_detailed": {
+      "memory_mb": 153,
+      "memory_percent": 0.23949008630008453,
+      "memory_trend": "stable",
+      "metrics_sampled": 35,
+      "api_latency_ms": 45.2,
+      "api_error_rate": 0.005,
+      "state_bus_lag_ms": 250.0,
+      "worker_queue_depth": 8
+    }
+  },
+  "passing_validation_set": [
+    "tests.integration.test_objective75_interface_hardening",
+    "tests.integration.test_objective23_operator_control",
+    "tests.integration.test_objective37_human_aware_interruption_and_safe_pause_handling",
+    "tests.integration.test_objective38_predictive_workspace_change_and_replanning"
+  ],
+  "known_constraints": [
+    "The bridge listener correctly emitted a fresh ACK for request_id objective-97-task-mim-arm-safe-home-1775325722, but classified it as stale_ignored because a higher authoritative task ordinal was already active.",
+    "The shared latest RESULT surface did not emit a fresh result packet for objective-97-task-mim-arm-safe-home-1775325722 during this run; its reconciliation block still points at the new active task id while the packet body remains on the older request id objective-97-task-mim-arm-safe-home-1775247707.",
+    "Direct successful RESULT evidence therefore comes from the execution-lane HTTP submission path, not from the bridge listener latest RESULT file.",
+    "Remote command-status polling via scripts/run_mim_arm_dispatch_attribution_check.py could not be completed from this shell because MIM_ARM_SSH_* credentials were not configured."
+  ]
+}

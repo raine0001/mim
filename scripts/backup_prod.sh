@@ -8,14 +8,15 @@ STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 OUT_FILE="$OUT_DIR/mim_prod_$STAMP.sql"
 ENV_SNAPSHOT="$OUT_DIR/mim_prod_env_$STAMP.env"
 DATA_ARCHIVE="$OUT_DIR/mim_prod_data_$STAMP.tgz"
+ENV_TOOLS="$ROOT_DIR/scripts/env_file_tools.py"
 
-BACKUP_RETENTION_DAYS="$(grep -E '^BACKUP_RETENTION_DAYS=' "$ENV_FILE" | tail -n1 | cut -d= -f2-)"
+BACKUP_RETENTION_DAYS="$(python3 "$ENV_TOOLS" get --file "$ENV_FILE" BACKUP_RETENTION_DAYS --default "")"
 if [[ -z "$BACKUP_RETENTION_DAYS" ]]; then
   BACKUP_RETENTION_DAYS=14
 fi
 
-POSTGRES_USER="$(grep -E '^POSTGRES_USER=' "$ENV_FILE" | tail -n1 | cut -d= -f2-)"
-POSTGRES_DB="$(grep -E '^POSTGRES_DB=' "$ENV_FILE" | tail -n1 | cut -d= -f2-)"
+POSTGRES_USER="$(python3 "$ENV_TOOLS" get --file "$ENV_FILE" POSTGRES_USER --default "")"
+POSTGRES_DB="$(python3 "$ENV_TOOLS" get --file "$ENV_FILE" POSTGRES_DB --default "")"
 
 if [[ -z "$POSTGRES_USER" || -z "$POSTGRES_DB" ]]; then
   echo "Missing POSTGRES_USER or POSTGRES_DB in $ENV_FILE"
