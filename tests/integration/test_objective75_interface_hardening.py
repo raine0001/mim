@@ -177,22 +177,116 @@ class Objective75InterfaceHardeningTest(unittest.TestCase):
                 ):
                     with patch.object(
                         export_module,
-                        "_latest_live_task_request_signal",
-                        return_value={
-                            "source": "runtime/shared/MIM_TOD_TASK_REQUEST.latest.json",
-                            "objective": "88",
-                            "task_id": "objective-88-task-001",
-                            "available": True,
-                        },
+                        "_active_formal_program_truth",
+                        return_value=None,
                     ):
-                        with patch.object(export_module, "_fetch_json", side_effect=fake_fetch):
-                            payload, _ = export_module.build_payload_bundle()
+                        with patch.object(
+                            export_module,
+                            "_live_initiative_truth",
+                            return_value=None,
+                        ):
+                            with patch.object(
+                                export_module,
+                                "_latest_live_task_request_signal",
+                                return_value={
+                                    "source": "runtime/shared/MIM_TOD_TASK_REQUEST.latest.json",
+                                    "objective": "88",
+                                    "task_id": "objective-88-task-001",
+                                    "available": True,
+                                },
+                            ):
+                                with patch.object(export_module, "_fetch_json", side_effect=fake_fetch):
+                                    payload, _ = export_module.build_payload_bundle()
 
         self.assertEqual(payload["objective_active"], "88")
         self.assertEqual(payload["current_next_objective"], "88")
         self.assertEqual(
             payload["source_of_truth"]["objective_active_source"],
             "live_task_request",
+        )
+
+    def test_build_payload_bundle_ignores_continuous_dispatch_loop_for_objective_authority(self) -> None:
+        export_module = load_export_module()
+        current_runtime_manifest, workspace_runtime_manifest = workspace_manifest_sources(
+            export_module
+        )
+
+        workspace_manifest = {
+            "schema_version": "2026-03-12-67",
+            "release_tag": "workspace-dev",
+            "contract_version": "tod-mim-shared-contract-v1",
+            "capabilities": ["manifest", "status"],
+        }
+
+        def fake_fetch(url: str, timeout: float = 2.5):
+            if url == current_runtime_manifest:
+                return None
+            if url == workspace_runtime_manifest:
+                return workspace_manifest
+            if url.endswith("/health"):
+                return {"status": "ok"}
+            return None
+
+        with patch.object(
+            export_module,
+            "WORKSPACE_RUNTIME_MANIFEST_SOURCES",
+            [current_runtime_manifest, workspace_runtime_manifest],
+        ):
+            with patch.object(
+                export_module,
+                "_parse_objective_index",
+                return_value=("152", "promoted_verified", "2912", "implemented", "2912", "implemented"),
+            ):
+                with patch.object(
+                    export_module,
+                    "_parse_objective_docs",
+                    return_value=("152", "promoted_verified", "2912", "implemented", "implemented"),
+                ):
+                    with patch.object(
+                        export_module,
+                        "_active_formal_program_truth",
+                        return_value={
+                            "objective": "2900",
+                            "execution_state": "executing",
+                            "source": "runtime/formal_program_drive_response.json",
+                        },
+                    ):
+                        with patch.object(
+                            export_module,
+                            "_live_initiative_truth",
+                            return_value=None,
+                        ):
+                            with patch.object(
+                                export_module,
+                                "_latest_live_task_request_signal",
+                                return_value={
+                                    "source": "runtime/shared/MIM_TOD_TASK_REQUEST.latest.json",
+                                    "objective": "2912",
+                                    "task_id": "objective-2912-task-008",
+                                    "available": True,
+                                    "source_service": "continuous_task_dispatch",
+                                    "title": "Continuous dispatch sample 8",
+                                    "scope": "Execute one standard MIM->TOD loop cycle and publish ACK/RESULT.",
+                                    "objective_authority_eligible": False,
+                                    "suppression_reason": "non_authoritative_continuous_dispatch_loop",
+                                },
+                            ):
+                                with patch.object(export_module, "_fetch_json", side_effect=fake_fetch):
+                                    payload, _ = export_module.build_payload_bundle()
+
+        self.assertEqual(payload["objective_in_flight"], "2900")
+        self.assertEqual(payload["objective_active"], "2900")
+        self.assertEqual(payload["current_next_objective"], "2900")
+        self.assertEqual(
+            payload["source_of_truth"]["objective_active_source"],
+            "formal_program_truth",
+        )
+        self.assertFalse(
+            payload["source_of_truth"]["live_task_request_signal"]["objective_authority_eligible"]
+        )
+        self.assertEqual(
+            payload["source_of_truth"]["live_task_request_signal"]["suppression_reason"],
+            "non_authoritative_continuous_dispatch_loop",
         )
 
     def test_build_payload_bundle_honors_objective_authority_reset_ceiling(self) -> None:
@@ -353,6 +447,213 @@ class Objective75InterfaceHardeningTest(unittest.TestCase):
         )
         self.assertEqual(manifest["release_tag"], "objective-152")
 
+    def test_build_payload_bundle_skips_boundary_reset_for_completed_promotion_ready_request(self) -> None:
+        export_module = load_export_module()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            shared_dir = Path(tmp_dir)
+            boundary_path = shared_dir / "MIM_TOD_PUBLICATION_BOUNDARY.latest.json"
+            boundary_path.write_text(
+                json.dumps(
+                    {
+                        "authoritative_request": {
+                            "objective_id": "objective-152",
+                            "request_id": "objective-152-task-smoke-20260418214904",
+                        }
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (shared_dir / "MIM_TASK_STATUS_REVIEW.latest.json").write_text(
+                json.dumps(
+                    {
+                        "state": "completed",
+                        "task": {
+                            "active_task_id": "objective-152-task-smoke-20260418214904",
+                            "authoritative_task_id": "objective-152-task-smoke-20260418214904",
+                            "objective_id": "152",
+                        },
+                        "gate": {"pass": True, "promotion_ready": True},
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            with patch.object(export_module, "DEFAULT_OUTPUT_DIR", shared_dir):
+                with patch.object(
+                    export_module,
+                    "_parse_objective_index",
+                    return_value=(
+                        "152",
+                        "promoted_verified",
+                        "170",
+                        "implemented",
+                        "153",
+                        "implemented",
+                    ),
+                ):
+                    with patch.object(
+                        export_module,
+                        "_parse_objective_docs",
+                        return_value=(
+                            "152",
+                            "promoted_verified",
+                            "170",
+                            "implemented",
+                            "implemented",
+                        ),
+                    ):
+                        with patch.object(
+                            export_module,
+                            "_latest_live_task_request_signal",
+                            return_value={
+                                "source": "runtime/shared/MIM_TOD_TASK_REQUEST.latest.json",
+                                "objective": "152",
+                                "task_id": "objective-152-task-smoke-20260418214904",
+                                "available": True,
+                            },
+                        ):
+                            with patch.object(
+                                export_module,
+                                "_fetch_json",
+                                return_value={"status": "ok"},
+                            ):
+                                payload, _ = export_module.build_payload_bundle(
+                                    output_dir=shared_dir
+                                )
+
+        self.assertEqual(payload["objective_active"], "153")
+        self.assertEqual(payload["current_next_objective"], "153")
+        self.assertIsNone(payload["source_of_truth"]["objective_authority_reset"])
+        self.assertTrue(
+            payload["source_of_truth"]["live_task_request_signal"]["terminal_completed_request"]
+        )
+        self.assertEqual(
+            payload["source_of_truth"]["terminal_request_review"]["reason"],
+            "completed_gate_passing_request",
+        )
+
+    def test_build_payload_bundle_suppresses_completed_request_when_stale_guard_has_newer_objective(
+        self,
+    ) -> None:
+        export_module = load_export_module()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            shared_dir = Path(tmp_dir)
+            (shared_dir / "MIM_TASK_STATUS_REVIEW.latest.json").write_text(
+                json.dumps(
+                    {
+                        "state": "completed",
+                        "task": {
+                            "active_task_id": "objective-216-task-008",
+                            "request_task_id": "objective-216-task-008",
+                            "objective_id": "216",
+                        },
+                        "gate": {"pass": True, "promotion_ready": True},
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (shared_dir / "TOD_MIM_COMMAND_STATUS.latest.json").write_text(
+                json.dumps(
+                    {
+                        "request_id": "objective-216-task-008",
+                        "task_id": "objective-216-task-008",
+                        "stale_guard": {
+                            "detected": True,
+                            "decision": "stale_request_ignored",
+                            "reason": "higher_authoritative_task_ordinal_active",
+                            "objective_id": "220",
+                            "current_request": {
+                                "request_id": "objective-220-task-008",
+                                "task_id": "objective-220-task-008",
+                            },
+                        },
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            with patch.object(
+                export_module,
+                "_parse_objective_index",
+                return_value=(
+                    "152",
+                    "promoted_verified",
+                    "153",
+                    "implemented",
+                    "153",
+                    "implemented",
+                ),
+            ):
+                with patch.object(
+                    export_module,
+                    "_parse_objective_docs",
+                    return_value=(
+                        "152",
+                        "promoted_verified",
+                        "153",
+                        "implemented",
+                        "implemented",
+                    ),
+                ):
+                    with patch.object(
+                        export_module,
+                        "_latest_live_task_request_signal",
+                        return_value={
+                            "source": "runtime/shared/MIM_TOD_TASK_REQUEST.latest.json",
+                            "objective": "216",
+                            "task_id": "objective-216-task-008",
+                            "available": True,
+                        },
+                    ):
+                        with patch.object(
+                            export_module,
+                            "_active_formal_program_truth",
+                            return_value={
+                                "objective": "200",
+                                "execution_state": "executing",
+                                "source": "runtime/formal_program_drive_response.json",
+                            },
+                        ):
+                            with patch.object(
+                                export_module,
+                                "_live_initiative_truth",
+                                return_value=None,
+                            ):
+                                with patch.object(
+                                    export_module,
+                                    "_fetch_json",
+                                    return_value={"status": "ok"},
+                                ):
+                                    payload, _ = export_module.build_payload_bundle(
+                                        output_dir=shared_dir
+                                    )
+
+        self.assertEqual(payload["objective_active"], "220")
+        self.assertEqual(payload["current_next_objective"], "220")
+        self.assertEqual(
+            payload["source_of_truth"]["objective_active_source"],
+            "command_status_stale_guard",
+        )
+        self.assertTrue(
+            payload["source_of_truth"]["live_task_request_signal"]["terminal_completed_request"]
+        )
+        self.assertEqual(
+            payload["source_of_truth"]["live_task_request_signal"]["authoritative_objective"],
+            "220",
+        )
+        self.assertEqual(
+            payload["source_of_truth"]["terminal_request_review"]["reason"],
+            "stale_guard_higher_authoritative_request",
+        )
+
     def test_build_payload_bundle_prefers_output_dir_over_fallback_authority_reset(self) -> None:
         export_module = load_export_module()
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -404,12 +705,42 @@ class Objective75InterfaceHardeningTest(unittest.TestCase):
                     ):
                         with patch.object(
                             export_module,
-                            "_fetch_json",
-                            return_value={"status": "ok"},
+                            "_latest_live_task_request_signal",
+                            return_value={
+                                "source": "runtime/shared/MIM_TOD_TASK_REQUEST.latest.json",
+                                "objective": None,
+                                "task_id": "",
+                                "available": False,
+                            },
                         ):
-                            payload, _ = export_module.build_payload_bundle(
-                                output_dir=output_dir
-                            )
+                            with patch.object(
+                                export_module,
+                                "_live_initiative_truth",
+                                return_value=None,
+                            ):
+                                with patch.object(
+                                    export_module,
+                                    "_latest_live_task_request_signal",
+                                    return_value={
+                                        "source": "runtime/shared/MIM_TOD_TASK_REQUEST.latest.json",
+                                        "objective": None,
+                                        "task_id": "",
+                                        "available": False,
+                                    },
+                                ):
+                                    with patch.object(
+                                        export_module,
+                                        "_live_initiative_truth",
+                                        return_value=None,
+                                    ):
+                                        with patch.object(
+                                            export_module,
+                                            "_fetch_json",
+                                            return_value={"status": "ok"},
+                                        ):
+                                            payload, _ = export_module.build_payload_bundle(
+                                                output_dir=output_dir
+                                            )
 
         self.assertEqual(payload["objective_active"], "170")
         self.assertEqual(payload["current_next_objective"], "170")
@@ -417,6 +748,80 @@ class Objective75InterfaceHardeningTest(unittest.TestCase):
             payload["source_of_truth"]["objective_active_source"],
             "objective_index_or_docs",
         )
+        self.assertIsNone(payload["source_of_truth"]["objective_authority_reset"])
+
+    def test_build_payload_bundle_ignores_inactive_authority_reset_metadata(self) -> None:
+        export_module = load_export_module()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            output_dir = Path(tmp_dir) / "shared"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            isolated_formal_response = Path(tmp_dir) / "missing_formal_program_drive_response.json"
+
+            (output_dir / "OBJECTIVE_AUTHORITY_RESET.latest.json").write_text(
+                json.dumps(
+                    {
+                        "active": False,
+                        "authoritative_objective": "216",
+                        "metadata": {
+                            "rollback_to_objective": "216",
+                        },
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            with patch.dict(os.environ, {"FORMAL_PROGRAM_RESPONSE_PATH": str(isolated_formal_response)}):
+                with patch.object(
+                    export_module,
+                    "_parse_objective_index",
+                    return_value=(
+                        "152",
+                        "promoted_verified",
+                        "170",
+                        "implemented",
+                        "171",
+                        "implemented",
+                    ),
+                ):
+                    with patch.object(
+                        export_module,
+                        "_parse_objective_docs",
+                        return_value=(
+                            "152",
+                            "promoted_verified",
+                            "170",
+                            "implemented",
+                            "implemented",
+                        ),
+                    ):
+                        with patch.object(
+                            export_module,
+                            "_latest_live_task_request_signal",
+                            return_value={
+                                "source": "runtime/shared/MIM_TOD_TASK_REQUEST.latest.json",
+                                "objective": None,
+                                "task_id": "",
+                                "available": False,
+                            },
+                        ):
+                            with patch.object(
+                                export_module,
+                                "_live_initiative_truth",
+                                return_value=None,
+                            ):
+                                with patch.object(
+                                    export_module,
+                                    "_fetch_json",
+                                    return_value={"status": "ok"},
+                                ):
+                                    payload, _ = export_module.build_payload_bundle(
+                                        output_dir=output_dir
+                                    )
+
+        self.assertEqual(payload["objective_active"], "170")
+        self.assertEqual(payload["current_next_objective"], "170")
         self.assertIsNone(payload["source_of_truth"]["objective_authority_reset"])
 
     def test_build_payload_bundle_overrides_stale_runtime_schema_with_static_schema(self) -> None:
