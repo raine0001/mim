@@ -124,6 +124,29 @@ class TodTaskStatusReviewTest(unittest.TestCase):
         self.assertEqual(summary["highest_severity"], "none")
         self.assertEqual(summary["alerts"], [])
 
+    def test_build_system_alert_summary_ignores_stale_ack_watchdog_history(self) -> None:
+        module = load_module()
+        now = datetime(2026, 4, 20, 20, 57, tzinfo=timezone.utc)
+        summary = module.build_system_alert_summary(
+            stale_ack_watchdog={
+                "generated_at": iso_utc(now - timedelta(days=17)),
+                "status": "alert",
+                "reason": "consecutive_stale_trigger_ack_failures",
+                "task_num": "3422",
+                "consecutive_stale_failures": 2,
+            },
+            catchup_status={
+                "catchup_gate_pass": True,
+                "publisher_warning": {"active": False},
+            },
+            liveness_events=[],
+            now=now,
+        )
+
+        self.assertFalse(bool(summary["active"]))
+        self.assertEqual(summary["highest_severity"], "none")
+        self.assertEqual(summary["alerts"], [])
+
     def test_build_task_status_review_detects_idle_bridge_stall(self) -> None:
         module = load_module()
         now = datetime(2026, 3, 30, 16, 20, tzinfo=timezone.utc)
@@ -278,6 +301,178 @@ class TodTaskStatusReviewTest(unittest.TestCase):
         )
         self.assertIn("catchup_gate_blocked", review["blocking_reason_codes"])
         self.assertIn("system_alert_critical", review["blocking_reason_codes"])
+
+    def test_build_task_status_review_same_objective_task_mismatch_stays_dispatch_blocked(self) -> None:
+        module = load_module()
+        now = datetime(2026, 5, 5, 12, 0, tzinfo=timezone.utc)
+        review = module.build_task_status_review(
+            task_request={
+                "generated_at": iso_utc(now - timedelta(minutes=8)),
+                "task_id": "objective-290-task-1001",
+                "request_id": "objective-290-task-1001-request",
+                "objective_id": "objective-290",
+            },
+            trigger={
+                "generated_at": iso_utc(now - timedelta(minutes=8)),
+                "trigger": "task_request_posted",
+                "task_id": "objective-290-task-2002",
+                "objective_id": "objective-290",
+            },
+            trigger_ack={
+                "generated_at": iso_utc(now - timedelta(minutes=7)),
+                "task_id": "objective-290-task-2002",
+            },
+            task_ack={
+                "generated_at": iso_utc(now - timedelta(minutes=6)),
+                "request_id": "objective-290-task-2002",
+                "objective_id": "objective-290",
+                "status": "accepted",
+            },
+            task_result={
+                "generated_at": iso_utc(now - timedelta(minutes=5)),
+                "request_id": "objective-290-task-2002",
+                "task_id": "objective-290-task-2002",
+                "objective_id": "objective-290",
+                "status": "completed",
+                "bridge_runtime": {
+                    "current_processing": {
+                        "task_id": "objective-290-task-2002",
+                    }
+                },
+            },
+            catchup_gate={"promotion_ready": True, "gate_pass": True},
+            troubleshooting_authority={
+                "authority": {
+                    "mim": {"permissions": ["read", "write"]},
+                    "tod": {"permissions": ["read", "write"]},
+                },
+                "enforcement": {"access_failure_action": "allow", "reason_code": ""},
+            },
+            persistent_task={
+                "task_id": "objective-290-task-1001",
+                "objective_id": "objective-290",
+                "status": "queued",
+            },
+            system_alert_summary={"active": False, "highest_severity": "none", "primary_alert": {}},
+            idle_seconds=120,
+            now=now,
+        )
+
+        self.assertEqual(review["state"], "dispatch_blocked")
+        self.assertEqual(review["task"]["active_task_id"], "objective-290-task-1001")
+        self.assertTrue(review["task"]["same_objective_task_mismatch"])
+        self.assertNotEqual(review["state"], "idle_blocked")
+        self.assertNotEqual(review["state"], "completed")
+        self.assertIn("task_stream_drift", review["blocking_reason_codes"])
+        self.assertIn("task_result_request_mismatch", review["blocking_reason_codes"])
+
+    def test_build_task_status_review_same_objective_result_mismatch_stays_dispatch_blocked(self) -> None:
+        module = load_module()
+        now = datetime(2026, 5, 5, 12, 15, tzinfo=timezone.utc)
+        review = module.build_task_status_review(
+            task_request={
+                "generated_at": iso_utc(now - timedelta(minutes=7)),
+                "task_id": "objective-291-task-1001",
+                "request_id": "objective-291-task-1001-request",
+                "objective_id": "objective-291",
+            },
+            trigger={
+                "generated_at": iso_utc(now - timedelta(minutes=7)),
+                "trigger": "task_request_posted",
+                "task_id": "objective-291-task-1001",
+                "objective_id": "objective-291",
+            },
+            trigger_ack=None,
+            task_ack=None,
+            task_result={
+                "generated_at": iso_utc(now - timedelta(minutes=6)),
+                "request_id": "objective-291-task-2002",
+                "task_id": "objective-291-task-2002",
+                "objective_id": "objective-291",
+                "status": "completed",
+                "bridge_runtime": {
+                    "current_processing": {
+                        "task_id": "objective-291-task-2002",
+                    }
+                },
+            },
+            catchup_gate={"promotion_ready": True, "gate_pass": True},
+            troubleshooting_authority={
+                "authority": {
+                    "mim": {"permissions": ["read", "write"]},
+                    "tod": {"permissions": ["read", "write"]},
+                },
+                "enforcement": {"access_failure_action": "allow", "reason_code": ""},
+            },
+            persistent_task={
+                "task_id": "objective-291-task-1001",
+                "objective_id": "objective-291",
+                "status": "queued",
+            },
+            system_alert_summary={"active": False, "highest_severity": "none", "primary_alert": {}},
+            idle_seconds=120,
+            now=now,
+        )
+
+        self.assertEqual(review["state"], "dispatch_blocked")
+        self.assertEqual(review["task"]["active_task_id"], "objective-291-task-1001")
+        self.assertTrue(review["task"]["same_objective_task_mismatch"])
+        self.assertNotEqual(review["state"], "idle_blocked")
+        self.assertNotEqual(review["state"], "completed")
+        self.assertIn("task_result_request_mismatch", review["blocking_reason_codes"])
+
+    def test_build_task_status_review_wrapper_only_result_stays_dispatch_blocked(self) -> None:
+        module = load_module()
+        now = datetime(2026, 5, 5, 12, 30, tzinfo=timezone.utc)
+        review = module.build_task_status_review(
+            task_request={
+                "generated_at": iso_utc(now - timedelta(minutes=7)),
+                "task_id": "objective-292-task-1001",
+                "request_id": "objective-292-task-1001-request",
+                "objective_id": "objective-292",
+            },
+            trigger={
+                "generated_at": iso_utc(now - timedelta(minutes=7)),
+                "trigger": "task_request_posted",
+                "task_id": "objective-292-task-1001",
+                "objective_id": "objective-292",
+            },
+            trigger_ack=None,
+            task_ack=None,
+            task_result={
+                "generated_at": iso_utc(now - timedelta(minutes=6)),
+                "request_id": "wrapper-1001",
+                "status": "completed",
+                "bridge_runtime": {
+                    "current_processing": {
+                        "task_id": "",
+                        "request_id": "wrapper-1001",
+                    }
+                },
+            },
+            catchup_gate={"promotion_ready": True, "gate_pass": True},
+            troubleshooting_authority={
+                "authority": {
+                    "mim": {"permissions": ["read", "write"]},
+                    "tod": {"permissions": ["read", "write"]},
+                },
+                "enforcement": {"access_failure_action": "allow", "reason_code": ""},
+            },
+            persistent_task={
+                "task_id": "objective-292-task-1001",
+                "objective_id": "objective-292",
+                "status": "queued",
+            },
+            system_alert_summary={"active": False, "highest_severity": "none", "primary_alert": {}},
+            idle_seconds=120,
+            now=now,
+        )
+
+        self.assertEqual(review["state"], "dispatch_blocked")
+        self.assertEqual(review["task"]["active_task_id"], "objective-292-task-1001")
+        self.assertNotEqual(review["state"], "idle_blocked")
+        self.assertNotEqual(review["state"], "completed")
+        self.assertIn("task_result_request_mismatch", review["blocking_reason_codes"])
 
     def test_build_task_status_review_avoids_false_trigger_ack_bridge_recovery_after_authoritative_completion(self) -> None:
         module = load_module()
@@ -449,12 +644,156 @@ class TodTaskStatusReviewTest(unittest.TestCase):
         self.assertNotIn("trigger_ack_not_current", review["blocking_reason_codes"])
         self.assertNotIn("task_ack_request_mismatch", review["blocking_reason_codes"])
         self.assertNotIn("task_result_request_mismatch", review["blocking_reason_codes"])
+
+    def test_build_task_status_review_accepts_distinct_handoff_request_id_when_task_id_matches(self) -> None:
+        module = load_module()
+        now = datetime(2026, 5, 2, 19, 4, tzinfo=timezone.utc)
+        review = module.build_task_status_review(
+            task_request={
+                "generated_at": iso_utc(now - timedelta(minutes=30)),
+                "request_id": "mim-day-02-live-resume-refresh-20260502",
+                "task_id": "objective-2900-task-7117",
+                "objective_id": "objective-2900",
+            },
+            trigger={},
+            trigger_ack={},
+            task_ack={
+                "generated_at": iso_utc(now - timedelta(minutes=2)),
+                "request_id": "mim-day-02-live-resume-refresh-20260502",
+                "task_id": "objective-2900-task-7117",
+                "status": "accepted",
+            },
+            task_result={
+                "generated_at": iso_utc(now - timedelta(seconds=10)),
+                "request_id": "mim-day-02-live-resume-refresh-20260502",
+                "task_id": "objective-2900-task-7117",
+                "status": "failed",
+                "result_status": "failed",
+                "bridge_runtime": {
+                    "current_processing": {
+                        "task_id": "objective-2900-task-7117",
+                    }
+                },
+            },
+            catchup_gate={"gate_pass": True},
+            troubleshooting_authority={
+                "authority": {
+                    "mim": {"permissions": ["read", "write"]},
+                    "tod": {"permissions": ["read", "write"]},
+                },
+                "enforcement": {"access_failure_action": "allow", "reason_code": ""},
+            },
+            persistent_task={},
+            system_alert_summary={"active": False, "highest_severity": "none", "primary_alert": {}},
+            idle_seconds=120,
+            now=now,
+        )
+
+        self.assertEqual(review["state"], "failed")
+        self.assertEqual(review["task"]["active_task_id"], "objective-2900-task-7117")
+        self.assertEqual(review["task"]["request_request_id"], "mim-day-02-live-resume-refresh-20260502")
+        self.assertEqual(review["task"]["result_request_id"], "mim-day-02-live-resume-refresh-20260502")
+        self.assertEqual(review["task"]["result_task_id"], "objective-2900-task-7117")
+        self.assertNotIn("task_result_request_mismatch", review["blocking_reason_codes"])
         self.assertNotIn("system_alert_critical", review["blocking_reason_codes"])
         action_codes = [item["code"] for item in review["pending_actions"]]
         self.assertIn("remediate_tod_executor_failure", action_codes)
         self.assertNotIn("stabilize_task_stream", action_codes)
         self.assertNotIn("reissue_task_with_matching_ack", action_codes)
         self.assertNotIn("reissue_task_with_matching_result", action_codes)
+
+    def test_build_task_status_review_ignores_non_current_terminal_result_for_active_task(self) -> None:
+        module = load_module()
+        now = datetime(2026, 5, 4, 18, 1, tzinfo=timezone.utc)
+        review = module.build_task_status_review(
+            task_request={
+                "generated_at": iso_utc(now - timedelta(minutes=13)),
+                "request_id": "objective-2913-task-7144-project-3-task-2-patch-token-extraction-so-only-the-identifier-value-is-captured",
+                "task_id": "objective-2913-task-7144",
+                "objective_id": "objective-2913",
+            },
+            trigger={},
+            trigger_ack={},
+            task_ack={},
+            task_result={
+                "generated_at": iso_utc(now - timedelta(seconds=20)),
+                "request_id": "objective-2913-task-7144-project-3-task-2-patch-token-extraction-so-only-the-identifier-value-is-captured",
+                "task_id": "objective-2913-task-7144",
+                "status": "failed",
+                "result_status": "failed",
+                "result_reason_code": "executor_failed",
+                "bridge_runtime": {
+                    "current_processing": {
+                        "task_id": "objective-2913-task-7143",
+                    }
+                },
+                "reconciliation": {
+                    "active_task_id": "objective-2913-task-7144",
+                    "existing_task_id": "objective-2913-task-7144",
+                    "review_decision_current": False,
+                    "review_passed": False,
+                    "stale_result_rebound": False,
+                },
+            },
+            catchup_gate={"gate_pass": True},
+            troubleshooting_authority={
+                "authority": {
+                    "mim": {"permissions": ["read", "write"]},
+                    "tod": {"permissions": ["read", "write"]},
+                },
+                "enforcement": {"access_failure_action": "allow", "reason_code": ""},
+            },
+            persistent_task={},
+            system_alert_summary={"active": False, "highest_severity": "none", "primary_alert": {}},
+            idle_seconds=120,
+            now=now,
+        )
+
+        self.assertEqual(review["state"], "queued")
+        self.assertEqual(review["state_reason"], "task_created")
+        self.assertEqual(review["task"]["active_task_id"], "objective-2913-task-7144")
+        self.assertFalse(review["task"]["result_review_current"])
+        self.assertNotIn("executor_failed", review["blocking_reason_codes"])
+
+    def test_build_mim_tod_decision_snapshot_does_not_mark_terminal_for_non_current_result(self) -> None:
+        module = load_module()
+        snapshot = module.build_mim_tod_decision_snapshot(
+            review={
+                "state": "queued",
+                "state_reason": "task_created",
+                "blocking_reason_codes": [],
+                "task": {
+                    "active_task_id": "objective-2913-task-7144",
+                    "objective_id": "objective-2913",
+                    "trigger_name": "",
+                    "trigger_ack_task_id": "",
+                    "request_request_id": "objective-2913-task-7144-project-3-task-2-patch-token-extraction-so-only-the-identifier-value-is-captured",
+                    "task_ack_request_id": "",
+                    "result_request_id": "objective-2913-task-7144-project-3-task-2-patch-token-extraction-so-only-the-identifier-value-is-captured",
+                    "result_task_id": "objective-2913-task-7144",
+                    "result_review_current": False,
+                },
+                "idle": {
+                    "active": False,
+                    "latest_progress_age_seconds": 17,
+                    "emergency_active": False,
+                    "direct_execution_ready": False,
+                },
+            },
+            next_action={},
+            system_alert_summary={"highest_severity": "none", "primary_alert": {}},
+            coordination_request={},
+            coordination_ack={},
+            ping_response={},
+            console_probe={},
+            now=datetime(2026, 5, 4, 18, 1, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(snapshot["questions"]["tod_liveness"]["status"], "alive")
+        self.assertNotIn(
+            "tod_task_result_current",
+            snapshot["questions"]["mim_knows_what_tod_did"]["evidence"],
+        )
 
     def test_build_task_status_review_does_not_block_on_trigger_drift_after_request_cleanup(self) -> None:
         module = load_module()
@@ -794,6 +1133,215 @@ class TodTaskStatusReviewTest(unittest.TestCase):
         self.assertEqual(review["state"], "awaiting_task_ack")
         self.assertEqual(review["task"]["trigger_ack_task_id"], active_task_id)
         self.assertNotIn("trigger_ack_not_current", review["blocking_reason_codes"])
+
+    def test_build_task_status_review_prefers_trigger_ack_current_task_id_over_acknowledges_request_id(self) -> None:
+        module = load_module()
+        now = datetime(2026, 5, 4, 18, 7, 13, tzinfo=timezone.utc)
+        active_task_id = "objective-2913-task-7144"
+        request_id = "objective-2913-task-7144-project-3-task-2-patch-token-extraction-so-only-the-identifier-value-is-captured"
+        review = module.build_task_status_review(
+            task_request={
+                "generated_at": iso_utc(now - timedelta(seconds=45)),
+                "task_id": active_task_id,
+                "request_id": request_id,
+                "objective_id": "objective-2913",
+            },
+            trigger={
+                "generated_at": iso_utc(now - timedelta(seconds=40)),
+                "trigger": "task_request_posted",
+                "task_id": active_task_id,
+                "objective_id": "objective-2913",
+            },
+            trigger_ack={
+                "generated_at": iso_utc(now - timedelta(seconds=8)),
+                "source": "shared-trigger-ack-v1",
+                "status": "acknowledged",
+                "acknowledges": request_id,
+                "current_task_id": active_task_id,
+                "trigger_context": {
+                    "task_id": active_task_id,
+                    "request_id": request_id,
+                },
+                "bridge_runtime": {
+                    "current_processing": {
+                        "task_id": active_task_id,
+                    }
+                },
+            },
+            task_ack={
+                "generated_at": iso_utc(now - timedelta(hours=2)),
+                "request_id": "objective-2913-task-7143-project-3-task-1-inspect-initiative-parsing-logic-for-initiative-id-objective-id-title-goal-extraction",
+                "task_id": "objective-2913-task-7143",
+                "status": "accepted",
+            },
+            task_result=None,
+            catchup_gate={
+                "generated_at": iso_utc(now - timedelta(seconds=10)),
+                "promotion_ready": True,
+                "gate_pass": True,
+            },
+            troubleshooting_authority={
+                "authority": {
+                    "mim": {"permissions": ["read", "write"]},
+                    "tod": {"permissions": ["read", "write"]},
+                },
+                "enforcement": {
+                    "access_failure_action": "no_go",
+                    "reason_code": "troubleshooting_access_denied",
+                },
+            },
+            persistent_task={},
+            system_alert_summary={
+                "active": False,
+                "highest_severity": "none",
+                "primary_alert": {},
+            },
+            idle_seconds=120,
+            now=now,
+        )
+
+        self.assertEqual(review["state"], "awaiting_task_ack")
+        self.assertEqual(review["task"]["trigger_ack_task_id"], active_task_id)
+        self.assertNotIn("trigger_ack_not_current", review["blocking_reason_codes"])
+        self.assertNotIn("task_ack_request_mismatch", review["blocking_reason_codes"])
+
+    def test_build_task_status_review_does_not_treat_non_authoritative_result_as_current_progress(self) -> None:
+        module = load_module()
+        now = datetime(2026, 5, 4, 20, 19, 4, tzinfo=timezone.utc)
+        active_task_id = "objective-2913-task-7144"
+        request_id = (
+            "objective-2913-task-7144-project-3-task-2-patch-token-extraction-"
+            "so-only-the-identifier-value-is-captured"
+        )
+        review = module.build_task_status_review(
+            task_request={
+                "generated_at": iso_utc(now - timedelta(seconds=820)),
+                "task_id": active_task_id,
+                "request_id": request_id,
+                "objective_id": "objective-2913",
+            },
+            trigger={
+                "generated_at": iso_utc(now - timedelta(seconds=819)),
+                "trigger": "task_request_posted",
+                "task_id": active_task_id,
+                "objective_id": "objective-2913",
+            },
+            trigger_ack={
+                "generated_at": iso_utc(now - timedelta(seconds=782)),
+                "source": "shared-trigger-ack-v1",
+                "status": "acknowledged",
+                "acknowledges": active_task_id,
+                "current_task_id": active_task_id,
+                "trigger_context": {
+                    "task_id": active_task_id,
+                    "request_id": request_id,
+                },
+                "bridge_runtime": {
+                    "current_processing": {
+                        "task_id": active_task_id,
+                    }
+                },
+            },
+            task_ack={
+                "generated_at": iso_utc(now - timedelta(seconds=15000)),
+                "request_id": "objective-2913-task-7143-project-3-task-1-inspect-initiative-parsing-logic-for-initiative-id-objective-id-title-goal-extraction",
+                "task_id": "objective-2913-task-7143",
+                "status": "accepted",
+            },
+            task_result={
+                "generated_at": iso_utc(now - timedelta(seconds=21)),
+                "request_id": request_id,
+                "task_id": active_task_id,
+                "status": "failed",
+                "result_status": "failed",
+                "bridge_runtime": {
+                    "current_processing": {
+                        "task_id": "objective-2913-task-7143",
+                    }
+                },
+            },
+            catchup_gate={
+                "generated_at": iso_utc(now - timedelta(seconds=10)),
+                "promotion_ready": True,
+                "gate_pass": True,
+            },
+            troubleshooting_authority={
+                "authority": {
+                    "mim": {"permissions": ["read", "write"]},
+                    "tod": {"permissions": ["read", "write"]},
+                },
+                "enforcement": {
+                    "access_failure_action": "no_go",
+                    "reason_code": "troubleshooting_access_denied",
+                },
+            },
+            persistent_task={},
+            system_alert_summary={
+                "active": False,
+                "highest_severity": "none",
+                "primary_alert": {},
+            },
+            idle_seconds=120,
+            now=now,
+        )
+
+        self.assertEqual(review["state"], "idle_blocked")
+        self.assertEqual(review["state_reason"], "tod_silence_emergency")
+        self.assertEqual(review["idle"]["latest_progress_age_seconds"], 782)
+        self.assertTrue(bool(review["idle"]["emergency_active"]))
+        self.assertIn("tod_silence_emergency", review["blocking_reason_codes"])
+
+    def test_build_mim_tod_decision_snapshot_escalates_prolonged_current_task_ack_wait(self) -> None:
+        module = load_module()
+        now = datetime(2026, 5, 4, 20, 19, 4, tzinfo=timezone.utc)
+        snapshot = module.build_mim_tod_decision_snapshot(
+            review={
+                "generated_at": iso_utc(now),
+                "state": "idle_blocked",
+                "state_reason": "tod_silence_emergency",
+                "blocking_reason_codes": ["tod_silence_emergency"],
+                "task": {
+                    "active_task_id": "objective-2913-task-7144",
+                    "objective_id": "objective-2913",
+                    "trigger_name": "task_request_posted",
+                    "trigger_ack_task_id": "objective-2913-task-7144",
+                    "task_ack_request_id": "objective-2913-task-7143-project-3-task-1-inspect-initiative-parsing-logic-for-initiative-id-objective-id-title-goal-extraction",
+                    "result_request_id": "objective-2913-task-7144-project-3-task-2-patch-token-extraction-so-only-the-identifier-value-is-captured",
+                },
+                "idle": {
+                    "active": True,
+                    "latest_progress_age_seconds": 782,
+                    "emergency_active": True,
+                    "emergency_threshold_seconds": 60,
+                    "direct_execution_ready": True,
+                    "direct_execution_threshold_seconds": 120,
+                },
+            },
+            next_action={
+                "selected_action": {
+                    "code": "declare_tod_emergency",
+                    "detail": "Escalate the lane as an emergency.",
+                }
+            },
+            system_alert_summary={
+                "highest_severity": "none",
+                "primary_alert": {},
+            },
+            coordination_request={
+                "request_id": "objective-2913-task-7144",
+            },
+            coordination_ack=None,
+            ping_response=None,
+            console_probe=None,
+            now=now,
+        )
+
+        self.assertEqual(snapshot["questions"]["tod_liveness"]["status"], "direct_execution_ready")
+        self.assertTrue(bool(snapshot["communication_escalation"]["required"]))
+        self.assertEqual(
+            snapshot["communication_escalation"]["code"],
+            "fallback_to_codex_direct_execution",
+        )
 
     def test_build_task_status_review_clears_stale_trigger_alert_after_current_lane_success(self) -> None:
         module = load_module()
@@ -1348,6 +1896,177 @@ class TodTaskStatusReviewTest(unittest.TestCase):
             )
             self.assertEqual(review["task"]["objective_id"], "115")
 
+    def test_watch_tod_task_status_review_refreshes_alignment_from_formal_program_state(self) -> None:
+        now = datetime.now(timezone.utc)
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            shared_dir = root / "shared"
+            log_dir = root / "logs"
+            task_state_file = root / "tasks.json"
+            formal_program_file = root / "formal_program_drive_response.json"
+            shared_dir.mkdir(parents=True, exist_ok=True)
+            log_dir.mkdir(parents=True, exist_ok=True)
+
+            (shared_dir / "MIM_TOD_TASK_REQUEST.latest.json").write_text(
+                json.dumps(
+                    {
+                        "generated_at": iso_utc(now - timedelta(minutes=30)),
+                        "task_id": "objective-152-task-008",
+                        "objective_id": "objective-152",
+                        "request_id": "objective-152-task-008",
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (shared_dir / "TOD_MIM_TASK_RESULT.latest.json").write_text(
+                json.dumps(
+                    {
+                        "generated_at": iso_utc(now - timedelta(seconds=10)),
+                        "task_id": "objective-152-task-008",
+                        "request_id": "objective-152-task-008",
+                        "status": "succeeded",
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (shared_dir / "TOD_CATCHUP_GATE.latest.json").write_text(
+                json.dumps(
+                    {
+                        "generated_at": iso_utc(now - timedelta(seconds=20)),
+                        "promotion_ready": True,
+                        "gate_pass": True,
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (shared_dir / "MIM_TOD_TROUBLESHOOTING_AUTHORITY.latest.json").write_text(
+                json.dumps(
+                    {
+                        "authority": {
+                            "mim": {"permissions": ["read", "write"]},
+                            "tod": {"permissions": ["read", "write"]},
+                        },
+                        "enforcement": {
+                            "access_failure_action": "no_go",
+                            "reason_code": "troubleshooting_access_denied",
+                        },
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (shared_dir / "MIM_CONTEXT_EXPORT.latest.json").write_text(
+                json.dumps(
+                    {
+                        "objective_active": "153",
+                        "objective_in_flight": "153",
+                        "current_next_objective": "153",
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (shared_dir / "TOD_INTEGRATION_STATUS.latest.json").write_text(
+                json.dumps(
+                    {
+                        "objective_alignment": {
+                            "status": "in_sync",
+                            "tod_current_objective": "153",
+                            "mim_objective_active": "153",
+                        }
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            formal_program_file.write_text(
+                json.dumps(
+                    {
+                        "generated_at": iso_utc(now - timedelta(minutes=1)),
+                        "execution_state": "executing",
+                        "objective": {
+                            "objective_id": 216,
+                            "status": "in_progress",
+                        },
+                        "continuation": {
+                            "status": {
+                                "active_task": {
+                                    "task_id": 1719,
+                                    "objective_id": 216,
+                                    "title": "Project 1 task 1: Inspect current completion conditions",
+                                },
+                                "active_project": {
+                                    "project_id": "MIM-DAY-01-EXECUTION-BOUND-COMPLETION",
+                                    "status": "executing",
+                                },
+                            }
+                        },
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            task_state_file.write_text(
+                json.dumps(
+                    {
+                        "task_id": "objective-152-task-008",
+                        "objective_id": 152,
+                        "status": "completed",
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            completed = subprocess.run(
+                ["bash", str(WATCH_SCRIPT)],
+                cwd=ROOT,
+                env={
+                    **os.environ,
+                    "SHARED_DIR": str(shared_dir),
+                    "LOG_DIR": str(log_dir),
+                    "TASK_STATE_FILE": str(task_state_file),
+                    "RUN_ONCE": "1",
+                    "AUTO_REFRESH_ALIGNMENT": "1",
+                    "FORMAL_PROGRAM_RESPONSE_FILE": str(formal_program_file),
+                    "FORMAL_PROGRAM_RESPONSE_PATH": str(formal_program_file),
+                },
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+
+            context_export = json.loads(
+                (shared_dir / "MIM_CONTEXT_EXPORT.latest.json").read_text(encoding="utf-8")
+            )
+            integration = json.loads(
+                (shared_dir / "TOD_INTEGRATION_STATUS.latest.json").read_text(encoding="utf-8")
+            )
+            review = json.loads(
+                (shared_dir / "MIM_TASK_STATUS_REVIEW.latest.json").read_text(encoding="utf-8")
+            )
+
+            self.assertEqual(str(context_export["objective_active"]), "216")
+            self.assertEqual(
+                str(integration["objective_alignment"]["mim_objective_active"]),
+                "216",
+            )
+            self.assertEqual(review["task"]["objective_id"], "216")
+            self.assertEqual(review["state"], "working")
+            self.assertTrue(review["formal_program"]["override_applied"])
+
     def test_watch_tod_task_status_review_clears_stale_trigger_alert_after_current_success(self) -> None:
         now = datetime.now(timezone.utc)
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -1524,6 +2243,195 @@ class TodTaskStatusReviewTest(unittest.TestCase):
             self.assertEqual(review["system_alerts"]["highest_severity"], "none")
             self.assertFalse(bool(next_action["escalation_recommended"]))
             self.assertEqual(next_action["selected_action"]["code"], "monitor_only")
+
+    def test_watch_tod_task_status_review_escalates_publisher_objective_mismatch(self) -> None:
+        now = datetime.now(timezone.utc)
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            shared_dir = root / "shared"
+            log_dir = root / "logs"
+            task_state_file = root / "tasks.json"
+            shared_dir.mkdir(parents=True, exist_ok=True)
+            log_dir.mkdir(parents=True, exist_ok=True)
+
+            (shared_dir / "MIM_TOD_TASK_REQUEST.latest.json").write_text(
+                json.dumps(
+                    {
+                        "generated_at": iso_utc(now - timedelta(minutes=20)),
+                        "task_id": "objective-152-task-008",
+                        "objective_id": "objective-152",
+                        "source_service": "objective152_publisher",
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (shared_dir / "MIM_CONTEXT_EXPORT.latest.json").write_text(
+                json.dumps(
+                    {
+                        "generated_at": iso_utc(now - timedelta(minutes=5)),
+                        "objective_active": "216",
+                        "latest_completed_objective": "152",
+                        "current_next_objective": "216",
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (shared_dir / "MIM_CONTEXT_EXPORT.latest.yaml").write_text(
+                "objective_active: '216'\n",
+                encoding="utf-8",
+            )
+            (shared_dir / "MIM_MANIFEST.latest.json").write_text(
+                json.dumps(
+                    {
+                        "manifest": {
+                            "schema_version": "2026-03-24-70",
+                            "release_tag": "objective-216",
+                            "objective_active": "216",
+                        }
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (shared_dir / "MIM_TOD_HANDSHAKE_PACKET.latest.json").write_text(
+                json.dumps(
+                    {
+                        "generated_at": iso_utc(now - timedelta(minutes=5)),
+                        "truth": {
+                            "objective_active": "216",
+                            "current_next_objective": "216",
+                            "latest_completed_objective": "152",
+                            "schema_version": "2026-03-24-70",
+                            "release_tag": "objective-216",
+                        }
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (log_dir / "tod_catchup_status.latest.json").write_text(
+                json.dumps(
+                    {
+                        "catchup_gate_pass": True,
+                        "publisher_warning": {
+                            "active": True,
+                            "code": "publisher_objective_mismatch",
+                            "message": "Canonical objective drift detected.",
+                            "canonical_objective_active": "216",
+                            "live_task_objective": "152",
+                        },
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (shared_dir / "TOD_INTEGRATION_STATUS.latest.json").write_text(
+                json.dumps(
+                    {
+                        "generated_at": iso_utc(now - timedelta(minutes=1)),
+                        "compatible": True,
+                        "mim_refresh": {
+                            "attempted": True,
+                            "copied_json": True,
+                            "copied_yaml": True,
+                            "copied_manifest": True,
+                            "failure_reason": "",
+                            "resolved_source_root": str(shared_dir),
+                        },
+                        "objective_alignment": {
+                            "status": "in_sync",
+                            "tod_current_objective": "152",
+                            "mim_objective_active": "152",
+                        },
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            task_state_file.write_text(json.dumps({}, indent=2) + "\n", encoding="utf-8")
+
+            completed = subprocess.run(
+                ["bash", str(WATCH_SCRIPT)],
+                cwd=ROOT,
+                env={
+                    **os.environ,
+                    "SHARED_DIR": str(shared_dir),
+                    "LOG_DIR": str(log_dir),
+                    "TASK_STATE_FILE": str(task_state_file),
+                    "RUN_ONCE": "1",
+                },
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+
+            system_alerts = json.loads(
+                (shared_dir / "MIM_SYSTEM_ALERTS.latest.json").read_text(encoding="utf-8")
+            )
+            review = json.loads(
+                (shared_dir / "MIM_TASK_STATUS_REVIEW.latest.json").read_text(encoding="utf-8")
+            )
+            next_action = json.loads(
+                (shared_dir / "MIM_TASK_STATUS_NEXT_ACTION.latest.json").read_text(encoding="utf-8")
+            )
+
+            self.assertTrue(bool(system_alerts["active"]))
+            self.assertEqual(system_alerts["primary_alert"]["code"], "publisher_objective_mismatch")
+            self.assertIn("publisher_objective_mismatch", review["blocking_reason_codes"])
+            self.assertTrue(bool(next_action["escalation_recommended"]))
+            self.assertEqual(next_action["selected_action"]["code"], "recouple_publisher_objective")
+            self.assertIn("objective 216", next_action["selected_action"]["detail"])
+            self.assertIn("objective 152", next_action["selected_action"]["detail"])
+
+    def test_build_task_status_review_marks_tod_silence_emergency_after_one_minute(self) -> None:
+        module = load_module()
+        now = datetime.now(timezone.utc)
+
+        review = module.build_task_status_review(
+            task_request={
+                "generated_at": iso_utc(now - timedelta(seconds=75)),
+                "task_id": "objective-97-task-bridge-recovery",
+                "objective_id": "objective-97",
+            },
+            trigger={
+                "generated_at": iso_utc(now - timedelta(seconds=75)),
+                "trigger": "task_request_posted",
+                "task_id": "objective-97-task-bridge-recovery",
+                "objective_id": "objective-97",
+            },
+            trigger_ack={},
+            task_ack={},
+            task_result={},
+            catchup_gate={"promotion_ready": True},
+            troubleshooting_authority={
+                "authority": {
+                    "mim": {"permissions": ["read", "write"]},
+                    "tod": {"permissions": ["read", "write"]},
+                },
+                "enforcement": {"access_failure_action": "allow"},
+            },
+            persistent_task={},
+            system_alert_summary={},
+            idle_seconds=60,
+            emergency_timeout_seconds=60,
+            direct_execution_timeout_seconds=120,
+            now=now,
+        )
+
+        self.assertEqual(review["state"], "idle_blocked")
+        self.assertTrue(bool(review["idle"]["emergency_active"]))
+        self.assertFalse(bool(review["idle"]["direct_execution_ready"]))
+        self.assertIn("tod_silence_emergency", review["blocking_reason_codes"])
+        self.assertEqual(review["pending_actions"][-1]["code"], "declare_tod_emergency")
 
 
     def test_watch_tod_task_status_review_ignores_consume_timeout_after_completion(self) -> None:

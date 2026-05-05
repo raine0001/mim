@@ -10,8 +10,11 @@ from pathlib import Path
 TERMINAL_SUCCESS_STATUSES = {"completed", "succeeded", "approved", "done"}
 TERMINAL_FAILURE_STATUSES = {"failed", "blocked", "rejected", "cancelled", "canceled"}
 TERMINAL_RESULT_STATUSES = TERMINAL_SUCCESS_STATUSES | TERMINAL_FAILURE_STATUSES
+FORMAL_PROGRAM_ACTIVE_STATES = {"active", "created", "executing", "in_progress", "queued", "running", "working"}
 ACTIVE_OPERATOR_INCIDENT_PRECEDENCE = "prefer_incident_over_latest"
 NON_TASK_STREAM_TRIGGERS = {"", "liveness_ping", "coordination_ack_posted"}
+DEFAULT_TOD_SILENCE_EMERGENCY_SECONDS = 60
+DEFAULT_TOD_DIRECT_EXECUTION_SECONDS = 120
 
 
 def read_json(path: Path) -> dict | None:
@@ -135,6 +138,22 @@ def normalize_objective(value: object) -> str:
     return text
 
 
+def _objective_sort_key(value: object) -> tuple[int, int]:
+    normalized = normalize_objective(value)
+    if not normalized:
+        return (0, 0)
+    major_text, _, minor_text = normalized.partition(".")
+    try:
+        major = int(major_text)
+    except ValueError:
+        major = 0
+    try:
+        minor = int(minor_text) if minor_text else 0
+    except ValueError:
+        minor = 0
+    return (major, minor)
+
+
 def parse_timestamp(value: object) -> datetime | None:
     text = str(value or "").strip()
     if not text:
@@ -162,6 +181,21 @@ def _first_text(payload: dict, *keys: str) -> str:
     return ""
 
 
+def _matches_current_request_identity(
+    value: str,
+    *,
+    active_task_id: str,
+    request_request_id: str = "",
+) -> bool:
+    current_value = str(value or "").strip()
+    if not current_value:
+        return False
+    if current_value == str(active_task_id or "").strip():
+        return True
+    request_value = str(request_request_id or "").strip()
+    return bool(request_value and current_value == request_value)
+
+
 def _is_task_stream_trigger(trigger: dict) -> bool:
     trigger_name = _first_text(trigger, "trigger").lower()
     return trigger_name not in NON_TASK_STREAM_TRIGGERS
@@ -178,24 +212,99 @@ def _trigger_ack_task_identity(trigger_ack: dict) -> str:
     return _first_text(
         trigger_ack,
         "task_id",
-        "request_id",
-        "acknowledges",
         "current_task_id",
     ) or _first_text(
         trigger_context,
         "task_id",
-        "request_id",
     ) or _first_text(
         current_processing,
         "task_id",
+    ) or _first_text(
+        trigger_ack,
+        "request_id",
+        "acknowledges",
+    ) or _first_text(
+        trigger_context,
+        "request_id",
+    ) or _first_text(
+        current_processing,
         "request_id",
     )
+
+
+def _result_review_is_current(*, task_result: dict, active_task_id: str) -> bool:
+    task_result = _as_dict(task_result)
+    if not task_result:
+        return False
+    active_task_text = str(active_task_id or "").strip()
+    result_task_id = _first_text(task_result, "task_id")
+    if not active_task_text or not result_task_id or result_task_id != active_task_text:
+        return False
+
+    reconciliation = _as_dict(task_result.get("reconciliation"))
+    if reconciliation:
+        review_passed = reconciliation.get("review_passed")
+        if review_passed is False:
+            return False
+        review_current = reconciliation.get("review_decision_current")
+        if review_current is False:
+            return False
+        existing_task_id = _first_text(reconciliation, "existing_task_id")
+        if existing_task_id and existing_task_id != active_task_text:
+            return False
+
+    current_processing_task_id = _bridge_current_processing_task_id(task_result)
+    if current_processing_task_id and current_processing_task_id != active_task_text:
+        return False
+
+    return True
 
 
 def _bridge_current_processing_task_id(task_result: dict) -> str:
     bridge_runtime = _as_dict(task_result.get("bridge_runtime"))
     current_processing = _as_dict(bridge_runtime.get("current_processing"))
     return _first_text(current_processing, "task_id", "request_id")
+
+
+def _formal_program_active_lane(formal_program_response: dict | None) -> dict:
+    payload = _as_dict(formal_program_response)
+    objective = _as_dict(payload.get("objective"))
+    continuation = _as_dict(payload.get("continuation"))
+    continuation_status = _as_dict(continuation.get("status"))
+    active_task = _as_dict(continuation_status.get("active_task"))
+    active_project = _as_dict(continuation_status.get("active_project"))
+
+    objective_id = normalize_objective(
+        objective.get("objective_id")
+        or active_task.get("objective_id")
+        or active_project.get("objective_id")
+    )
+    objective_status = _first_text(objective, "status").lower()
+    execution_state = (
+        _first_text(payload, "execution_state").lower()
+        or _first_text(objective, "execution_state").lower()
+        or _first_text(continuation_status, "execution_state").lower()
+        or _first_text(active_task, "execution_state").lower()
+        or _first_text(active_project, "status").lower()
+    )
+    active = bool(
+        objective_id
+        and (
+            objective_status in FORMAL_PROGRAM_ACTIVE_STATES
+            or execution_state in FORMAL_PROGRAM_ACTIVE_STATES
+        )
+    )
+    return {
+        "active": active,
+        "objective_id": objective_id,
+        "objective_status": objective_status,
+        "execution_state": execution_state,
+        "task_id": _first_text(active_task, "task_id"),
+        "task_title": _first_text(active_task, "display_title", "title"),
+        "project_id": _first_text(active_project, "project_id"),
+        "project_status": _first_text(active_project, "status"),
+        "generated_at": _first_text(payload, "generated_at"),
+    }
 
 
 def _sanitize_persistent_task(
@@ -274,6 +383,16 @@ def _authoritative_task_override(
     ack_and_result_agree = bool(
         task_ack_request_id and task_ack_request_id == result_request_id
     )
+    request_objective = normalize_objective(request_task_id)
+    result_objective = normalize_objective(result_request_id)
+    same_objective_task_conflict = bool(
+        request_task_id
+        and result_request_id
+        and request_task_id != result_request_id
+        and request_objective
+        and result_objective
+        and request_objective == result_objective
+    )
 
     if authoritative_processing and stale_marker_present and (stale_request_matches or stale_trigger_matches):
         return result_request_id, "task_result_marked_prior_request_stale"
@@ -282,6 +401,7 @@ def _authoritative_task_override(
         result_status in TERMINAL_RESULT_STATUSES
         and ack_and_result_agree
         and active_processing_matches
+        and not same_objective_task_conflict
     ):
         return result_request_id, "task_ack_and_terminal_result_agree_on_authoritative_task"
 
@@ -296,6 +416,41 @@ def _authoritative_task_override(
         return result_request_id, "task_ack_and_result_agree_on_authoritative_task"
 
     return "", ""
+
+
+def _same_objective_task_mismatch(
+    *,
+    request_task_id: str,
+    task_request: dict,
+    trigger_task_id: str,
+    trigger: dict,
+    task_ack_request_id: str,
+    task_ack: dict,
+    result_task_id: str,
+    task_result: dict,
+) -> bool:
+    request_task_text = str(request_task_id or "").strip()
+    if not request_task_text:
+        return False
+
+    request_objective = normalize_objective(
+        task_request.get("objective_id") or task_request.get("objective") or request_task_text
+    )
+
+    def _same_objective(candidate_task_id: str, candidate_objective: object) -> bool:
+        candidate_task_text = str(candidate_task_id or "").strip()
+        if not candidate_task_text or candidate_task_text == request_task_text:
+            return False
+        candidate_objective_text = normalize_objective(candidate_objective or candidate_task_text)
+        return bool(request_objective and candidate_objective_text and candidate_objective_text == request_objective)
+
+    return any(
+        (
+            _same_objective(trigger_task_id, trigger.get("objective_id")),
+            _same_objective(task_ack_request_id, task_ack.get("objective_id")),
+            _same_objective(result_task_id, task_result.get("objective_id")),
+        )
+    )
 
 
 def detect_completed_stream_supersession(
@@ -398,13 +553,28 @@ def build_system_alert_summary(
 ) -> dict:
     reference = now or datetime.now(timezone.utc)
     liveness_warning_max_age_seconds = 90
+    stale_ack_watchdog_max_age_seconds = 900
     stale_ack_watchdog = _as_dict(stale_ack_watchdog)
     catchup_status = _as_dict(catchup_status)
     liveness_events = liveness_events if isinstance(liveness_events, list) else []
 
     alerts: list[dict[str, object]] = []
 
-    if str(stale_ack_watchdog.get("status") or "").strip().lower() == "alert":
+    stale_ack_generated_at = parse_timestamp(stale_ack_watchdog.get("generated_at"))
+    stale_ack_age_seconds = (
+        max(0, int((reference - stale_ack_generated_at).total_seconds()))
+        if stale_ack_generated_at is not None
+        else None
+    )
+    stale_ack_is_fresh = (
+        stale_ack_age_seconds is None
+        or stale_ack_age_seconds <= stale_ack_watchdog_max_age_seconds
+    )
+
+    if (
+        str(stale_ack_watchdog.get("status") or "").strip().lower() == "alert"
+        and stale_ack_is_fresh
+    ):
         alerts.append(
             {
                 "code": "stale_trigger_ack_failures",
@@ -419,6 +589,7 @@ def build_system_alert_summary(
                     "consecutive_failures": int(
                         stale_ack_watchdog.get("consecutive_stale_failures", 0) or 0
                     ),
+                    "age_seconds": stale_ack_age_seconds,
                 },
             }
         )
@@ -534,8 +705,10 @@ def reconcile_system_alert_summary_for_review(
 
     active_task_id = _first_text(task, "active_task_id")
     trigger_ack_task_id = _first_text(task, "trigger_ack_task_id")
+    request_request_id = _first_text(task, "request_request_id")
     task_ack_request_id = _first_text(task, "task_ack_request_id")
     result_request_id = _first_text(task, "result_request_id")
+    result_task_id = _first_text(task, "result_task_id")
     blocking_reason_codes = {
         str(item).strip()
         for item in review.get("blocking_reason_codes", [])
@@ -559,7 +732,20 @@ def reconcile_system_alert_summary_for_review(
 
     stale_trigger_alert_cleared = bool(
         active_task_id
-        and active_task_id in {trigger_ack_task_id, task_ack_request_id, result_request_id}
+        and (
+            trigger_ack_task_id == active_task_id
+            or _matches_current_request_identity(
+                task_ack_request_id,
+                active_task_id=active_task_id,
+                request_request_id=request_request_id,
+            )
+            or result_task_id == active_task_id
+            or _matches_current_request_identity(
+                result_request_id,
+                active_task_id=active_task_id,
+                request_request_id=request_request_id,
+            )
+        )
         and "trigger_ack_not_current" not in blocking_reason_codes
     )
     if stale_trigger_alert_cleared:
@@ -596,8 +782,11 @@ def build_task_status_review(
     catchup_gate: dict | None,
     troubleshooting_authority: dict | None,
     persistent_task: dict | None,
+    formal_program_response: dict | None = None,
     system_alert_summary: dict | None = None,
     idle_seconds: int = 120,
+    emergency_timeout_seconds: int = DEFAULT_TOD_SILENCE_EMERGENCY_SECONDS,
+    direct_execution_timeout_seconds: int = DEFAULT_TOD_DIRECT_EXECUTION_SECONDS,
     now: datetime | None = None,
 ) -> dict:
     reference = now or datetime.now(timezone.utc)
@@ -609,6 +798,7 @@ def build_task_status_review(
     catchup_gate = _as_dict(catchup_gate)
     troubleshooting_authority = _as_dict(troubleshooting_authority)
     persistent_task = _as_dict(persistent_task)
+    formal_program_response = _as_dict(formal_program_response)
     system_alert_summary = _as_dict(system_alert_summary)
     persistent_task = _sanitize_persistent_task(
         persistent_task=persistent_task,
@@ -621,10 +811,12 @@ def build_task_status_review(
     actionable_trigger = _is_task_stream_trigger(trigger)
 
     request_task_id = _first_text(task_request, "task_id", "request_id")
+    request_request_id = _first_text(task_request, "request_id")
     trigger_task_id = _first_text(trigger, "task_id", "request_id") if actionable_trigger else ""
     trigger_ack_task_id = _trigger_ack_task_identity(trigger_ack)
     task_ack_request_id = _first_text(task_ack, "request_id", "task_id")
-    result_request_id = _first_text(task_result, "request_id", "task_id")
+    result_request_id = _first_text(task_result, "request_id")
+    result_task_id = _first_text(task_result, "task_id", "request_id")
     persistent_task_id = _first_text(persistent_task, "task_id", "request_id")
     supersession = detect_completed_stream_supersession(
         task_request=task_request,
@@ -639,19 +831,36 @@ def build_task_status_review(
             request_task_id=request_task_id,
             trigger_task_id=trigger_task_id,
             task_ack_request_id=task_ack_request_id,
-            result_request_id=result_request_id,
+            result_request_id=result_task_id,
             task_result=task_result,
         )
-    active_task_id = authoritative_task_id or trigger_task_id or request_task_id or persistent_task_id
+    same_objective_task_mismatch = _same_objective_task_mismatch(
+        request_task_id=request_task_id,
+        task_request=task_request,
+        trigger_task_id=trigger_task_id,
+        trigger=trigger,
+        task_ack_request_id=task_ack_request_id,
+        task_ack=task_ack,
+        result_task_id=result_task_id,
+        task_result=task_result,
+    )
+    active_task_id = authoritative_task_id or (
+        request_task_id if same_objective_task_mismatch else (trigger_task_id or request_task_id)
+    ) or persistent_task_id
+    formal_program_lane = _formal_program_active_lane(formal_program_response)
 
     persistent_status = _first_text(persistent_task, "status").lower()
     result_status = _first_text(task_result, "status").lower()
     current_processing_task_id = _bridge_current_processing_task_id(task_result)
-    terminal_authoritative_result = bool(
-        active_task_id
-        and result_request_id == active_task_id
-        and result_status in TERMINAL_RESULT_STATUSES
+    result_review_current = _result_review_is_current(
+        task_result=task_result,
+        active_task_id=active_task_id,
     )
+    terminal_authoritative_result = bool(
+        result_review_current and result_status in TERMINAL_RESULT_STATUSES
+    )
+    if terminal_authoritative_result and task_ack_request_id and task_ack_request_id != active_task_id:
+        task_ack_request_id = ""
     execution_transport_healthy = bool(
         terminal_authoritative_result
         and (
@@ -677,6 +886,37 @@ def build_task_status_review(
             or active_task_id
         )
     )
+    formal_program_objective = str(formal_program_lane.get("objective_id") or "").strip()
+    formal_program_override = bool(
+        formal_program_lane.get("active") is True
+        and formal_program_objective
+        and (
+            not task_objective
+            or _objective_sort_key(formal_program_objective)
+            > _objective_sort_key(task_objective)
+        )
+    )
+    if formal_program_override:
+        active_task_id = str(formal_program_lane.get("task_id") or "").strip() or f"objective-{formal_program_lane.get('objective_id')}-formal-program-active"
+        authoritative_task_id = active_task_id
+        authoritative_task_reason = "formal_program_active_lane"
+        request_task_id = ""
+        trigger_task_id = ""
+        trigger_ack_task_id = ""
+        task_ack_request_id = ""
+        result_request_id = ""
+        result_status = ""
+        persistent_task_id = ""
+        persistent_status = ""
+        trigger_name = ""
+        actionable_trigger = False
+        terminal_authoritative_result = False
+        execution_transport_healthy = False
+        terminal_execution_failure = False
+        execution_failure_reason = ""
+        execution_failure_error = ""
+        execution_failure_mode = ""
+        task_objective = str(formal_program_lane.get("objective_id") or "").strip()
 
     gate_pass = bool(
         catchup_gate.get("promotion_ready") is True
@@ -792,6 +1032,7 @@ def build_task_status_review(
             trigger_ack_task_id == active_task_id
             or task_ack_request_id == active_task_id
             or result_request_id == active_task_id
+            or result_task_id == active_task_id
         )
     )
     if (
@@ -806,6 +1047,30 @@ def build_task_status_review(
             "acknowledge_and_remediate_system_alerts",
             f"Resolve critical system alert '{primary_code}' before continuing dispatch. Detail: {primary_detail}",
         )
+
+    if (
+        primary_alert_code == "publisher_objective_mismatch"
+        and not terminal_execution_failure
+    ):
+        add_reason("publisher_objective_mismatch")
+        canonical_objective = str(primary_alert.get("context", {}).get("canonical_objective") or "").strip()
+        live_task_objective = str(primary_alert.get("context", {}).get("live_task_objective") or "").strip()
+        detail = (
+            "Rebuild TOD integration status from canonical MIM export and republish the active task lane only if it still matches canonical objective truth."
+        )
+        if canonical_objective and live_task_objective:
+            detail = (
+                f"Canonical MIM truth is objective {canonical_objective}, but the live task lane still references objective {live_task_objective}. "
+                "Rebuild TOD integration status from canonical MIM export, then reissue the active task lane only if it matches canonical objective truth."
+            )
+        add_action("recouple_publisher_objective", detail)
+
+    current_task_ack = _matches_current_request_identity(
+        task_ack_request_id,
+        active_task_id=active_task_id,
+        request_request_id=request_request_id,
+    )
+    current_result = bool(result_task_id and result_task_id == active_task_id)
 
     if (
         active_task_id
@@ -823,7 +1088,8 @@ def build_task_status_review(
     if (
         active_task_id
         and task_ack_request_id
-        and task_ack_request_id != active_task_id
+        and not current_task_ack
+        and trigger_ack_task_id != active_task_id
         and not terminal_authoritative_result
         and not completed_stream_superseded
     ):
@@ -833,11 +1099,11 @@ def build_task_status_review(
             "Reissue the active task and require TOD_MIM_TASK_ACK.latest.json request_id to exactly match the current task_id.",
         )
 
-    if active_task_id and result_request_id and result_request_id != active_task_id:
+    if active_task_id and result_task_id and result_task_id != active_task_id:
         add_reason("task_result_request_mismatch")
         add_action(
             "reissue_task_with_matching_result",
-            "Reissue the active task and require TOD_MIM_TASK_RESULT.latest.json request_id to exactly match the current task_id.",
+            "Reissue the active task and require TOD_MIM_TASK_RESULT.latest.json task_id to exactly match the current task_id.",
         )
 
     if active_task_id and trigger_ack_task_id == active_task_id and not task_ack_request_id:
@@ -846,7 +1112,7 @@ def build_task_status_review(
             "TOD has acknowledged the trigger but has not yet published TOD_MIM_TASK_ACK.latest.json for the active task.",
         )
 
-    if active_task_id and task_ack_request_id == active_task_id and not result_request_id:
+    if active_task_id and current_task_ack and not result_task_id:
         add_action(
             "wait_for_task_result",
             "TOD has accepted the task but has not yet published TOD_MIM_TASK_RESULT.latest.json for the active task.",
@@ -855,11 +1121,13 @@ def build_task_status_review(
     review_state = "no_active_task"
     if active_task_id:
         review_state = "queued"
-    if result_request_id == active_task_id and result_status in TERMINAL_SUCCESS_STATUSES:
+    if formal_program_override:
+        review_state = "working"
+    if result_review_current and result_status in TERMINAL_SUCCESS_STATUSES:
         review_state = "completed"
-    elif result_request_id == active_task_id and result_status in TERMINAL_FAILURE_STATUSES:
+    elif result_review_current and result_status in TERMINAL_FAILURE_STATUSES:
         review_state = "failed"
-    elif task_ack_request_id == active_task_id:
+    elif current_task_ack:
         review_state = "awaiting_result"
     elif trigger_ack_task_id == active_task_id:
         review_state = "awaiting_task_ack"
@@ -869,8 +1137,8 @@ def build_task_status_review(
     latest_progress_age_candidates = [
         age
         for age in (
-            result_age if result_request_id == active_task_id else None,
-            task_ack_age if task_ack_request_id == active_task_id else None,
+            result_age if result_review_current else None,
+            task_ack_age if current_task_ack else None,
             trigger_ack_age if trigger_ack_task_id == active_task_id else None,
             trigger_age if trigger_task_id == active_task_id else None,
             request_age if request_task_id == active_task_id else None,
@@ -883,6 +1151,20 @@ def build_task_status_review(
         and isinstance(latest_progress_age, int)
         and latest_progress_age >= idle_seconds
     )
+    silence_emergency_active = bool(
+        review_state in {"queued", "awaiting_trigger_ack", "awaiting_task_ack", "awaiting_result"}
+        and isinstance(latest_progress_age, int)
+        and latest_progress_age >= max(1, int(emergency_timeout_seconds))
+        and not terminal_authoritative_result
+        and primary_alert_code != "publisher_objective_mismatch"
+    )
+    direct_execution_ready = bool(
+        silence_emergency_active
+        and isinstance(latest_progress_age, int)
+        and latest_progress_age >= max(
+            int(emergency_timeout_seconds), int(direct_execution_timeout_seconds)
+        )
+    )
 
     if persistent_status == "queued" and not actionable_trigger and not request_task_id:
         add_reason("queued_not_dispatched")
@@ -891,7 +1173,55 @@ def build_task_status_review(
             "Publish the queued persistent TOD task into the shared request and trigger artifacts so execution can begin.",
         )
 
-    if idle_active and blocking_reason_codes:
+    if silence_emergency_active:
+        add_reason("tod_silence_emergency")
+        emergency_detail = (
+            f"TOD has been silent on the active task for at least {int(emergency_timeout_seconds)} seconds. "
+            "Escalate the lane as an emergency, stop passive waiting, and force bounded recovery or fallback execution."
+        )
+        if active_task_id and isinstance(latest_progress_age, int):
+            emergency_detail = (
+                f"TOD has been silent on {active_task_id} for {latest_progress_age} seconds. "
+                "Escalate the lane as an emergency, stop passive waiting, and force bounded recovery or fallback execution."
+            )
+        add_action("declare_tod_emergency", emergency_detail)
+
+    if direct_execution_ready:
+        add_reason("tod_silence_direct_execution_ready")
+        direct_execution_detail = (
+            f"TOD silence has persisted beyond {int(direct_execution_timeout_seconds)} seconds. "
+            "Submit the bounded task to the local Codex/OpenAI handoff path, complete the work directly if possible, and publish MIM-side status and error artifacts."
+        )
+        if active_task_id and isinstance(latest_progress_age, int):
+            direct_execution_detail = (
+                f"TOD silence on {active_task_id} has persisted for {latest_progress_age} seconds. "
+                "Submit the bounded task to the local Codex/OpenAI handoff path, complete the work directly if possible, and publish MIM-side status and error artifacts."
+            )
+        add_action("fallback_to_codex_direct_execution", direct_execution_detail)
+
+    lineage_mismatch_reason_codes = {
+        "task_stream_drift",
+        "task_ack_request_mismatch",
+        "task_result_request_mismatch",
+        "trigger_ack_not_current",
+    }
+    silence_reason_codes = {
+        "tod_silence_emergency",
+        "tod_silence_direct_execution_ready",
+    }
+    lineage_mismatch_dispatch_blocked = bool(
+        (
+            same_objective_task_mismatch
+            or bool(blocking_reason_codes)
+            and set(blocking_reason_codes).issubset(
+                lineage_mismatch_reason_codes | silence_reason_codes
+            )
+        )
+        and review_state in {"queued", "awaiting_trigger_ack", "awaiting_task_ack", "awaiting_result"}
+        and any(code in lineage_mismatch_reason_codes for code in blocking_reason_codes)
+    )
+
+    if idle_active and blocking_reason_codes and not lineage_mismatch_dispatch_blocked:
         review_state = "idle_blocked"
     elif blocking_reason_codes and review_state in {"queued", "awaiting_trigger_ack", "awaiting_task_ack", "awaiting_result"}:
         review_state = "dispatch_blocked"
@@ -904,6 +1234,7 @@ def build_task_status_review(
         "awaiting_task_ack": primary_reason or "trigger_ack_current",
         "awaiting_trigger_ack": primary_reason or "trigger_emitted_waiting_for_ack",
         "queued": primary_reason or ("persistent_task_queued" if persistent_status == "queued" else "task_created"),
+        "working": primary_reason or "formal_program_active_lane",
         "dispatch_blocked": primary_reason or "dispatch_blocked",
         "idle_blocked": primary_reason or "idle_without_progress",
         "no_active_task": primary_reason or "no_task_detected",
@@ -916,16 +1247,20 @@ def build_task_status_review(
             "active_task_id": active_task_id,
             "objective_id": task_objective,
             "request_task_id": request_task_id,
+            "request_request_id": request_request_id,
             "trigger_task_id": trigger_task_id,
             "trigger_ack_task_id": trigger_ack_task_id,
             "task_ack_request_id": task_ack_request_id,
             "result_request_id": result_request_id,
+            "result_task_id": result_task_id,
+            "result_review_current": result_review_current,
             "authoritative_task_id": authoritative_task_id,
             "authoritative_task_reason": authoritative_task_reason,
             "persistent_task_id": persistent_task_id,
             "persistent_status": persistent_status,
             "result_status": result_status,
             "trigger_name": trigger_name,
+            "same_objective_task_mismatch": same_objective_task_mismatch,
         },
         "state": review_state,
         "state_reason": state_reason,
@@ -934,6 +1269,10 @@ def build_task_status_review(
             "active": idle_active,
             "threshold_seconds": int(idle_seconds),
             "latest_progress_age_seconds": latest_progress_age,
+            "emergency_active": silence_emergency_active,
+            "emergency_threshold_seconds": int(emergency_timeout_seconds),
+            "direct_execution_ready": direct_execution_ready,
+            "direct_execution_threshold_seconds": int(direct_execution_timeout_seconds),
         },
         "gate": {
             "pass": gate_pass,
@@ -952,6 +1291,16 @@ def build_task_status_review(
             "result_age_seconds": result_age,
         },
         "pending_actions": pending_actions,
+        "formal_program": {
+            "active": bool(formal_program_lane.get("active") is True),
+            "override_applied": formal_program_override,
+            "objective_id": str(formal_program_lane.get("objective_id") or "").strip(),
+            "task_id": str(formal_program_lane.get("task_id") or "").strip(),
+            "task_title": str(formal_program_lane.get("task_title") or "").strip(),
+            "project_id": str(formal_program_lane.get("project_id") or "").strip(),
+            "execution_state": str(formal_program_lane.get("execution_state") or "").strip(),
+            "generated_at": str(formal_program_lane.get("generated_at") or "").strip(),
+        },
         "system_alerts": {
             "active": bool(system_alert_summary.get("active") is True),
             "highest_severity": highest_alert_severity,
@@ -997,8 +1346,11 @@ def build_mim_tod_decision_snapshot(
     state_reason = _first_text(review, "state_reason")
     trigger_name = _first_text(task, "trigger_name")
     trigger_ack_task_id = _first_text(task, "trigger_ack_task_id")
+    request_request_id = _first_text(task, "request_request_id")
     task_ack_request_id = _first_text(task, "task_ack_request_id")
     result_request_id = _first_text(task, "result_request_id")
+    result_task_id = _first_text(task, "result_task_id")
+    result_review_current = bool(task.get("result_review_current") is True)
     coordination_request_id = _first_text(coordination_request, "request_id", "task_id")
     coordination_ack_id = _first_text(coordination_ack, "request_id", "task_id")
     ping_status = _first_text(ping_response, "heartbeat_status", "status").lower()
@@ -1012,17 +1364,25 @@ def build_mim_tod_decision_snapshot(
     tod_has_current_task_evidence = []
     if active_task_id and trigger_ack_task_id == active_task_id:
         tod_has_current_task_evidence.append("trigger_ack_current")
-    if active_task_id and task_ack_request_id == active_task_id:
+    if _matches_current_request_identity(
+        task_ack_request_id,
+        active_task_id=active_task_id,
+        request_request_id=request_request_id,
+    ):
         tod_has_current_task_evidence.append("task_ack_current")
-    if active_task_id and result_request_id == active_task_id:
+    if result_review_current and active_task_id and result_task_id == active_task_id:
         tod_has_current_task_evidence.append("task_result_current")
     if active_task_id and coordination_ack_id == active_task_id:
         tod_has_current_task_evidence.append("coordination_ack_current")
 
     mim_has_tod_activity_evidence = []
-    if active_task_id and task_ack_request_id == active_task_id:
+    if _matches_current_request_identity(
+        task_ack_request_id,
+        active_task_id=active_task_id,
+        request_request_id=request_request_id,
+    ):
         mim_has_tod_activity_evidence.append("tod_task_ack_current")
-    if active_task_id and result_request_id == active_task_id:
+    if result_review_current and active_task_id and result_task_id == active_task_id:
         mim_has_tod_activity_evidence.append("tod_task_result_current")
     if coordination_request_id:
         mim_has_tod_activity_evidence.append("tod_coordination_request_seen")
@@ -1042,6 +1402,7 @@ def build_mim_tod_decision_snapshot(
         "awaiting_trigger_ack": "tod_has_not_confirmed_observation",
         "awaiting_task_ack": "tod_has_seen_request_waiting_acceptance",
         "awaiting_result": "tod_is_working_or_finishing",
+        "working": "formal_program_active_lane",
         "completed": "tod_published_terminal_result",
         "failed": "tod_published_terminal_failure",
         "idle_blocked": "tod_progress_uncertain_blocked",
@@ -1083,9 +1444,15 @@ def build_mim_tod_decision_snapshot(
             or (isinstance(latest_progress_age_seconds, int) and latest_progress_age_seconds >= 60)
         )
     )
+    emergency_required = bool(idle.get("emergency_active") is True)
+    direct_execution_ready = bool(idle.get("direct_execution_ready") is True)
 
     liveness_status = "alive"
-    if silence_detected:
+    if direct_execution_ready:
+        liveness_status = "direct_execution_ready"
+    elif emergency_required:
+        liveness_status = "emergency"
+    elif silence_detected:
         liveness_status = "silent"
     elif degraded_detected:
         liveness_status = "degraded"
@@ -1093,9 +1460,23 @@ def build_mim_tod_decision_snapshot(
         liveness_status = "terminal"
 
     escalation_required = liveness_status in {"silent", "degraded"} and state not in {"completed", "failed"}
+    if liveness_status in {"emergency", "direct_execution_ready"} and state not in {"completed", "failed"}:
+        escalation_required = True
     escalation_code = "monitor_only"
     escalation_detail = "Keep observing the current TOD lane."
-    if liveness_status == "silent":
+    if liveness_status == "direct_execution_ready":
+        escalation_code = "fallback_to_codex_direct_execution"
+        escalation_detail = (
+            "TOD has remained silent past the direct-execution threshold. "
+            "Stop waiting on TOD, submit the bounded task to the local Codex/OpenAI handoff path, and publish MIM-side status and error artifacts."
+        )
+    elif liveness_status == "emergency":
+        escalation_code = "declare_tod_emergency"
+        escalation_detail = (
+            "TOD has exceeded the emergency silence threshold. "
+            "Treat the lane as an emergency, recover the bridge immediately, and prepare direct execution fallback if silence continues."
+        )
+    elif liveness_status == "silent":
         escalation_code = "ask_tod_status_loudly"
         escalation_detail = (
             "TOD is not providing current ACK, RESULT, coordination, or fresh ping evidence. "
@@ -1163,6 +1544,8 @@ def build_mim_tod_decision_snapshot(
                 "age_seconds": console_probe_age_seconds,
                 "http_status": console_probe_http_status,
             },
+            "emergency_threshold_seconds": int(idle.get("emergency_threshold_seconds", DEFAULT_TOD_SILENCE_EMERGENCY_SECONDS) or DEFAULT_TOD_SILENCE_EMERGENCY_SECONDS),
+            "direct_execution_threshold_seconds": int(idle.get("direct_execution_threshold_seconds", DEFAULT_TOD_DIRECT_EXECUTION_SECONDS) or DEFAULT_TOD_DIRECT_EXECUTION_SECONDS),
             "trigger_artifact": "MIM_TO_TOD_TRIGGER.latest.json",
             "ping_artifact": "MIM_TO_TOD_PING.latest.json",
             "response_artifact": "TOD_TO_MIM_PING.latest.json",
@@ -1213,6 +1596,11 @@ def build_publisher_warning(
         if isinstance(integration.get("mim_handshake"), dict)
         else {}
     )
+    integrated_live_task = (
+        integration.get("live_task_request")
+        if isinstance(integration.get("live_task_request"), dict)
+        else {}
+    )
 
     canonical_objective = normalize_objective(
         context_export.get("objective_active")
@@ -1227,7 +1615,10 @@ def build_publisher_warning(
         or ""
     ).strip()
     live_task_objective = normalize_objective(
-        task_request.get("objective_id") or task_request.get("task_id")
+        integrated_live_task.get("normalized_objective_id")
+        or integrated_live_task.get("objective_id")
+        or task_request.get("objective_id")
+        or task_request.get("task_id")
     )
     coordination_objective = normalize_objective(
         coordination_ack.get("objective_id") or coordination_ack.get("task_id")
