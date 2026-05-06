@@ -1,0 +1,29 @@
+[Unit]
+Description=MIM Continuous Evolution Training
+After=network-online.target mim-training-web.service
+Wants=network-online.target mim-training-web.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/testpilot/mim
+Environment=PYTHONPATH=/home/testpilot/mim
+Environment=MIM_TRAINING_BASE_URL=http://127.0.0.1:18021
+Environment=MIM_TRAINING_PROGRESS_ACTOR=workspace
+Environment=MIM_TRAINING_PROGRESS_SOURCE=objective173
+Environment=MIM_TRAINING_PROFILE_ID=routine
+Environment=MIM_TRAINING_PROFILE_LABEL=Routine bounded training
+Environment=MIM_TRAINING_TARGET_CONVERSATIONS=320
+Environment=MIM_TRAINING_MIN_CONVERSATIONS=240
+Environment=MIM_TRAINING_MAX_CONVERSATIONS=720
+Environment=MIM_TRAINING_TARGET_WINDOW_SECONDS=5400
+Environment=MIM_TRAINING_MAX_CYCLE_SECONDS=7200
+Environment=MIM_TRAINING_REQUEST_TIMEOUT_SECONDS=90
+Environment=MIM_TRAINING_RUNTIME_SERVICE_NAME=mim-training-web.service
+Environment=MIM_TRAINING_HEARTBEAT_SECONDS=20
+Environment=MIM_TRAINING_PAUSE_SECONDS=15
+ExecStart=/home/testpilot/mim/.venv/bin/python /home/testpilot/mim/scripts/mim_evolution_continuous_runner.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

@@ -1,15 +1,28 @@
+import asyncio
+import base64
+from email.parser import BytesParser
+from email.policy import default as email_policy_default
 import json
+import logging
+import mimetypes
+import os
 from datetime import datetime, timezone
 from hashlib import sha256
+import ipaddress
 from pathlib import Path
 import re
+from urllib import error as urllib_error
+from urllib import request as urllib_request
+from urllib.parse import parse_qs, urlparse
+from uuid import uuid4
 
-from fastapi import APIRouter, Depends
-from fastapi.responses import HTMLResponse
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from core.autonomy_driver_service import build_initiative_status
 from core.autonomy_boundary_service import build_boundary_action_controls, build_boundary_decision_basis, build_boundary_profile_snapshot
 from core.camera_scene import (
     collect_fresh_camera_observations,
@@ -22,6 +35,13 @@ from core.execution_readiness_service import (
   load_latest_execution_readiness,
 )
 from core.execution_strategy_service import latest_execution_strategy_plan, to_execution_strategy_plan_out
+from core.interface_service import (
+  append_interface_message,
+  list_interface_messages,
+  to_interface_message_out,
+  to_interface_session_out,
+  upsert_interface_session,
+)
 from core.models import (
     Actor,
     CapabilityExecution,
@@ -42,6 +62,17 @@ from core.models import (
     WorkspaceStewardshipState,
     WorkspaceStrategyGoal,
 )
+from core.config import settings
+from core.mim_ui_auth import (
+  clear_authenticated_mimtod_cookie,
+  credentials_match,
+  ensure_authenticated_mimtod_api_request,
+  maybe_require_mimtod_page_login,
+  mimtod_auth_required,
+  normalize_next_path,
+  request_has_valid_mimtod_auth,
+  set_authenticated_mimtod_cookie,
+)
 from core.mim_arm_dispatch_telemetry import refresh_dispatch_telemetry_record
 from core.operator_commitment_monitoring_service import (
     latest_commitment_monitoring_profile,
@@ -60,13 +91,14 @@ from core.operator_resolution_service import (
   choose_operator_resolution_commitment,
   commitment_effect_labels,
   commitment_is_recovery_policy_tuning_derived,
-  commitment_scope_application,
   commitment_snapshot,
 )
 from core.policy_conflict_resolution_service import list_workspace_policy_conflict_profiles
 from core.proposal_policy_convergence_service import list_workspace_proposal_policy_preferences
 from core.self_evolution_service import build_self_evolution_briefing
+from core.training_routine_service import build_training_routine_snapshot, control_training_routine
 from core.runtime_recovery_service import RuntimeRecoveryService
+from core.primitive_request_recovery_service import load_authoritative_request_status
 from core.ui_health_service import (
   build_mim_ui_health_snapshot,
   build_mim_ui_health_snapshot_from_rows,
@@ -74,8 +106,18 @@ from core.ui_health_service import (
 )
 
 router = APIRouter(tags=["mim-ui"])
+logger = logging.getLogger(__name__)
 SHARED_RUNTIME_ROOT = Path("runtime/shared")
 runtime_recovery_service = RuntimeRecoveryService(SHARED_RUNTIME_ROOT)
+MIM_PRIMARY_THREAD_KEY = "primary_operator"
+MIM_UI_MEDIA_ROOT = SHARED_RUNTIME_ROOT / "mim_ui_media"
+MIM_UI_ALLOWED_IMAGE_TYPES = {
+  "image/png": ".png",
+  "image/jpeg": ".jpg",
+  "image/webp": ".webp",
+}
+MIM_UI_MAX_IMAGE_BYTES = 8 * 1024 * 1024
+UI_BUILD_ID = "unified-console-recovery-v1"
 
 MIC_PROMPT_MIN_CONFIDENCE = 0.66
 MIC_PROMPT_MAX_AGE_SECONDS = 25.0
@@ -87,6 +129,1047 @@ class RuntimeRecoveryEventRequest(BaseModel):
     detail: str | None = None
     next_retry_at: str | None = None
     metadata: dict | None = None
+
+
+class FrontendMediaStatusRequest(BaseModel):
+  lane: str
+  status: str
+  detail: str | None = None
+  secure_context: bool | None = None
+  media_devices_available: bool | None = None
+  permission_state: str | None = None
+  selected_device_id: str | None = None
+  selected_device_label: str | None = None
+
+
+class MimUiTrainingActionRequest(BaseModel):
+  action: str
+
+
+MIM_UI_FRONTEND_MEDIA_TTL_SECONDS = 900.0
+_mim_ui_frontend_media_state: dict[str, dict[str, object]] = {}
+
+
+def _record_frontend_media_status(request: FrontendMediaStatusRequest) -> dict[str, object]:
+  now = datetime.now(timezone.utc)
+  lane = str(request.lane or "").strip().lower()
+  payload = {
+    "lane": lane,
+    "status": str(request.status or "unknown").strip().lower() or "unknown",
+    "detail": str(request.detail or "").strip(),
+    "secure_context": bool(request.secure_context) if request.secure_context is not None else None,
+    "media_devices_available": bool(request.media_devices_available) if request.media_devices_available is not None else None,
+    "permission_state": str(request.permission_state or "").strip().lower() or None,
+    "selected_device_id": str(request.selected_device_id or "").strip() or None,
+    "selected_device_label": str(request.selected_device_label or "").strip() or None,
+    "last_reported_at": now.isoformat(),
+    "last_reported_ts": now.timestamp(),
+  }
+  _mim_ui_frontend_media_state[lane] = payload
+  return payload
+
+
+def _frontend_media_snapshot(now: datetime | None = None) -> dict[str, dict[str, object]]:
+  now = now or datetime.now(timezone.utc)
+  snapshot: dict[str, dict[str, object]] = {}
+  for lane, payload in _mim_ui_frontend_media_state.items():
+    try:
+      last_reported_ts = float(payload.get("last_reported_ts") or 0.0)
+    except (TypeError, ValueError):
+      last_reported_ts = 0.0
+    if last_reported_ts <= 0:
+      continue
+    age_seconds = max(0.0, now.timestamp() - last_reported_ts)
+    if age_seconds > MIM_UI_FRONTEND_MEDIA_TTL_SECONDS:
+      continue
+    item = dict(payload)
+    item.pop("last_reported_ts", None)
+    item["age_seconds"] = age_seconds
+    snapshot[lane] = item
+  return snapshot
+
+
+def _frontend_media_issue_summary(frontend_media: dict[str, dict[str, object]]) -> str:
+  issue_labels: list[str] = []
+  status_labels = {
+    "api_unavailable": "API unavailable",
+    "permission_denied": "permission denied",
+    "insecure_context": "insecure context",
+    "no_device": "no device",
+    "device_busy": "device busy",
+    "start_failed": "start failed",
+    "recovering": "recovering",
+  }
+  for lane in ("camera", "microphone"):
+    entry = frontend_media.get(lane)
+    if not entry:
+      continue
+    status = str(entry.get("status") or "").strip().lower()
+    if status in {"", "ready", "active", "watching", "listening", "ok"}:
+      continue
+    lane_label = "camera" if lane == "camera" else "microphone"
+    issue_label = status_labels.get(status, status.replace("_", " "))
+    issue_labels.append(f"{lane_label} {issue_label}")
+  return "; ".join(issue_labels)
+
+
+def _normalize_public_mim_base(value: object) -> str:
+  text = str(value or "").strip()
+  if not text:
+    return ""
+  candidate = text if "://" in text else f"https://{text}"
+  try:
+    parsed = urlparse(candidate)
+  except Exception:
+    return ""
+  if not parsed.scheme or not parsed.netloc:
+    return ""
+  path = (parsed.path or "").rstrip("/")
+  return f"{parsed.scheme}://{parsed.netloc}{path}"
+
+
+def _build_public_mim_url(value: object) -> str:
+  base = _normalize_public_mim_base(value)
+  if not base:
+    return ""
+  if base.endswith("/mim"):
+    return base
+  return f"{base}/mim"
+
+
+def _request_header_host(request: Request) -> str:
+  forwarded_host = str(request.headers.get("x-forwarded-host") or "").strip()
+  if forwarded_host:
+    return forwarded_host.split(",", 1)[0].strip()
+  return str(request.headers.get("host") or request.url.netloc or "").strip()
+
+
+def _request_host_name(request: Request) -> str:
+  host = _request_header_host(request)
+  if not host:
+    return str(request.url.hostname or "").strip().lower()
+  if host.startswith("[") and "]" in host:
+    return host[1 : host.index("]")].strip().lower()
+  if ":" in host:
+    return host.rsplit(":", 1)[0].strip().lower()
+  return host.strip().lower()
+
+
+def _is_loopback_host(host: str) -> bool:
+  normalized = str(host or "").strip().lower()
+  if normalized in {"", "localhost", "127.0.0.1", "::1"}:
+    return True
+  try:
+    return ipaddress.ip_address(normalized).is_loopback
+  except ValueError:
+    return False
+
+
+def _effective_request_scheme(request: Request) -> str:
+  forwarded_proto = str(request.headers.get("x-forwarded-proto") or "").strip()
+  if forwarded_proto:
+    return forwarded_proto.split(",", 1)[0].strip().lower()
+  cf_visitor = str(request.headers.get("cf-visitor") or "").strip()
+  if cf_visitor:
+    try:
+      visitor_payload = json.loads(cf_visitor)
+    except json.JSONDecodeError:
+      visitor_payload = None
+    if isinstance(visitor_payload, dict):
+      scheme = str(visitor_payload.get("scheme") or "").strip().lower()
+      if scheme:
+        return scheme
+  return str(request.url.scheme or "http").strip().lower() or "http"
+
+
+def _public_mim_redirect_target(request: Request) -> str:
+  public_mim_url = _build_public_mim_url(settings.remote_shell_domain)
+  if not public_mim_url:
+    return ""
+  if _effective_request_scheme(request) == "https":
+    return ""
+  request_host = _request_host_name(request)
+  public_host = str(urlparse(public_mim_url).hostname or "").strip().lower()
+  if public_host and request_host == public_host:
+    return ""
+  if _is_loopback_host(request_host):
+    return ""
+  query = str(request.url.query or "").strip()
+  if not query:
+    return public_mim_url
+  return f"{public_mim_url}?{query}"
+
+
+def _dedicated_public_mim_redirect_target(request: Request) -> str:
+  public_base = _normalize_public_mim_base(settings.remote_shell_domain)
+  if not public_base:
+    return ""
+  public_host = str(urlparse(public_base).hostname or "").strip().lower()
+  request_host = _request_host_name(request)
+  if not public_host or request_host == public_host or _is_loopback_host(request_host):
+    return ""
+  path = str(request.url.path or "").strip() or "/mim"
+  query = str(request.url.query or "").strip()
+  target = f"{public_base}{path}"
+  if not query:
+    return target
+  return f"{target}?{query}"
+
+
+def _mim_ui_login_page(*, next_path: str, error_message: str = "") -> str:
+  error_block = (
+    f'<p class="error">{error_message}</p>'
+    if str(error_message or "").strip()
+    else ""
+  )
+  return f"""
+<!doctype html>
+<html lang=\"en\">
+<head>
+  <meta charset=\"utf-8\" />
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
+  <title>MIM Operator Console | Secure Sign In</title>
+  <style>
+    :root {{
+      --bg: #06131e;
+      --bg-strong: #0c2233;
+      --panel: rgba(10, 25, 38, 0.94);
+      --line: rgba(77, 196, 211, 0.30);
+      --line-strong: rgba(77, 196, 211, 0.52);
+      --text: #e8f1f7;
+      --muted: #97afbf;
+      --warn: #ff9561;
+      --mim: #4dc4d3;
+      --tod: #ff9b54;
+      --display: \"Iowan Old Style\", \"Palatino Linotype\", \"Book Antiqua\", serif;
+      --body: \"IBM Plex Sans\", \"Segoe UI\", sans-serif;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      font-family: var(--body);
+      color: var(--text);
+      background:
+        radial-gradient(circle at top left, rgba(77, 196, 211, 0.16), transparent 28%),
+        radial-gradient(circle at top right, rgba(255, 155, 84, 0.10), transparent 24%),
+        linear-gradient(180deg, #030910 0%, var(--bg) 100%);
+      padding: 24px;
+    }}
+    .panel {{
+      width: min(520px, 100%);
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 26px;
+      box-shadow: 0 28px 80px rgba(0, 0, 0, 0.44);
+      padding: 28px;
+    }}
+    .eyebrow {{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 7px 12px;
+      color: var(--mim);
+      background: rgba(77, 196, 211, 0.08);
+      font-size: 0.78rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      font-weight: 700;
+    }}
+    h1 {{
+      margin: 18px 0 10px;
+      font-family: var(--display);
+      letter-spacing: 0.03em;
+      font-size: 2rem;
+      line-height: 1.1;
+    }}
+    p {{ margin: 0 0 16px; color: var(--muted); line-height: 1.6; }}
+    .lead {{ font-size: 1rem; max-width: 42ch; }}
+    .facts {{
+      display: grid;
+      gap: 10px;
+      margin: 18px 0 20px;
+      padding: 16px;
+      border: 1px solid rgba(151, 175, 191, 0.18);
+      border-radius: 18px;
+      background: rgba(255, 255, 255, 0.03);
+    }}
+    .fact {{ margin: 0; font-size: 0.92rem; }}
+    .fact strong {{ color: var(--text); }}
+    .site-chip {{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 6px;
+      color: var(--tod);
+      font-size: 0.86rem;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }}
+    .signin-card {{
+      border: 1px solid var(--line-strong);
+      border-radius: 22px;
+      padding: 18px;
+      background: linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.01));
+    }}
+    label {{ display: block; margin: 0 0 8px; font-size: 0.88rem; color: var(--muted); }}
+    input {{
+      width: 100%;
+      border-radius: 14px;
+      border: 1px solid rgba(77, 196, 211, 0.28);
+      background: rgba(5, 16, 26, 0.78);
+      color: var(--text);
+      padding: 12px 14px;
+      margin: 0 0 14px;
+      font-size: 1rem;
+    }}
+    input:focus {{
+      outline: 2px solid rgba(77, 196, 211, 0.32);
+      outline-offset: 1px;
+      border-color: rgba(77, 196, 211, 0.54);
+    }}
+    button {{
+      width: 100%;
+      border: 0;
+      border-radius: 14px;
+      padding: 12px 14px;
+      background: linear-gradient(135deg, var(--mim), #73f0bf);
+      color: #03121d;
+      font-weight: 700;
+      cursor: pointer;
+    }}
+    .error {{ margin: 0 0 14px; color: var(--warn); }}
+    .footnote {{ margin-top: 16px; font-size: 0.84rem; }}
+    .back-link {{ color: var(--mim); font-weight: 700; text-decoration: none; }}
+    .back-link:hover, .back-link:focus-visible {{ text-decoration: underline; }}
+  </style>
+</head>
+<body>
+  <main class=\"panel\">
+    <div class=\"eyebrow\">Restricted Operator Access</div>
+    <h1>MIM Operator Console</h1>
+    <p class=\"lead\">This sign-in page is for the administrative MIM console at mim.mimtod.com. It grants access to the internal operator interface only.</p>
+    <div class=\"facts\">
+      <p class=\"fact\"><strong>Site:</strong> MIM + TOD administrative console</p>
+      <p class=\"fact\"><strong>Purpose:</strong> operator monitoring, diagnostics, and controlled runtime actions</p>
+      <p class=\"fact\"><strong>Data requested:</strong> console username and password only. This page does not request payment, banking, or card information.</p>
+    </div>
+    <div class=\"signin-card\">
+      <div class=\"site-chip\">mim.mimtod.com</div>
+      <p>Use your MIM operator credentials to continue to the protected console.</p>
+      {error_block}
+      <form method=\"post\" action=\"/mim/login\">
+        <input type=\"hidden\" name=\"next\" value=\"{next_path}\" />
+        <label for=\"username\">Operator username</label>
+        <input id=\"username\" name=\"username\" type=\"text\" autocomplete=\"username\" spellcheck=\"false\" required />
+        <label for=\"password\">Operator password</label>
+        <input id=\"password\" name=\"password\" type=\"password\" autocomplete=\"current-password\" required />
+        <button type=\"submit\">Open Operator Console</button>
+      </form>
+    </div>
+    <p class=\"footnote\">If you expected the public chat page instead, return to <a class=\"back-link\" href=\"/\">the main MIM + TOD workspace</a>.</p>
+  </main>
+</body>
+</html>
+"""
+
+
+@router.get("/mim/login", response_class=HTMLResponse)
+async def mim_ui_login_get(request: Request):
+  dedicated_redirect = _dedicated_public_mim_redirect_target(request)
+  if dedicated_redirect:
+    return RedirectResponse(url=dedicated_redirect, status_code=303)
+  next_path = normalize_next_path(request.query_params.get("next"), default="/mim")
+  if not mimtod_auth_required(request):
+    return RedirectResponse(url=next_path, status_code=303)
+  if request_has_valid_mimtod_auth(request):
+    return RedirectResponse(url=next_path, status_code=303)
+  return HTMLResponse(_mim_ui_login_page(next_path=next_path))
+
+
+@router.post("/mim/login")
+async def mim_ui_login_post(request: Request):
+  dedicated_redirect = _dedicated_public_mim_redirect_target(request)
+  if dedicated_redirect:
+    return RedirectResponse(url=dedicated_redirect, status_code=303)
+  raw_body = (await request.body()).decode("utf-8", errors="replace")
+  parsed_form = parse_qs(raw_body, keep_blank_values=True)
+  next_path = normalize_next_path((parsed_form.get("next") or ["/mim"])[0], default="/mim")
+  username = str((parsed_form.get("username") or [""])[0]).strip()
+  password = str((parsed_form.get("password") or [""])[0])
+  if not credentials_match(username=username, password=password):
+    return HTMLResponse(
+      _mim_ui_login_page(next_path=next_path, error_message="Invalid username or password."),
+      status_code=401,
+    )
+  response = RedirectResponse(url=next_path, status_code=303)
+  set_authenticated_mimtod_cookie(response, request, username=username)
+  return response
+
+
+@router.get("/mim/logout")
+async def mim_ui_logout(request: Request):
+  dedicated_redirect = _dedicated_public_mim_redirect_target(request)
+  if dedicated_redirect:
+    return RedirectResponse(url=dedicated_redirect, status_code=303)
+  response = RedirectResponse(url="/mim/login", status_code=303)
+  clear_authenticated_mimtod_cookie(response, request)
+  return response
+
+
+def _mim_ui_primary_thread_key() -> str:
+  return MIM_PRIMARY_THREAD_KEY
+
+
+def _ensure_mim_ui_media_root() -> Path:
+  MIM_UI_MEDIA_ROOT.mkdir(parents=True, exist_ok=True)
+  return MIM_UI_MEDIA_ROOT
+
+
+def _mim_ui_image_extension(content_type: str, filename: str) -> str:
+  normalized_type = str(content_type or "").strip().lower()
+  if normalized_type in MIM_UI_ALLOWED_IMAGE_TYPES:
+    return MIM_UI_ALLOWED_IMAGE_TYPES[normalized_type]
+  guessed = mimetypes.guess_type(str(filename or ""))[0] or ""
+  guessed = guessed.strip().lower()
+  if guessed in MIM_UI_ALLOWED_IMAGE_TYPES:
+    return MIM_UI_ALLOWED_IMAGE_TYPES[guessed]
+  suffix = Path(str(filename or "upload")).suffix.lower()
+  if suffix in {".png", ".jpg", ".jpeg", ".webp"}:
+    return ".jpg" if suffix == ".jpeg" else suffix
+  raise HTTPException(status_code=400, detail="unsupported_image_type")
+
+
+def _mim_ui_media_url(asset_name: str) -> str:
+  return f"/mim/ui/media/{asset_name}"
+
+
+def _parse_mim_ui_multipart_form(
+  *,
+  content_type: str,
+  body: bytes,
+) -> tuple[dict[str, str], dict[str, object]]:
+  normalized_content_type = str(content_type or "").strip()
+  if not normalized_content_type.lower().startswith("multipart/form-data"):
+    raise HTTPException(status_code=415, detail="unsupported_media_type")
+  if "boundary=" not in normalized_content_type.lower():
+    raise HTTPException(status_code=400, detail="multipart_boundary_missing")
+  if not body:
+    raise HTTPException(status_code=400, detail="empty_multipart_body")
+
+  envelope = (
+    f"Content-Type: {normalized_content_type}\r\n"
+    "MIME-Version: 1.0\r\n\r\n"
+  ).encode("utf-8") + body
+  message = BytesParser(policy=email_policy_default).parsebytes(envelope)
+  if not message.is_multipart():
+    raise HTTPException(status_code=400, detail="invalid_multipart_body")
+
+  fields: dict[str, str] = {}
+  upload: dict[str, object] | None = None
+  for part in message.iter_parts():
+    part_name = str(
+      part.get_param("name", header="content-disposition") or ""
+    ).strip()
+    if not part_name:
+      continue
+    payload = part.get_payload(decode=True) or b""
+    filename = part.get_filename()
+    if filename is None:
+      charset = part.get_content_charset() or "utf-8"
+      fields[part_name] = payload.decode(charset, errors="replace")
+      continue
+    upload = {
+      "field_name": part_name,
+      "filename": str(filename or "upload").strip() or "upload",
+      "content_type": str(part.get_content_type() or "").strip().lower(),
+      "content": payload,
+    }
+
+  if not isinstance(upload, dict):
+    raise HTTPException(status_code=400, detail="image_file_missing")
+  if str(upload.get("field_name") or "").strip() != "file":
+    raise HTTPException(status_code=400, detail="unexpected_file_field")
+  return fields, upload
+
+
+def _interface_message_attachment(metadata_json: object) -> dict[str, object] | None:
+  metadata = metadata_json if isinstance(metadata_json, dict) else {}
+  attachment = metadata.get("attachment")
+  if not isinstance(attachment, dict):
+    return None
+  return {
+    "kind": str(attachment.get("kind") or "").strip(),
+    "url": str(attachment.get("url") or "").strip(),
+    "thumbnail_url": str(attachment.get("thumbnail_url") or attachment.get("url") or "").strip(),
+    "mime_type": str(attachment.get("mime_type") or "").strip(),
+    "filename": str(attachment.get("filename") or "").strip(),
+    "size_bytes": int(attachment.get("size_bytes") or 0),
+    "width": int(attachment.get("width") or 0),
+    "height": int(attachment.get("height") or 0),
+    "sha256": str(attachment.get("sha256") or "").strip(),
+  }
+
+
+MIM_UI_MESSAGE_TYPES = {
+  "user",
+  "mim_reply",
+  "system_execution",
+  "system_summary",
+}
+
+
+def _message_role_class(message: dict[str, object]) -> str:
+  role = str(message.get("role") or message.get("direction") or "mim").strip().lower()
+  if role in {"operator", "user", "inbound"}:
+    return "user"
+  if role == "system":
+    return "system"
+  return "mim"
+
+
+def _compact_multiline_text(raw: str, *, max_len: int = 180) -> str:
+  lines = [str(line).strip() for line in str(raw or "").splitlines() if str(line).strip()]
+  return _compact_sentence(" ".join(lines), max_len=max_len)
+
+
+def _parse_execution_steps(text: str) -> list[dict[str, object]]:
+  steps: list[dict[str, object]] = []
+  current: dict[str, object] | None = None
+
+  def ensure_current() -> dict[str, object]:
+    nonlocal current
+    if current is None:
+      current = {
+        "iteration": "",
+        "task": "",
+        "result": "",
+        "delta": "",
+        "notes": [],
+      }
+      steps.append(current)
+    return current
+
+  for raw_line in str(text or "").splitlines():
+    line = str(raw_line or "").strip()
+    if not line:
+      continue
+    iteration_match = re.match(r"^Iteration\s+([^:]+):\s*(.*)$", line, re.IGNORECASE)
+    if iteration_match:
+      current = {
+        "iteration": f"Iteration {iteration_match.group(1).strip()}",
+        "task": "",
+        "result": "",
+        "delta": "",
+        "notes": [],
+      }
+      trailing = str(iteration_match.group(2) or "").strip()
+      if trailing:
+        current["notes"].append(trailing)
+      steps.append(current)
+      continue
+
+    task_match = re.match(r"^Task:\s*(.*)$", line, re.IGNORECASE)
+    if task_match:
+      ensure_current()["task"] = str(task_match.group(1) or "").strip()
+      continue
+
+    result_match = re.match(r"^Result:\s*(.*)$", line, re.IGNORECASE)
+    if result_match:
+      ensure_current()["result"] = str(result_match.group(1) or "").strip()
+      continue
+
+    delta_match = re.match(r"^Delta:\s*(.*)$", line, re.IGNORECASE)
+    if delta_match:
+      ensure_current()["delta"] = str(delta_match.group(1) or "").strip()
+      continue
+
+    ensure_current()["notes"].append(line)
+
+  normalized_steps: list[dict[str, object]] = []
+  for step in steps:
+    notes = [
+      str(item).strip()
+      for item in (step.get("notes") or [])
+      if str(item).strip()
+    ]
+    normalized_steps.append(
+      {
+        "iteration": str(step.get("iteration") or "").strip(),
+        "task": str(step.get("task") or "").strip(),
+        "result": str(step.get("result") or "").strip(),
+        "delta": str(step.get("delta") or "").strip(),
+        "notes": notes,
+      }
+    )
+  return [
+    step
+    for step in normalized_steps
+    if any(
+      [
+        step["iteration"],
+        step["task"],
+        step["result"],
+        step["delta"],
+        step["notes"],
+      ]
+    )
+  ]
+
+
+def _infer_mim_ui_message_type(
+  *,
+  message: dict[str, object],
+  metadata: dict[str, object],
+  content: str,
+) -> str:
+  explicit = str(metadata.get("message_type") or message.get("message_type") or "").strip().lower()
+  if explicit in MIM_UI_MESSAGE_TYPES:
+    return explicit
+
+  role_class = _message_role_class(message)
+  if role_class == "user":
+    return "user"
+  if role_class == "system":
+    return "system_summary"
+
+  has_execution_id = int(metadata.get("execution_id") or 0) > 0
+  has_structured_markers = bool(
+    re.search(r"(^|\n)Iteration\s+[^:]+:", content, re.IGNORECASE)
+    or re.search(r"(^|\n)Task:\s*", content, re.IGNORECASE)
+    or re.search(r"(^|\n)Result:\s*", content, re.IGNORECASE)
+    or re.search(r"(^|\n)Delta:\s*", content, re.IGNORECASE)
+  )
+  line_count = len([line for line in content.splitlines() if str(line).strip()])
+  if has_structured_markers and (has_execution_id or line_count >= 4):
+    return "system_execution"
+  if has_execution_id and (line_count >= 6 or len(content) >= 320):
+    return "system_execution"
+  return "mim_reply"
+
+
+def _summarize_execution_message(
+  *,
+  content: str,
+  metadata: dict[str, object],
+  steps: list[dict[str, object]],
+) -> str:
+  summary_override = str(metadata.get("summary_text") or metadata.get("execution_summary") or "").strip()
+  if summary_override:
+    return _compact_sentence(summary_override, max_len=180)
+
+  if steps:
+    first_result = next(
+      (str(step.get("result") or "").strip() for step in steps if str(step.get("result") or "").strip()),
+      "",
+    )
+    first_task = next(
+      (str(step.get("task") or "").strip() for step in steps if str(step.get("task") or "").strip()),
+      "",
+    )
+    detail = first_result or first_task
+    summary = f"Execution trace with {len(steps)} step{'s' if len(steps) != 1 else ''}"
+    if detail:
+      summary = f"{summary}. {detail}"
+    return _compact_sentence(summary, max_len=180)
+
+  result_match = re.search(r"(?:^|\n)Result:\s*(.+)", content, re.IGNORECASE)
+  if result_match:
+    return _compact_sentence(str(result_match.group(1) or "").strip(), max_len=180)
+  return _compact_multiline_text(content, max_len=180)
+
+
+def _serialize_execution_payload(
+  *,
+  content: str,
+  metadata: dict[str, object],
+) -> dict[str, object]:
+  steps = _parse_execution_steps(content)
+  lines = [line for line in str(content or "").splitlines() if str(line).strip()]
+  preview = "\n".join(lines[:24]).strip()
+  summary = _summarize_execution_message(content=content, metadata=metadata, steps=steps)
+  return {
+    "summary_text": summary,
+    "inline_text": summary,
+    "execution_text": str(content or "").strip(),
+    "execution_preview": preview,
+    "execution_truncated": len(lines) > 24,
+    "structured_output": {
+      "steps": steps,
+      "step_count": len(steps),
+      "line_count": len(lines),
+      "has_structure": bool(steps),
+    },
+  }
+
+
+def _serialize_chat_message(message: dict[str, object]) -> dict[str, object]:
+  metadata = message.get("metadata_json") if isinstance(message.get("metadata_json"), dict) else {}
+  content = str(message.get("content") or "").strip()
+  normalized_type = _infer_mim_ui_message_type(
+    message=message,
+    metadata=metadata,
+    content=content,
+  )
+  execution_payload = (
+    _serialize_execution_payload(content=content, metadata=metadata)
+    if normalized_type == "system_execution"
+    else {
+      "summary_text": "",
+      "inline_text": content,
+      "execution_text": "",
+      "execution_preview": "",
+      "execution_truncated": False,
+      "structured_output": {
+        "steps": [],
+        "step_count": 0,
+        "line_count": 0,
+        "has_structure": False,
+      },
+    }
+  )
+  summary_text = (
+    execution_payload["summary_text"]
+    if normalized_type == "system_execution"
+    else _compact_multiline_text(content, max_len=180)
+  )
+  return {
+    **message,
+    "message_type": normalized_type,
+    "interaction_mode": str(metadata.get("interaction_mode") or "text").strip() or "text",
+    "attachment": _interface_message_attachment(metadata),
+    "summary_text": summary_text,
+    "inline_text": execution_payload["inline_text"] if normalized_type == "system_execution" else content,
+    "execution_text": execution_payload["execution_text"],
+    "execution_preview": execution_payload["execution_preview"],
+    "execution_truncated": bool(execution_payload["execution_truncated"]),
+    "structured_output": execution_payload["structured_output"],
+    "execution_id": int(metadata.get("execution_id") or 0),
+  }
+
+
+async def _load_mim_ui_chat_thread(*, db: AsyncSession) -> dict[str, object]:
+  session_key = _mim_ui_primary_thread_key()
+  try:
+    session, rows = await list_interface_messages(
+      session_key=session_key,
+      limit=200,
+      db=db,
+    )
+    session_out = to_interface_session_out(session)
+    messages = [
+      _serialize_chat_message(to_interface_message_out(row))
+      for row in reversed(rows)
+    ]
+  except ValueError:
+    session_out = {
+      "session_key": session_key,
+      "channel": "chat",
+      "status": "active",
+      "context_json": {},
+      "metadata_json": {},
+    }
+    messages = []
+  except Exception as exc:  # noqa: BLE001
+    if not _is_mim_ui_db_unavailable(exc):
+      raise
+    session_out = {
+      "session_key": session_key,
+      "channel": "chat",
+      "status": "degraded",
+      "context_json": {"primary_thread": True, "degraded": True},
+      "metadata_json": {"db_unavailable": True},
+    }
+    messages = []
+  return {
+    "session": session_out,
+    "messages": messages,
+    "primary_thread": session_key,
+  }
+
+
+def _is_mim_ui_db_unavailable(exc: Exception) -> bool:
+  error_text = str(exc or "").strip().lower()
+  return isinstance(exc, (ConnectionRefusedError, TimeoutError, OSError)) or any(
+    phrase in error_text
+    for phrase in (
+      "refused the network connection",
+      "connection refused",
+      "failed to connect",
+      "could not connect",
+      "asyncpg",
+      "targetserverattributenotmatched",
+    )
+  )
+
+
+def _build_mim_ui_degraded_state(*, db_error_text: str = "") -> dict[str, object]:
+  now = datetime.now(timezone.utc)
+  frontend_media = _frontend_media_snapshot(now)
+  routine_training = build_training_routine_snapshot()
+  frontend_media_issue = _frontend_media_issue_summary(frontend_media)
+  authoritative_request = load_authoritative_request_status(shared_root=SHARED_RUNTIME_ROOT)
+  runtime_health_summary = "Database-backed MIM state is temporarily unavailable. Chat remains available while shared-runtime artifacts continue to load."
+  if db_error_text:
+    runtime_health_summary = f"{runtime_health_summary} Latest storage error: {_compact_sentence(db_error_text, max_len=180)}"
+  if frontend_media_issue:
+    runtime_health_summary = f"{runtime_health_summary} Frontend media: {frontend_media_issue}."
+  runtime_health = {
+    "status": "degraded",
+    "summary": runtime_health_summary,
+    "frontend_media": frontend_media,
+    "database": {
+      "available": False,
+      "error": _compact_sentence(db_error_text, max_len=220),
+      "captured_at": now.isoformat(),
+    },
+  }
+  initiative_driver = {
+    "status": "DEGRADED",
+    "summary": "MIM kept the primary operator thread online while database connectivity is unavailable.",
+    "active_objective": {
+      "id": str(authoritative_request.get("objective_id") or "").strip(),
+      "title": str(authoritative_request.get("objective_title") or "Keep the operator surface available").strip(),
+      "display_title": str(authoritative_request.get("objective_title") or "Keep the operator surface available").strip(),
+    },
+    "active_task": {
+      "id": str(authoritative_request.get("task_id") or "").strip(),
+      "title": "Hold the primary MIM thread open while runtime storage recovers.",
+      "display_title": "Hold the primary MIM thread open while runtime storage recovers.",
+    },
+    "next_task": {
+      "id": "",
+      "title": "Restore database connectivity or continue through TOD-backed coordination.",
+      "display_title": "Restore database connectivity or continue through TOD-backed coordination.",
+    },
+    "activity": {
+      "state": "warning",
+      "label": "Degraded",
+      "summary": runtime_health_summary,
+      "stale_seconds": 0,
+    },
+    "progress": {
+      "percent": 0,
+      "movement_percent": 0,
+      "completed_task_count": 0,
+      "task_count": 0,
+      "summary": "Database-backed bounded task telemetry is unavailable.",
+      "movement_summary": "Chat-first operator control remains available.",
+    },
+    "blockers": [
+      {
+        "code": "database_unavailable",
+        "summary": "Database connectivity failed while loading the MIM operator surface.",
+      }
+    ],
+    "program_status": {
+      "summary": "Program queue is unavailable while MIM runs in degraded mode.",
+      "projects": [],
+    },
+    "active_project": {},
+  }
+  tod_truth_reconciliation = _build_tod_truth_reconciliation_snapshot(
+    initiative_driver=initiative_driver,
+    authoritative_request=authoritative_request,
+    shared_root=SHARED_RUNTIME_ROOT,
+  )
+  operator_reasoning = {
+    "summary": runtime_health_summary,
+    "runtime_health": runtime_health,
+    "runtime_recovery": runtime_recovery_service.get_summary(),
+    "active_work": {"summary": "Primary operator chat is online in degraded mode."},
+    "current_recommendation": {
+      "summary": "Use the primary thread for status and coordination while database connectivity recovers."
+    },
+    "execution_readiness": {
+      "execution_allowed": False,
+      "gate_state": "database_unavailable",
+      "summary": "Database-backed execution readiness could not be loaded.",
+    },
+    "tod_truth_reconciliation": tod_truth_reconciliation,
+  }
+  system_activity = _build_system_activity_snapshot(
+    initiative_driver=initiative_driver,
+    operator_reasoning=operator_reasoning,
+    runtime_health=runtime_health,
+    runtime_recovery=operator_reasoning["runtime_recovery"],
+    authoritative_request=authoritative_request,
+    collaboration_progress={},
+    dispatch_telemetry={},
+    tod_decision_process={},
+  )
+  operator_reasoning["system_activity"] = system_activity
+  chat_thread = _append_mim_live_worklog(
+    {
+      "session": {
+        "session_key": _mim_ui_primary_thread_key(),
+        "channel": "chat",
+        "status": "degraded",
+        "context_json": {"primary_thread": True, "degraded": True},
+        "metadata_json": {"db_unavailable": True},
+      },
+      "messages": [
+        {
+          "role": "mim",
+          "message_type": "system_summary",
+          "content": runtime_health_summary,
+          "created_at": now.isoformat(),
+        }
+      ],
+      "primary_thread": _mim_ui_primary_thread_key(),
+    },
+    system_activity=system_activity,
+    initiative_driver=initiative_driver,
+    operator_reasoning=operator_reasoning,
+    generated_at=now.isoformat(),
+  )
+  return {
+    "speaking": False,
+    "camera_last_label": "",
+    "camera_last_confidence": 0.0,
+    "camera_scene_summary": "",
+    "camera_source_count": 0,
+    "voice_listen_hint": "Voice can stay local while MIM runtime storage reconnects.",
+    "conversation_policy_profile": "tightened_v1",
+    "runtime_build": f"{UI_BUILD_ID}-degraded-no-db",
+    "runtime_features": [
+      "chat_first_operator_surface",
+      "runtime_artifact_fallback",
+      "database_connectivity_degraded_mode",
+      "routine_training_status",
+      "routine_training_controls",
+    ],
+    "inquiry_prompt": "MIM storage is temporarily offline. Use this thread for status, coordination, and bounded next steps while runtime state recovers.",
+    "operator_reasoning": operator_reasoning,
+    "system_activity": system_activity,
+    "tod_truth_reconciliation": system_activity.get("tod_truth_reconciliation") if isinstance(system_activity.get("tod_truth_reconciliation"), dict) else tod_truth_reconciliation,
+    "initiative_driver": initiative_driver,
+    "collaboration_progress": {},
+    "dispatch_telemetry": {},
+    "mim_arm_dispatch_telemetry": {},
+    "primitive_request": authoritative_request,
+    "chat_thread": chat_thread,
+    "routine_training": routine_training,
+    "frontend_media": frontend_media,
+    "conversation_context": {
+      "environment_now": "Database connectivity unavailable.",
+      "program_status_summary": str(initiative_driver.get("program_status", {}).get("summary") or "").strip(),
+      "program_status": initiative_driver.get("program_status") if isinstance(initiative_driver.get("program_status"), dict) else {},
+      "active_goal": str(initiative_driver.get("active_objective", {}).get("display_title") or "").strip(),
+      "initiative_active_objective": str(initiative_driver.get("active_objective", {}).get("display_title") or "").strip(),
+      "initiative_active_task": str(initiative_driver.get("active_task", {}).get("display_title") or "").strip(),
+      "initiative_next_task": str(initiative_driver.get("next_task", {}).get("display_title") or "").strip(),
+      "initiative_activity_state": str(initiative_driver.get("activity", {}).get("state") or "").strip(),
+      "initiative_activity_label": str(initiative_driver.get("activity", {}).get("label") or "").strip(),
+      "initiative_activity_summary": str(initiative_driver.get("activity", {}).get("summary") or runtime_health_summary).strip(),
+      "operator_reasoning_summary": runtime_health_summary,
+      "runtime_health_summary": runtime_health_summary,
+      "routine_training_summary": str(routine_training.get("summary") or "").strip(),
+      "open_question": "",
+      "memory_hint": "",
+      "recent_user_input": "No recent database-backed input available.",
+    },
+    "latest_output_action_id": 0,
+    "latest_output_text": runtime_health_summary,
+    "latest_output_allowed": False,
+  }
+
+
+def _mim_ui_openai_ready() -> tuple[bool, str]:
+  forced_disable = str(os.getenv("MIM_DISABLE_OPENAI", "")).strip().lower() in {"1", "true", "yes", "on"}
+  api_key = str(settings.openai_api_key or os.getenv("MIM_OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY") or "").strip()
+  allowed = bool(
+    settings.allow_openai
+    or str(os.getenv("MIM_ALLOW_OPENAI", "")).strip().lower() in {"1", "true", "yes", "on"}
+  )
+  if forced_disable:
+    return False, "openai_disabled"
+  if not allowed:
+    return False, "openai_not_allowed"
+  if not api_key:
+    return False, "openai_api_key_missing"
+  return True, api_key
+
+
+def _extract_openai_message_text(content: object) -> str:
+  if isinstance(content, str):
+    return content.strip()
+  if isinstance(content, list):
+    parts: list[str] = []
+    for item in content:
+      if isinstance(item, dict):
+        text = str(item.get("text") or "").strip()
+        if text:
+          parts.append(text)
+    return "\n".join(parts).strip()
+  return ""
+
+
+def _analyze_image_with_openai_sync(*, image_bytes: bytes, mime_type: str, prompt: str) -> str:
+  ready, detail = _mim_ui_openai_ready()
+  if not ready:
+    raise RuntimeError(detail)
+
+  model = str(os.getenv("MIM_IMAGE_OPENAI_MODEL") or "gpt-4.1-mini").strip() or "gpt-4.1-mini"
+  api_url = str(os.getenv("MIM_OPENAI_CHAT_URL") or "https://api.openai.com/v1/chat/completions").strip()
+  image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+  payload = {
+    "model": model,
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {"type": "text", "text": prompt},
+          {
+            "type": "image_url",
+            "image_url": {"url": f"data:{mime_type};base64,{image_b64}"},
+          },
+        ],
+      }
+    ],
+    "max_tokens": 500,
+  }
+  req = urllib_request.Request(
+    api_url,
+    data=json.dumps(payload).encode("utf-8"),
+    headers={
+      "Content-Type": "application/json",
+      "Authorization": f"Bearer {detail}",
+    },
+    method="POST",
+  )
+  try:
+    with urllib_request.urlopen(req, timeout=45) as response:
+      raw = response.read().decode("utf-8")
+  except urllib_error.HTTPError as exc:
+    detail_text = exc.read().decode("utf-8", errors="replace") if exc.fp else str(exc)
+    raise RuntimeError(f"openai_http_error:{exc.code}:{detail_text}") from exc
+  except urllib_error.URLError as exc:
+    raise RuntimeError(f"openai_transport_error:{exc}") from exc
+
+  payload_out = json.loads(raw)
+  choices = payload_out.get("choices") if isinstance(payload_out, dict) else []
+  first_choice = choices[0] if isinstance(choices, list) and choices else {}
+  message = first_choice.get("message") if isinstance(first_choice, dict) else {}
+  content = message.get("content") if isinstance(message, dict) else ""
+  text = _extract_openai_message_text(content)
+  if not text:
+    raise RuntimeError("openai_empty_response")
+  return text
+
+
+async def _analyze_image_with_openai(*, image_bytes: bytes, mime_type: str, prompt: str) -> str:
+  return await asyncio.to_thread(
+    _analyze_image_with_openai_sync,
+    image_bytes=image_bytes,
+    mime_type=mime_type,
+    prompt=prompt,
+  )
 
 
 def _known_people() -> set[str]:
@@ -131,6 +1214,439 @@ def _compact_sentence(raw: str, *, max_len: int = 180) -> str:
     return f"{text[: max_len - 3].rstrip()}..."
 
 
+def _first_nonempty_text(*values: object) -> str:
+  for value in values:
+    text = str(value or "").strip()
+    if text:
+      return text
+  return ""
+
+
+def _resolve_initiative_label(payload: object, fallback: str = "") -> str:
+  data = payload if isinstance(payload, dict) else {}
+  return _compact_sentence(
+    _first_nonempty_text(
+      data.get("display_title"),
+      data.get("title"),
+      data.get("objective"),
+      data.get("project_id"),
+      fallback,
+    ),
+    max_len=140,
+  )
+
+
+def _normalize_tod_stage_status(value: object) -> str:
+  return str(value or "").strip().lower()
+
+
+def _tod_stage_is_complete(value: object) -> bool:
+  return _normalize_tod_stage_status(value) in {"accepted", "complete", "completed", "passed", "success", "succeeded", "not_needed"}
+
+
+def _derive_tod_phase_progress(
+  active_task: dict[str, object] | None,
+  execution_result: dict[str, object] | None,
+  validation: dict[str, object] | None,
+  activity_state: str,
+  next_step: str,
+  wait_reason: str,
+) -> dict[str, object]:
+  task = active_task if isinstance(active_task, dict) else {}
+  result = execution_result if isinstance(execution_result, dict) else {}
+  validation_payload = validation if isinstance(validation, dict) else {}
+  contract = task.get("execution_contract") if isinstance(task.get("execution_contract"), dict) else {}
+  intake = contract.get("task_intake") if isinstance(contract.get("task_intake"), dict) else {}
+  planner = contract.get("bounded_step_planner") if isinstance(contract.get("bounded_step_planner"), dict) else {}
+  patch_writer = contract.get("patch_writer") if isinstance(contract.get("patch_writer"), dict) else {}
+  command_runner = contract.get("command_runner") if isinstance(contract.get("command_runner"), dict) else {}
+  validator = contract.get("validator") if isinstance(contract.get("validator"), dict) else {}
+  result_publisher = contract.get("result_publisher") if isinstance(contract.get("result_publisher"), dict) else {}
+
+  patch_status = _normalize_tod_stage_status(patch_writer.get("status"))
+  command_status = _normalize_tod_stage_status(command_runner.get("status"))
+  implementation_complete = _tod_stage_is_complete(patch_status) or (not patch_status and _tod_stage_is_complete(command_status))
+
+  milestones = [
+    {
+      "id": "task_intake",
+      "label": "Task intake",
+      "weight": 10,
+      "status": _normalize_tod_stage_status(intake.get("status")),
+      "complete": _tod_stage_is_complete(intake.get("status")),
+    },
+    {
+      "id": "inspection",
+      "label": "Inspection and planning",
+      "weight": 20,
+      "status": _normalize_tod_stage_status(planner.get("status") or (planner.get("active_step") if isinstance(planner.get("active_step"), dict) else {}).get("status")),
+      "complete": _tod_stage_is_complete(planner.get("status")) or _tod_stage_is_complete((planner.get("active_step") if isinstance(planner.get("active_step"), dict) else {}).get("status")),
+    },
+    {
+      "id": "implementation",
+      "label": "Implementation",
+      "weight": 35,
+      "status": patch_status or command_status,
+      "complete": implementation_complete,
+    },
+    {
+      "id": "validation",
+      "label": "Focused validation",
+      "weight": 20,
+      "status": _normalize_tod_stage_status(validator.get("status") or validation_payload.get("status")),
+      "complete": _tod_stage_is_complete(validator.get("status")) or _tod_stage_is_complete(validation_payload.get("status")),
+    },
+    {
+      "id": "publication",
+      "label": "Evidence publish",
+      "weight": 15,
+      "status": _normalize_tod_stage_status(result_publisher.get("status")),
+      "complete": _tod_stage_is_complete(result_publisher.get("status")),
+    },
+  ]
+
+  percent_complete = sum(item["weight"] for item in milestones if item["complete"])
+  implementation_pending = not milestones[2]["complete"] and any(
+    phrase in f"{next_step} {wait_reason}".lower()
+    for phrase in ("implementation", "patch", "bounded execution-loop slice", "bounded local implementation step")
+  )
+  if implementation_pending:
+    percent_complete = min(percent_complete, 60)
+  if str(activity_state or "").strip().lower() == "complete":
+    percent_complete = 100
+
+  completed_count = sum(1 for item in milestones if item["complete"])
+  total_count = len(milestones)
+  next_gate = "Phase 2 handoff" if percent_complete >= 100 else "Implementation" if implementation_pending else "Focused validation" if not milestones[3]["complete"] else "Evidence publish" if not milestones[4]["complete"] else "Phase 1 closeout"
+  if percent_complete >= 100:
+    summary = "Phase 1 complete and verified."
+  elif implementation_pending:
+    summary = f"Phase 1 is about {percent_complete}% complete. Inspection is done; implementation is the next gate."
+  elif not milestones[3]["complete"]:
+    summary = f"Phase 1 is about {percent_complete}% complete. Focused validation is the next gate."
+  elif not milestones[4]["complete"]:
+    summary = f"Phase 1 is about {percent_complete}% complete. Evidence publish is the next gate."
+  else:
+    summary = f"Phase 1 is about {percent_complete}% complete. Final closeout is the next gate."
+
+  return {
+    "available": bool(contract) or bool(task) or bool(result),
+    "label": "Phase 1 progress",
+    "percent_complete": max(0, min(100, int(percent_complete))),
+    "completed_milestones": completed_count,
+    "total_milestones": total_count,
+    "next_gate": next_gate,
+    "summary": summary,
+    "milestones": milestones,
+  }
+
+
+def _derive_tod_stall_signal(
+  activity_state: str,
+  updated_at: str,
+  phase_progress: dict[str, object],
+  next_step: str,
+  wait_reason: str,
+) -> dict[str, object]:
+  normalized_state = str(activity_state or "idle").strip().lower() or "idle"
+  age_seconds = _age_seconds(datetime.now(timezone.utc), _parse_payload_timestamp(updated_at))
+  if age_seconds is None or normalized_state in {"complete", "blocked", "idle"}:
+    return {
+      "flagged": False,
+      "level": "ok",
+      "threshold_seconds": None,
+      "age_seconds": age_seconds,
+      "summary": "",
+    }
+
+  threshold_seconds = 1200 if normalized_state == "waiting" else 900 if normalized_state == "working" else 600 if normalized_state == "stalled" else None
+  flagged = bool(threshold_seconds is not None and age_seconds >= threshold_seconds)
+  if not flagged:
+    return {
+      "flagged": False,
+      "level": "ok",
+      "threshold_seconds": threshold_seconds,
+      "age_seconds": age_seconds,
+      "summary": "",
+    }
+
+  progress_percent = int(phase_progress.get("percent_complete") or 0)
+  progress_summary = str(phase_progress.get("summary") or "Phase progress is published.").strip()
+  delay_minutes = max(1, int(round(age_seconds / 60.0)))
+  detail = _compact_sentence(wait_reason or next_step or "No next bounded step detail is published.", max_len=160)
+  summary = (
+    f"Probable stall: Phase 1 is holding at {progress_percent}% for about {delay_minutes}m without a newer execution update. "
+    f"{progress_summary} {detail}"
+  )
+  return {
+    "flagged": True,
+    "level": "probable_stall",
+    "threshold_seconds": threshold_seconds,
+    "age_seconds": age_seconds,
+    "summary": _compact_sentence(summary, max_len=220),
+  }
+
+
+def _derive_tod_execution_progress_snapshot(
+  active_task_payload: dict[str, object] | None,
+  activity_payload: dict[str, object] | None,
+  validation_payload: dict[str, object] | None,
+  execution_result_payload: dict[str, object] | None,
+  truth_payload: dict[str, object] | None,
+) -> dict[str, object]:
+  active_task = active_task_payload if isinstance(active_task_payload, dict) else {}
+  activity = activity_payload if isinstance(activity_payload, dict) else {}
+  validation = validation_payload if isinstance(validation_payload, dict) else {}
+  execution_result = execution_result_payload if isinstance(execution_result_payload, dict) else {}
+  truth = truth_payload if isinstance(truth_payload, dict) else {}
+
+  available = any(bool(payload) for payload in (active_task, activity, validation, execution_result, truth))
+  updated_at = _latest_timestamp_value(
+    execution_result.get("updated_at"),
+    execution_result.get("generated_at"),
+    validation.get("updated_at"),
+    validation.get("generated_at"),
+    activity.get("updated_at"),
+    activity.get("generated_at"),
+    active_task.get("updated_at"),
+    active_task.get("generated_at"),
+    truth.get("generated_at"),
+  )
+  status = str(
+    execution_result.get("status")
+    or activity.get("status")
+    or active_task.get("status")
+    or truth.get("status")
+    or ""
+  ).strip().lower()
+  execution_state = str(
+    execution_result.get("execution_state")
+    or activity.get("execution_state")
+    or active_task.get("execution_state")
+    or active_task.get("status")
+    or ""
+  ).strip().lower()
+  next_step = _compact_sentence(
+    execution_result.get("next_step")
+    or activity.get("next_step")
+    or active_task.get("next_step")
+    or "",
+    max_len=220,
+  )
+  wait_reason = _compact_sentence(
+    execution_result.get("wait_reason")
+    or active_task.get("wait_reason")
+    or activity.get("wait_reason")
+    or "",
+    max_len=220,
+  )
+  validation_status = str(validation.get("status") or "").strip().lower()
+  age_seconds = _age_seconds(datetime.now(timezone.utc), _parse_payload_timestamp(updated_at))
+
+  activity_state = "idle"
+  if status in {"failed", "error", "blocked"} or execution_state in {"failed", "error", "blocked"}:
+    activity_state = "stalled"
+  elif validation_status in {"pending", "waiting"}:
+    activity_state = "waiting"
+  elif status in {"waiting", "pending"} or execution_state in {"waiting", "waiting_on_next_step", "step_completed_waiting_next_selection"}:
+    activity_state = "waiting"
+  elif status in {"completed", "complete", "success", "succeeded"} or execution_state in {"completed", "complete", "success", "succeeded"}:
+    activity_state = "complete"
+  elif status in {"running", "active", "in_progress"} or execution_state in {"accepted", "planned", "running", "active", "in_progress"}:
+    activity_state = "stalled" if age_seconds is not None and age_seconds > 900 else "working"
+
+  phase_progress = _derive_tod_phase_progress(active_task, execution_result, validation, activity_state, next_step, wait_reason)
+  stall_signal = _derive_tod_stall_signal(activity_state, updated_at, phase_progress, next_step, wait_reason)
+  return {
+    "available": available,
+    "updated_at": updated_at,
+    "last_update_age_seconds": age_seconds,
+    "activity_state": activity_state,
+    "next_step": next_step,
+    "wait_reason": wait_reason,
+    "phase_progress": phase_progress,
+    "stall_signal": stall_signal,
+  }
+
+
+def _load_tod_execution_progress_snapshot(*, shared_root: Path = SHARED_RUNTIME_ROOT) -> dict[str, object]:
+  return _derive_tod_execution_progress_snapshot(
+    _load_json_artifact(shared_root / "TOD_ACTIVE_TASK.latest.json"),
+    _load_json_artifact(shared_root / "TOD_ACTIVITY_STREAM.latest.json"),
+    _load_json_artifact(shared_root / "TOD_VALIDATION_RESULT.latest.json"),
+    _load_json_artifact(shared_root / "TOD_EXECUTION_RESULT.latest.json"),
+    _load_json_artifact(shared_root / "TOD_EXECUTION_TRUTH.latest.json"),
+  )
+
+
+def _build_mim_live_worklog_messages(
+  *,
+  system_activity: dict[str, object] | None,
+  initiative_driver: dict[str, object] | None,
+  operator_reasoning: dict[str, object] | None,
+  generated_at: str = "",
+) -> list[dict[str, object]]:
+  activity = system_activity if isinstance(system_activity, dict) else {}
+  initiative = initiative_driver if isinstance(initiative_driver, dict) else {}
+  reasoning = operator_reasoning if isinstance(operator_reasoning, dict) else {}
+  active_work = reasoning.get("active_work") if isinstance(reasoning.get("active_work"), dict) else {}
+  self_evolution = reasoning.get("self_evolution") if isinstance(reasoning.get("self_evolution"), dict) else {}
+  recommendation = reasoning.get("current_recommendation") if isinstance(reasoning.get("current_recommendation"), dict) else {}
+  relation = activity.get("relation") if isinstance(activity.get("relation"), dict) else {}
+  tod_phase_progress = activity.get("tod_phase_progress") if isinstance(activity.get("tod_phase_progress"), dict) else {}
+  tod_stall_signal = activity.get("tod_stall_signal") if isinstance(activity.get("tod_stall_signal"), dict) else {}
+
+  objective = _resolve_initiative_label(initiative.get("active_objective"), "No active objective")
+  active_task = _resolve_initiative_label(initiative.get("active_task"), "")
+  next_task = _resolve_initiative_label(initiative.get("next_task"), "")
+  status_label = _compact_sentence(
+    _first_nonempty_text(activity.get("status_label"), activity.get("label"), initiative.get("status"), "Idle"),
+    max_len=80,
+  )
+  headline = _compact_sentence(
+    _first_nonempty_text(activity.get("headline"), activity.get("summary"), initiative.get("summary")),
+    max_len=140,
+  )
+  current_slice = _compact_sentence(
+    _first_nonempty_text(
+      active_work.get("summary"),
+      self_evolution.get("natural_language_development_active_slice"),
+      self_evolution.get("action_summary"),
+      initiative.get("activity", {}).get("summary") if isinstance(initiative.get("activity"), dict) else "",
+      activity.get("summary"),
+    ),
+    max_len=140,
+  )
+  next_move = _compact_sentence(
+    _first_nonempty_text(
+      self_evolution.get("natural_language_development_next_step"),
+      recommendation.get("summary"),
+      next_task,
+      initiative.get("progress", {}).get("summary") if isinstance(initiative.get("progress"), dict) else "",
+    ),
+    max_len=140,
+  )
+  wait_reason = _compact_sentence(
+    _first_nonempty_text(
+      activity.get("execution_allowed_reason"),
+      activity.get("stall_reason"),
+      relation.get("summary"),
+    ),
+    max_len=140,
+  )
+  updated_at = str(
+    generated_at
+    or activity.get("last_activity_at")
+    or activity.get("mim_last_activity_at")
+    or activity.get("last_task_progress_at")
+    or datetime.now(timezone.utc).isoformat()
+  ).strip()
+
+  live_target = _first_nonempty_text(active_task, objective, "the current MIM lane")
+  messages: list[dict[str, object]] = [
+    {
+      "role": "mim",
+      "message_type": "system_summary",
+      "content": f"Live MIM feed: MIM is {status_label.lower()} on {live_target}.",
+      "created_at": updated_at,
+    }
+  ]
+  if objective:
+    messages.append(
+      {
+        "role": "system",
+        "message_type": "system_summary",
+        "content": f"Objective now: {objective}",
+        "created_at": updated_at,
+      }
+    )
+  if current_slice:
+    messages.append(
+      {
+        "role": "system",
+        "message_type": "system_summary",
+        "content": f"Current slice: {current_slice}",
+        "created_at": updated_at,
+      }
+    )
+  if headline:
+    messages.append(
+      {
+        "role": "system",
+        "message_type": "system_summary",
+        "content": f"Status now: {headline}",
+        "created_at": updated_at,
+      }
+    )
+  if wait_reason:
+    messages.append(
+      {
+        "role": "system",
+        "message_type": "system_summary",
+        "content": f"Waiting on: {wait_reason}",
+        "created_at": updated_at,
+      }
+    )
+  if bool(tod_phase_progress.get("available")):
+    messages.append(
+      {
+        "role": "system",
+        "message_type": "system_summary",
+        "content": f"Phase 1 progress: {int(tod_phase_progress.get('percent_complete') or 0)}% complete. Next gate: {_first_nonempty_text(tod_phase_progress.get('next_gate'), 'Unknown')}.",
+        "created_at": updated_at,
+      }
+    )
+  if bool(tod_stall_signal):
+    stall_summary = str(tod_stall_signal.get("summary") or "").strip()
+    if bool(tod_stall_signal.get("flagged")) and stall_summary:
+      stall_line = f"Stall watch: {stall_summary}"
+    else:
+      age_seconds = tod_stall_signal.get("age_seconds")
+      age_text = ""
+      if isinstance(age_seconds, (int, float)) and age_seconds >= 0:
+        age_text = f" Last TOD update about {max(1, int(round(float(age_seconds) / 60.0)))}m ago."
+      stall_line = f"Stall watch: Clear.{age_text}".strip()
+    messages.append(
+      {
+        "role": "system",
+        "message_type": "system_summary",
+        "content": stall_line,
+        "created_at": updated_at,
+      }
+    )
+  if next_move:
+    messages.append(
+      {
+        "role": "system",
+        "message_type": "system_summary",
+        "content": f"Next move: {next_move}",
+        "created_at": updated_at,
+      }
+    )
+  return messages
+
+
+def _append_mim_live_worklog(
+  chat_thread: dict[str, object],
+  *,
+  system_activity: dict[str, object] | None,
+  initiative_driver: dict[str, object] | None,
+  operator_reasoning: dict[str, object] | None,
+  generated_at: str = "",
+) -> dict[str, object]:
+  payload = dict(chat_thread or {})
+  existing_messages = payload.get("messages") if isinstance(payload.get("messages"), list) else []
+  worklog_messages = _build_mim_live_worklog_messages(
+    system_activity=system_activity,
+    initiative_driver=initiative_driver,
+    operator_reasoning=operator_reasoning,
+    generated_at=generated_at,
+  )
+  if not worklog_messages:
+    payload["messages"] = list(existing_messages)
+    return payload
+  payload["messages"] = [*existing_messages, *worklog_messages]
+  return payload
 def _tokenize(text: str) -> set[str]:
     cleaned = re.sub(r"[^a-z0-9\s]", " ", str(text or "").lower())
     return {token for token in cleaned.split() if token}
@@ -283,7 +1799,11 @@ def _plain_answer_from_context(
             "I need one concrete request from you: ask one question or name one action."
         )
 
-    if "what can you do" in ql or "what can you help with" in ql:
+    if (
+      "what can you do" in ql
+      or "what can u do" in ql
+      or "what can you help with" in ql
+    ):
         return "I can answer a question, suggest a plan, or take an action."
 
     if "just chatting for now" in ql or "keep this simple and conversational" in ql:
@@ -598,6 +2118,29 @@ def _extract_conversation_session_id(metadata: object) -> str:
     return str(
         metadata.get("conversation_session_id") or metadata.get("session_id") or ""
     ).strip()
+
+
+def _conversation_reply_text_from_resolution(
+  resolution: InputEventResolution | None,
+) -> str:
+  if resolution is None:
+    return ""
+  metadata = resolution.metadata_json if isinstance(resolution.metadata_json, dict) else {}
+  reply_contract = (
+    metadata.get("communication_reply_contract")
+    if isinstance(metadata.get("communication_reply_contract"), dict)
+    else {}
+  )
+  reply_text = str(reply_contract.get("reply_text") or "").strip()
+  if reply_text:
+    return reply_text
+  result_override = str(metadata.get("mim_interface_result_override") or "").strip()
+  if result_override:
+    return result_override
+  clarification_prompt = str(resolution.clarification_prompt or "").strip()
+  if clarification_prompt:
+    return clarification_prompt
+  return str(metadata.get("mim_interface_reply_override") or "").strip()
 
 
 def _resolve_active_perception_session(
@@ -964,6 +2507,7 @@ def _build_operator_reasoning_summary(
     learned_preferences: list[dict],
     proposal_policy: dict,
     conflict_resolution: dict,
+    active_work: dict | None = None,
     collaboration_progress: dict | None = None,
     dispatch_telemetry: dict | None = None,
     tod_decision_process: dict | None = None,
@@ -974,6 +2518,7 @@ def _build_operator_reasoning_summary(
     collaboration_progress = (
       collaboration_progress if isinstance(collaboration_progress, dict) else {}
     )
+    active_work = active_work if isinstance(active_work, dict) else {}
     dispatch_telemetry = (
       dispatch_telemetry if isinstance(dispatch_telemetry, dict) else {}
     )
@@ -1004,6 +2549,9 @@ def _build_operator_reasoning_summary(
             "Gateway governance: "
             f"{str(gateway_governance.get('summary') or '').strip()}"
         )
+    active_work_summary = str(active_work.get("summary") or "").strip()
+    if active_work_summary:
+      parts.append(f"Active work: {active_work_summary}")
     collaboration_summary = str(collaboration_progress.get("summary") or "").strip()
     if collaboration_summary:
       parts.append(f"TOD collaboration: {collaboration_summary}")
@@ -1201,6 +2749,11 @@ def _operator_self_evolution_snapshot(briefing: dict) -> dict:
     snapshot = packet.get("snapshot", {}) if isinstance(packet.get("snapshot", {}), dict) else {}
     decision = packet.get("decision", {}) if isinstance(packet.get("decision", {}), dict) else {}
     target = packet.get("target", {}) if isinstance(packet.get("target", {}), dict) else {}
+    natural_language_development = (
+        packet.get("natural_language_development", {})
+        if isinstance(packet.get("natural_language_development", {}), dict)
+        else {}
+    )
     recommendation = (
         target.get("recommendation", {}) if isinstance(target.get("recommendation", {}), dict) else {}
     )
@@ -1233,19 +2786,47 @@ def _operator_self_evolution_snapshot(briefing: dict) -> dict:
     summary = str(decision.get("summary") or snapshot.get("summary") or "").strip()
     normalized_action = _summarize_operator_http_action(action)
     operator_commands = _build_self_evolution_operator_commands(
-      decision=decision,
-      target=target,
-      action=normalized_action,
+        decision=decision,
+        target=target,
+        action=normalized_action,
     )
     primary_operator_command = operator_commands[0] if operator_commands else {}
     operator_command_summary = ""
     if primary_operator_command:
-      operator_command_summary = _compact_sentence(
-        f"{str(primary_operator_command.get('method') or '').strip()} "
-        f"{str(primary_operator_command.get('path') or '').strip()}: "
-        f"{str(primary_operator_command.get('purpose') or '').strip()}",
+        operator_command_summary = _compact_sentence(
+            f"{str(primary_operator_command.get('method') or '').strip()} "
+            f"{str(primary_operator_command.get('path') or '').strip()}: "
+            f"{str(primary_operator_command.get('purpose') or '').strip()}",
+            max_len=220,
+        )
+    natural_language_development_summary = _compact_sentence(
+        str(natural_language_development.get("summary") or "").strip(),
         max_len=220,
-      )
+    )
+    natural_language_development_active_slice = _compact_sentence(
+      str(natural_language_development.get("active_slice_summary") or "").strip(),
+      max_len=220,
+    )
+    natural_language_development_progress = _compact_sentence(
+      str(natural_language_development.get("progress_summary") or "").strip(),
+      max_len=220,
+    )
+    natural_language_development_next_step = _compact_sentence(
+        str(natural_language_development.get("next_step_summary") or "").strip(),
+        max_len=220,
+    )
+    natural_language_development_pass_bar = _compact_sentence(
+        str(natural_language_development.get("selected_skill_pass_bar_summary") or "").strip(),
+        max_len=220,
+    )
+    natural_language_development_continuation = _compact_sentence(
+      str(natural_language_development.get("continuation_policy_summary") or "").strip(),
+      max_len=220,
+    )
+    natural_language_development_whats_next = _compact_sentence(
+      str(natural_language_development.get("whats_next_framework_summary") or "").strip(),
+      max_len=220,
+    )
     return {
         "summary": _compact_sentence(summary, max_len=200),
         "status": str(snapshot.get("status") or "").strip(),
@@ -1254,13 +2835,27 @@ def _operator_self_evolution_snapshot(briefing: dict) -> dict:
         "target_kind": str(target.get("target_kind") or decision.get("target_kind") or "").strip(),
         "target_id": target.get("target_id", decision.get("target_id")),
         "target_summary": _compact_sentence(target_summary, max_len=180),
-      "action": normalized_action,
-      "action_summary": str(normalized_action.get("summary") or "").strip(),
-      "action_method": str(normalized_action.get("method") or "").strip(),
-      "action_path": str(normalized_action.get("path") or "").strip(),
-      "operator_commands": operator_commands,
-      "primary_operator_command": primary_operator_command,
-      "operator_command_summary": operator_command_summary,
+        "action": normalized_action,
+        "action_summary": str(normalized_action.get("summary") or "").strip(),
+        "action_method": str(normalized_action.get("method") or "").strip(),
+        "action_path": str(normalized_action.get("path") or "").strip(),
+        "operator_commands": operator_commands,
+        "primary_operator_command": primary_operator_command,
+        "operator_command_summary": operator_command_summary,
+        "natural_language_development": natural_language_development,
+        "natural_language_development_summary": natural_language_development_summary,
+        "natural_language_development_active_slice": natural_language_development_active_slice,
+        "natural_language_development_progress": natural_language_development_progress,
+        "natural_language_development_next_step": natural_language_development_next_step,
+        "natural_language_development_pass_bar": natural_language_development_pass_bar,
+        "natural_language_development_continuation": natural_language_development_continuation,
+        "natural_language_development_whats_next": natural_language_development_whats_next,
+        "natural_language_development_skill_id": str(
+            natural_language_development.get("selected_skill_id") or ""
+        ).strip(),
+        "natural_language_development_skill_title": str(
+            natural_language_development.get("selected_skill_title") or ""
+        ).strip(),
         "snapshot": snapshot,
         "decision": decision,
         "target": target,
@@ -1743,6 +3338,34 @@ def _resolve_execution_identity(payload: dict) -> dict:
 def _operator_collaboration_progress_snapshot(
     shared_root: Path = SHARED_RUNTIME_ROOT,
 ) -> dict:
+  authoritative_request = load_authoritative_request_status(shared_root=shared_root)
+  if authoritative_request:
+    request_id = str(authoritative_request.get("request_id") or "").strip()
+    return {
+      "request_id": request_id,
+      "task_id": str(authoritative_request.get("task_id") or request_id).strip(),
+      "execution_id": request_id,
+      "id_kind": "bridge_request_id",
+      "execution_lane": "primitive_request_recovery",
+      "execution_id_label": f"request {request_id}",
+      "generated_at": str(authoritative_request.get("generated_at") or "").strip(),
+      "type": "primitive_request_recovery",
+      "summary": _compact_sentence(
+        f"request {request_id} | {authoritative_request.get('result_status') or 'unknown'} | {authoritative_request.get('decision_code') or 'decision_recorded'}",
+        max_len=180,
+      ),
+      "active_workstream": {
+        "name": "primitive_request_recovery",
+        "mim_status": str(authoritative_request.get("decision_code") or "").strip(),
+        "tod_status": str(authoritative_request.get("result_status") or "").strip(),
+        "latest_observation": _compact_sentence(
+          str(authoritative_request.get("decision_detail") or authoritative_request.get("result_reason") or "").strip(),
+          max_len=180,
+        ),
+      },
+      "workstreams": [],
+    }
+
   payload = _load_json_artifact(shared_root / "MIM_TOD_COLLAB_PROGRESS.latest.json")
   if not payload:
     return {}
@@ -1810,6 +3433,30 @@ def _operator_collaboration_progress_snapshot(
 def _operator_dispatch_telemetry_snapshot(
     shared_root: Path = SHARED_RUNTIME_ROOT,
 ) -> dict:
+  authoritative_request = load_authoritative_request_status(shared_root=shared_root)
+  if authoritative_request:
+    request_id = str(authoritative_request.get("request_id") or "").strip()
+    return {
+      "request_id": request_id,
+      "task_id": str(authoritative_request.get("task_id") or request_id).strip(),
+      "correlation_id": request_id,
+      "execution_id": request_id,
+      "execution_lane": "primitive_request_recovery",
+      "command_name": str(authoritative_request.get("action_name") or "").strip(),
+      "dispatch_timestamp": str(authoritative_request.get("generated_at") or "").strip(),
+      "host_received_timestamp": "",
+      "host_completed_timestamp": str(authoritative_request.get("generated_at") or "").strip(),
+      "dispatch_status": str(authoritative_request.get("request_status") or "recorded").strip(),
+      "completion_status": str(authoritative_request.get("result_status") or "").strip(),
+      "result_reason": str(authoritative_request.get("result_reason") or "").strip(),
+      "record_path": str(shared_root / "TOD_MIM_TASK_RESULT.latest.json"),
+      "evidence_source_kinds": ["decision_artifact", "request_artifact", "result_artifact"],
+      "summary": _compact_sentence(
+        f"{authoritative_request.get('action_name') or 'request'}; request {request_id}; completion {authoritative_request.get('result_status') or 'unknown'}",
+        max_len=180,
+      ),
+    }
+
   payload = refresh_dispatch_telemetry_record(shared_root)
   if not payload:
     return {}
@@ -1934,6 +3581,274 @@ def _operator_tod_decision_process_snapshot(
     },
     "blocking_reason_codes": payload.get("blocking_reason_codes") if isinstance(payload.get("blocking_reason_codes"), list) else [],
     "summary": "; ".join(part for part in summary_parts if part),
+  }
+
+
+def _coordination_request_identifier(payload: dict) -> str:
+  if not isinstance(payload, dict):
+    return ""
+  return str(payload.get("request_id") or payload.get("task_id") or "").strip()
+
+
+def _coordination_status_value(payload: dict) -> str:
+  if not isinstance(payload, dict):
+    return ""
+  coordination = payload.get("coordination") if isinstance(payload.get("coordination"), dict) else {}
+  return str(
+    payload.get("ack_status")
+    or payload.get("status")
+    or coordination.get("status")
+    or ""
+  ).strip().lower()
+
+
+def _artifact_latest_timestamp(payload: dict) -> datetime | None:
+  if not isinstance(payload, dict):
+    return None
+  latest: datetime | None = None
+  for key in ("generated_at", "emitted_at", "acknowledged_at", "updated_at", "published_at"):
+    parsed = _parse_payload_timestamp(payload.get(key))
+    if parsed is not None and (latest is None or parsed > latest):
+      latest = parsed
+  return latest
+
+
+def _coordination_ack_matches_request(request_status: str, ack_status: str) -> bool:
+  normalized_request = str(request_status or "").strip().lower()
+  normalized_ack = str(ack_status or "").strip().lower()
+  pending_statuses = {"pending", "acknowledged", "accepted", "active", "in_progress", "pending_review"}
+  resolved_statuses = {"resolved", "closed", "done", "complete", "completed"}
+  if normalized_request in {"resolved", "closed", "done", "complete", "completed", "none"}:
+    return normalized_ack in resolved_statuses
+  if normalized_request in {"", "active", "pending", "open", "new", "received", "in_review", "reviewing"}:
+    return normalized_ack in pending_statuses
+  return normalized_ack == normalized_request
+
+
+def _build_tod_truth_reconciliation_snapshot(
+    *,
+    initiative_driver: dict,
+    authoritative_request: dict,
+    shared_root: Path = SHARED_RUNTIME_ROOT,
+) -> dict:
+  initiative = initiative_driver if isinstance(initiative_driver, dict) else {}
+  request = authoritative_request if isinstance(authoritative_request, dict) else {}
+  active_objective = initiative.get("active_objective") if isinstance(initiative.get("active_objective"), dict) else {}
+  integration_payload = _load_json_artifact(shared_root / "TOD_INTEGRATION_STATUS.latest.json")
+  canonical_objective_id = str(
+    ((integration_payload.get("mim_handshake") or {}).get("current_next_objective") if isinstance(integration_payload.get("mim_handshake"), dict) else "")
+    or ((integration_payload.get("mim_status") or {}).get("objective_active") if isinstance(integration_payload.get("mim_status"), dict) else "")
+    or ((integration_payload.get("objective_alignment") or {}).get("mim_objective_active") if isinstance(integration_payload.get("objective_alignment"), dict) else "")
+    or active_objective.get("objective_id")
+    or active_objective.get("id")
+    or ""
+  ).strip()
+  live_request_objective_id = str(
+    ((integration_payload.get("live_task_request") or {}).get("normalized_objective_id") if isinstance(integration_payload.get("live_task_request"), dict) else "")
+    or ((integration_payload.get("live_task_request") or {}).get("objective_id") if isinstance(integration_payload.get("live_task_request"), dict) else "")
+    or request.get("objective_id")
+    or ""
+  ).strip()
+
+  truth_payload = _load_json_artifact(shared_root / "TOD_EXECUTION_TRUTH.latest.json")
+  execution_decision = _load_json_artifact(shared_root / "TOD_MIM_EXECUTION_DECISION.latest.json")
+  command_status = _load_json_artifact(shared_root / "TOD_MIM_COMMAND_STATUS.latest.json")
+  coordination_request = _load_json_artifact(shared_root / "TOD_MIM_COORDINATION_REQUEST.latest.json")
+  coordination_ack = _load_json_artifact(shared_root / "MIM_TOD_COORDINATION_ACK.latest.json")
+  fallback_activation = _load_json_artifact(shared_root / "MIM_TOD_FALLBACK_ACTIVATION.latest.json")
+  bridge_task_ack = _load_json_artifact(shared_root / "TOD_MIM_TASK_ACK.latest.json")
+  bridge_task_result = _load_json_artifact(shared_root / "TOD_MIM_TASK_RESULT.latest.json")
+  bridge_consume_evidence = _load_json_artifact(shared_root / "MIM_TOD_CONSUME_EVIDENCE.latest.json")
+  authoritative_request_status = load_authoritative_request_status(shared_root=shared_root) or {}
+
+  summary_payload = truth_payload.get("summary") if isinstance(truth_payload.get("summary"), dict) else {}
+  truth_rows = truth_payload.get("recent_execution_truth") if isinstance(truth_payload.get("recent_execution_truth"), list) else []
+  execution_count = int(summary_payload.get("execution_count") or len(truth_rows) or 0)
+  active_request_id = str(
+    authoritative_request_status.get("request_id")
+    or authoritative_request_status.get("task_id")
+    or request.get("request_id")
+    or request.get("task_id")
+    or ""
+  ).strip()
+  active_task_id = str(
+    authoritative_request_status.get("task_id")
+    or authoritative_request_status.get("request_id")
+    or request.get("task_id")
+    or active_request_id
+    or ""
+  ).strip()
+  decision_state = str(execution_decision.get("execution_state") or "").strip().lower()
+  decision_outcome = str(execution_decision.get("decision_outcome") or "").strip().lower()
+  decision_summary = str(execution_decision.get("summary") or "").strip()
+  command_decision = command_status.get("decision") if isinstance(command_status.get("decision"), dict) else {}
+  command_status_state = str(command_status.get("status") or "").strip().lower()
+  command_reason_code = str(command_decision.get("reason_code") or "").strip().lower()
+  raw_command_requires_human = bool(command_decision.get("requires_human") is True)
+  autonomy_override_active = bool(settings.mim_full_autonomous_authority and raw_command_requires_human)
+  command_requires_human = bool(raw_command_requires_human and not autonomy_override_active)
+  command_summary = str(command_decision.get("summary") or command_status.get("summary") or "").strip()
+  fallback_task_id = str(fallback_activation.get("task_id") or "").strip()
+  fallback_objective_id = str(fallback_activation.get("objective_id") or "").strip()
+  fallback_execution_state = str(fallback_activation.get("execution_state") or "").strip().lower()
+  fallback_decision_outcome = str(fallback_activation.get("decision_outcome") or "").strip().lower()
+  fallback_summary = str(fallback_activation.get("summary") or "").strip()
+  fallback_matches_objective = bool(
+    fallback_objective_id
+    and canonical_objective_id
+    and str(fallback_objective_id).replace("objective-", "") == str(canonical_objective_id).replace("objective-", "")
+  )
+  fallback_active = bool(
+    fallback_matches_objective
+    and fallback_task_id
+    and fallback_execution_state in {"accepted", "running", "completed"}
+    and fallback_decision_outcome == "mim_direct_execution_takeover"
+  )
+
+  coordination_request_id = _coordination_request_identifier(coordination_request)
+  coordination_request_status = str((coordination_request or {}).get("status") or "").strip().lower()
+  coordination_ack_id = _coordination_request_identifier(coordination_ack)
+  coordination_ack_status = _coordination_status_value(coordination_ack)
+  coordination_ack_matches = bool(
+    coordination_request_id
+    and coordination_ack_id == coordination_request_id
+    and _coordination_ack_matches_request(coordination_request_status, coordination_ack_status)
+  )
+  coordination_request_ts = _artifact_latest_timestamp(coordination_request)
+  coordination_ack_ts = _artifact_latest_timestamp(coordination_ack)
+  coordination_request_newer = bool(
+    coordination_request_ts is not None
+    and (coordination_ack_ts is None or coordination_request_ts > coordination_ack_ts)
+  )
+  coordination_pending = bool(
+    coordination_request_id
+    and coordination_request_status not in {"resolved", "closed", "done", "complete", "completed", "none"}
+  )
+  coordination_response_missing = bool(
+    coordination_pending and (not coordination_ack_matches or coordination_request_newer)
+  )
+
+  def _bridge_payload_matches(payload: dict) -> bool:
+    if not isinstance(payload, dict):
+      return False
+    identity = _resolve_execution_identity(payload)
+    candidate_values = {
+      str(identity.get("execution_id") or "").strip(),
+      str(identity.get("request_id") or "").strip(),
+      str(identity.get("task_id") or "").strip(),
+      str(payload.get("request_id") or "").strip(),
+      str(payload.get("task_id") or payload.get("task") or "").strip(),
+      str(payload.get("execution_id") or "").strip(),
+    }
+    candidate_values.discard("")
+    return bool(candidate_values and ({active_request_id, active_task_id} - {""}) & candidate_values)
+
+  positive_bridge_statuses = {"acknowledged", "accepted", "active", "running", "in_progress", "pending_review", "succeeded", "done", "completed", "complete", "resolved", "closed"}
+  bridge_request_confirmed = False
+  bridge_confirmation_source = ""
+  bridge_request_status = str(authoritative_request_status.get("request_status") or "").strip().lower()
+  bridge_result_status = str(authoritative_request_status.get("result_status") or "").strip().lower()
+  if active_request_id and (bridge_request_status in positive_bridge_statuses or bridge_result_status in positive_bridge_statuses):
+    bridge_request_confirmed = True
+    bridge_confirmation_source = "authoritative_request_status"
+  if not bridge_request_confirmed and _bridge_payload_matches(bridge_task_ack):
+    ack_status = str(bridge_task_ack.get("status") or "").strip().lower()
+    if ack_status in positive_bridge_statuses:
+      bridge_request_confirmed = True
+      bridge_confirmation_source = "tod_mim_task_ack"
+  if not bridge_request_confirmed and _bridge_payload_matches(bridge_task_result):
+    result_status = str(bridge_task_result.get("status") or bridge_task_result.get("result_status") or "").strip().lower()
+    if result_status in positive_bridge_statuses:
+      bridge_request_confirmed = True
+      bridge_confirmation_source = "tod_mim_task_result"
+  if not bridge_request_confirmed and _bridge_payload_matches(bridge_consume_evidence):
+    current_payload = bridge_consume_evidence.get("current") if isinstance(bridge_consume_evidence.get("current"), dict) else {}
+    ack_status = str((current_payload.get("task_ack") or {}).get("status") if isinstance(current_payload.get("task_ack"), dict) else "").strip().lower()
+    result_status = str((current_payload.get("task_result") or {}).get("status") if isinstance(current_payload.get("task_result"), dict) else "").strip().lower()
+    if ack_status in positive_bridge_statuses or result_status in positive_bridge_statuses:
+      bridge_request_confirmed = True
+      bridge_confirmation_source = "mim_tod_consume_evidence"
+
+  negative_decision_states = {
+    "waiting_on_dependency",
+    "blocked",
+    "failed",
+    "stale",
+    "unknown",
+    "hold",
+  }
+  negative_decision_outcomes = {
+    "acknowledge_and_wait_on_dependency",
+    "blocked",
+    "failed",
+    "hold",
+  }
+  execution_confirmed = bool(execution_count > 0)
+  if decision_state in negative_decision_states or decision_outcome in negative_decision_outcomes:
+    execution_confirmed = False
+  if fallback_active:
+    execution_confirmed = True
+  if bridge_request_confirmed and decision_state not in negative_decision_states and decision_outcome not in negative_decision_outcomes:
+    execution_confirmed = True
+
+  state = "execution_confirmed" if execution_confirmed else "execution_unconfirmed"
+  summary = "TOD has not published recent execution confirmation for the current work yet."
+  if execution_confirmed:
+    if execution_count > 0:
+      summary = (
+        f"TOD has published {execution_count} recent execution confirmation"
+        f"{'' if execution_count == 1 else 's'} on the shared truth surface."
+      )
+    elif bridge_request_confirmed:
+      summary = "TOD has confirmed execution on the bridge request lane for the active request."
+  elif decision_summary:
+    summary = decision_summary
+  if fallback_active:
+    state = "execution_confirmed"
+    summary = fallback_summary or "MIM claimed bounded fallback authority and is executing the active task locally."
+
+  if coordination_response_missing:
+    state = "coordination_response_missing"
+    issue_code = str((coordination_request or {}).get("issue_code") or "coordination_request_active").strip().replace("_", " ")
+    summary = _compact_sentence(
+      f"TOD is waiting on MIM to answer coordination request {coordination_request_id}. "
+      f"Issue: {issue_code}. Publish a current coordination ACK before claiming completion.",
+      max_len=220,
+    )
+  elif command_requires_human:
+    execution_confirmed = False
+    state = command_status_state or command_reason_code or "hard_boundary_requires_human"
+    summary = command_summary or decision_summary or "TOD escalated the active request to a hard boundary and requires human action."
+
+  return {
+    "state": state,
+    "authoritative_source": "MIM" if fallback_active else "TOD",
+    "execution_confirmed": execution_confirmed,
+    "canonical_objective_id": canonical_objective_id,
+    "live_request_objective_id": live_request_objective_id,
+    "decision_state": decision_state,
+    "decision_outcome": decision_outcome,
+    "decision_summary": decision_summary,
+    "command_status": command_status_state,
+    "reason_code": "" if autonomy_override_active else command_reason_code,
+    "requires_human": command_requires_human,
+    "raw_requires_human": raw_command_requires_human,
+    "autonomy_override_active": autonomy_override_active,
+    "raw_reason_code": command_reason_code,
+    "fallback_active": fallback_active,
+    "fallback_execution_state": fallback_execution_state,
+    "fallback_task_id": fallback_task_id,
+    "execution_count": execution_count,
+    "bridge_request_id": active_request_id,
+    "bridge_request_confirmed": bridge_request_confirmed,
+    "bridge_confirmation_source": bridge_confirmation_source,
+    "coordination_request_id": coordination_request_id,
+    "coordination_request_status": coordination_request_status,
+    "coordination_ack_id": coordination_ack_id,
+    "coordination_ack_status": coordination_ack_status,
+    "coordination_pending": coordination_pending,
+    "coordination_response_missing": coordination_response_missing,
+    "summary": summary,
   }
 
 
@@ -2170,6 +4085,86 @@ def _operator_feedback_loop_snapshot(execution_row: CapabilityExecution | None) 
   }
 
 
+def _operator_active_work_snapshot(
+    collaboration_progress: dict | None,
+    feedback_loop: dict | None,
+) -> dict:
+  collaboration = collaboration_progress if isinstance(collaboration_progress, dict) else {}
+  feedback = feedback_loop if isinstance(feedback_loop, dict) else {}
+  request_id = str(collaboration.get("request_id") or "").strip()
+  task_id = str(collaboration.get("task_id") or "").strip()
+  execution_id = str(collaboration.get("execution_id") or "").strip()
+  execution_label = str(collaboration.get("execution_id_label") or execution_id or "").strip()
+  collaboration_summary = str(collaboration.get("summary") or "").strip()
+  active_workstream = (
+    collaboration.get("active_workstream")
+    if isinstance(collaboration.get("active_workstream"), dict)
+    else {}
+  )
+  work_name = str(active_workstream.get("name") or "").strip()
+  work_status = str(active_workstream.get("tod_status") or "").strip().lower()
+  latest_observation = str(active_workstream.get("latest_observation") or "").strip()
+  feedback_status = str(feedback.get("latest_status") or "").strip().lower()
+
+  tracked = bool(request_id or task_id or execution_id)
+  state = "reply_only"
+  badge = "Reply only"
+  evidence_source = "conversation"
+
+  if tracked:
+    evidence_source = "tracked_request"
+    if work_status in {"completed", "done", "succeeded", "success"}:
+      state = "completed"
+      badge = "Completed"
+    elif work_status in {"failed", "blocked", "error"}:
+      state = "blocked"
+      badge = "Blocked"
+    else:
+      state = "working"
+      badge = "Working now"
+  elif feedback_status:
+    evidence_source = "feedback_loop"
+    if feedback_status in {"succeeded", "completed", "done"}:
+      state = "completed"
+      badge = "Completed"
+    elif feedback_status in {"failed", "blocked", "error"}:
+      state = "blocked"
+      badge = "Blocked"
+    elif feedback_status in {"accepted", "running", "pending", "dispatched"}:
+      state = "working"
+      badge = "Working now"
+
+  if state == "reply_only":
+    summary = "No tracked work is active right now. The latest turn may have been conversation-only."
+  else:
+    headline = execution_label or task_id or request_id or "tracked work"
+    details = latest_observation or collaboration_summary or str(feedback.get("summary") or "").strip()
+    scope = work_name.replace("_", " ") if work_name else ""
+    status_text = work_status.replace("_", " ") if work_status else ""
+    summary_parts = [f"{headline} is {badge.lower()}."]
+    if scope:
+      summary_parts.append(f"Workstream: {scope}.")
+    if status_text and status_text not in {badge.lower(), "working now"}:
+      summary_parts.append(f"Status: {status_text}.")
+    if details:
+      summary_parts.append(details)
+    summary = _compact_sentence(" ".join(summary_parts), max_len=220)
+
+  return {
+    "tracked": tracked or state != "reply_only",
+    "state": state,
+    "badge": badge,
+    "request_id": request_id,
+    "task_id": task_id,
+    "execution_id": execution_id,
+    "execution_id_label": execution_label,
+    "workstream_name": work_name,
+    "workstream_status": work_status,
+    "evidence_source": evidence_source,
+    "summary": summary,
+  }
+
+
 def _operator_stability_guard_snapshot(
     runtime_health: dict,
     runtime_recovery: dict,
@@ -2207,6 +4202,510 @@ def _operator_stability_guard_snapshot(
     "active": active,
     "blocking_conditions": blockers[:6],
     "summary": summary,
+  }
+
+
+def _latest_timestamp_value(*values: object) -> str:
+  latest: datetime | None = None
+  pending = list(values)
+  while pending:
+    value = pending.pop(0)
+    if isinstance(value, (list, tuple, set)):
+      pending.extend(list(value))
+      continue
+    parsed = _parse_payload_timestamp(value)
+    if parsed is None:
+      continue
+    if latest is None or parsed > latest:
+      latest = parsed
+  return latest.isoformat().replace("+00:00", "Z") if latest is not None else ""
+
+
+def _runtime_recovery_activity_timestamps(runtime_recovery: dict) -> list[str]:
+  recovery = runtime_recovery if isinstance(runtime_recovery, dict) else {}
+  lanes = recovery.get("lanes") if isinstance(recovery.get("lanes"), dict) else {}
+  timestamps: list[str] = []
+  for lane in lanes.values():
+    if not isinstance(lane, dict):
+      continue
+    for key in (
+      "last_recovery_attempt_at",
+      "last_healthy_frame_at",
+      "last_frame_seen_at",
+      "first_healthy_at",
+    ):
+      value = str(lane.get(key) or "").strip()
+      if value:
+        timestamps.append(value)
+  return timestamps
+
+
+def _build_system_activity_snapshot(
+    *,
+    initiative_driver: dict,
+    operator_reasoning: dict,
+    runtime_health: dict,
+    runtime_recovery: dict,
+    authoritative_request: dict,
+    collaboration_progress: dict,
+    dispatch_telemetry: dict,
+    tod_decision_process: dict,
+) -> dict:
+  initiative = initiative_driver if isinstance(initiative_driver, dict) else {}
+  reasoning = operator_reasoning if isinstance(operator_reasoning, dict) else {}
+  health = runtime_health if isinstance(runtime_health, dict) else {}
+  recovery = runtime_recovery if isinstance(runtime_recovery, dict) else {}
+  request = authoritative_request if isinstance(authoritative_request, dict) else {}
+  collaboration = collaboration_progress if isinstance(collaboration_progress, dict) else {}
+  dispatch = dispatch_telemetry if isinstance(dispatch_telemetry, dict) else {}
+  tod_decision = tod_decision_process if isinstance(tod_decision_process, dict) else {}
+
+  activity = initiative.get("activity") if isinstance(initiative.get("activity"), dict) else {}
+  active_task = initiative.get("active_task") if isinstance(initiative.get("active_task"), dict) else {}
+  next_task = initiative.get("next_task") if isinstance(initiative.get("next_task"), dict) else {}
+  progress = initiative.get("progress") if isinstance(initiative.get("progress"), dict) else {}
+  active_objective = (
+    initiative.get("active_objective")
+    if isinstance(initiative.get("active_objective"), dict)
+    else {}
+  )
+  readiness = (
+    reasoning.get("execution_readiness")
+    if isinstance(reasoning.get("execution_readiness"), dict)
+    else {}
+  )
+  active_work = (
+    reasoning.get("active_work")
+    if isinstance(reasoning.get("active_work"), dict)
+    else {}
+  )
+  stability_guard = (
+    reasoning.get("stability_guard")
+    if isinstance(reasoning.get("stability_guard"), dict)
+    else {}
+  )
+  escalation = (
+    tod_decision.get("communication_escalation")
+    if isinstance(tod_decision.get("communication_escalation"), dict)
+    else {}
+  )
+
+  activity_state = str(activity.get("state") or "idle").strip().lower() or "idle"
+  active_work_state = str(active_work.get("state") or "").strip().lower()
+  progress_percent = float(progress.get("percent") or 0.0)
+  recovery_status = str(recovery.get("status") or "healthy").strip().lower() or "healthy"
+  execution_allowed = bool(readiness.get("execution_allowed", True))
+  readiness_summary = str(readiness.get("summary") or "").strip()
+  readiness_gate_state = str(readiness.get("gate_state") or "").strip().lower()
+  activity_summary = str(activity.get("summary") or "").strip()
+  active_work_summary = str(active_work.get("summary") or "").strip()
+  canonical_objective_id = str(
+    active_objective.get("objective_id") or active_objective.get("id") or ""
+  ).strip()
+  live_request_objective_id = str(request.get("objective_id") or "").strip()
+
+  should_be_working = False
+  should_be_working_reason = "No active objective or follow-on work is currently visible."
+  if activity_state == "completed" and not next_task:
+    should_be_working = False
+    should_be_working_reason = "The active objective is already marked complete."
+  elif active_task:
+    should_be_working = True
+    should_be_working_reason = "An active bounded task is present in the initiative driver."
+  elif next_task:
+    should_be_working = True
+    should_be_working_reason = "A follow-on bounded task is ready but not executing yet."
+  elif canonical_objective_id and activity_state in {"idle", "working", "stale", "stuck"}:
+    should_be_working = True
+    should_be_working_reason = "The initiative still has an active objective loaded."
+  elif bool(active_work.get("tracked")):
+    should_be_working = True
+    should_be_working_reason = "Tracked collaboration work is still visible in the handoff layer."
+
+  tod_truth_reconciliation = _build_tod_truth_reconciliation_snapshot(
+    initiative_driver=initiative,
+    authoritative_request=request,
+    shared_root=SHARED_RUNTIME_ROOT,
+  )
+  tod_execution_progress = _load_tod_execution_progress_snapshot(shared_root=SHARED_RUNTIME_ROOT)
+  canonical_objective_id = str(
+    tod_truth_reconciliation.get("canonical_objective_id") or canonical_objective_id
+  ).strip()
+  live_request_objective_id = str(
+    tod_truth_reconciliation.get("live_request_objective_id") or live_request_objective_id
+  ).strip()
+  objective_drift = bool(
+    canonical_objective_id
+    and live_request_objective_id
+    and canonical_objective_id != live_request_objective_id
+  )
+  boundary_blocked = bool(
+    tod_truth_reconciliation.get("requires_human", False)
+    or str(tod_truth_reconciliation.get("state") or "").strip().lower() in {"hard_boundary_escalated", "hard_boundary_requires_human"}
+    or str(tod_truth_reconciliation.get("reason_code") or "").strip().lower() == "hard_boundary_requires_human"
+  )
+  completion_signal_visible = bool(
+    activity_state == "completed"
+    or active_work_state == "completed"
+    or progress_percent >= 100.0
+  )
+  tod_truth_reconciliation = dict(tod_truth_reconciliation)
+  autonomous_completion_authority = bool(
+    settings.mim_full_autonomous_authority
+    and completion_signal_visible
+    and not bool(tod_truth_reconciliation.get("execution_confirmed", False))
+  )
+  tod_truth_reconciliation["autonomous_completion_authority"] = autonomous_completion_authority
+  tod_truth_reconciliation["should_override_completion"] = bool(
+    completion_signal_visible
+    and not bool(tod_truth_reconciliation.get("execution_confirmed", False))
+    and not autonomous_completion_authority
+  )
+  if autonomous_completion_authority:
+    should_be_working = False
+    should_be_working_reason = "MIM accepted the visible completion signal under full autonomous authority."
+    tod_truth_reconciliation["summary"] = (
+      str(tod_truth_reconciliation.get("summary") or "").strip()
+      or "MIM accepted completion under full autonomous authority without waiting for TOD confirmation."
+    )
+  tod_liveness = (
+    tod_decision.get("tod_liveness")
+    if isinstance(tod_decision.get("tod_liveness"), dict)
+    else {}
+  )
+  task_review_active_task_id = str(
+    tod_decision.get("active_task_id")
+    or ((tod_decision.get("tod_current_work") or {}).get("task_id") if isinstance(tod_decision.get("tod_current_work"), dict) else "")
+    or ""
+  ).strip()
+  current_task_waiting_on_ack = bool(
+    str(tod_decision.get("state") or "").strip().lower() == "awaiting_task_ack"
+    and str(tod_decision.get("state_reason") or "").strip().lower() == "trigger_ack_current"
+    and str(tod_liveness.get("status") or "").strip().lower() == "alive"
+    and not bool(escalation.get("required", False))
+    and bool(task_review_active_task_id)
+    and task_review_active_task_id in {
+      str(active_task.get("task_id") or "").strip(),
+      str(request.get("task_id") or "").strip(),
+      str(request.get("request_id") or "").strip(),
+    }
+  )
+  tod_truth_reconciliation["current_task_waiting_on_ack"] = current_task_waiting_on_ack
+  if current_task_waiting_on_ack:
+    current_task_waiting_on_ack_summary = (
+      "TOD has current-task evidence and the lane is healthy; the current task is waiting for the live TOD task ACK."
+    )
+    tod_truth_reconciliation["state"] = "awaiting_task_ack"
+    tod_truth_reconciliation["summary"] = current_task_waiting_on_ack_summary
+    tod_truth_reconciliation["authoritative_source"] = "TOD"
+    execution_allowed = True
+    readiness_summary = current_task_waiting_on_ack_summary
+    readiness_gate_state = "open"
+  if bool(tod_truth_reconciliation.get("coordination_response_missing", False)):
+    tod_truth_reconciliation["progress_label"] = "Waiting on MIM"
+    tod_truth_reconciliation["progress_detail"] = str(tod_truth_reconciliation.get("summary") or "").strip()
+  elif bool(tod_truth_reconciliation.get("should_override_completion", False)):
+    tod_truth_reconciliation["progress_label"] = "Execution unconfirmed"
+    tod_truth_reconciliation["progress_detail"] = str(tod_truth_reconciliation.get("summary") or "").strip()
+
+  frontend_media = (
+    health.get("frontend_media") if isinstance(health.get("frontend_media"), dict) else {}
+  )
+  heartbeat_at = _latest_timestamp_value(
+    (
+      health.get("latest", {}) if isinstance(health.get("latest", {}), dict) else {}
+    ).get("camera", {}).get("last_seen_at") if isinstance((health.get("latest", {}) if isinstance(health.get("latest", {}), dict) else {}).get("camera", {}), dict) else "",
+    (
+      health.get("latest", {}) if isinstance(health.get("latest", {}), dict) else {}
+    ).get("microphone", {}).get("last_seen_at") if isinstance((health.get("latest", {}) if isinstance(health.get("latest", {}), dict) else {}).get("microphone", {}), dict) else "",
+    (
+      health.get("latest", {}) if isinstance(health.get("latest", {}), dict) else {}
+    ).get("speech_output", {}).get("created_at") if isinstance((health.get("latest", {}) if isinstance(health.get("latest", {}), dict) else {}).get("speech_output", {}), dict) else "",
+    frontend_media.get("camera", {}).get("last_reported_at") if isinstance(frontend_media.get("camera", {}), dict) else "",
+    frontend_media.get("microphone", {}).get("last_reported_at") if isinstance(frontend_media.get("microphone", {}), dict) else "",
+    request.get("generated_at"),
+    collaboration.get("generated_at"),
+    dispatch.get("dispatch_timestamp"),
+    dispatch.get("host_received_timestamp"),
+    dispatch.get("host_completed_timestamp"),
+    tod_decision.get("generated_at"),
+  )
+  heartbeat_age_seconds = None
+  heartbeat_dt = _parse_payload_timestamp(heartbeat_at)
+  if heartbeat_dt is not None:
+    heartbeat_age_seconds = max(0.0, (datetime.now(timezone.utc) - heartbeat_dt).total_seconds())
+
+  alignment_summary = "MIM and TOD agree on the active objective."
+  alignment_label = "Aligned"
+  if objective_drift:
+    alignment_label = f"{canonical_objective_id} vs {live_request_objective_id}"
+    alignment_summary = (
+      f"Canonical objective is {canonical_objective_id}, but the live TOD request still references {live_request_objective_id}."
+    )
+  elif should_be_working and canonical_objective_id and not live_request_objective_id:
+    alignment_label = "No live request"
+    alignment_summary = "The initiative has active work, but no live TOD request is visible for the current objective."
+
+  reason_candidates: list[str] = []
+  if objective_drift or alignment_label == "No live request":
+    reason_candidates.append(alignment_summary)
+  if activity_state in {"stale", "stuck"} and activity_summary:
+    reason_candidates.append(activity_summary)
+  if should_be_working and active_work_state == "completed" and next_task:
+    reason_candidates.append(
+      "The latest tracked TOD request is completed, but the initiative already has follow-on work queued."
+    )
+  if should_be_working and not execution_allowed and readiness_summary:
+    reason_candidates.append(readiness_summary)
+  if recovery_status in {"degraded", "suboptimal"} and str(recovery.get("summary") or "").strip():
+    reason_candidates.append(str(recovery.get("summary") or "").strip())
+  if bool(escalation.get("required", False)):
+    reason_candidates.append(
+      str(escalation.get("detail") or escalation.get("code") or "TOD escalation required").strip()
+    )
+  if bool(stability_guard.get("active", False)) and str(stability_guard.get("summary") or "").strip():
+    reason_candidates.append(str(stability_guard.get("summary") or "").strip())
+  if should_be_working and activity_state == "idle":
+    reason_candidates.append(
+      "The initiative has ready work, but no fresh bounded execution signal is visible right now."
+    )
+
+  deduped_reasons: list[str] = []
+  for item in reason_candidates:
+    cleaned = str(item or "").strip()
+    if cleaned and cleaned not in deduped_reasons:
+      deduped_reasons.append(cleaned)
+  stall_reason = _compact_sentence(" ".join(deduped_reasons[:3]), max_len=260)
+
+  mim_last_activity_at = _latest_timestamp_value(
+    activity.get("started_at"),
+    collaboration.get("generated_at"),
+    dispatch.get("dispatch_timestamp"),
+    _runtime_recovery_activity_timestamps(recovery),
+  )
+  last_task_progress_at = _latest_timestamp_value(
+    dispatch.get("host_completed_timestamp"),
+    dispatch.get("host_received_timestamp"),
+    collaboration.get("generated_at"),
+    request.get("generated_at"),
+  )
+  tod_last_activity_at = _latest_timestamp_value(
+    request.get("generated_at"),
+    tod_decision.get("generated_at"),
+    dispatch.get("host_received_timestamp"),
+    dispatch.get("host_completed_timestamp"),
+  )
+
+  last_task_progress_age_seconds = None
+  last_task_progress_dt = _parse_payload_timestamp(last_task_progress_at)
+  if last_task_progress_dt is not None:
+    last_task_progress_age_seconds = max(0.0, (datetime.now(timezone.utc) - last_task_progress_dt).total_seconds())
+
+  if heartbeat_age_seconds is None:
+    heartbeat_state = "unknown"
+  elif heartbeat_age_seconds <= 30.0:
+    heartbeat_state = "fresh"
+  elif heartbeat_age_seconds <= 120.0:
+    heartbeat_state = "aging"
+  elif heartbeat_age_seconds <= 600.0:
+    heartbeat_state = "stale"
+  else:
+    heartbeat_state = "frozen"
+
+  if bool(tod_truth_reconciliation.get("coordination_response_missing", False)):
+    status_code = "stale"
+    status_label = "WAITING ON MIM"
+    headline = "WAITING ON MIM - TOD requested coordination and needs a current response"
+    tone = "error"
+  elif boundary_blocked:
+    status_code = "blocked"
+    status_label = "BLOCKED"
+    headline = "BLOCKED - hard boundary requires human action"
+    tone = "error"
+  elif bool(tod_truth_reconciliation.get("should_override_completion", False)):
+    status_code = "warning"
+    status_label = "UNCONFIRMED"
+    headline = "UNCONFIRMED - TOD has not confirmed execution"
+    tone = "warn"
+  elif heartbeat_state == "frozen" or (
+    should_be_working
+    and heartbeat_state in {"stale", "unknown"}
+    and recovery_status == "degraded"
+  ):
+    status_code = "frozen"
+    status_label = "FROZEN"
+    headline = "FROZEN - no usable heartbeat or recovery"
+    tone = "error"
+  elif (
+    objective_drift
+    or activity_state in {"stale", "stuck"}
+    or bool(escalation.get("required", False))
+    or (should_be_working and last_task_progress_age_seconds is not None and last_task_progress_age_seconds >= 600.0)
+  ):
+    status_code = "stale"
+    status_label = "STALE"
+    headline = "STALE - expected work but no real progress"
+    tone = "error"
+  elif current_task_waiting_on_ack:
+    status_code = "active"
+    status_label = "WAITING"
+    headline = "WAITING - current TOD lane is healthy and awaiting task ACK"
+    tone = "active"
+  elif (
+    not execution_allowed
+    or readiness_gate_state in {"blocked", "degraded"}
+    or recovery_status in {"degraded", "suboptimal"}
+    or (should_be_working and activity_state == "idle")
+    or (should_be_working and last_task_progress_age_seconds is not None and last_task_progress_age_seconds >= 300.0)
+  ):
+    status_code = "warning"
+    status_label = "WARNING"
+    headline = "WARNING - alive, but execution is constrained"
+    tone = "warn"
+  elif should_be_working and execution_allowed and activity_state == "working":
+    status_code = "active"
+    status_label = "ACTIVE"
+    headline = "ACTIVE - executing tasks"
+    tone = "active"
+  else:
+    status_code = "idle"
+    status_label = "IDLE"
+    headline = "IDLE - healthy, no live task right now"
+    tone = "ready"
+
+  if status_code == "active":
+    if current_task_waiting_on_ack:
+      summary = str(tod_truth_reconciliation.get("summary") or "").strip()
+    else:
+      summary = activity_summary or active_work_summary or "MIM is actively advancing the current objective."
+  elif status_code == "idle":
+    summary = activity_summary or "MIM is healthy, but no live task is currently executing."
+  elif status_code == "blocked":
+    summary = str(tod_truth_reconciliation.get("summary") or "").strip() or "A hard boundary is blocking execution and requires human action."
+  elif status_code == "warning":
+    summary = str(tod_truth_reconciliation.get("summary") or "").strip() or stall_reason or readiness_summary or "MIM is alive, but something is preventing clean execution."
+  elif status_code == "stale":
+    summary = str(tod_truth_reconciliation.get("summary") or "").strip() or stall_reason or "Expected work is not advancing."
+  else:
+    summary = stall_reason or "Heartbeat and recovery evidence are too old to trust active execution."
+
+  relation_flow = "Flowing"
+  if bool(tod_truth_reconciliation.get("coordination_response_missing", False)):
+    relation_flow = "Waiting on MIM"
+  elif boundary_blocked:
+    relation_flow = "Blocked"
+  elif bool(tod_truth_reconciliation.get("should_override_completion", False)):
+    relation_flow = "Awaiting TOD confirmation"
+  elif current_task_waiting_on_ack:
+    relation_flow = "Waiting"
+  elif not execution_allowed:
+    relation_flow = "Blocked"
+  elif objective_drift:
+    relation_flow = "Drifted"
+  elif status_code in {"stale", "frozen"}:
+    relation_flow = "Stalled"
+  elif should_be_working and status_code in {"warning", "idle"}:
+    relation_flow = "Waiting"
+
+  bridge_health = "Healthy"
+  if bool(tod_truth_reconciliation.get("coordination_response_missing", False)):
+    bridge_health = "Waiting on MIM"
+  elif boundary_blocked:
+    bridge_health = "Human gate"
+  elif bool(escalation.get("required", False)):
+    bridge_health = "Escalated"
+  elif objective_drift:
+    bridge_health = "Out of sync"
+  elif str(tod_liveness.get("status") or "").strip().lower() in {"stale", "terminal", "unknown"}:
+    bridge_health = str(tod_liveness.get("status") or "Attention").strip().replace("_", " ")
+
+  staleness_state = "fresh"
+  if status_code in {"warning", "blocked"}:
+    staleness_state = "warning"
+  elif status_code == "stale":
+    staleness_state = "stale"
+  elif status_code == "frozen":
+    staleness_state = "frozen"
+
+  execution_allowed_reason = str(tod_truth_reconciliation.get("summary") or "").strip() if bool(
+    tod_truth_reconciliation.get("coordination_response_missing", False)
+    or boundary_blocked
+    or tod_truth_reconciliation.get("should_override_completion", False)
+  ) else (str(tod_truth_reconciliation.get("summary") or "").strip() if current_task_waiting_on_ack else readiness_summary) or (
+    "Execution is allowed."
+    if execution_allowed
+    else "Execution is currently blocked by readiness policy."
+  )
+  heartbeat_detail = (
+    f"Heartbeat {heartbeat_state}."
+    if heartbeat_age_seconds is None
+    else f"Heartbeat {heartbeat_state}; last signal about {int(round(heartbeat_age_seconds))} seconds ago."
+  )
+  relation_summary = _compact_sentence(
+    f"Objective alignment: {alignment_summary} Bridge health: {bridge_health}. Execution flow: {relation_flow}. Authoritative execution source: {str(tod_truth_reconciliation.get('authoritative_source') or 'TOD').strip()}. {str(tod_truth_reconciliation.get('summary') or '').strip()}",
+    max_len=220,
+  )
+  meter_percent = {
+    "active": 88,
+    "idle": 24,
+    "blocked": 36,
+    "warning": 52,
+    "stale": 18,
+    "frozen": 4,
+  }.get(status_code, 0)
+
+  return {
+    "state": status_code,
+    "label": status_label,
+    "headline": headline,
+    "status_code": status_code,
+    "status_label": status_label,
+    "tone": tone,
+    "summary": summary,
+    "authoritative_source": "TOD",
+    "authoritative_reason": str(tod_truth_reconciliation.get("summary") or "").strip(),
+    "tod_truth_reconciliation": tod_truth_reconciliation,
+    "tod_phase_progress": tod_execution_progress.get("phase_progress") if isinstance(tod_execution_progress.get("phase_progress"), dict) else {},
+    "tod_stall_signal": tod_execution_progress.get("stall_signal") if isinstance(tod_execution_progress.get("stall_signal"), dict) else {},
+    "should_be_working": should_be_working,
+    "should_be_working_reason": should_be_working_reason,
+    "stall_reason": stall_reason or "No current stall evidence.",
+    "meter_percent": meter_percent,
+    "last_activity_at": _latest_timestamp_value(mim_last_activity_at, tod_last_activity_at),
+    "last_task_progress_at": last_task_progress_at,
+    "last_task_progress_age_seconds": last_task_progress_age_seconds,
+    "mim_last_activity_at": mim_last_activity_at,
+    "mim_last_activity_detail": "Latest MIM-side task, dispatch, or runtime recovery evidence.",
+    "tod_last_activity_at": tod_last_activity_at,
+    "tod_last_activity_detail": "Latest TOD-visible request, decision, or completion evidence.",
+    "heartbeat_at": heartbeat_at,
+    "heartbeat_state": heartbeat_state,
+    "heartbeat_age_seconds": heartbeat_age_seconds,
+    "heartbeat_detail": heartbeat_detail,
+    "execution_allowed": execution_allowed,
+    "execution_allowed_label": "Blocked" if boundary_blocked or not execution_allowed else "Allowed",
+    "execution_allowed_reason": execution_allowed_reason,
+    "staleness_state": staleness_state,
+    "staleness_label": staleness_state.upper(),
+    "staleness_detail": stall_reason or heartbeat_detail,
+    "recovery_label": str(recovery.get("status") or "healthy").strip().replace("_", " ") or "healthy",
+    "recovery_summary": str(recovery.get("summary") or "").strip() or "No recovery issues are visible.",
+    "alignment_label": alignment_label,
+    "alignment_summary": alignment_summary,
+    "relation_summary": relation_summary,
+    "relation": {
+      "objective_alignment": alignment_label,
+      "objective_alignment_detail": alignment_summary,
+      "bridge_health": bridge_health,
+      "execution_flow": relation_flow,
+      "authoritative_source": "TOD",
+      "authoritative_reason": str(tod_truth_reconciliation.get("summary") or "").strip(),
+      "last_handoff_at": _latest_timestamp_value(request.get("generated_at"), dispatch.get("host_received_timestamp")),
+      "last_feedback_at": _latest_timestamp_value(dispatch.get("host_completed_timestamp"), tod_decision.get("generated_at")),
+      "summary": relation_summary,
+    },
+    "canonical_objective_id": canonical_objective_id,
+    "live_request_objective_id": live_request_objective_id,
   }
 
 
@@ -2300,6 +4799,7 @@ def _build_operator_reasoning_payload(
       recommendation,
     )
     feedback_loop = _operator_feedback_loop_snapshot(latest_execution_row)
+    active_work = _operator_active_work_snapshot(collaboration_progress, feedback_loop)
     stability_guard = _operator_stability_guard_snapshot(
       runtime_health,
       runtime_recovery,
@@ -2322,6 +4822,7 @@ def _build_operator_reasoning_payload(
             learned_preferences=learned_preferences,
             proposal_policy=proposal_policy,
             conflict_resolution=conflict_resolution,
+            active_work=active_work,
             collaboration_progress=collaboration_progress,
             dispatch_telemetry=dispatch_telemetry,
             tod_decision_process=tod_decision_process,
@@ -2348,6 +4849,7 @@ def _build_operator_reasoning_payload(
         "trust_signal_summary": trust_signal_summary,
         "lightweight_autonomy": lightweight_autonomy,
         "feedback_loop": feedback_loop,
+        "active_work": active_work,
         "stability_guard": stability_guard,
         "current_recommendation": recommendation,
         "resolution_commitment": commitment,
@@ -2479,8 +4981,18 @@ def _build_camera_state_prompt(
 
 
 @router.get("/mim", response_class=HTMLResponse)
-async def mim_ui_page() -> str:
-    return """
+async def mim_ui_page(request: Request, db: AsyncSession = Depends(get_db)):
+  dedicated_redirect = _dedicated_public_mim_redirect_target(request)
+  if dedicated_redirect:
+    return RedirectResponse(url=dedicated_redirect, status_code=307)
+  redirect_target = _public_mim_redirect_target(request)
+  if redirect_target:
+    return RedirectResponse(url=redirect_target, status_code=307)
+  auth_redirect = maybe_require_mimtod_page_login(request, next_path="/mim")
+  if auth_redirect is not None:
+    return auth_redirect
+  preloaded_chat_thread = await _load_mim_ui_chat_thread(db=db)
+  return """
 <!doctype html>
 <html lang=\"en\">
 <head>
@@ -2842,7 +5354,1243 @@ async def mim_ui_page() -> str:
       gap: 10px;
       margin-top: 10px;
     }
+    body {
+      align-items: stretch;
+      padding: 18px;
+      gap: 14px;
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    .panel {
+      width: min(1280px, 100%);
+      margin: 0 auto;
+      padding: 18px;
+      border-radius: 18px;
+      background: linear-gradient(180deg, rgba(9, 26, 39, 0.96), rgba(7, 19, 29, 0.98));
+      box-shadow: 0 22px 56px rgba(0, 0, 0, 0.32);
+    }
+    .app-shell {
+      width: min(1280px, 100%);
+      margin: 0 auto;
+      display: grid;
+      gap: 14px;
+    }
+    .hero {
+      display: grid;
+      gap: 14px;
+      padding: 16px 18px;
+      border: 1px solid #17435a;
+      border-radius: 18px;
+      background: linear-gradient(135deg, rgba(13, 41, 59, 0.98), rgba(9, 25, 36, 0.98));
+      box-shadow: 0 18px 42px rgba(0, 0, 0, 0.22);
+    }
+    .console-nav {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .console-link {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 12px;
+      border-radius: 999px;
+      border: 1px solid rgba(49, 123, 151, 0.4);
+      background: rgba(8, 33, 46, 0.5);
+      color: #f3fbff;
+      text-decoration: none;
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      transition: border-color 160ms ease, background 160ms ease, color 160ms ease;
+    }
+    .console-link.utility {
+      border-color: rgba(156, 204, 224, 0.34);
+      background: rgba(8, 33, 46, 0.34);
+    }
+    .console-link:hover,
+    .console-link:focus-visible {
+      border-color: rgba(62, 198, 255, 0.55);
+      color: #f3fbff;
+      outline: none;
+    }
+    .console-link.active {
+      border-color: rgba(62, 198, 255, 0.72);
+      background: rgba(19, 78, 101, 0.44);
+      color: #f3fbff;
+    }
+    .hero-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 14px;
+      flex-wrap: wrap;
+    }
+    .hero-status-cluster,
+    .hero-toolbar {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .hero-toolbar {
+      justify-content: space-between;
+    }
+    .hero-copy {
+      display: grid;
+      gap: 8px;
+      min-width: 0;
+    }
+    .hero-copy .summary {
+      max-width: 920px;
+      color: var(--muted);
+      line-height: 1.5;
+      font-size: 14px;
+    }
+    .chat-shell {
+      display: grid;
+      gap: 12px;
+      min-height: 0;
+    }
+    .chat-meta {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .chat-meta-title {
+      display: grid;
+      gap: 4px;
+      min-width: 0;
+    }
+    .chat-meta-title strong {
+      font-size: 18px;
+      color: #f3fbff;
+    }
+    .chat-meta-title span,
+    .chat-meta-note {
+      font-size: 13px;
+      color: var(--muted);
+      line-height: 1.45;
+    }
+    .chat-thread {
+      display: grid;
+      gap: 12px;
+    }
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 14px 18px;
+      border: 1px solid #17435a;
+      border-radius: 18px;
+      background: linear-gradient(135deg, rgba(13, 41, 59, 0.98), rgba(9, 25, 36, 0.98));
+      box-shadow: 0 18px 42px rgba(0, 0, 0, 0.22);
+    }
+    .topbar-left,
+    .topbar-right,
+    .status-chip-row,
+    .quick-actions,
+    .system-activity-banner {
+      margin-top: 14px;
+      border: 1px solid rgba(49, 123, 151, 0.55);
+      border-radius: 18px;
+      background: linear-gradient(135deg, rgba(9, 31, 45, 0.96), rgba(7, 22, 33, 0.98));
+      padding: 16px;
+      display: grid;
+      gap: 14px;
+      box-shadow: 0 12px 30px rgba(0, 0, 0, 0.18);
+    }
+    .system-activity-banner-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .system-activity-banner-copy {
+      display: grid;
+      gap: 6px;
+      min-width: 0;
+    }
+    .system-activity-banner-copy strong {
+      font-size: 18px;
+      color: #f3fbff;
+      line-height: 1.35;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+    }
+    .system-activity-banner-summary {
+      font-size: 13px;
+      color: var(--muted);
+      line-height: 1.5;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+    }
+    .system-activity-banner-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+    }
+    .system-relation-grid {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 12px;
+    }
+    .voice-primary-row,
+    .composer-meta,
+    .thread-tools,
+    .sidebar-list,
+    .secondary-tab-row,
+    .status-metrics {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    .topbar-left {
+      gap: 14px;
+    }
+    .topbar-right {
+      justify-content: flex-end;
+    }
+    .mode-toggle {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px;
+      border: 1px solid #1d5975;
+      border-radius: 999px;
+      background: rgba(8, 33, 46, 0.88);
+    }
+    .mode-chip {
+      border: 0;
+      border-radius: 999px;
+      background: transparent;
+      color: var(--muted);
+      padding: 7px 12px;
+      font-size: 12px;
+      font-weight: 600;
+    }
+    .mode-chip.active {
+      background: linear-gradient(135deg, #1795c8, #0f6d92);
+      color: #f4fcff;
+      box-shadow: 0 8px 18px rgba(10, 67, 92, 0.28);
+    }
+    .brand-stack {
+      display: grid;
+      gap: 4px;
+    }
+    h1 {
+      font-size: 24px;
+      letter-spacing: 0.14em;
+    }
+    .surface-kicker {
+      font-size: 11px;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: #9fcedf;
+    }
+    .surface-kicker.surface-kicker-nav {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      letter-spacing: 0.08em;
+    }
+    .console-nav-link {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      border: 1px solid rgba(49, 123, 151, 0.4);
+      background: rgba(8, 33, 46, 0.5);
+      color: #cce8f5;
+      text-decoration: none;
+      transition: border-color 160ms ease, background 160ms ease, color 160ms ease;
+    }
+    .console-nav-link.utility {
+      border-color: rgba(156, 204, 224, 0.34);
+      background: rgba(8, 33, 46, 0.34);
+    }
+    .console-nav-link:hover {
+      border-color: rgba(62, 198, 255, 0.55);
+      color: #f3fbff;
+    }
+    .console-nav-link.active {
+      border-color: rgba(62, 198, 255, 0.72);
+      background: rgba(19, 78, 101, 0.44);
+      color: #f3fbff;
+    }
+    .console-nav-light {
+      width: 9px;
+      height: 9px;
+      border-radius: 999px;
+      background: #4f6470;
+      box-shadow: 0 0 0 rgba(0, 0, 0, 0);
+    }
+    .console-nav-light.ok {
+      background: var(--ok);
+      box-shadow: 0 0 14px rgba(45, 207, 107, 0.55);
+    }
+    .console-nav-light.err {
+      background: var(--err);
+      box-shadow: 0 0 14px rgba(197, 106, 45, 0.45);
+    }
+    .status-chip,
+    .quick-action,
+    .status-metric,
+    .tab-chip,
+    .composer-toggle {
+      border: 1px solid #1e5e7c;
+      border-radius: 999px;
+      background: rgba(11, 43, 61, 0.86);
+      color: #dff6ff;
+      padding: 8px 12px;
+      font-size: 12px;
+      line-height: 1;
+    }
+    .status-chip.subtle,
+    .composer-toggle {
+      color: var(--muted);
+    }
+    .status-chip[data-tone="active"] {
+      border-color: #39d4ff;
+      color: #effcff;
+      background: rgba(17, 105, 140, 0.42);
+    }
+    .status-chip[data-tone="ready"] {
+      border-color: #44d59a;
+      color: #eafff6;
+      background: rgba(17, 92, 63, 0.36);
+    }
+    .status-chip[data-tone="warn"] {
+      border-color: #efb261;
+      color: #fff2de;
+      background: rgba(101, 61, 17, 0.4);
+    }
+    .status-chip[data-tone="error"] {
+      border-color: #ef8e61;
+      color: #fff0ea;
+      background: rgba(112, 43, 27, 0.44);
+    }
+    .status-chip.strong,
+    .quick-action.primary,
+    .tab-chip.active,
+    .composer-send {
+      background: linear-gradient(135deg, #1795c8, #0f6d92);
+      border-color: #2fc7ee;
+      color: #f4fcff;
+    }
+    .quick-action,
+    .tab-chip,
+    .composer-attach,
+    .composer-mic,
+    .composer-send,
+    .secondary-action,
+    .voice-primary-button,
+    .thread-clear {
+      transition: transform 140ms ease, filter 140ms ease, border-color 140ms ease;
+    }
+    .quick-action:hover,
+    .tab-chip:hover,
+    .composer-attach:hover,
+    .composer-mic:hover,
+    .composer-send:hover,
+    .secondary-action:hover,
+    .voice-primary-button:hover,
+    .thread-clear:hover {
+      transform: translateY(-1px);
+    }
+    .primary-chat-panel {
+      margin-top: 14px;
+    }
+    .layout-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr);
+      gap: 14px;
+      align-items: start;
+    }
+    .chat-surface {
+      display: grid;
+      gap: 14px;
+    }
+    .primary-chat-panel .chat-log {
+      min-height: 420px;
+      max-height: 68vh;
+    }
+    .chat-hero {
+      display: grid;
+      gap: 12px;
+    }
+    .chat-summary-row {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .media-self-test-card {
+      border: 1px solid #184f67;
+      border-radius: 18px;
+      padding: 14px;
+      background: linear-gradient(180deg, rgba(8, 28, 41, 0.98), rgba(7, 20, 31, 0.98));
+      display: grid;
+      gap: 12px;
+    }
+    .media-self-test-header {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .media-self-test-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 10px;
+    }
+    .media-self-test-item {
+      display: grid;
+      gap: 6px;
+      padding: 10px 12px;
+      border: 1px solid #184961;
+      border-radius: 14px;
+      background: rgba(8, 31, 45, 0.88);
+      min-width: 0;
+    }
+    .media-self-test-label {
+      font-size: 11px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: #9dc9da;
+    }
+    .media-self-test-value {
+      font-size: 13px;
+      line-height: 1.45;
+      color: #effaff;
+      word-break: break-word;
+    }
+    .media-self-test-actions {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    .media-self-test-note {
+      margin-top: 4px;
+      font-size: 12px;
+      color: #91c8db;
+      line-height: 1.45;
+    }
+    .context-chip {
+      display: inline-flex;
+      gap: 8px;
+      align-items: flex-start;
+      flex-wrap: wrap;
+      padding: 10px 14px;
+      border-radius: 14px;
+      border: 1px solid #1c5069;
+      background: rgba(7, 33, 48, 0.92);
+      color: #d8eef9;
+      font-size: 13px;
+      line-height: 1.45;
+      white-space: normal;
+      overflow-wrap: anywhere;
+    }
+    .thread-shell {
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      gap: 12px;
+      min-height: 0;
+    }
+    .thread-card {
+      border: 1px solid #184c64;
+      border-radius: 20px;
+      background: linear-gradient(180deg, rgba(8, 26, 39, 0.98), rgba(7, 21, 31, 0.98));
+      padding: 14px;
+      display: grid;
+      gap: 12px;
+      min-height: 0;
+    }
+    .thread-header {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .thread-title {
+      display: grid;
+      gap: 4px;
+    }
+    .thread-title strong {
+      font-size: 18px;
+      color: #f3fbff;
+    }
+    .thread-title span {
+      font-size: 13px;
+      color: var(--muted);
+    }
+    .chat-log {
+      margin-top: 0;
+      min-height: 420px;
+      max-height: none;
+      height: min(62vh, 820px);
+      overflow-y: auto;
+      overflow-x: hidden;
+      padding: 18px;
+      padding-bottom: 30px;
+      gap: 12px;
+      align-content: start;
+      border-radius: 18px;
+      background:
+        radial-gradient(circle at top right, rgba(27, 103, 136, 0.16), transparent 28%),
+        linear-gradient(180deg, rgba(10, 25, 36, 0.98), rgba(7, 17, 26, 0.99));
+    }
+    .chat-bubble {
+      position: relative;
+      max-width: min(76ch, 88%);
+      min-width: 0;
+      border-radius: 18px;
+      padding: 12px 14px;
+      font-size: 14px;
+      line-height: 1.5;
+      display: grid;
+      gap: 10px;
+      overflow: visible;
+      box-shadow: 0 12px 24px rgba(0, 0, 0, 0.18);
+    }
+    .chat-bubble.has-copy-action {
+      padding-right: 64px;
+    }
+    .chat-bubble.user {
+      background: linear-gradient(135deg, rgba(24, 91, 123, 0.98), rgba(17, 66, 90, 0.98));
+      border-color: #2aaad6;
+    }
+    .chat-bubble.mim {
+      background: linear-gradient(135deg, rgba(11, 38, 54, 0.98), rgba(10, 28, 40, 0.98));
+      border-color: #1b5d7e;
+    }
+    .chat-bubble.system {
+      justify-self: center;
+      max-width: 100%;
+      background: rgba(111, 89, 30, 0.18);
+      border-color: rgba(230, 183, 47, 0.4);
+      color: #fde9a9;
+    }
+    .chat-bubble.execution {
+      justify-self: stretch;
+      max-width: 100%;
+      background: linear-gradient(180deg, rgba(46, 54, 24, 0.86), rgba(28, 32, 16, 0.92));
+      border-color: rgba(202, 177, 98, 0.44);
+      color: #f7efc8;
+      gap: 12px;
+    }
+    .bubble-meta {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+      font-size: 11px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: #9cc9da;
+    }
+    .bubble-summary {
+      font-size: 14px;
+      line-height: 1.6;
+      color: inherit;
+      overflow: visible;
+      user-select: text;
+    }
+    .bubble-text {
+      white-space: pre-wrap;
+      word-break: break-word;
+      line-height: 1.6;
+      overflow: visible;
+      user-select: text;
+      padding-bottom: 2px;
+    }
+    .bubble-copy-btn {
+      position: absolute;
+      top: 10px;
+      right: 10px;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      border: 1px solid rgba(115, 190, 219, 0.35);
+      border-radius: 999px;
+      background: rgba(8, 28, 40, 0.9);
+      color: #d8f5ff;
+      padding: 5px 10px;
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.03em;
+      cursor: pointer;
+      transition: background 120ms ease, border-color 120ms ease, transform 120ms ease;
+    }
+    .bubble-copy-btn:hover,
+    .bubble-copy-btn:focus-visible {
+      background: rgba(18, 62, 84, 0.96);
+      border-color: rgba(115, 190, 219, 0.6);
+      transform: translateY(-1px);
+      outline: none;
+    }
+    .bubble-copy-btn svg {
+      width: 12px;
+      height: 12px;
+      fill: currentColor;
+      flex: 0 0 auto;
+    }
+    .bubble-copy-btn.copied {
+      background: rgba(23, 110, 76, 0.92);
+      border-color: rgba(116, 226, 172, 0.55);
+    }
+    .execution-details {
+      border: 1px solid rgba(202, 177, 98, 0.22);
+      border-radius: 14px;
+      background: rgba(18, 20, 12, 0.58);
+      overflow: hidden;
+    }
+    .execution-details > summary,
+    .execution-raw-toggle > summary {
+      cursor: pointer;
+      list-style: none;
+      padding: 10px 12px;
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: #f6e7ab;
+      background: rgba(73, 65, 30, 0.26);
+    }
+    .execution-details > summary::-webkit-details-marker,
+    .execution-raw-toggle > summary::-webkit-details-marker {
+      display: none;
+    }
+    .execution-scroll {
+      max-height: 280px;
+      overflow: auto;
+      display: grid;
+      gap: 12px;
+      padding: 12px;
+    }
+    .execution-steps {
+      display: grid;
+      gap: 10px;
+    }
+    .execution-step {
+      display: grid;
+      gap: 8px;
+      padding: 10px 12px;
+      border: 1px solid rgba(202, 177, 98, 0.16);
+      border-radius: 12px;
+      background: rgba(14, 17, 12, 0.72);
+    }
+    .execution-step-header {
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: #f6e7ab;
+    }
+    .execution-step-grid {
+      display: grid;
+      gap: 8px;
+    }
+    .execution-row {
+      display: grid;
+      gap: 4px;
+    }
+    .execution-row-label {
+      font-size: 11px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: #d6c37b;
+    }
+    .execution-row-value,
+    .execution-note {
+      font-size: 12px;
+      line-height: 1.5;
+      color: #f7efc8;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .execution-notes {
+      display: grid;
+      gap: 6px;
+    }
+    .execution-raw-toggle {
+      border: 1px solid rgba(202, 177, 98, 0.16);
+      border-radius: 12px;
+      overflow: hidden;
+      background: rgba(10, 12, 9, 0.7);
+    }
+    .execution-raw {
+      margin: 0;
+      max-height: 240px;
+      overflow: auto;
+      padding: 12px;
+      font-size: 11px;
+      line-height: 1.45;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      color: #e4dcc0;
+      background: rgba(5, 8, 6, 0.84);
+    }
+    .execution-footnote {
+      font-size: 11px;
+      color: #d5cda7;
+    }
+    .bubble-attachment {
+      display: grid;
+      gap: 8px;
+      padding: 10px;
+      border: 1px solid rgba(113, 188, 220, 0.26);
+      border-radius: 14px;
+      background: rgba(8, 24, 34, 0.62);
+    }
+    .bubble-attachment img {
+      width: min(100%, 480px);
+      border-radius: 12px;
+      border: 1px solid #1c516d;
+      display: block;
+    }
+    .bubble-attachment figcaption {
+      font-size: 12px;
+      color: #a8d4e5;
+    }
+    .empty-thread {
+      display: grid;
+      gap: 10px;
+      align-content: center;
+      justify-items: start;
+      min-height: 100%;
+      padding: 18px;
+      border: 1px dashed #235772;
+      border-radius: 16px;
+      background: rgba(9, 29, 41, 0.78);
+    }
+    .empty-thread strong {
+      font-size: 18px;
+      color: #f2fbff;
+    }
+    .composer-shell {
+      display: grid;
+      gap: 12px;
+      padding: 14px;
+      border: 1px solid #1b4f69;
+      border-radius: 18px;
+      background: linear-gradient(180deg, rgba(8, 28, 42, 0.98), rgba(9, 24, 35, 0.98));
+    }
+    .dropzone {
+      border: 1px dashed #297394;
+      border-radius: 14px;
+      padding: 12px 14px;
+      color: #a9d9ec;
+      font-size: 13px;
+      background: rgba(10, 32, 45, 0.56);
+    }
+    .dropzone.active {
+      border-color: #36d2fb;
+      background: rgba(15, 72, 95, 0.38);
+    }
+    .composer-input {
+      min-height: 72px;
+      resize: vertical;
+      background: #0a1f2d;
+      color: var(--text);
+      border: 1px solid #1a4f68;
+      border-radius: 14px;
+      padding: 14px;
+      font-size: 15px;
+      font-family: inherit;
+    }
+    .composer-actions {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .composer-action-group {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    .composer-attach,
+    .composer-mic,
+    .composer-send,
+    .secondary-action,
+    .voice-primary-button,
+    .thread-clear {
+      border-radius: 14px;
+      padding: 11px 14px;
+      font-size: 14px;
+    }
+    .composer-mic {
+      min-width: 148px;
+      background: linear-gradient(135deg, rgba(19, 130, 95, 0.96), rgba(18, 91, 68, 0.96));
+      border-color: #3fdba7;
+    }
+    .voice-primary-button {
+      min-width: 180px;
+      background: linear-gradient(135deg, rgba(18, 127, 163, 0.96), rgba(14, 84, 109, 0.96));
+      border-color: #3bd7ff;
+      font-weight: 600;
+    }
+    .voice-primary-button.error {
+      background: linear-gradient(135deg, rgba(146, 83, 34, 0.96), rgba(112, 59, 19, 0.96));
+      border-color: #f1a05d;
+    }
+    .thread-clear {
+      background: rgba(13, 35, 48, 0.92);
+    }
+    .image-preview-wrap {
+      display: grid;
+      gap: 10px;
+      border: 1px solid #1a4f68;
+      border-radius: 14px;
+      padding: 12px;
+      background: rgba(8, 23, 34, 0.82);
+    }
+    .image-preview-wrap[hidden] {
+      display: none;
+    }
+    .image-preview-card {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .image-preview-card img {
+      width: min(180px, 100%);
+      border-radius: 12px;
+      border: 1px solid #1f5b79;
+    }
+    .sidebar-shell {
+      display: grid;
+      gap: 14px;
+      position: sticky;
+      top: 18px;
+    }
+    .sidebar-card {
+      border: 1px solid #184a62;
+      border-radius: 18px;
+      padding: 14px;
+      background: linear-gradient(180deg, rgba(8, 27, 40, 0.98), rgba(7, 20, 31, 0.98));
+      display: grid;
+      gap: 12px;
+    }
+    .sidebar-card h2,
+    .secondary-section h2 {
+      margin: 0;
+      font-size: 15px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: #a9d7e9;
+    }
+    .sidebar-keyline {
+      display: grid;
+      gap: 8px;
+    }
+    .sidebar-keyline strong,
+    .status-metric strong {
+      color: #f2fbff;
+    }
+    .sidebar-copy,
+    .status-copy {
+      font-size: 13px;
+      color: var(--muted);
+      line-height: 1.45;
+    }
+    .secondary-shell {
+      display: grid;
+      gap: 12px;
+    }
+    .activity-feed-strip {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 14px;
+    }
+    .activity-feed-card {
+      border: 1px solid rgba(49, 123, 151, 0.45);
+      border-radius: 16px;
+      background: rgba(8, 27, 39, 0.78);
+      padding: 14px;
+      display: grid;
+      gap: 8px;
+      min-width: 0;
+    }
+    .activity-feed-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      min-width: 0;
+    }
+    .activity-feed-label {
+      font-size: 11px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: #91c8db;
+    }
+    .activity-feed-head strong {
+      font-size: 14px;
+      color: #f3fbff;
+      line-height: 1.4;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+    }
+    .activity-feed-detail {
+      font-size: 12px;
+      color: var(--muted);
+      line-height: 1.5;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+    }
+    .activity-live-indicator {
+      width: 12px;
+      height: 12px;
+      border-radius: 999px;
+      background: #5f7380;
+      animation: activityPulse 1.8s ease-in-out infinite;
+      flex: 0 0 auto;
+    }
+    .activity-live-indicator[data-tone="active"],
+    .activity-feed-card[data-tone="active"] .activity-live-indicator {
+      background: #3ec6ff;
+      box-shadow: 0 0 0 0 rgba(62, 198, 255, 0.4);
+    }
+    .activity-live-indicator[data-tone="ready"],
+    .activity-feed-card[data-tone="ready"] .activity-live-indicator {
+      background: #44d59a;
+      box-shadow: 0 0 0 0 rgba(68, 213, 154, 0.35);
+    }
+    .activity-live-indicator[data-tone="warn"],
+    .activity-feed-card[data-tone="warn"] .activity-live-indicator {
+      background: #efb261;
+      box-shadow: 0 0 0 0 rgba(239, 178, 97, 0.35);
+    }
+    .activity-live-indicator[data-tone="error"],
+    .activity-feed-card[data-tone="error"] .activity-live-indicator {
+      background: #ef8e61;
+      box-shadow: 0 0 0 0 rgba(239, 142, 97, 0.35);
+    }
+    .overview-card {
+      border: 1px solid #184a62;
+      border-radius: 18px;
+      padding: 18px;
+      background: linear-gradient(180deg, rgba(8, 27, 40, 0.98), rgba(7, 20, 31, 0.98));
+      display: grid;
+      gap: 16px;
+    }
+    .overview-card h2 {
+      margin: 0;
+      font-size: 15px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: #a9d7e9;
+    }
+    .overview-header {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .overview-summary {
+      font-size: 13px;
+      color: var(--muted);
+      line-height: 1.5;
+    }
+    .overview-meta-row {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    .secondary-tab-actions {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: flex-start;
+    }
+    .secondary-tab-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 14px;
+      flex-wrap: wrap;
+    }
+    .secondary-panels {
+      display: grid;
+      gap: 12px;
+    }
+    .secondary-section {
+      display: none;
+      gap: 12px;
+    }
+    .secondary-section.active {
+      display: grid;
+    }
+    body.operator-mode .debug-only {
+      display: none !important;
+    }
+    body.debug-mode .operator-mode-note {
+      display: none !important;
+    }
+    .status-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+    }
+    .status-tile {
+      border: 1px solid #17485f;
+      border-radius: 16px;
+      padding: 14px;
+      background: rgba(8, 27, 39, 0.88);
+      display: grid;
+      gap: 8px;
+    }
+    .status-tile span {
+      font-size: 11px;
+      color: #91c8db;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+    .status-tile strong {
+      font-size: 14px;
+      color: #f3fbff;
+      line-height: 1.45;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+    }
+    .status-subtext {
+      font-size: 12px;
+      color: var(--muted);
+      line-height: 1.45;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+    }
+    .progress-meter {
+      position: relative;
+      width: 100%;
+      height: 8px;
+      border-radius: 999px;
+      overflow: hidden;
+      background: rgba(134, 185, 205, 0.16);
+      border: 1px solid rgba(47, 126, 156, 0.35);
+    }
+    .progress-meter-fill {
+      width: 0%;
+      height: 100%;
+      border-radius: inherit;
+      background: linear-gradient(90deg, #3ec6ff, #89f0c7);
+      transition: width 220ms ease;
+    }
+    .activity-truth-panel {
+      margin-top: 14px;
+      border: 1px solid rgba(49, 123, 151, 0.55);
+      border-radius: 16px;
+      background: rgba(8, 27, 39, 0.72);
+      padding: 14px;
+      display: grid;
+      gap: 12px;
+    }
+    .activity-truth-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .activity-truth-copy {
+      display: grid;
+      gap: 6px;
+      min-width: 0;
+    }
+    .activity-truth-kicker {
+      font-size: 11px;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      color: #91c8db;
+    }
+    .activity-truth-head strong {
+      font-size: 15px;
+      color: #f3fbff;
+      line-height: 1.4;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+    }
+    .activity-truth-meter {
+      height: 10px;
+    }
+    .activity-truth-grid .status-tile {
+      padding: 12px;
+      gap: 6px;
+    }
+    .activity-truth-note {
+      border-top: 1px solid rgba(49, 123, 151, 0.35);
+      padding-top: 10px;
+      display: grid;
+      gap: 6px;
+    }
+    .activity-truth-note strong {
+      font-size: 12px;
+      color: #dff6ff;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+    .program-queue-toolbar {
+      margin-top: 12px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }
+    .program-queue-list {
+      display: grid;
+      gap: 10px;
+      margin-top: 12px;
+    }
+    .program-queue-item {
+      border: 1px solid rgba(49, 123, 151, 0.55);
+      border-radius: 14px;
+      padding: 12px;
+      background: rgba(8, 27, 39, 0.72);
+      display: grid;
+      gap: 6px;
+    }
+    .program-queue-item.active {
+      border-color: rgba(62, 198, 255, 0.85);
+      box-shadow: inset 0 0 0 1px rgba(62, 198, 255, 0.18);
+    }
+    .program-queue-heading {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      color: #f3fbff;
+      font-size: 12px;
+      line-height: 1.4;
+    }
+    .program-queue-heading strong {
+      font-size: 13px;
+      line-height: 1.4;
+      color: #f3fbff;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+    }
+    .program-queue-order {
+      color: #91c8db;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      font-size: 11px;
+      white-space: nowrap;
+    }
+    .program-queue-status {
+      justify-self: start;
+      border-radius: 999px;
+      padding: 4px 8px;
+      font-size: 11px;
+      line-height: 1.2;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: #d7f7ff;
+      background: rgba(33, 94, 116, 0.6);
+    }
+    .program-queue-status.active {
+      background: rgba(62, 198, 255, 0.2);
+      color: #8feaff;
+    }
+    .program-queue-status.completed {
+      background: rgba(56, 161, 105, 0.22);
+      color: #95f1bf;
+    }
+    .program-queue-status.blocked {
+      background: rgba(196, 89, 17, 0.24);
+      color: #ffc18a;
+    }
+    .program-queue-objective {
+      font-size: 12px;
+      color: var(--muted);
+      line-height: 1.45;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+    }
+    .diagnostics-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(280px, 360px);
+      gap: 12px;
+    }
+    .media-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+      gap: 12px;
+    }
+    .media-card {
+      border: 1px solid #16485d;
+      border-radius: 16px;
+      overflow: hidden;
+      background: rgba(8, 24, 34, 0.92);
+      display: grid;
+      gap: 0;
+    }
+    .media-card img {
+      width: 100%;
+      aspect-ratio: 16 / 11;
+      object-fit: cover;
+      display: block;
+    }
+    .media-card figcaption {
+      padding: 10px 12px 12px;
+      font-size: 12px;
+      color: var(--muted);
+      line-height: 1.45;
+    }
+    .visually-hidden {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border: 0;
+    }
     @media (max-width: 720px) {
+      body {
+        padding: 12px;
+      }
+      .topbar {
+        padding-right: 56px;
+      }
+      .layout-grid,
+      .activity-feed-strip,
+      .diagnostics-grid,
+      .system-activity-banner-grid,
+      .system-relation-grid,
+      .status-grid {
+        grid-template-columns: 1fr;
+      }
+      .sidebar-shell {
+        position: static;
+      }
+      .chat-log {
+        height: 54vh;
+        min-height: 320px;
+      }
+      .chat-bubble {
+        max-width: 100%;
+      }
       .chat-controls {
         grid-template-columns: 1fr;
       }
@@ -2855,11 +6603,15 @@ async def mim_ui_page() -> str:
       0%, 100% { box-shadow: inset 0 0 0 rgba(31,213,255,0.0); }
       50% { box-shadow: inset 0 0 120px rgba(31,213,255,0.16); }
     }
+    @keyframes activityPulse {
+      0%, 100% { transform: scale(0.92); }
+      50% { transform: scale(1.12); }
+    }
   </style>
 </head>
 <body>
   <div class="top-right">
-    <button id="settingsBtn" class="icon-btn" title="MIM settings" aria-label="MIM settings">⚙</button>
+    <div hidden></div>
   </div>
 
   <div id="settingsPanel" class="settings-panel" role="dialog" aria-label="MIM settings">
@@ -2949,61 +6701,419 @@ async def mim_ui_page() -> str:
     </div>
   </div>
 
-  <h1 id="mimIcon" class="mim-icon">MIM</h1>
-  <div id="buildTag" class="small" style="text-align:center; margin-top:-8px; margin-bottom:8px;">Build: loading...</div>
-
-  <div class=\"panel\">
-    <div class=\"wave-wrap\">
-      <div id=\"wave\" class=\"wave\"></div>
-    </div>
-    <div id=\"status\" class=\"status\">Listening...</div>
-    <div id="micEvent" class="mic-event">Mic event: waiting...</div>
-    <div id=\"micDiag\" class=\"small\">Mic: detecting devices...</div>
-    <div id=\"micDebug\" class=\"debug-log\">Mic debug: starting...</div>
-    <div id=\"camera\" class=\"small\">Camera: waiting for observations</div>
-    <div id=\"inquiry\" class=\"small\"></div>
-
-    <div class=\"controls\">
-      <input id=\"sayInput\" placeholder=\"Type what MIM should say\" value=\"Hello, I am MIM.\" />
-      <button id=\"speakBtn\">Speak</button>
-      <button id=\"listenBtn\">Listen</button>
-    </div>
-
-    <div class=\"controls\" style=\"grid-template-columns: 1fr auto; margin-top: 10px;\">
-      <input id=\"cameraInput\" placeholder=\"Who is in view? (e.g. unknown, person, alice)\" value=\"unknown\" />
-      <button id=\"cameraBtn\">Send Camera Event</button>
-    </div>
-
-    <div id=\"textChatPanel\" class=\"text-chat-panel\">
-      <div class=\"object-memory-header\">
-        <div class=\"object-memory-title\">Text Chat</div>
-        <div class=\"object-memory-caption\">Direct typed conversation</div>
+  <div class="app-shell">
+    <header class="hero mim-hero">
+      <div class="console-nav">
+        <a class="console-link utility" href="/"><span>Public Home</span></a>
+        <a class="console-link active" href="/mim"><span id="mimConsoleLight" class="console-nav-light"></span><span>MIM Primary Operator Surface</span></a>
+        <a class="console-link" href="/tod"><span id="todConsoleLight" class="console-nav-light"></span><span>TOD Console</span></a>
+        <a class="console-link utility" href="/chat"><span>Direct Chat</span></a>
+        <button id="settingsBtn" class="console-link utility" type="button"><span>Settings</span></button>
+        <a class="console-link utility" href="/mim/logout"><span>Logout</span></a>
       </div>
-      <div id=\"chatLog\" class=\"chat-log\" aria-live=\"polite\" aria-label=\"Text chat history\">
-        <div class=\"chat-bubble mim\">Text chat is ready. Type a message and press Send Text.</div>
+      <div class="surface-kicker">MIM Primary Operator Surface</div>
+      <div class="hero-row">
+        <div class="hero-copy">
+          <h1 id="mimIcon" class="mim-icon">MIM</h1>
+          <div class="summary">Persistent operator conversation, voice, camera, and TOD bridge telemetry stay on this surface.</div>
+        </div>
+        <div class="hero-status-cluster">
+          <div id="buildTag" class="status-chip subtle">UI_BUILD_ID = unified-console-recovery-v1</div>
+          <div id="voiceAvailabilityChip" class="status-chip strong">Voice checking…</div>
+          <div id="connectionChip" class="status-chip subtle">Runtime syncing…</div>
+          <div id="initiativeChip" class="status-chip subtle">Initiative idle</div>
+        </div>
       </div>
-      <div class=\"chat-controls\">
-        <input id=\"chatInput\" placeholder=\"Type a message to MIM\" value=\"\" />
-        <button id=\"chatSendBtn\">Send Text</button>
-        <button id=\"chatClearBtn\" type=\"button\">Clear</button>
+      <div class="hero-toolbar">
+        <div class="mode-toggle" aria-label="Interface mode selector">
+          <button id="operatorModeBtn" class="mode-chip active" type="button">Operator</button>
+          <button id="debugModeBtn" class="mode-chip" type="button">Debug</button>
+        </div>
+        <div class="thread-tools">
+          <div id="threadStatusChip" class="status-chip subtle">Thread loading…</div>
+          <div id="voiceHintChip" class="status-chip subtle">Voice replies stay in this thread.</div>
+          <button id="chatClearBtn" class="thread-clear" type="button">Clear View</button>
+        </div>
+      </div>
+    </header>
+
+    <div id="textChatPanel" class="primary-chat-panel">
+      <section class="panel">
+        <div class="chat-shell thread-card mim-chat-shell">
+          <div class="chat-meta">
+            <div class="chat-meta-title">
+              <strong>Conversation</strong>
+              <span>One persistent primary thread across refreshes and clients.</span>
+            </div>
+            <div id="inquiry" class="chat-meta-note"></div>
+          </div>
+
+        <div id="chatLog" class="chat-thread chat-log" aria-live="polite" aria-label="Primary MIM conversation thread"></div>
+
+        <div id="imagePreviewWrap" class="chat-preview image-preview-wrap" hidden>
+          <div class="image-preview-card">
+            <img id="imagePreviewImg" alt="Selected image preview" />
+            <div class="sidebar-keyline">
+              <strong id="imagePreviewName">Selected image</strong>
+              <div id="imagePreviewMeta" class="sidebar-copy">Add an optional prompt, then send.</div>
+              <button id="imageRemoveBtn" class="secondary-action" type="button">Remove image</button>
+            </div>
+          </div>
+        </div>
+
+        <form id="chatForm" class="chat-form composer-shell" onsubmit="return false;">
+          <div id="chatDropzone" class="chat-dropzone dropzone">Drop a screenshot here, or use Image to attach png, jpg, jpeg, or webp.</div>
+          <label class="visually-hidden" for="chatInput">Message MIM</label>
+          <textarea id="chatInput" class="chat-input composer-input" placeholder="Message MIM" rows="3"></textarea>
+          <div class="composer-actions">
+            <div class="composer-action-group">
+              <input id="imageUploadInput" type="file" accept="image/png,image/jpeg,image/webp" hidden />
+              <button id="imageUploadBtn" class="composer-attach" type="button">Image</button>
+              <button id="chatMicBtn" class="composer-mic" type="button">Turn Listener On</button>
+            </div>
+            <div class="composer-action-group">
+              <button id="chatSendBtn" class="composer-send" type="button">Send</button>
+            </div>
+          </div>
+        </form>
+      </div>
+      </section>
+    </div>
+
+    <div class="system-activity-banner">
+      <div class="system-activity-banner-head">
+        <div class="system-activity-banner-copy">
+          <div class="surface-kicker">System Activity Status</div>
+          <strong id="systemActivityHeadlineText">Loading…</strong>
+          <div id="systemActivitySummaryText" class="system-activity-banner-summary">Checking whether MIM is actually progressing work right now…</div>
+        </div>
+        <div id="systemActivityBadge" class="status-chip subtle" data-tone="warn">Checking…</div>
+      </div>
+      <div class="progress-meter activity-truth-meter" aria-hidden="true">
+        <div id="systemActivityFill" class="progress-meter-fill"></div>
+      </div>
+      <div class="activity-feed-strip">
+        <div id="mimWorkStateCard" class="activity-feed-card" data-tone="warn">
+          <div class="activity-feed-head">
+            <div>
+              <div class="activity-feed-label">MIM Now</div>
+              <strong id="mimWorkStateText">Checking…</strong>
+            </div>
+            <span id="mimWorkStateIndicator" class="activity-live-indicator" data-tone="warn" aria-hidden="true"></span>
+          </div>
+          <div id="mimWorkStateDetailText" class="activity-feed-detail">Checking if MIM is active, idle, or waiting…</div>
+        </div>
+        <div id="coordinationStateCard" class="activity-feed-card" data-tone="warn">
+          <div class="activity-feed-head">
+            <div>
+              <div class="activity-feed-label">TOD Coordination</div>
+              <strong id="coordinationStateText">Checking…</strong>
+            </div>
+          </div>
+          <div id="coordinationStateDetailText" class="activity-feed-detail">Checking whether MIM is blocked, flowing, or waiting on TOD…</div>
+        </div>
+        <div id="operatorGuidanceCard" class="activity-feed-card" data-tone="warn">
+          <div class="activity-feed-head">
+            <div>
+              <div class="activity-feed-label">Operator Guidance</div>
+              <strong id="operatorGuidanceText">Checking…</strong>
+            </div>
+          </div>
+          <div id="operatorGuidanceDetailText" class="activity-feed-detail">Deciding whether it is safe to add another objective…</div>
+        </div>
+      </div>
+      <div class="system-activity-banner-grid">
+        <div class="status-tile">
+          <span>Last Activity</span>
+          <strong id="systemLastActivityText">Loading…</strong>
+          <div id="systemLastActivityDetailText" class="status-subtext">Checking latest MIM or TOD signal…</div>
+        </div>
+        <div class="status-tile">
+          <span>Last Task Progress</span>
+          <strong id="systemLastTaskProgressText">Loading…</strong>
+          <div id="systemLastTaskProgressDetailText" class="status-subtext">Checking dispatch and feedback timestamps…</div>
+        </div>
+        <div class="status-tile">
+          <span>Execution Allowed</span>
+          <strong id="systemExecutionAllowedText">Loading…</strong>
+          <div id="systemExecutionAllowedDetailText" class="status-subtext">Checking readiness policy…</div>
+        </div>
+        <div class="status-tile">
+          <span>Staleness State</span>
+          <strong id="systemStalenessText">Loading…</strong>
+          <div id="systemStalenessDetailText" class="status-subtext">Checking heartbeat and progress age…</div>
+        </div>
+      </div>
+      <div class="system-relation-grid">
+        <div class="status-tile">
+          <span>Objective Alignment</span>
+          <strong id="relationObjectiveText">Loading…</strong>
+          <div id="relationObjectiveDetailText" class="status-subtext">Checking MIM and TOD objective agreement…</div>
+        </div>
+        <div class="status-tile">
+          <span>Bridge Health</span>
+          <strong id="relationBridgeText">Loading…</strong>
+          <div id="relationBridgeDetailText" class="status-subtext">Checking handoff bridge health…</div>
+        </div>
+        <div class="status-tile">
+          <span>Execution Flow</span>
+          <strong id="relationFlowText">Loading…</strong>
+          <div id="relationFlowDetailText" class="status-subtext">Checking whether work is flowing or blocked…</div>
+        </div>
+        <div class="status-tile">
+          <span>Last Handoff</span>
+          <strong id="relationHandoffText">Loading…</strong>
+          <div id="relationHandoffDetailText" class="status-subtext">Checking last request or bridge receive…</div>
+        </div>
+        <div class="status-tile">
+          <span>Last Feedback</span>
+          <strong id="relationFeedbackText">Loading…</strong>
+          <div id="relationFeedbackDetailText" class="status-subtext">Checking last TOD feedback or completion…</div>
+        </div>
+      </div>
+      <div class="activity-truth-note">
+        <strong>Stall Reason</strong>
+        <div id="systemStallReasonText" class="status-subtext">Checking for stall evidence…</div>
       </div>
     </div>
 
-    <div id=\"objectMemoryPanel\" class=\"object-memory-panel\" hidden>
-      <div class=\"object-memory-header\">
-        <div class=\"object-memory-title\">Object Memory</div>
-        <div class=\"object-memory-caption\">Live camera continuity</div>
+    <div class="layout-grid">
+      <div class="chat-surface">
+        <div class="panel chat-hero">
+          <div class="chat-summary-row">
+            <div id="contextChip" class="context-chip">Loading current objective context…</div>
+            <div class="quick-actions">
+              <button class="quick-action primary" type="button" data-quick-action="continue_work" data-quick-message="Continue the current initiative and summarize progress.">Continue Work</button>
+              <button class="quick-action" type="button" data-quick-action="unstick_mim" data-quick-message="If the current initiative is stale or stuck, unstick MIM now. Use TOD and the available broker or OpenAI path to continue the active objective, then summarize the blocker and what you did.">Unstick MIM</button>
+              <button class="quick-action" type="button" data-quick-action="smart_recovery" data-quick-message="Inspect current runtime health. If MIM, TOD coordination, or the active initiative is stale or unhealthy, recover it now and summarize the repair action.">Smart Recovery</button>
+              <button class="quick-action" type="button" data-quick-action="force_tod_help" data-quick-message="Escalate to TOD now. Request immediate external help for the current initiative, include the current blocker, the active objective, and the next bounded action needed.">Force TOD Help</button>
+              <button class="quick-action" type="button" data-quick-action="show_blockers" data-quick-message="Show current blockers and next task.">Show Blockers</button>
+              <button class="quick-action" type="button" data-quick-action="check_tod_status" data-quick-message="Check TOD status and report it back.">Check TOD Status</button>
+              <button class="quick-action" type="button" data-quick-action="review_latest_image" data-quick-message="Summarize the latest image or visual context in this thread.">Review Latest Image</button>
+            </div>
+          </div>
+          <div class="voice-primary-row">
+            <button id="listenBtn" class="voice-primary-button" type="button">Turn Listener On</button>
+            <div id="voiceStateChip" class="status-chip subtle" data-tone="warn">Voice: checking</div>
+            <div id="status" class="status-chip subtle">Ready for full-time listening.</div>
+            <div id="micEvent" class="status-chip subtle">Recent voice event: waiting…</div>
+            <label class="composer-toggle" for="autoListenToggle">
+              <input id="autoListenToggle" type="checkbox" />
+              Full-time listener
+            </label>
+          </div>
+          <div class="media-self-test-card">
+            <div class="media-self-test-header">
+              <div class="thread-title">
+                <strong>Media Self-Test</strong>
+                <span>Live browser and runtime checks for remote mic and camera.</span>
+              </div>
+              <div id="selfTestSummaryChip" class="status-chip subtle" data-tone="warn">Self-test pending</div>
+            </div>
+            <div class="media-self-test-actions">
+              <button id="selfTestRunBtn" class="secondary-action" type="button">Run Self-Test</button>
+              <button id="selfTestToggleListenerBtn" class="secondary-action" type="button">Turn Listener On</button>
+              <div id="selfTestTimestamp" class="status-chip subtle">Awaiting first self-test.</div>
+            </div>
+            <div id="selfTestGuidanceText" class="media-self-test-note">Run the self-test after changing browser or device permissions.</div>
+            <div class="media-self-test-grid">
+              <div class="media-self-test-item">
+                <div class="media-self-test-label">Secure Origin</div>
+                <div id="selfTestSecureValue" class="media-self-test-value">Checking…</div>
+              </div>
+              <div class="media-self-test-item">
+                <div class="media-self-test-label">Browser Media API</div>
+                <div id="selfTestMediaApiValue" class="media-self-test-value">Checking…</div>
+              </div>
+              <div class="media-self-test-item">
+                <div class="media-self-test-label">Microphone Permission</div>
+                <div id="selfTestMicPermissionValue" class="media-self-test-value">Checking…</div>
+              </div>
+              <div class="media-self-test-item">
+                <div class="media-self-test-label">Microphone Device</div>
+                <div id="selfTestMicDeviceValue" class="media-self-test-value">Checking…</div>
+              </div>
+              <div class="media-self-test-item">
+                <div class="media-self-test-label">Listener Mode</div>
+                <div id="selfTestListenerValue" class="media-self-test-value">Checking…</div>
+              </div>
+              <div class="media-self-test-item">
+                <div class="media-self-test-label">Last Voice Activity</div>
+                <div id="selfTestMicActivityValue" class="media-self-test-value">Checking…</div>
+              </div>
+              <div class="media-self-test-item">
+                <div class="media-self-test-label">Camera State</div>
+                <div id="selfTestCameraValue" class="media-self-test-value">Checking…</div>
+              </div>
+              <div class="media-self-test-item">
+                <div class="media-self-test-label">Backend Sync</div>
+                <div id="selfTestBackendValue" class="media-self-test-value">Checking…</div>
+              </div>
+            </div>
+          </div>
+        </div>
       </div>
-      <ul id=\"objectMemoryList\" class=\"object-memory-list\"></ul>
     </div>
 
-    <div id=\"systemReasoningPanel\" class=\"object-memory-panel\" hidden>
-      <div class=\"object-memory-header\">
-        <div class=\"object-memory-title\">System Reasoning</div>
-        <div class=\"object-memory-caption\">Operator-visible decision context</div>
+    <div class="panel secondary-shell">
+      <div class="secondary-tab-row">
+        <div class="sidebar-keyline">
+          <h2>Operator Views</h2>
+          <div class="sidebar-copy">The conversation stays primary. Queue, voice, status, and diagnostics move into tabs.</div>
+        </div>
+        <div class="secondary-tab-actions">
+          <button id="secondaryTabOverview" class="tab-chip active" type="button" data-tab="overview">Overview</button>
+          <button id="secondaryTabQueue" class="tab-chip" type="button" data-tab="queue">Queue</button>
+          <button id="secondaryTabVoice" class="tab-chip" type="button" data-tab="voice">Voice</button>
+          <button id="secondaryTabStatus" class="tab-chip" type="button" data-tab="status">Status</button>
+          <button id="secondaryTabReasoning" class="tab-chip" type="button" data-tab="reasoning">Reasoning</button>
+          <button id="secondaryTabDiagnostics" class="tab-chip" type="button" data-tab="diagnostics">Diagnostics</button>
+          <button id="secondaryTabMedia" class="tab-chip" type="button" data-tab="media">Media</button>
+        </div>
       </div>
-      <div id=\"systemReasoningSummary\" class=\"object-memory-note\"></div>
-      <ul id=\"systemReasoningList\" class=\"object-memory-list\"></ul>
+
+      <div class="secondary-panels">
+        <div id="secondaryPanelOverview" class="secondary-section active">
+          <div class="overview-card">
+            <div class="overview-header">
+              <div class="sidebar-keyline">
+                <h2>Current Status</h2>
+                <div id="initiativeSummaryText" class="overview-summary">Initiative state loading…</div>
+              </div>
+              <div class="overview-meta-row">
+                <div id="initiativeChipSecondary" class="status-chip subtle">Initiative loading…</div>
+              </div>
+            </div>
+            <div class="status-grid">
+              <div class="status-tile">
+                <span>Objective</span>
+                <strong id="activeObjectiveText">Loading…</strong>
+              </div>
+              <div class="status-tile">
+                <span>Active Task</span>
+                <strong id="activeTaskText">Loading…</strong>
+              </div>
+              <div class="status-tile">
+                <span>Activity</span>
+                <strong id="activityStateText">Loading…</strong>
+                <div id="activityStateDetailText" class="status-subtext">Checking initiative activity…</div>
+              </div>
+              <div class="status-tile">
+                <span>Progress Meaning</span>
+                <strong id="progressText">Loading…</strong>
+                <div class="progress-meter" aria-hidden="true">
+                  <div id="progressFill" class="progress-meter-fill"></div>
+                </div>
+                <div id="progressDetailText" class="status-subtext">Checking bounded task progress…</div>
+              </div>
+              <div class="status-tile">
+                <span>Next Task</span>
+                <strong id="nextTaskText">Loading…</strong>
+              </div>
+              <div class="status-tile">
+                <span>Blockers</span>
+                <strong id="blockerCountText">0 visible</strong>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div id="secondaryPanelQueue" class="secondary-section">
+          <div class="sidebar-card">
+            <h2>Program Queue</h2>
+            <div id="programQueueSummaryText" class="sidebar-copy">Checking ordered project progression…</div>
+            <div class="program-queue-toolbar">
+              <div id="programQueueMetaText" class="status-subtext">Preparing the active and nearby steps…</div>
+              <button id="programQueueToggleBtn" class="secondary-action" type="button">Show all</button>
+            </div>
+            <div id="programQueueList" class="program-queue-list"></div>
+          </div>
+        </div>
+
+        <div id="secondaryPanelVoice" class="secondary-section">
+          <div class="sidebar-card">
+            <h2>Voice</h2>
+            <div id="voiceAvailabilityText" class="sidebar-copy">Checking microphone and speech availability…</div>
+            <div class="sidebar-list">
+              <div id="micDiag" class="status-chip subtle">Mic: detecting devices…</div>
+              <div id="camera" class="status-chip subtle">Camera: waiting for observations</div>
+            </div>
+          </div>
+        </div>
+
+        <div id="secondaryPanelStatus" class="secondary-section">
+          <div class="status-grid">
+            <div class="status-tile">
+              <span>Recent Input</span>
+              <strong id="recentInputText">Waiting for input…</strong>
+            </div>
+            <div class="status-tile">
+              <span>Open Question</span>
+              <strong id="openQuestionText">None</strong>
+            </div>
+            <div class="status-tile">
+              <span>Memory Hint</span>
+              <strong id="memoryHintText">None</strong>
+            </div>
+            <div class="status-tile">
+              <span>Runtime Health</span>
+              <strong id="runtimeHealthText">Loading…</strong>
+            </div>
+          </div>
+          <div id="objectMemoryPanel" class="object-memory-panel" hidden>
+            <div class="object-memory-header">
+              <div class="object-memory-title">Object Memory</div>
+              <div class="object-memory-caption">Live camera continuity</div>
+            </div>
+            <ul id="objectMemoryList" class="object-memory-list"></ul>
+          </div>
+        </div>
+
+        <div id="secondaryPanelReasoning" class="secondary-section">
+          <div id="systemReasoningPanel" class="object-memory-panel" hidden>
+            <div class="object-memory-header">
+              <div class="object-memory-title">System Reasoning</div>
+              <div class="object-memory-caption">Operator-visible decision context</div>
+            </div>
+            <div id="systemReasoningSummary" class="object-memory-note"></div>
+            <ul id="systemReasoningList" class="object-memory-list"></ul>
+          </div>
+        </div>
+
+        <div id="secondaryPanelDiagnostics" class="secondary-section">
+          <div class="sidebar-card operator-mode-note">
+            <h2>Diagnostics Stay Secondary</h2>
+            <div class="sidebar-copy">Operator mode keeps raw microphone, camera, and runtime controls out of the main workflow. Switch to Debug mode only when you need low-level troubleshooting.</div>
+            <div class="sidebar-list">
+              <button id="openDebugModeBtn" class="secondary-action" type="button">Switch To Debug Mode</button>
+            </div>
+          </div>
+          <div class="diagnostics-grid debug-only">
+            <div class="sidebar-card">
+              <h2>Voice And Runtime</h2>
+              <div class="wave-wrap">
+                <div id="wave" class="wave"></div>
+              </div>
+              <div id="micDebug" class="debug-log">Mic debug: starting...</div>
+            </div>
+            <div class="sidebar-card">
+              <h2>Operator Controls</h2>
+              <div class="controls">
+                <input id="sayInput" placeholder="Type what MIM should say" value="Hello, I am MIM." />
+                <button id="speakBtn" class="secondary-action" type="button">Speak</button>
+                <button id="cameraBtn" class="secondary-action" type="button">Send Camera Event</button>
+              </div>
+              <div class="controls" style="grid-template-columns: 1fr; margin-top: 0;">
+                <input id="cameraInput" placeholder="Who is in view? (e.g. unknown, person, alice)" value="unknown" />
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div id="secondaryPanelMedia" class="secondary-section">
+          <div id="mediaGrid" class="media-grid"></div>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -3023,7 +7133,110 @@ async def mim_ui_page() -> str:
     const chatInput = document.getElementById('chatInput');
     const chatSendBtn = document.getElementById('chatSendBtn');
     const chatClearBtn = document.getElementById('chatClearBtn');
+    const chatMicBtn = document.getElementById('chatMicBtn');
+    const imageUploadBtn = document.getElementById('imageUploadBtn');
+    const imageUploadInput = document.getElementById('imageUploadInput');
+    const imagePreviewWrap = document.getElementById('imagePreviewWrap');
+    const imagePreviewImg = document.getElementById('imagePreviewImg');
+    const imagePreviewName = document.getElementById('imagePreviewName');
+    const imagePreviewMeta = document.getElementById('imagePreviewMeta');
+    const imageRemoveBtn = document.getElementById('imageRemoveBtn');
+    const chatDropzone = document.getElementById('chatDropzone');
+    const autoListenToggle = document.getElementById('autoListenToggle');
+    const voiceAvailabilityChip = document.getElementById('voiceAvailabilityChip');
+    const voiceStateChip = document.getElementById('voiceStateChip');
+    const connectionChip = document.getElementById('connectionChip');
+    const initiativeChip = document.getElementById('initiativeChip');
+    const initiativeChipSecondary = document.getElementById('initiativeChipSecondary');
+    const contextChip = document.getElementById('contextChip');
+    const threadStatusChip = document.getElementById('threadStatusChip');
+    const voiceHintChip = document.getElementById('voiceHintChip');
+    const activeObjectiveText = document.getElementById('activeObjectiveText');
+    const activeTaskText = document.getElementById('activeTaskText');
+    const activityStateText = document.getElementById('activityStateText');
+    const activityStateDetailText = document.getElementById('activityStateDetailText');
+    const progressText = document.getElementById('progressText');
+    const progressDetailText = document.getElementById('progressDetailText');
+    const progressFill = document.getElementById('progressFill');
+    const nextTaskText = document.getElementById('nextTaskText');
+    const blockerCountText = document.getElementById('blockerCountText');
+    const initiativeSummaryText = document.getElementById('initiativeSummaryText');
+    const systemActivityHeadlineText = document.getElementById('systemActivityHeadlineText');
+    const systemActivityBadge = document.getElementById('systemActivityBadge');
+    const systemActivitySummaryText = document.getElementById('systemActivitySummaryText');
+    const systemActivityFill = document.getElementById('systemActivityFill');
+    const systemLastActivityText = document.getElementById('systemLastActivityText');
+    const systemLastActivityDetailText = document.getElementById('systemLastActivityDetailText');
+    const systemLastTaskProgressText = document.getElementById('systemLastTaskProgressText');
+    const systemLastTaskProgressDetailText = document.getElementById('systemLastTaskProgressDetailText');
+    const systemExecutionAllowedText = document.getElementById('systemExecutionAllowedText');
+    const systemExecutionAllowedDetailText = document.getElementById('systemExecutionAllowedDetailText');
+    const systemStalenessText = document.getElementById('systemStalenessText');
+    const systemStalenessDetailText = document.getElementById('systemStalenessDetailText');
+    const relationObjectiveText = document.getElementById('relationObjectiveText');
+    const relationObjectiveDetailText = document.getElementById('relationObjectiveDetailText');
+    const relationBridgeText = document.getElementById('relationBridgeText');
+    const relationBridgeDetailText = document.getElementById('relationBridgeDetailText');
+    const relationFlowText = document.getElementById('relationFlowText');
+    const relationFlowDetailText = document.getElementById('relationFlowDetailText');
+    const relationHandoffText = document.getElementById('relationHandoffText');
+    const relationHandoffDetailText = document.getElementById('relationHandoffDetailText');
+    const relationFeedbackText = document.getElementById('relationFeedbackText');
+    const relationFeedbackDetailText = document.getElementById('relationFeedbackDetailText');
+    const systemStallReasonText = document.getElementById('systemStallReasonText');
+    const mimWorkStateCard = document.getElementById('mimWorkStateCard');
+    const mimWorkStateText = document.getElementById('mimWorkStateText');
+    const mimWorkStateDetailText = document.getElementById('mimWorkStateDetailText');
+    const mimWorkStateIndicator = document.getElementById('mimWorkStateIndicator');
+    const coordinationStateCard = document.getElementById('coordinationStateCard');
+    const coordinationStateText = document.getElementById('coordinationStateText');
+    const coordinationStateDetailText = document.getElementById('coordinationStateDetailText');
+    const operatorGuidanceCard = document.getElementById('operatorGuidanceCard');
+    const operatorGuidanceText = document.getElementById('operatorGuidanceText');
+    const operatorGuidanceDetailText = document.getElementById('operatorGuidanceDetailText');
+    const programQueueSummaryText = document.getElementById('programQueueSummaryText');
+    const programQueueMetaText = document.getElementById('programQueueMetaText');
+    const programQueueToggleBtn = document.getElementById('programQueueToggleBtn');
+    const programQueueList = document.getElementById('programQueueList');
+    const voiceAvailabilityText = document.getElementById('voiceAvailabilityText');
+    const recentInputText = document.getElementById('recentInputText');
+    const openQuestionText = document.getElementById('openQuestionText');
+    const memoryHintText = document.getElementById('memoryHintText');
+    const runtimeHealthText = document.getElementById('runtimeHealthText');
+    const trainingRoutineSummaryText = document.getElementById('trainingRoutineSummaryText');
+    const trainingRoutinePhaseChip = document.getElementById('trainingRoutinePhaseChip');
+    const trainingRoutineRuntimeChip = document.getElementById('trainingRoutineRuntimeChip');
+    const trainingRoutineNextChip = document.getElementById('trainingRoutineNextChip');
+    const trainingRoutineWindowText = document.getElementById('trainingRoutineWindowText');
+    const trainingRoutineBudgetText = document.getElementById('trainingRoutineBudgetText');
+    const trainingRoutineScoreText = document.getElementById('trainingRoutineScoreText');
+    const trainingRoutineFailuresText = document.getElementById('trainingRoutineFailuresText');
+    const trainingRoutineDetailText = document.getElementById('trainingRoutineDetailText');
+    const trainingRoutineStartBtn = document.getElementById('trainingRoutineStartBtn');
+    const trainingRoutineRestartBtn = document.getElementById('trainingRoutineRestartBtn');
+    const trainingRoutineStopBtn = document.getElementById('trainingRoutineStopBtn');
+    const mediaGrid = document.getElementById('mediaGrid');
+    const selfTestSummaryChip = document.getElementById('selfTestSummaryChip');
+    const selfTestRunBtn = document.getElementById('selfTestRunBtn');
+    const selfTestToggleListenerBtn = document.getElementById('selfTestToggleListenerBtn');
+    const selfTestTimestamp = document.getElementById('selfTestTimestamp');
+    const selfTestGuidanceText = document.getElementById('selfTestGuidanceText');
+    const selfTestSecureValue = document.getElementById('selfTestSecureValue');
+    const selfTestMediaApiValue = document.getElementById('selfTestMediaApiValue');
+    const selfTestMicPermissionValue = document.getElementById('selfTestMicPermissionValue');
+    const selfTestMicDeviceValue = document.getElementById('selfTestMicDeviceValue');
+    const selfTestListenerValue = document.getElementById('selfTestListenerValue');
+    const selfTestMicActivityValue = document.getElementById('selfTestMicActivityValue');
+    const selfTestCameraValue = document.getElementById('selfTestCameraValue');
+    const selfTestBackendValue = document.getElementById('selfTestBackendValue');
+    const secondaryTabs = Array.from(document.querySelectorAll('[data-tab]'));
+    const quickActionButtons = Array.from(document.querySelectorAll('[data-quick-message]'));
     const mimIcon = document.getElementById('mimIcon');
+    const mimConsoleLight = document.getElementById('mimConsoleLight');
+    const todConsoleLight = document.getElementById('todConsoleLight');
+    const operatorModeBtn = document.getElementById('operatorModeBtn');
+    const debugModeBtn = document.getElementById('debugModeBtn');
+    const openDebugModeBtn = document.getElementById('openDebugModeBtn');
     const settingsBtn = document.getElementById('settingsBtn');
     const settingsPanel = document.getElementById('settingsPanel');
     const voiceSelect = document.getElementById('voiceSelect');
@@ -3059,27 +7272,1074 @@ async def mim_ui_page() -> str:
     window.addEventListener('error', (event) => {
       const msg = String(event?.message || 'unknown_js_error');
       if (micEventEl) {
-        micEventEl.textContent = `Mic event: js-error:${msg}`;
+        micEventEl.textContent = `Recent voice event: js-error:${msg}`;
       }
       statusEl.textContent = `UI error: ${msg}`;
+      if (voiceStateChip) {
+        voiceStateChip.textContent = 'Voice: error';
+        voiceStateChip.dataset.tone = 'error';
+      }
     });
 
-    let micAutoMode = false;
+    const AUTO_LISTEN_STORAGE_KEY = 'mim_auto_listen_enabled';
+    let micAutoMode = localStorage.getItem(AUTO_LISTEN_STORAGE_KEY) === '1';
     let micListening = false;
     let recognition = null;
+    let selfTestLastRunAt = 0;
+    let selfTestLastSummary = 'Self-test pending';
 
-    function appendChatMessage(role, text) {
+    const preloadedChatThread = __MIM_PRELOADED_CHAT_THREAD__;
+    let chatThreadMessages = Array.isArray(preloadedChatThread.messages) ? preloadedChatThread.messages : [];
+    let chatLocallyCleared = false;
+    let chatLocalClearCutoffIso = '';
+    let chatLocalClearNotice = null;
+    let lastRenderedChatSignature = '';
+    let selectedComposerImage = null;
+    let activeSecondaryTab = 'overview';
+    let uiMode = localStorage.getItem('mim_ui_mode') || 'operator';
+    let showFullProgramQueue = false;
+
+    function safeText(value, fallback = '') {
+      const text = String(value || '').trim();
+      return text || fallback;
+    }
+
+    function setTextWithTitle(element, text, fallback = '') {
+      if (!element) return;
+      const resolved = safeText(text, fallback);
+      element.textContent = resolved;
+      element.title = resolved;
+    }
+
+    function resolveInitiativeLabel(entry, fallback = '') {
+      if (!entry || typeof entry !== 'object') return safeText(fallback);
+      return safeText(entry.display_title || entry.title || entry.scope || entry.description, fallback);
+    }
+
+    function formatAgeSummary(secondsValue) {
+      const seconds = Number(secondsValue);
+      if (!Number.isFinite(seconds) || seconds < 1) return '';
+      if (seconds < 90) return `${Math.round(seconds)}s`;
+      const minutes = Math.round(seconds / 60);
+      if (minutes < 90) return `${minutes}m`;
+      const hours = Math.round(minutes / 60);
+      return `${hours}h`;
+    }
+
+    function formatActivityTimestamp(value, emptyLabel = 'No recent signal') {
+      if (!value) return emptyLabel;
+      const parsed = new Date(value);
+      if (Number.isNaN(parsed.getTime())) return emptyLabel;
+      const ageSeconds = Math.max(0, (Date.now() - parsed.getTime()) / 1000);
+      const ageLabel = formatAgeSummary(ageSeconds);
+      const recentLabel = ageSeconds < 86400
+        ? parsed.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+        : parsed.toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+      return ageLabel ? `${recentLabel} (${ageLabel} ago)` : recentLabel;
+    }
+
+    function activityToneFromState(state, shouldBeWorking) {
+      const normalized = safeText(state).toLowerCase();
+      if (normalized === 'active' || normalized === 'working') return 'active';
+      if (normalized === 'idle' && !shouldBeWorking) return 'ready';
+      if (normalized === 'warning' || normalized === 'recovering') return 'warn';
+      if (normalized === 'stale' || normalized === 'frozen' || normalized === 'stalled') return 'error';
+      if (normalized === 'idle' && shouldBeWorking) return 'warn';
+      return 'warn';
+    }
+
+    function renderSystemActivityTruth(systemActivity = {}) {
+      const state = safeText(systemActivity.status_code || systemActivity.state, 'idle').toLowerCase();
+      const headline = safeText(systemActivity.headline || systemActivity.label, 'IDLE - healthy, no live task right now');
+      const summary = safeText(systemActivity.summary, 'No active work is currently required.');
+      const shouldBeWorking = Boolean(systemActivity.should_be_working);
+      const lastActivity = safeText(systemActivity.last_activity_at || systemActivity.mim_last_activity_at || systemActivity.tod_last_activity_at);
+      const lastTaskProgress = safeText(systemActivity.last_task_progress_at);
+      const executionAllowed = Boolean(systemActivity.execution_allowed);
+      const executionAllowedLabel = safeText(systemActivity.execution_allowed_label, executionAllowed ? 'Yes' : 'No');
+      const executionAllowedDetail = safeText(systemActivity.execution_allowed_reason, executionAllowed ? 'Execution is allowed.' : 'Execution is blocked.');
+      const stalenessLabel = safeText(systemActivity.staleness_label, 'FRESH');
+      const stalenessDetail = safeText(systemActivity.staleness_detail, 'No current staleness evidence.');
+      const relation = (systemActivity.relation && typeof systemActivity.relation === 'object') ? systemActivity.relation : {};
+      const relationObjective = safeText(relation.objective_alignment, 'Aligned');
+      const relationObjectiveDetail = safeText(relation.objective_alignment_detail, 'MIM and TOD agree on the active objective.');
+      const relationBridge = safeText(relation.bridge_health, 'Healthy');
+      const relationBridgeDetail = safeText(relation.summary, 'The MIM↔TOD bridge looks healthy.');
+      const relationFlow = safeText(relation.execution_flow, 'Flowing');
+      const relationFlowDetail = shouldBeWorking
+        ? 'Work is expected to move through the current objective.'
+        : 'No live execution flow is required right now.';
+      const relationHandoffAt = safeText(relation.last_handoff_at);
+      const relationFeedbackAt = safeText(relation.last_feedback_at);
+      const stallReason = safeText(systemActivity.stall_reason, 'No current stall evidence.');
+      const meterPercent = Math.max(0, Math.min(100, Number(systemActivity.meter_percent || 0)));
+      const tone = safeText(systemActivity.tone, activityToneFromState(state, shouldBeWorking));
+
+      setTextWithTitle(systemActivityHeadlineText, headline, 'IDLE - healthy, no live task right now');
+      if (systemActivityBadge) {
+        const badgeText = safeText(systemActivity.status_label, safeText(systemActivity.label, 'IDLE'));
+        systemActivityBadge.textContent = shouldBeWorking ? `${badgeText} · should move` : badgeText;
+        systemActivityBadge.title = summary;
+        systemActivityBadge.setAttribute('data-tone', tone);
+      }
+      if (systemActivitySummaryText) {
+        systemActivitySummaryText.textContent = summary;
+        systemActivitySummaryText.title = summary;
+      }
+      if (systemActivityFill) {
+        systemActivityFill.style.width = `${meterPercent}%`;
+      }
+
+      setTextWithTitle(systemLastActivityText, formatActivityTimestamp(lastActivity), 'No recent signal');
+      if (systemLastActivityDetailText) {
+        const detail = safeText(systemActivity.heartbeat_detail, 'Latest MIM or TOD activity heartbeat.');
+        systemLastActivityDetailText.textContent = detail;
+        systemLastActivityDetailText.title = detail;
+      }
+
+      setTextWithTitle(systemLastTaskProgressText, formatActivityTimestamp(lastTaskProgress), 'No recent progress');
+      if (systemLastTaskProgressDetailText) {
+        const detail = safeText(
+          systemActivity.last_task_progress_age_seconds ? `Last bounded progress arrived about ${formatAgeSummary(systemActivity.last_task_progress_age_seconds)} ago.` : '',
+          'Latest request, dispatch, or feedback timestamp for tracked work.',
+        );
+        systemLastTaskProgressDetailText.textContent = detail;
+        systemLastTaskProgressDetailText.title = detail;
+      }
+
+      setTextWithTitle(systemExecutionAllowedText, executionAllowedLabel, 'No');
+      if (systemExecutionAllowedDetailText) {
+        systemExecutionAllowedDetailText.textContent = executionAllowedDetail;
+        systemExecutionAllowedDetailText.title = executionAllowedDetail;
+      }
+
+      setTextWithTitle(systemStalenessText, stalenessLabel, 'FRESH');
+      if (systemStalenessDetailText) {
+        systemStalenessDetailText.textContent = stalenessDetail;
+        systemStalenessDetailText.title = stalenessDetail;
+      }
+
+      setTextWithTitle(relationObjectiveText, relationObjective, 'Aligned');
+      if (relationObjectiveDetailText) {
+        relationObjectiveDetailText.textContent = relationObjectiveDetail;
+        relationObjectiveDetailText.title = relationObjectiveDetail;
+      }
+
+      setTextWithTitle(relationBridgeText, relationBridge, 'Healthy');
+      if (relationBridgeDetailText) {
+        relationBridgeDetailText.textContent = relationBridgeDetail;
+        relationBridgeDetailText.title = relationBridgeDetail;
+      }
+
+      setTextWithTitle(relationFlowText, relationFlow, 'Flowing');
+      if (relationFlowDetailText) {
+        relationFlowDetailText.textContent = relationFlowDetail;
+        relationFlowDetailText.title = relationFlowDetail;
+      }
+
+      setTextWithTitle(relationHandoffText, formatActivityTimestamp(relationHandoffAt), 'No recent handoff');
+      if (relationHandoffDetailText) {
+        const detail = safeText(systemActivity.should_be_working_reason, 'Latest bridge request or handoff timestamp.');
+        relationHandoffDetailText.textContent = detail;
+        relationHandoffDetailText.title = detail;
+      }
+
+      setTextWithTitle(relationFeedbackText, formatActivityTimestamp(relationFeedbackAt), 'No recent feedback');
+      if (relationFeedbackDetailText) {
+        const detail = safeText(systemActivity.recovery_summary, 'Latest TOD feedback or completion evidence.');
+        relationFeedbackDetailText.textContent = detail;
+        relationFeedbackDetailText.title = detail;
+      }
+
+      if (systemStallReasonText) {
+        systemStallReasonText.textContent = stallReason;
+        systemStallReasonText.title = stallReason;
+      }
+      renderOperatorActivityFeed(systemActivity, tone);
+    }
+
+    function renderOperatorActivityFeed(systemActivity = {}, defaultTone = 'warn') {
+      const state = safeText(systemActivity.status_code || systemActivity.state, 'idle').toLowerCase();
+      const shouldBeWorking = Boolean(systemActivity.should_be_working);
+      const relation = (systemActivity.relation && typeof systemActivity.relation === 'object') ? systemActivity.relation : {};
+      const flow = safeText(relation.execution_flow, 'Flowing');
+      const bridgeHealth = safeText(relation.bridge_health, 'Healthy');
+      const tone = safeText(systemActivity.tone, defaultTone || activityToneFromState(state, shouldBeWorking));
+      const mimStateLabel = safeText(systemActivity.status_label || systemActivity.label, 'Idle');
+      const mimStateDetail = safeText(
+        systemActivity.summary,
+        shouldBeWorking ? 'MIM is expected to be moving the current objective.' : 'No live task currently requires motion.',
+      );
+
+      let guidanceTitle = 'Safe for a new objective';
+      let guidanceDetail = 'MIM is not actively moving a live task right now, so adding a new objective is reasonable.';
+      let guidanceTone = 'ready';
+      if (!Boolean(systemActivity.execution_allowed)) {
+        guidanceTitle = 'Hold new objectives';
+        guidanceDetail = safeText(systemActivity.execution_allowed_reason, 'Execution readiness is blocked, so do not queue a new objective yet.');
+        guidanceTone = 'error';
+      } else if (shouldBeWorking && ['active', 'working'].includes(state)) {
+        guidanceTitle = 'MIM is already working';
+        guidanceDetail = 'A live objective is already moving. Avoid adding a second objective until this one settles.';
+        guidanceTone = 'active';
+      } else if (shouldBeWorking) {
+        guidanceTitle = 'Hold while coordination catches up';
+        guidanceDetail = safeText(systemActivity.stall_reason || relation.summary, 'MIM should be working, but coordination has not caught up yet.');
+        guidanceTone = tone === 'error' ? 'error' : 'warn';
+      }
+
+      if (mimWorkStateCard) mimWorkStateCard.setAttribute('data-tone', tone);
+      if (mimWorkStateIndicator) mimWorkStateIndicator.setAttribute('data-tone', tone);
+      setTextWithTitle(mimWorkStateText, mimStateLabel, 'Idle');
+      if (mimWorkStateDetailText) {
+        mimWorkStateDetailText.textContent = mimStateDetail;
+        mimWorkStateDetailText.title = mimStateDetail;
+      }
+
+      const coordinationTone = relation.summary
+        ? (String(bridgeHealth).toLowerCase().includes('healthy') && String(flow).toLowerCase().includes('flow')
+          ? (shouldBeWorking ? 'active' : 'ready')
+          : shouldBeWorking ? 'warn' : tone)
+        : tone;
+      if (coordinationStateCard) coordinationStateCard.setAttribute('data-tone', coordinationTone);
+      setTextWithTitle(coordinationStateText, `${flow} · ${bridgeHealth}`, 'Checking…');
+      if (coordinationStateDetailText) {
+        const detail = safeText(relation.summary, 'Watching MIM to TOD coordination and bridge health.');
+        coordinationStateDetailText.textContent = detail;
+        coordinationStateDetailText.title = detail;
+      }
+
+      if (operatorGuidanceCard) operatorGuidanceCard.setAttribute('data-tone', guidanceTone);
+      setTextWithTitle(operatorGuidanceText, guidanceTitle, 'Checking…');
+      if (operatorGuidanceDetailText) {
+        operatorGuidanceDetailText.textContent = guidanceDetail;
+        operatorGuidanceDetailText.title = guidanceDetail;
+      }
+    }
+
+    function buildQuickActionMessage(button) {
+      const action = safeText(button?.dataset?.quickAction).toLowerCase();
+      const fallback = safeText(button?.dataset?.quickMessage);
+      const state = latestUiState && typeof latestUiState === 'object' ? latestUiState : {};
+      const systemActivity = state && typeof state.system_activity === 'object' ? state.system_activity : {};
+      const initiative = state && typeof state.initiative_driver === 'object' ? state.initiative_driver : {};
+      const activeObjective = resolveInitiativeLabel(initiative.active_objective, 'the current objective');
+      const nextTask = resolveInitiativeLabel(initiative.next_task, 'the next bounded task');
+      const stallReason = safeText(systemActivity.stall_reason, 'no explicit stall reason recorded');
+      const executionAllowedReason = safeText(systemActivity.execution_allowed_reason, 'execution readiness needs inspection');
+      const relation = (systemActivity.relation && typeof systemActivity.relation === 'object') ? systemActivity.relation : {};
+      const relationSummary = safeText(relation.summary, 'MIM and TOD relationship needs inspection.');
+
+      if (action === 'continue_work') {
+        if (safeText(systemActivity.status_code) === 'active') {
+          return `Continue executing ${activeObjective}. Summarize the latest progress signal, what task is active now, and the next bounded step.`;
+        }
+        if (Boolean(systemActivity.should_be_working)) {
+          return `Resume ${activeObjective} now. If no task is live, create or dispatch the next bounded task (${nextTask}). Explain the blocker you cleared and summarize progress.`;
+        }
+      }
+
+      if (action === 'unstick_mim') {
+        return `Unstick MIM for ${activeObjective}. Diagnose why the system reports ${safeText(systemActivity.status_label, 'WARNING')} and use the available TOD, broker, or implementation path to clear this blocker: ${stallReason}. Then summarize the repair and the next bounded step.`;
+      }
+
+      if (action === 'smart_recovery') {
+        if (!Boolean(systemActivity.execution_allowed)) {
+          return `Smart recovery for ${activeObjective}: execution is blocked. Refresh execution readiness, repair the stale or blocked gate (${executionAllowedReason}), then resume the next bounded task ${nextTask}. If the gate stays blocked, trigger the corrective branch and summarize what changed.`;
+        }
+        if (safeText(systemActivity.status_code) === 'idle' && Boolean(systemActivity.should_be_working)) {
+          return `Smart recovery for ${activeObjective}: the system is idle but should be working. Resume or create the next bounded task (${nextTask}), refresh handoff state if needed, and summarize the action taken.`;
+        }
+        if (['warning', 'stale', 'frozen'].includes(safeText(systemActivity.status_code).toLowerCase())) {
+          return `Smart recovery for ${activeObjective}: inspect runtime health, bridge health, and execution flow. Clear this issue first: ${stallReason}. If repeated idle or stale behavior continues, trigger the corrective branch or external assist, then summarize the repair.`;
+        }
+      }
+
+      if (action === 'force_tod_help') {
+        return `Escalate to TOD now for ${activeObjective}. Include this relation summary: ${relationSummary} Include the current blocker (${stallReason}) and request immediate external help for the next bounded action ${nextTask}.`;
+      }
+
+      return fallback;
+    }
+
+    const primaryThreadKey = safeText(preloadedChatThread.primary_thread, 'primary_operator');
+
+    function setUiMode(mode) {
+      uiMode = mode === 'debug' ? 'debug' : 'operator';
+      localStorage.setItem('mim_ui_mode', uiMode);
+      document.body.classList.toggle('operator-mode', uiMode === 'operator');
+      document.body.classList.toggle('debug-mode', uiMode === 'debug');
+      if (operatorModeBtn) operatorModeBtn.classList.toggle('active', uiMode === 'operator');
+      if (debugModeBtn) debugModeBtn.classList.toggle('active', uiMode === 'debug');
+      if (settingsPanel && uiMode === 'operator') {
+        settingsPanel.classList.remove('open');
+      }
+    }
+
+    function updateVoiceStateUi() {
+      if (!voiceStateChip) return;
+      const voiceReady = Boolean(window.SpeechRecognition || window.webkitSpeechRecognition || window.speechSynthesis);
+      let label = 'Voice: idle';
+      let tone = 'warn';
+      if (!voiceReady) {
+        label = 'Voice: unavailable';
+        tone = 'error';
+      } else if (!window.isSecureContext && !healthState.micAvailable) {
+        label = 'Voice: secure origin required';
+        tone = 'error';
+      } else if (!healthState.micAvailable) {
+        label = 'Voice: permission needed';
+        tone = 'error';
+      } else if (!healthState.backendOk) {
+        label = 'Voice: backend offline';
+        tone = 'warn';
+      } else if (speechInterruptionPending) {
+        label = 'Voice: checking interruption';
+        tone = 'warn';
+      } else if (speechPlaybackActive || activeSpeechOwner) {
+        label = 'Voice: speaking';
+        tone = 'active';
+      } else if (speechInFlight || micStartInFlight) {
+        label = 'Voice: processing';
+        tone = 'warn';
+      } else if (micListening || micAutoMode) {
+        label = 'Voice: listening';
+        tone = 'active';
+      } else if (!healthState.micOk || micRecoveryMode) {
+        label = 'Voice: recovering';
+        tone = 'warn';
+      } else {
+        label = 'Voice: ready';
+        tone = 'ready';
+      }
+      voiceStateChip.textContent = label;
+      voiceStateChip.dataset.tone = tone;
+    }
+
+    function persistMicAutoMode() {
+      localStorage.setItem(AUTO_LISTEN_STORAGE_KEY, micAutoMode ? '1' : '0');
+    }
+
+    function setSelfTestSummary(text, tone = 'warn') {
+      selfTestLastSummary = String(text || '').trim() || 'Self-test pending';
+      if (selfTestSummaryChip) {
+        selfTestSummaryChip.textContent = selfTestLastSummary;
+        selfTestSummaryChip.dataset.tone = tone;
+      }
+    }
+
+    function renderSelfTestPanel() {
+      const secureContext = Boolean(window.isSecureContext);
+      const browserMediaReady = mediaApiAvailable();
+      const micPermissionLabel = !browserMediaReady
+        ? 'Unavailable in this browser runtime'
+        : micPermissionState === 'granted'
+          ? 'Granted'
+          : micPermissionState === 'denied'
+            ? 'Denied or blocked'
+            : micPermissionState === 'unavailable'
+              ? 'Unavailable'
+              : 'Unknown';
+      const selectedMicText = selectedMicLabel || selectedMicDeviceId || (availableMics.length ? `${availableMics.length} detected` : 'No microphone detected');
+      const listenerText = micAutoMode
+        ? (micListening ? 'Active and listening' : micStartInFlight ? 'Starting listener' : micRecoveryMode ? 'Recovering listener' : micRestartPending ? 'Queued to restart' : 'Armed for full-time listening')
+        : 'Off';
+      const lastVoiceActivity = micLastEvent || (micRecoveryReason ? `recovering:${micRecoveryReason}` : 'No voice event yet');
+      const cameraText = healthState.cameraOk
+        ? (cameraStream && cameraStream.active ? 'Watcher active' : availableCameras.length ? 'Device available' : 'Camera ready')
+        : (cameraSettingsStatus && cameraSettingsStatus.textContent) ? cameraSettingsStatus.textContent : 'Camera unavailable';
+      const backendText = healthState.backendOk ? 'Connected to backend' : 'Backend offline or stale';
+      const cameraPermissionBlocked = /permission|blocked|allow camera access/i.test(String(cameraText || ''));
+      let guidanceText = 'Run the self-test after changing browser or device permissions.';
+      if (!secureContext) {
+        guidanceText = 'Open MIM on https or localhost. Browser media capture is blocked on insecure origins.';
+      } else if (!browserMediaReady) {
+        guidanceText = 'This browser runtime does not expose media capture APIs to the MIM page.';
+      } else if (micPermissionState === 'denied' || cameraPermissionBlocked) {
+        guidanceText = 'Browser access is blocked. Allow microphone and camera for mim.mimtod.com, then run the self-test again.';
+      } else if (micAutoMode || (cameraStream && cameraStream.active)) {
+        guidanceText = 'Media access is available. Keep the listener or camera preview running only when you need live sensing.';
+      }
+
+      if (selfTestSecureValue) selfTestSecureValue.textContent = secureContext ? 'Secure origin available' : mediaSecureContextLabel();
+      if (selfTestMediaApiValue) selfTestMediaApiValue.textContent = browserMediaReady ? 'navigator.mediaDevices available' : 'Browser media APIs unavailable';
+      if (selfTestMicPermissionValue) selfTestMicPermissionValue.textContent = micPermissionLabel;
+      if (selfTestMicDeviceValue) selfTestMicDeviceValue.textContent = selectedMicText;
+      if (selfTestListenerValue) selfTestListenerValue.textContent = listenerText;
+      if (selfTestMicActivityValue) selfTestMicActivityValue.textContent = lastVoiceActivity;
+      if (selfTestCameraValue) selfTestCameraValue.textContent = cameraText;
+      if (selfTestBackendValue) selfTestBackendValue.textContent = backendText;
+      if (selfTestToggleListenerBtn) selfTestToggleListenerBtn.textContent = micAutoMode ? 'Turn Listener Off' : 'Turn Listener On';
+      if (selfTestTimestamp) {
+        selfTestTimestamp.textContent = selfTestLastRunAt > 0
+          ? `Last self-test: ${new Date(selfTestLastRunAt).toLocaleTimeString()}`
+          : 'Awaiting first self-test.';
+      }
+      if (selfTestGuidanceText) {
+        selfTestGuidanceText.textContent = guidanceText;
+      }
+
+      let summaryText = selfTestLastSummary;
+      let tone = 'warn';
+      if (!browserMediaReady || !secureContext || micPermissionState === 'denied' || !healthState.backendOk) {
+        summaryText = !secureContext
+          ? 'Mic and camera require a secure origin.'
+          : micPermissionState === 'denied'
+            ? 'Browser permissions are blocking microphone access.'
+            : !browserMediaReady
+              ? 'This browser runtime cannot capture media.'
+              : 'Backend sync is currently offline.';
+        tone = 'error';
+      } else if (cameraPermissionBlocked) {
+        summaryText = 'Camera access is still blocked or unavailable.';
+        tone = 'error';
+      } else if (micAutoMode && micListening && healthState.cameraOk) {
+        summaryText = 'Listener and camera are both active.';
+        tone = 'ready';
+      } else if (micAutoMode) {
+        summaryText = 'Listener is armed and waiting to stabilize.';
+        tone = 'active';
+      } else if (healthState.cameraOk || browserMediaReady) {
+        summaryText = 'Media runtime is available. Turn the listener on to start open mic.';
+        tone = 'warn';
+      }
+      setSelfTestSummary(summaryText, tone);
+    }
+
+    function visibleChatThreadMessages(messages = []) {
+      const sourceMessages = Array.isArray(messages) ? messages : [];
+      let latestSummaryIndex = -1;
+      sourceMessages.forEach((message, index) => {
+        if (normalizeMessageType(message) === 'system_summary') {
+          latestSummaryIndex = index;
+        }
+      });
+      const summaryShouldStayVisible = latestSummaryIndex >= 0
+        && (latestSummaryIndex >= sourceMessages.length - 3
+          || !sourceMessages.some((message) => normalizeMessageType(message) !== 'system_summary'));
+      const filteredSourceMessages = sourceMessages.filter((message, index) => {
+        const messageType = normalizeMessageType(message);
+        if (messageType !== 'system_summary') {
+          return true;
+        }
+        return summaryShouldStayVisible && index === latestSummaryIndex;
+      });
+      if (!chatLocallyCleared) {
+        return filteredSourceMessages;
+      }
+      const cutoffMs = Date.parse(String(chatLocalClearCutoffIso || ''));
+      const filteredMessages = filteredSourceMessages.filter((message) => {
+        if (!cutoffMs) return false;
+        const createdAtMs = Date.parse(String(message && message.created_at ? message.created_at : ''));
+        return Number.isFinite(createdAtMs) && createdAtMs >= cutoffMs;
+      });
+      if (chatLocalClearNotice) {
+        return [chatLocalClearNotice, ...filteredMessages];
+      }
+      return filteredMessages;
+    }
+
+    function compactMultilineText(value, limit = 180) {
+      const normalized = String(value || '')
+        .split(/\\r?\\n/)
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .join(' ')
+        .replace(/\\s+/g, ' ')
+        .trim();
+      if (!normalized) return '';
+      if (normalized.length <= limit) return normalized;
+      return `${normalized.slice(0, limit - 3).trimEnd()}...`;
+    }
+
+    function looksLikeExecutionLog(content, message = {}) {
+      const text = String(content || '');
+      const executionId = Number(message.execution_id || 0);
+      const structured = /(^|\\n)Iteration\\s+[^:]+:|(^|\\n)Task:\\s*|(^|\\n)Result:\\s*|(^|\\n)Delta:\\s*/im.test(text);
+      const lineCount = text.split(/\\r?\\n/).filter((line) => line.trim()).length;
+      return structured || (executionId > 0 && (lineCount >= 6 || text.length >= 320));
+    }
+
+    function normalizeMessageType(message = {}) {
+      const explicit = safeText(message.message_type).toLowerCase();
+      if (['user', 'mim_reply', 'system_execution', 'system_summary'].includes(explicit)) {
+        return explicit;
+      }
+      const role = safeText(message.role || message.direction || 'mim').toLowerCase();
+      if (role === 'operator' || role === 'user' || role === 'inbound') return 'user';
+      if (role === 'system') return 'system_summary';
+      if (looksLikeExecutionLog(message.execution_text || message.content || '', message)) {
+        return 'system_execution';
+      }
+      return 'mim_reply';
+    }
+
+    function parseStructuredExecution(text = '') {
+      const steps = [];
+      let current = null;
+
+      const ensureCurrent = () => {
+        if (!current) {
+          current = { iteration: '', task: '', result: '', delta: '', notes: [] };
+          steps.push(current);
+        }
+        return current;
+      };
+
+      String(text || '').split(/\\r?\\n/).forEach((rawLine) => {
+        const line = String(rawLine || '').trim();
+        if (!line) return;
+        const iterationMatch = line.match(/^Iteration\\s+([^:]+):\\s*(.*)$/i);
+        if (iterationMatch) {
+          current = {
+            iteration: `Iteration ${String(iterationMatch[1] || '').trim()}`,
+            task: '',
+            result: '',
+            delta: '',
+            notes: [],
+          };
+          const trailing = String(iterationMatch[2] || '').trim();
+          if (trailing) current.notes.push(trailing);
+          steps.push(current);
+          return;
+        }
+        const taskMatch = line.match(/^Task:\\s*(.*)$/i);
+        if (taskMatch) {
+          ensureCurrent().task = String(taskMatch[1] || '').trim();
+          return;
+        }
+        const resultMatch = line.match(/^Result:\\s*(.*)$/i);
+        if (resultMatch) {
+          ensureCurrent().result = String(resultMatch[1] || '').trim();
+          return;
+        }
+        const deltaMatch = line.match(/^Delta:\\s*(.*)$/i);
+        if (deltaMatch) {
+          ensureCurrent().delta = String(deltaMatch[1] || '').trim();
+          return;
+        }
+        ensureCurrent().notes.push(line);
+      });
+
+      return steps.filter((step) => step.iteration || step.task || step.result || step.delta || (Array.isArray(step.notes) && step.notes.length));
+    }
+
+    function messageRoleClass(message = {}) {
+      const messageType = normalizeMessageType(message);
+      if (messageType === 'user') return 'user';
+      if (messageType === 'system_execution' || messageType === 'system_summary') return 'system';
+      return 'mim';
+    }
+
+    function messageLabel(message = {}) {
+      const messageType = normalizeMessageType(message);
+      if (messageType === 'user') return 'Operator';
+      if (messageType === 'system_execution') return 'Execution';
+      if (messageType === 'system_summary') return 'System';
+      return 'MIM';
+    }
+
+    function formatMessageTime(value) {
+      if (!value) return '';
+      const parsed = new Date(value);
+      if (Number.isNaN(parsed.getTime())) return '';
+      return parsed.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    }
+
+    function buildMetaRow(parts = []) {
+      const filtered = parts.filter(Boolean);
+      if (!filtered.length) return null;
+      const meta = document.createElement('div');
+      meta.className = 'bubble-meta';
+      meta.textContent = filtered.join(' · ');
+      return meta;
+    }
+
+    function buildTextBlock(text, className = 'bubble-text') {
+      const value = String(text || '');
+      if (!value.trim()) return null;
+      const body = document.createElement('div');
+      body.className = className;
+      body.textContent = value;
+      return body;
+    }
+
+    function extractMessageText(message = {}) {
+      return safeText(message.inline_text || message.summary_text || message.content || message.execution_text);
+    }
+
+    function buildChatRenderSignature(messages = []) {
+      const normalized = Array.isArray(messages) ? messages : [];
+      return JSON.stringify(normalized.map((message) => ({
+        created_at: safeText(message.created_at),
+        role: safeText(message.role || message.direction),
+        message_type: normalizeMessageType(message),
+        interaction_mode: safeText(message.interaction_mode),
+        content: extractMessageText(message),
+        execution_text: safeText(message.execution_text),
+        attachment_url: safeText(message?.attachment?.url),
+        attachment_name: safeText(message?.attachment?.filename),
+      })));
+    }
+
+    function isChatSelectionActive() {
+      if (!chatLog || typeof window.getSelection !== 'function') return false;
+      const selection = window.getSelection();
+      if (!selection || selection.isCollapsed) return false;
+      const anchorNode = selection.anchorNode;
+      const focusNode = selection.focusNode;
+      return Boolean(anchorNode && focusNode && chatLog.contains(anchorNode) && chatLog.contains(focusNode));
+    }
+
+    async function copyTextToClipboard(text) {
+      const value = String(text || '');
+      if (!value.trim()) return false;
+      if (navigator.clipboard && window.isSecureContext) {
+        try {
+          await navigator.clipboard.writeText(value);
+          return true;
+        } catch (_) {
+        }
+      }
+      const helper = document.createElement('textarea');
+      helper.value = value;
+      helper.setAttribute('readonly', 'readonly');
+      helper.style.position = 'fixed';
+      helper.style.opacity = '0';
+      helper.style.pointerEvents = 'none';
+      document.body.appendChild(helper);
+      helper.focus();
+      helper.select();
+      let copied = false;
+      try {
+        copied = document.execCommand('copy');
+      } catch (_) {
+        copied = false;
+      }
+      helper.remove();
+      return copied;
+    }
+
+    function findPreviousOperatorMessage(messages = [], startIndex = -1) {
+      if (!Array.isArray(messages)) return null;
+      for (let index = startIndex - 1; index >= 0; index -= 1) {
+        const candidate = messages[index];
+        if (normalizeMessageType(candidate) === 'user') {
+          return candidate;
+        }
+      }
+      return null;
+    }
+
+    function buildExchangeSnippet(messages = [], index = -1) {
+      if (!Array.isArray(messages) || index < 0 || index >= messages.length) return '';
+      const currentMessage = messages[index];
+      const parts = [];
+      const operatorMessage = findPreviousOperatorMessage(messages, index);
+      const operatorText = extractMessageText(operatorMessage);
+      if (operatorText) {
+        parts.push(`Operator:\n${operatorText}`);
+      }
+      const mimText = extractMessageText(currentMessage);
+      if (mimText) {
+        parts.push(`MIM:\n${mimText}`);
+      }
+      return parts.join('\\n\\n').trim();
+    }
+
+    function buildCopyExchangeButton(messages = [], index = -1) {
+      const snippet = buildExchangeSnippet(messages, index);
+      if (!snippet) return null;
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'bubble-copy-btn';
+      button.setAttribute('aria-label', 'Copy operator question and MIM response');
+      button.title = 'Copy question and response';
+      button.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M16 1H6C4.9 1 4 1.9 4 3v12h2V3h10V1zm3 4H10c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h9c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H10V7h9v14z"/></svg><span data-copy-label>Copy</span>';
+      button.addEventListener('click', async (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        const copied = await copyTextToClipboard(snippet);
+        const label = button.querySelector('[data-copy-label]');
+        button.classList.toggle('copied', copied);
+        if (label) {
+          label.textContent = copied ? 'Copied' : 'Retry';
+        }
+        statusEl.textContent = copied
+          ? 'Copied question and response.'
+          : 'Copy failed. Select the message text and copy manually.';
+        window.setTimeout(() => {
+          button.classList.remove('copied');
+          if (label) {
+            label.textContent = 'Copy';
+          }
+        }, 1600);
+      });
+      return button;
+    }
+
+    function normalizeExecutionPayload(message = {}) {
+      const rawText = safeText(message.execution_text || message.content);
+      const providedStructured = message.structured_output && typeof message.structured_output === 'object'
+        ? message.structured_output
+        : {};
+      const steps = Array.isArray(providedStructured.steps) && providedStructured.steps.length
+        ? providedStructured.steps
+        : parseStructuredExecution(rawText);
+      const lines = rawText.split(/\\r?\\n/).filter((line) => line.trim());
+      const preview = safeText(message.execution_preview) || lines.slice(0, 24).join('\\n');
+      const firstResult = steps
+        .map((step) => safeText(step.result))
+        .find(Boolean);
+      const firstTask = steps
+        .map((step) => safeText(step.task))
+        .find(Boolean);
+      const summary = safeText(message.summary_text || message.inline_text)
+        || firstResult
+        || firstTask
+        || compactMultilineText(rawText, 180)
+        || 'Execution output available.';
+      return {
+        summary,
+        rawText,
+        preview,
+        truncated: Boolean(message.execution_truncated) || lines.length > 24,
+        steps,
+        lineCount: Number(providedStructured.line_count || lines.length || 0),
+      };
+    }
+
+    function buildExecutionStep(step = {}, index = 0) {
+      const card = document.createElement('section');
+      card.className = 'execution-step';
+
+      const header = document.createElement('div');
+      header.className = 'execution-step-header';
+      header.textContent = safeText(step.iteration, `Step ${index + 1}`);
+      card.appendChild(header);
+
+      const grid = document.createElement('div');
+      grid.className = 'execution-step-grid';
+      const rows = [
+        ['Task', safeText(step.task)],
+        ['Result', safeText(step.result)],
+        ['Delta', safeText(step.delta)],
+      ].filter(([, value]) => value);
+
+      rows.forEach(([label, value]) => {
+        const row = document.createElement('div');
+        row.className = 'execution-row';
+        const rowLabel = document.createElement('div');
+        rowLabel.className = 'execution-row-label';
+        rowLabel.textContent = label;
+        row.appendChild(rowLabel);
+        const rowValue = document.createElement('div');
+        rowValue.className = 'execution-row-value';
+        rowValue.textContent = value;
+        row.appendChild(rowValue);
+        grid.appendChild(row);
+      });
+
+      const notes = Array.isArray(step.notes) ? step.notes.filter((item) => safeText(item)) : [];
+      if (notes.length) {
+        const notesWrap = document.createElement('div');
+        notesWrap.className = 'execution-notes';
+        notes.forEach((note) => {
+          const noteEl = document.createElement('div');
+          noteEl.className = 'execution-note';
+          noteEl.textContent = safeText(note);
+          notesWrap.appendChild(noteEl);
+        });
+        grid.appendChild(notesWrap);
+      }
+
+      card.appendChild(grid);
+      return card;
+    }
+
+    function buildExecutionDetails(message = {}) {
+      const execution = normalizeExecutionPayload(message);
+      if (!execution.rawText) return null;
+
+      const details = document.createElement('details');
+      details.className = 'execution-details';
+
+      const summary = document.createElement('summary');
+      const summaryParts = ['View execution output'];
+      if (execution.steps.length) {
+        summaryParts.push(`${execution.steps.length} structured step${execution.steps.length === 1 ? '' : 's'}`);
+      } else if (execution.lineCount > 0) {
+        summaryParts.push(`${execution.lineCount} lines`);
+      }
+      summary.textContent = summaryParts.join(' · ');
+      details.appendChild(summary);
+
+      const scroll = document.createElement('div');
+      scroll.className = 'execution-scroll';
+
+      if (execution.steps.length) {
+        const stepsWrap = document.createElement('div');
+        stepsWrap.className = 'execution-steps';
+        execution.steps.forEach((step, index) => {
+          stepsWrap.appendChild(buildExecutionStep(step, index));
+        });
+        scroll.appendChild(stepsWrap);
+      }
+
+      const rawToggle = document.createElement('details');
+      rawToggle.className = 'execution-raw-toggle';
+      const rawSummary = document.createElement('summary');
+      rawSummary.textContent = execution.truncated ? 'Show full raw log' : 'Show raw log';
+      rawToggle.appendChild(rawSummary);
+      const raw = document.createElement('pre');
+      raw.className = 'execution-raw';
+      raw.textContent = execution.rawText;
+      rawToggle.appendChild(raw);
+      scroll.appendChild(rawToggle);
+
+      if (execution.truncated) {
+        const footnote = document.createElement('div');
+        footnote.className = 'execution-footnote';
+        footnote.textContent = 'Large execution output is collapsed by default to keep the conversation readable.';
+        scroll.appendChild(footnote);
+      }
+
+      details.appendChild(scroll);
+      return details;
+    }
+
+    function setSecondaryTab(tabName) {
+      activeSecondaryTab = tabName;
+      secondaryTabs.forEach((button) => {
+        const isActive = String(button.dataset.tab || '') === tabName;
+        button.classList.toggle('active', isActive);
+      });
+      ['overview', 'queue', 'voice', 'status', 'reasoning', 'diagnostics', 'media'].forEach((tab) => {
+        const panel = document.getElementById(`secondaryPanel${tab.charAt(0).toUpperCase()}${tab.slice(1)}`);
+        if (panel) {
+          panel.classList.toggle('active', tab === tabName);
+        }
+      });
+    }
+
+    function buildEmptyThreadState() {
+      const empty = document.createElement('div');
+      empty.className = 'empty-thread';
+      empty.innerHTML = '<strong>Voice-first chat is ready.</strong><div>Speak, type, or attach an image to continue the primary MIM thread.</div>';
+      return empty;
+    }
+
+    function buildAttachmentFigure(attachment = {}) {
+      const url = safeText(attachment.url);
+      if (!url) return null;
+      const figure = document.createElement('figure');
+      figure.className = 'bubble-attachment';
+      const image = document.createElement('img');
+      image.src = url;
+      image.alt = safeText(attachment.filename, 'Attached image');
+      figure.appendChild(image);
+      const caption = document.createElement('figcaption');
+      const size = Number(attachment.size_bytes || 0);
+      caption.textContent = [
+        safeText(attachment.filename, 'Image attachment'),
+        size > 0 ? `${Math.max(1, Math.round(size / 1024))} KB` : '',
+      ].filter(Boolean).join(' · ');
+      figure.appendChild(caption);
+      return figure;
+    }
+
+    function buildChatBubble(message = {}, index = -1, messages = []) {
+      const bubble = document.createElement('div');
+      const messageType = normalizeMessageType(message);
+      bubble.className = `chat-bubble ${messageRoleClass(message)}${messageType === 'system_execution' ? ' execution' : ''}`;
+      const metaParts = [messageLabel(message)];
+      const mode = (messageType === 'system_execution' || messageType === 'system_summary')
+        ? messageType.replace(/_/g, ' ')
+        : safeText(message.interaction_mode || message.message_type).replace(/_/g, ' ');
+      if (mode) {
+        metaParts.push(mode);
+      }
+      const time = formatMessageTime(message.created_at);
+      if (time) {
+        metaParts.push(time);
+      }
+      const metaSummary = metaParts.filter(Boolean).join(' · ');
+      if (metaSummary) {
+        bubble.title = metaSummary;
+      }
+
+      if (messageType === 'mim_reply') {
+        const copyButton = buildCopyExchangeButton(messages, index);
+        if (copyButton) {
+          bubble.classList.add('has-copy-action');
+          bubble.appendChild(copyButton);
+        }
+      }
+
+      const meta = buildMetaRow(metaParts);
+      if (meta) {
+        bubble.appendChild(meta);
+      }
+
+      const attachment = message && typeof message.attachment === 'object' ? message.attachment : null;
+      if (attachment && safeText(attachment.url)) {
+        const figure = buildAttachmentFigure(attachment);
+        if (figure) bubble.appendChild(figure);
+      }
+
+      if (messageType === 'system_execution') {
+        const execution = normalizeExecutionPayload(message);
+        const summary = buildTextBlock(execution.summary, 'bubble-summary');
+        if (summary) {
+          bubble.appendChild(summary);
+        }
+        const details = buildExecutionDetails(message);
+        if (details) {
+          bubble.appendChild(details);
+        }
+        return bubble;
+      }
+
+      const inlineText = safeText(message.inline_text || message.summary_text || message.content);
+      if (inlineText) {
+        const body = buildTextBlock(inlineText, messageType === 'system_summary' ? 'bubble-summary' : 'bubble-text');
+        if (body) bubble.appendChild(body);
+      }
+      return bubble;
+    }
+
+    function renderMediaGrid(messages = []) {
+      if (!mediaGrid) return;
+      mediaGrid.innerHTML = '';
+      const imageMessages = messages.filter((message) => {
+        const attachment = message && message.attachment && typeof message.attachment === 'object'
+          ? message.attachment
+          : null;
+        return Boolean(attachment && safeText(attachment.url));
+      });
+      if (!imageMessages.length) {
+        const empty = document.createElement('div');
+        empty.className = 'sidebar-copy';
+        empty.textContent = 'No uploaded images yet. Attach screenshots from the main composer.';
+        mediaGrid.appendChild(empty);
+        return;
+      }
+      imageMessages.slice().reverse().forEach((message) => {
+        const attachment = message && message.attachment && typeof message.attachment === 'object'
+          ? message.attachment
+          : null;
+        if (!attachment) return;
+        const figure = document.createElement('figure');
+        figure.className = 'media-card';
+        const image = document.createElement('img');
+        image.src = safeText(attachment.url);
+        image.alt = safeText(attachment.filename, 'Uploaded image');
+        figure.appendChild(image);
+        const caption = document.createElement('figcaption');
+        caption.textContent = [safeText(attachment.filename, 'Image'), safeText(message.content)].filter(Boolean).join(' · ');
+        figure.appendChild(caption);
+        mediaGrid.appendChild(figure);
+      });
+    }
+
+    function renderChatThread(messages = [], { force = false } = {}) {
       if (!chatLog) return;
-      const clean = String(text || '').trim();
+      const visibleMessages = visibleChatThreadMessages(messages);
+      const signature = buildChatRenderSignature(visibleMessages);
+      if (!force && signature === lastRenderedChatSignature) {
+        renderMediaGrid(visibleMessages);
+        return;
+      }
+      if (!force && isChatSelectionActive()) {
+        return;
+      }
+      const distanceToBottom = chatLog.scrollHeight - chatLog.scrollTop - chatLog.clientHeight;
+      const shouldStickToBottom = force || !chatLog.children.length || distanceToBottom < 72;
+      chatLog.innerHTML = '';
+      if (!Array.isArray(visibleMessages) || !visibleMessages.length) {
+        lastRenderedChatSignature = signature;
+        chatLog.appendChild(buildEmptyThreadState());
+        renderMediaGrid([]);
+        return;
+      }
+      visibleMessages.forEach((message, index) => {
+        chatLog.appendChild(buildChatBubble(message, index, visibleMessages));
+      });
+      lastRenderedChatSignature = signature;
+      if (shouldStickToBottom) {
+        window.requestAnimationFrame(() => {
+          chatLog.scrollTop = chatLog.scrollHeight;
+        });
+      }
+      renderMediaGrid(visibleMessages);
+    }
+
+    function appendChatMessage(role, text, options = {}) {
+      const clean = safeText(text);
       if (!clean) return;
-      const item = document.createElement('div');
-      item.className = `chat-bubble ${role === 'user' ? 'user' : 'mim'}`;
-      item.textContent = clean;
-      chatLog.appendChild(item);
-      chatLog.scrollTop = chatLog.scrollHeight;
+      const tempMessage = {
+        role: role === 'user' ? 'operator' : role,
+        content: clean,
+        created_at: new Date().toISOString(),
+        interaction_mode: safeText(options.interactionMode, role === 'user' ? 'text' : ''),
+        message_type: safeText(options.messageType, role === 'user' ? 'user' : 'mim_reply'),
+        attachment: options.attachment || null,
+      };
+      chatThreadMessages = [...chatThreadMessages, tempMessage];
+      renderChatThread(chatThreadMessages, { force: true });
+    }
+
+    function createClientMessageId(prefix) {
+      if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+        return `${prefix}-${window.crypto.randomUUID()}`;
+      }
+      return `${prefix}-${Date.now()}-${Math.floor(Math.random() * 1000000)}`;
+    }
+
+    const textChatSessionStorageKey = 'mim_text_chat_session_id';
+    let textChatSessionId = primaryThreadKey;
+    localStorage.setItem(textChatSessionStorageKey, textChatSessionId);
+
+    function classifyTextChatIntent(text) {
+      const raw = String(text || '').trim();
+      const lowered = raw.toLowerCase();
+      const looksLikeQuestion = raw.endsWith('?') || /^(what|why|how|when|where|who|which|is|are|can|could|will|would|do|does|did|tell me|give me|explain|show me)\\b/.test(lowered);
+      if (looksLikeQuestion) {
+        return 'discussion';
+      }
+      if (/(^|\\b)(run|execute|dispatch|invoke|trigger|open|download|delete|remove|erase|shut down|shutdown)\\b/.test(lowered)) {
+        return 'execute_capability';
+      }
+      return 'discussion';
+    }
+
+    function classifyTextChatSafetyFlags(text) {
+      const lowered = String(text || '').trim().toLowerCase();
+      if (!lowered) return [];
+      const explicitDestructiveTargets = [
+        '/var/lib',
+        'database',
+        'delete the database',
+        'remove the database',
+        'erase the database',
+        'shut down the system',
+        'shutdown the system',
+        'rm -rf',
+      ];
+      const explicitDestructiveVerbs = /(delete|remove|erase|destroy|wipe|shutdown|shut down)/.test(lowered);
+      if (explicitDestructiveVerbs && explicitDestructiveTargets.some((token) => lowered.includes(token))) {
+        return ['blocked'];
+      }
+      return [];
     }
 
     function summarizeTextResolution(result) {
+      const interfaceReply = result && typeof result.mim_interface === 'object' ? result.mim_interface : {};
+      const explicitReply = String(interfaceReply.reply_text || '').trim();
+      if (explicitReply) {
+        return explicitReply;
+      }
+
       const resolution = result && typeof result.resolution === 'object' ? result.resolution : {};
       const prompt = String(resolution.clarification_prompt || '').trim();
       if (prompt) {
@@ -3102,12 +8362,42 @@ async def mim_ui_page() -> str:
       return 'Message received.';
     }
 
-    async function sendTextChat() {
-      const text = String(chatInput ? chatInput.value : '').trim();
-      if (!text) return;
+    function resetComposerImage() {
+      selectedComposerImage = null;
+      if (imageUploadInput) imageUploadInput.value = '';
+      if (imagePreviewImg) imagePreviewImg.removeAttribute('src');
+      if (imagePreviewName) imagePreviewName.textContent = 'Selected image';
+      if (imagePreviewMeta) imagePreviewMeta.textContent = 'Add an optional prompt, then send.';
+      if (imagePreviewWrap) imagePreviewWrap.hidden = true;
+      if (chatDropzone) chatDropzone.classList.remove('active');
+    }
 
-      appendChatMessage('user', text);
-      if (chatInput) chatInput.value = '';
+    function setComposerImage(file) {
+      if (!(file instanceof File)) return;
+      selectedComposerImage = file;
+      if (imagePreviewName) imagePreviewName.textContent = file.name || 'Selected image';
+      if (imagePreviewMeta) {
+        imagePreviewMeta.textContent = `${Math.max(1, Math.round((Number(file.size || 0)) / 1024))} KB · ${safeText(file.type, 'image file')}`;
+      }
+      if (imagePreviewImg) {
+        const previewUrl = URL.createObjectURL(file);
+        imagePreviewImg.src = previewUrl;
+      }
+      if (imagePreviewWrap) imagePreviewWrap.hidden = false;
+    }
+
+    async function submitConversationTurn(messageText, interactionMode = 'text') {
+      const text = String(messageText || '').trim();
+      if (!text) return;
+      const parsedIntent = classifyTextChatIntent(text);
+      const safetyFlags = classifyTextChatSafetyFlags(text);
+      const source = interactionMode === 'voice'
+        ? 'mim_ui_voice_chat'
+        : interactionMode === 'quick_action'
+          ? 'mim_ui_quick_action'
+          : 'mim_ui_text_chat';
+
+      appendChatMessage('user', text, { interactionMode });
 
       try {
         const response = await fetch('/gateway/intake/text', {
@@ -3115,9 +8405,13 @@ async def mim_ui_page() -> str:
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             text,
-            parsed_intent: 'discussion',
+            parsed_intent: parsedIntent,
+            safety_flags: safetyFlags,
             metadata_json: {
-              source: 'mim_ui_text_chat',
+              source,
+              interaction_mode: interactionMode,
+              message_type: 'user',
+              conversation_session_id: textChatSessionId,
               route_preference: 'conversation_layer',
             },
           }),
@@ -3128,12 +8422,63 @@ async def mim_ui_page() -> str:
         }
 
         const result = await response.json();
-        appendChatMessage('mim', summarizeTextResolution(result));
+        if (chatInput && interactionMode !== 'voice') {
+          chatInput.value = '';
+        }
+        await refreshState();
+        if (!latestUiState?.chat_thread) {
+          appendChatMessage('mim', summarizeTextResolution(result));
+        }
       } catch (error) {
         const detail = error && error.message ? String(error.message) : 'request_failed';
         appendChatMessage('mim', `Text chat is temporarily unavailable (${detail}).`);
       }
-      refreshState();
+    }
+
+    async function uploadComposerImage() {
+      if (!(selectedComposerImage instanceof File)) return;
+      const prompt = String(chatInput ? chatInput.value : '').trim();
+      appendChatMessage('user', prompt || `Shared image: ${selectedComposerImage.name}`, {
+        interactionMode: 'image',
+        attachment: {
+          url: imagePreviewImg ? imagePreviewImg.src : '',
+          filename: selectedComposerImage.name,
+          size_bytes: Number(selectedComposerImage.size || 0),
+        },
+      });
+
+      const form = new FormData();
+      form.append('file', selectedComposerImage);
+      form.append('prompt', prompt);
+      form.append('session_key', textChatSessionId);
+      if (chatInput) chatInput.value = '';
+
+      try {
+        const response = await fetch('/mim/ui/chat/upload-image', {
+          method: 'POST',
+          body: form,
+        });
+        if (!response.ok) {
+          appendChatMessage('mim', `Image upload failed (${response.status}).`);
+          return;
+        }
+        await response.json();
+        resetComposerImage();
+        await refreshState();
+      } catch (error) {
+        const detail = error && error.message ? String(error.message) : 'upload_failed';
+        appendChatMessage('mim', `Image upload is temporarily unavailable (${detail}).`);
+      }
+    }
+
+    async function sendTextChat() {
+      const text = String(chatInput ? chatInput.value : '').trim();
+      if (selectedComposerImage instanceof File) {
+        await uploadComposerImage();
+        return;
+      }
+      if (!text) return;
+      await submitConversationTurn(text, 'text');
     }
 
     let motionInterval = null;
@@ -3276,6 +8621,15 @@ async def mim_ui_page() -> str:
     let speechInFlight = false;
     let speechPlaybackActive = false;
     let activeSpeechOwner = '';
+    let speechInterruptionPending = false;
+    let speechInterruptedOwner = '';
+    let speechInterruptionTimer = null;
+    let speechInterruptionStartedAt = 0;
+    let speechInterruptionLastProbeAt = 0;
+    const frontendMediaStatusCache = {
+      microphone: { signature: '', at: 0 },
+      camera: { signature: '', at: 0 },
+    };
     let micSuppressedUntil = 0;
     let recentSpokenUtterances = [];
     let localTtsPlaybackToken = 0;
@@ -3283,6 +8637,7 @@ async def mim_ui_page() -> str:
     let lastSpokenPhraseAt = 0;
     let refreshInFlight = false;
     let refreshPending = false;
+    const SPEECH_INTERRUPTION_CONFIRM_MS = 1200;
     const runtimeHealthRecoveryCooldownUntil = {
       camera: 0,
       microphone: 0,
@@ -3341,7 +8696,8 @@ async def mim_ui_page() -> str:
 
     function setSpeaking(on) {
       wave.classList.toggle('speaking', !!on);
-      statusEl.textContent = on ? 'MIM is speaking...' : 'MIM is listening...';
+      statusEl.textContent = on ? 'MIM is speaking back.' : 'MIM is listening for the next turn.';
+      updateVoiceStateUi();
     }
 
     function clamp(value, min, max) {
@@ -3361,7 +8717,7 @@ async def mim_ui_page() -> str:
     }
 
     function normalizeDialogSnippet(raw, maxLen = 120) {
-      const text = String(raw || '').replace(/\s+/g, ' ').trim();
+      const text = String(raw || '').replace(/\\s+/g, ' ').trim();
       if (!text) return '';
       if (text.length <= maxLen) return text;
       return `${text.slice(0, maxLen - 3).trim()}...`;
@@ -3519,6 +8875,96 @@ async def mim_ui_page() -> str:
           </li>
         `;
       }).join('');
+
+
+    function formatTrainingWindowLabel(totalSeconds) {
+      const seconds = Number(totalSeconds || 0);
+      if (!Number.isFinite(seconds) || seconds <= 0) return 'Unknown';
+      const hours = Math.floor(seconds / 3600);
+      const minutes = Math.max(1, Math.round((seconds % 3600) / 60));
+      if (hours > 0) {
+        return `${hours}h ${minutes}m`;
+      }
+      return `${minutes}m`;
+    }
+
+    async function postRoutineTrainingAction(action) {
+      if (!trainingRoutineDetailText) return;
+      trainingRoutineDetailText.textContent = `Running ${action}...`;
+      const res = await fetch('/mim/ui/training/action', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action }),
+      });
+      if (!res.ok) {
+        let detail = 'Training action failed.';
+        try {
+          const payload = await res.json();
+          detail = safeText(payload.detail || payload.message || detail, detail);
+        } catch (_) {
+        }
+        trainingRoutineDetailText.textContent = detail;
+        return;
+      }
+      const payload = await res.json();
+      const training = payload && typeof payload.training === 'object' ? payload.training : {};
+      renderRoutineTrainingPanel(training);
+      refreshState();
+    }
+
+    function renderRoutineTrainingPanel(training = {}) {
+      if (!trainingRoutineSummaryText) return;
+      const nextPlan = (training && typeof training.next_cycle_plan === 'object') ? training.next_cycle_plan : {};
+      const latestCycle = (training && typeof training.latest_cycle === 'object') ? training.latest_cycle : {};
+      const controls = (training && typeof training.controls === 'object') ? training.controls : {};
+      trainingRoutineSummaryText.textContent = safeText(training.summary, 'Routine training is unavailable.');
+      trainingRoutinePhaseChip.textContent = `Status: ${safeText(training.state_label, 'unknown')}`;
+      trainingRoutineRuntimeChip.textContent = `Runtime: ${training.runtime_service_active ? 'ready' : 'offline'}`;
+      trainingRoutineNextChip.textContent = `Next batch: ${safeText(nextPlan.target_conversations, 'n/a')} conversations`;
+      trainingRoutineWindowText.textContent = formatTrainingWindowLabel(nextPlan.target_window_seconds);
+      trainingRoutineBudgetText.textContent = `${safeText(nextPlan.min_conversations, 'n/a')}-${safeText(nextPlan.max_conversations, 'n/a')}`;
+      trainingRoutineScoreText.textContent = Number.isFinite(Number(latestCycle.overall)) ? Number(latestCycle.overall).toFixed(3) : 'No cycle';
+      trainingRoutineFailuresText.textContent = Number.isFinite(Number(latestCycle.failure_count)) ? String(Number(latestCycle.failure_count)) : 'Unknown';
+      trainingRoutineDetailText.textContent = safeText(training.detail, 'Run this during idle windows on the dedicated training runtime.');
+      trainingRoutineStartBtn.disabled = !Boolean(controls.can_start);
+      trainingRoutineRestartBtn.disabled = !Boolean(controls.can_restart);
+      trainingRoutineStopBtn.disabled = !Boolean(controls.can_stop);
+    }
+        <div id="secondaryPanelTraining" class="secondary-section">
+          <div class="sidebar-card">
+            <h2>Routine Training</h2>
+            <div id="trainingRoutineSummaryText" class="sidebar-copy">Loading routine training status…</div>
+            <div class="sidebar-list">
+              <div id="trainingRoutinePhaseChip" class="status-chip subtle">Status: loading…</div>
+              <div id="trainingRoutineRuntimeChip" class="status-chip subtle">Runtime: loading…</div>
+              <div id="trainingRoutineNextChip" class="status-chip subtle">Next batch: loading…</div>
+            </div>
+            <div class="status-grid" style="margin-top:12px;">
+              <div class="status-tile">
+                <span>Window</span>
+                <strong id="trainingRoutineWindowText">Loading…</strong>
+              </div>
+              <div class="status-tile">
+                <span>Budget</span>
+                <strong id="trainingRoutineBudgetText">Loading…</strong>
+              </div>
+              <div class="status-tile">
+                <span>Last Overall</span>
+                <strong id="trainingRoutineScoreText">Loading…</strong>
+              </div>
+              <div class="status-tile">
+                <span>Failures</span>
+                <strong id="trainingRoutineFailuresText">Loading…</strong>
+              </div>
+            </div>
+            <div id="trainingRoutineDetailText" class="sidebar-copy" style="margin-top:12px;">Use this during idle or evening windows.</div>
+            <div class="sidebar-list" style="margin-top:12px;">
+              <button id="trainingRoutineStartBtn" class="secondary-action" type="button">Start Routine</button>
+              <button id="trainingRoutineRestartBtn" class="secondary-action" type="button">Restart Routine</button>
+              <button id="trainingRoutineStopBtn" class="secondary-action" type="button">Stop Routine</button>
+            </div>
+          </div>
+        </div>
     }
 
     function collectSystemReasoningEntries(reasoning = {}) {
@@ -3697,6 +9143,20 @@ async def mim_ui_page() -> str:
       }
 
       const collaboration = (reasoning && typeof reasoning.collaboration_progress === 'object') ? reasoning.collaboration_progress : {};
+      const activeWork = (reasoning && typeof reasoning.active_work === 'object') ? reasoning.active_work : {};
+      if (String(activeWork.summary || '').trim()) {
+        const meta = [
+          activeWork.badge,
+          activeWork.execution_id_label || activeWork.task_id || activeWork.request_id,
+          activeWork.workstream_name && String(activeWork.workstream_name || '').trim().replaceAll('_', ' '),
+          activeWork.workstream_status && String(activeWork.workstream_status || '').trim().replaceAll('_', ' '),
+        ].filter(Boolean).join(' | ');
+        entries.push({
+          title: 'MIM work status',
+          meta,
+          note: String(activeWork.summary || '').trim(),
+        });
+      }
       if (String(collaboration.summary || '').trim()) {
         const activeWorkstream = (collaboration.active_workstream && typeof collaboration.active_workstream === 'object')
           ? collaboration.active_workstream
@@ -3836,8 +9296,8 @@ async def mim_ui_page() -> str:
     function normalizeSpeechSignature(textRaw) {
       return String(textRaw || '')
         .toLowerCase()
-        .replace(/[^a-z0-9\s]/g, ' ')
-        .replace(/\s+/g, ' ')
+        .replace(/[^a-z0-9\\s]/g, ' ')
+        .replace(/\\s+/g, ' ')
         .trim();
     }
 
@@ -3854,6 +9314,108 @@ async def mim_ui_page() -> str:
 
     function suppressionWindowMs() {
       return Math.max(0, micSuppressedUntil - Date.now());
+    }
+
+    function clearSpeechInterruptionTimer() {
+      if (speechInterruptionTimer) {
+        clearTimeout(speechInterruptionTimer);
+        speechInterruptionTimer = null;
+      }
+    }
+
+    function resetSpeechInterruptionState() {
+      clearSpeechInterruptionTimer();
+      speechInterruptionPending = false;
+      speechInterruptedOwner = '';
+      speechInterruptionStartedAt = 0;
+    }
+
+    function isLikelyIntentionalInterruption(transcript, confidence = 0) {
+      const text = String(transcript || '').trim();
+      if (!text) return false;
+      const wordCount = text.split(/\\s+/).filter(Boolean).length;
+      if (hasWakePhrase(text)) return true;
+      if (wordCount >= 3) return true;
+      return text.length >= 8 && Number(confidence || 0) >= 0.72;
+    }
+
+    function resumeSpeechAfterInterruption(reason = 'resume') {
+      if (!speechInterruptionPending) return false;
+      const owner = speechInterruptedOwner || activeSpeechOwner;
+      resetSpeechInterruptionState();
+      if (!owner) return false;
+      try {
+        if (owner === 'browser_tts' && window.speechSynthesis && typeof window.speechSynthesis.resume === 'function') {
+          window.speechSynthesis.resume();
+          speechPlaybackActive = true;
+          activeSpeechOwner = 'browser_tts';
+          setSpeaking(true);
+        } else if (owner === 'server_tts' && activeServerTtsAudio) {
+          const playPromise = activeServerTtsAudio.play();
+          if (playPromise && typeof playPromise.catch === 'function') {
+            playPromise.catch(() => {});
+          }
+          speechPlaybackActive = true;
+          activeSpeechOwner = 'server_tts';
+          setSpeaking(true);
+        } else {
+          return false;
+        }
+        addSpeechDebug('resumed', `source=${owner} reason=${reason}`);
+        updateConnectionChrome();
+        return true;
+      } catch (_) {
+        return false;
+      }
+    }
+
+    function cancelSpeechForInterruption(reason = 'confirmed-input') {
+      const owner = speechInterruptedOwner || activeSpeechOwner;
+      resetSpeechInterruptionState();
+      if (owner) {
+        addSpeechDebug('canceled', `source=${owner} reason=${reason}`);
+      }
+      stopServerTtsPlayback();
+      localTtsPlaybackToken += 1;
+      if (window.speechSynthesis && window.speechSynthesis.cancel) {
+        window.speechSynthesis.cancel();
+      }
+      speechPlaybackActive = false;
+      activeSpeechOwner = '';
+      setSpeaking(false);
+      updateConnectionChrome();
+    }
+
+    function pauseSpeechForInterruption(trigger = 'speech-detected') {
+      if (speechInterruptionPending || !speechPlaybackActive || !activeSpeechOwner) return false;
+      const now = Date.now();
+      if ((now - speechInterruptionLastProbeAt) < 900) return false;
+      let paused = false;
+      try {
+        if (activeSpeechOwner === 'browser_tts' && window.speechSynthesis && typeof window.speechSynthesis.pause === 'function') {
+          window.speechSynthesis.pause();
+          paused = true;
+        } else if (activeSpeechOwner === 'server_tts' && activeServerTtsAudio) {
+          activeServerTtsAudio.pause();
+          paused = true;
+        }
+      } catch (_) {
+      }
+      if (!paused) return false;
+      speechInterruptionLastProbeAt = now;
+      speechInterruptionPending = true;
+      speechInterruptedOwner = activeSpeechOwner;
+      speechInterruptionStartedAt = now;
+      speechPlaybackActive = false;
+      setSpeaking(false);
+      addSpeechDebug('paused', `source=${activeSpeechOwner} reason=${trigger}`);
+      clearSpeechInterruptionTimer();
+      speechInterruptionTimer = setTimeout(() => {
+        resumeSpeechAfterInterruption('timeout');
+      }, SPEECH_INTERRUPTION_CONFIRM_MS);
+      statusEl.textContent = 'Possible interruption detected. Waiting for new input...';
+      updateConnectionChrome();
+      return true;
     }
 
     function addSpeechDebug(stage, detail = '') {
@@ -3886,6 +9448,7 @@ async def mim_ui_page() -> str:
     }
 
     function isMicSuppressedNow() {
+      if (speechInterruptionPending) return false;
       return speechInFlight || speechPlaybackActive || Date.now() < micSuppressedUntil;
     }
 
@@ -3911,7 +9474,7 @@ async def mim_ui_page() -> str:
     }
 
     function hasWakePhrase(transcript) {
-      const text = ` ${String(transcript || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim()} `;
+      const text = ` ${String(transcript || '').toLowerCase().replace(/[^a-z0-9\\s]/g, ' ').replace(/\\s+/g, ' ').trim()} `;
       if (!text.trim()) return false;
       return text.includes(' mim ') || text.includes(' hey mim ') || text.includes(' okay mim ') || text.includes(' ok mim ');
     }
@@ -3945,7 +9508,7 @@ async def mim_ui_page() -> str:
     }
 
     function rewriteQueuedOutputText(textRaw, data = {}) {
-      let text = String(textRaw || '').replace(/\s+/g, ' ').trim();
+      let text = String(textRaw || '').replace(/\\s+/g, ' ').trim();
       if (!text) return '';
 
       const context = (data && typeof data.conversation_context === 'object')
@@ -3967,8 +9530,8 @@ async def mim_ui_page() -> str:
       }
 
       text = text
-        .replace(/^i\s+can\s+see\s+someone\.\s*/i, '')
-        .replace(/^hi\s+there[,\s]*/i, '');
+        .replace(/^i\\s+can\\s+see\\s+someone\\.\\s*/i, '')
+        .replace(/^hi\\s+there[,\\s]*/i, '');
 
       const signature = normalizeSpeechSignature(text);
       const cannedAckOnly = new Set([
@@ -4360,7 +9923,7 @@ async def mim_ui_page() -> str:
 
     function extractFirstUrl(rawText) {
       const text = String(rawText || '');
-      const match = text.match(/https?:\/\/[^\s)]+/i);
+      const match = text.match(/https?:\\/\\/[^\\s)]+/i);
       return match ? String(match[0]).trim() : '';
     }
 
@@ -4806,11 +10369,40 @@ async def mim_ui_page() -> str:
       micLastEventAt = Date.now();
       micLastEvent = detailText ? `${eventLabel}:${detailText} @ ${time}` : `${eventLabel} @ ${time}`;
       if (micEventEl) {
-        micEventEl.textContent = `Mic event: ${micLastEvent}`;
+        micEventEl.textContent = `Recent voice event: ${micLastEvent}`;
       }
       addMicDebug(`event:${eventLabel}`, detailText);
-      listenBtn.textContent = micAutoMode ? 'Listening On' : 'Listening Off';
+      syncListenButtonLabel();
       updateMicDiagnostics();
+    }
+
+    function syncListenButtonLabel() {
+      if (!listenBtn) return;
+      persistMicAutoMode();
+      if (autoListenToggle) {
+        autoListenToggle.checked = Boolean(micAutoMode);
+      }
+      if (chatMicBtn) {
+        chatMicBtn.textContent = micAutoMode ? 'Turn Listener Off' : 'Turn Listener On';
+      }
+      const hasVoiceApi = Boolean(window.SpeechRecognition || window.webkitSpeechRecognition || window.speechSynthesis);
+      listenBtn.classList.remove('error');
+      if (!hasVoiceApi) {
+        listenBtn.textContent = 'Voice Unavailable';
+        listenBtn.classList.add('error');
+        return;
+      }
+      if (!healthState.micAvailable) {
+        listenBtn.textContent = 'Enable Microphone';
+        listenBtn.classList.add('error');
+        return;
+      }
+      if (micAutoMode && micStartInFlight) {
+        listenBtn.textContent = 'Processing…';
+        return;
+      }
+      listenBtn.textContent = micAutoMode ? 'Turn Listener Off' : 'Turn Listener On';
+      renderSelfTestPanel();
     }
 
     function resolvePreferredMicDevice() {
@@ -5001,6 +10593,10 @@ async def mim_ui_page() -> str:
       }
       if (!healthState.voicesOk) {
         statusEl.textContent = 'Voice list unavailable. Using system default voice.';
+        return;
+      }
+      if (speechInterruptionPending) {
+        statusEl.textContent = 'Possible interruption detected. Waiting for new input...';
         return;
       }
       if (!micAutoMode && isMicEffectivelyActive()) {
@@ -5230,14 +10826,27 @@ async def mim_ui_page() -> str:
       }
     }
 
+    function setConsoleNavLight(node, ok) {
+      if (!node) return;
+      node.classList.remove('ok', 'err');
+      node.classList.add(ok ? 'ok' : 'err');
+    }
+
+    function updateConsoleNavLights({ mimOk = true, todOk = true } = {}) {
+      setConsoleNavLight(mimConsoleLight, Boolean(mimOk));
+      setConsoleNavLight(todConsoleLight, Boolean(todOk));
+    }
+
     function updateIconGlow() {
       mimIcon.classList.remove('ok', 'err');
       if (hasCriticalHealthError()) {
         mimIcon.classList.add('err');
+        updateConsoleNavLights({ mimOk: false, todOk: false });
         applyStatusFromHealth();
         return;
       }
       mimIcon.classList.add('ok');
+      updateConsoleNavLights({ mimOk: true, todOk: true });
       applyStatusFromHealth();
     }
 
@@ -5272,7 +10881,8 @@ async def mim_ui_page() -> str:
         micEndTimestamps = [];
         if (micUnstableCycleCount >= MIC_UNSTABLE_MAX_CYCLES) {
           micAutoMode = false;
-          listenBtn.textContent = 'Listening Off';
+          persistMicAutoMode();
+          syncListenButtonLabel();
           statusEl.textContent = 'Mic paused after repeated unstable starts. Press Listen to retry.';
           updateIconGlow();
           return;
@@ -5319,7 +10929,8 @@ async def mim_ui_page() -> str:
 
     function pauseMicAuto(reasonText) {
       micAutoMode = false;
-      listenBtn.textContent = 'Listening Off';
+      persistMicAutoMode();
+      syncListenButtonLabel();
       micListening = false;
       micStartInFlight = false;
       micRestartPending = false;
@@ -5369,6 +10980,88 @@ async def mim_ui_page() -> str:
       backendFailureStreak += 1;
       if (backendFailureStreak >= 3) {
         healthState.backendOk = false;
+      }
+    }
+
+    function mediaApiAvailable() {
+      return Boolean(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+    }
+
+    function mediaSecureContextLabel() {
+      if (window.isSecureContext) {
+        return 'secure context available';
+      }
+      const origin = `${location.protocol}//${location.host}`;
+      return `secure context required for media capture on ${origin}`;
+    }
+
+    function describeMediaStartupFailure(lane, error = null, apiMissing = false) {
+      const parts = [];
+      if (apiMissing) {
+        parts.push('browser media APIs unavailable');
+      }
+      if (!window.isSecureContext) {
+        parts.push(mediaSecureContextLabel());
+      }
+      const errorName = String(error?.name || '').trim();
+      if (errorName === 'NotAllowedError') {
+        parts.push('permission denied by browser');
+      } else if (errorName === 'NotFoundError' || errorName === 'DevicesNotFoundError') {
+        parts.push(`no ${lane} device detected`);
+      } else if (errorName === 'NotReadableError' || errorName === 'TrackStartError') {
+        parts.push(`${lane} device is busy or unavailable`);
+      } else if (errorName === 'SecurityError') {
+        parts.push('browser rejected media access for this origin');
+      }
+      const message = String(error?.message || '').trim();
+      if (message && !parts.includes(message)) {
+        parts.push(message);
+      }
+      return parts.join('; ') || `${lane} startup failed`;
+    }
+
+    function deriveMediaFailureStatus(error = null, apiMissing = false) {
+      if (apiMissing) {
+        return window.isSecureContext ? 'api_unavailable' : 'insecure_context';
+      }
+      const errorName = String(error?.name || '').trim();
+      if (!window.isSecureContext && (errorName === 'SecurityError' || errorName === 'NotAllowedError' || !errorName)) {
+        return 'insecure_context';
+      }
+      if (errorName === 'NotAllowedError') return 'permission_denied';
+      if (errorName === 'NotFoundError' || errorName === 'DevicesNotFoundError') return 'no_device';
+      if (errorName === 'NotReadableError' || errorName === 'TrackStartError') return 'device_busy';
+      if (errorName === 'SecurityError') return 'insecure_context';
+      return 'start_failed';
+    }
+
+    async function reportFrontendMediaStatus(lane, status, detail = '', extra = {}) {
+      const laneKey = lane === 'camera' ? 'camera' : 'microphone';
+      const payload = {
+        lane: laneKey,
+        status: String(status || 'unknown').trim().toLowerCase() || 'unknown',
+        detail: String(detail || '').trim(),
+        secure_context: Boolean(window.isSecureContext),
+        media_devices_available: mediaApiAvailable(),
+        permission_state: laneKey === 'microphone' ? micPermissionState : null,
+        selected_device_id: laneKey === 'microphone' ? (selectedMicDeviceId || null) : (selectedCameraDeviceId || null),
+        selected_device_label: laneKey === 'microphone' ? (selectedMicLabel || null) : null,
+        ...extra,
+      };
+      const signature = JSON.stringify(payload);
+      const cacheEntry = frontendMediaStatusCache[laneKey];
+      const now = Date.now();
+      if (cacheEntry && cacheEntry.signature === signature && now - cacheEntry.at < 5000) {
+        return;
+      }
+      frontendMediaStatusCache[laneKey] = { signature, at: now };
+      try {
+        await fetchWithTimeout('/mim/ui/frontend-media-status', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        }, 3500);
+      } catch (_) {
       }
     }
 
@@ -5438,7 +11131,7 @@ async def mim_ui_page() -> str:
       if (!compact) return true;
       if (compact.length <= 2) return true;
 
-      const normalized = text.replace(/[^a-z'\s]/g, ' ').replace(/\s+/g, ' ').trim();
+      const normalized = text.replace(/[^a-z'\\s]/g, ' ').replace(/\\s+/g, ' ').trim();
       const tokens = normalized ? normalized.split(' ').filter(Boolean) : [];
       if (!tokens.length) return true;
       if (tokens.length >= 2 && tokens.every((token) => token.length <= 2)) {
@@ -5495,9 +11188,9 @@ async def mim_ui_page() -> str:
       if (!text.trim()) return false;
       if (text.includes('my name is') || text.includes("i am") || text.includes("i'm")) return false;
 
-      const normalized = text.replace(/[^a-z'\s]/g, ' ').replace(/\s+/g, ' ').trim();
+      const normalized = text.replace(/[^a-z'\\s]/g, ' ').replace(/\\s+/g, ' ').trim();
       if (!normalized) return false;
-      return /^(hello|hi|hey)(\s+(ma'?am|mam|maam|sir|mim))*$/.test(normalized);
+      return /^(hello|hi|hey)(\\s+(ma'?am|mam|maam|sir|mim))*$/.test(normalized);
     }
 
     async function maybeHandleGreetingWithoutIntent(transcript) {
@@ -5522,7 +11215,7 @@ async def mim_ui_page() -> str:
 
     async function maybeHandleStandaloneNameDuringStartup(transcript) {
       if (!startupInquiryIssued || !shouldAskForNameNow()) return false;
-      const text = String(transcript || '').toLowerCase().replace(/[^a-z'\-\s]/g, ' ').replace(/\s+/g, ' ').trim();
+      const text = String(transcript || '').toLowerCase().replace(/[^a-z'\\-\\s]/g, ' ').replace(/\\s+/g, ' ').trim();
       if (!text) return false;
       if (text.includes('my name is') || text.includes("i'm") || text.includes('i am')) return false;
 
@@ -5539,7 +11232,7 @@ async def mim_ui_page() -> str:
     }
 
     function isLikelyIdentityAttemptTranscript(transcript) {
-      const text = String(transcript || '').toLowerCase().replace(/[^a-z'\s]/g, ' ').replace(/\s+/g, ' ').trim();
+      const text = String(transcript || '').toLowerCase().replace(/[^a-z'\\s]/g, ' ').replace(/\\s+/g, ' ').trim();
       if (!text) return false;
       if (text.includes('my name is') || text.includes('name is') || text.includes('i am') || text.includes("i'm")) return true;
 
@@ -5589,12 +11282,15 @@ async def mim_ui_page() -> str:
       }
       activeServerTtsUrl = '';
       speechPlaybackActive = false;
+      if (activeSpeechOwner === 'server_tts') {
+        activeSpeechOwner = '';
+      }
       setSpeaking(false);
     }
 
     function speakWithBrowserTts(text, interrupt = true) {
       const phrase = String(text || '').trim();
-      const smoothedPhrase = phrase.replace(/\s*[—-]\s*/g, ', ').replace(/\s{2,}/g, ' ').trim();
+      const smoothedPhrase = phrase.replace(/\\s*[—-]\\s*/g, ', ').replace(/\\s{2,}/g, ' ').trim();
       if (!phrase) return false;
       if (!window.speechSynthesis) {
         lastLocalTtsError = 'speechSynthesis API unavailable';
@@ -5748,6 +11444,7 @@ async def mim_ui_page() -> str:
       if (!phrase || !serverTtsEnabled) return false;
 
       try {
+        resetSpeechInterruptionState();
         const playbackToken = localTtsPlaybackToken;
         activeSpeechOwner = 'server_tts';
         rememberSpokenUtterance(phrase, 'server_tts');
@@ -5839,13 +11536,14 @@ async def mim_ui_page() -> str:
         return false;
       }
 
-      if ((speechInFlight || speechPlaybackActive) && !interrupt) {
+      if ((speechInFlight || speechPlaybackActive || speechInterruptionPending) && !interrupt) {
         addSpeechDebug('suppressed', `source=${sourceTag} reason=busy_no_interrupt sig=${shortSpeechSignature(phrase)} token=${localTtsPlaybackToken}`);
         return false;
       }
 
-      if ((speechInFlight || speechPlaybackActive) && interrupt) {
+      if ((speechInFlight || speechPlaybackActive || speechInterruptionPending) && interrupt) {
         addSpeechDebug('canceled', `source=${sourceTag} reason=interrupt-active-owner owner=${activeSpeechOwner || '-'} token=${localTtsPlaybackToken}`);
+        resetSpeechInterruptionState();
         stopServerTtsPlayback();
         localTtsPlaybackToken += 1;
         if (window.speechSynthesis && window.speechSynthesis.cancel) {
@@ -5860,6 +11558,7 @@ async def mim_ui_page() -> str:
 
       const requestId = ++speechRequestSeq;
       speechInFlight = true;
+      resetSpeechInterruptionState();
       addSpeechDebug('queued', `source=${sourceTag} route=auto sig=${shortSpeechSignature(phrase)} request=${requestId} token=${localTtsPlaybackToken} suppressMs=${suppressionWindowMs()}`);
       try {
         const serverSpoken = await speakWithServerTts(phrase, interrupt);
@@ -6002,8 +11701,8 @@ async def mim_ui_page() -> str:
         const idx = text.indexOf(leadIn);
         if (idx < 0) continue;
         const tail = text.slice(idx + leadIn.length)
-          .replace(/[^a-z'\-\s]/g, ' ')
-          .replace(/\s+/g, ' ')
+          .replace(/[^a-z'\\-\\s]/g, ' ')
+          .replace(/\\s+/g, ' ')
           .trim();
         if (tail) return tail;
       }
@@ -6356,6 +12055,18 @@ async def mim_ui_page() -> str:
       if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
         micPermissionState = 'unavailable';
         noteMicEvent('permission', 'mediaDevices unavailable');
+        healthState.micAvailable = false;
+        healthState.micOk = false;
+        statusEl.textContent = window.isSecureContext
+          ? 'Microphone API unavailable in this browser runtime.'
+          : 'Microphone blocked because this page is not running in a secure context.';
+        updateConnectionChrome();
+        updateIconGlow();
+        await reportFrontendMediaStatus(
+          'microphone',
+          deriveMediaFailureStatus(null, true),
+          describeMediaStartupFailure('microphone', null, true),
+        );
         return false;
       }
 
@@ -6448,15 +12159,29 @@ async def mim_ui_page() -> str:
           stopMicPermissionStream();
         }
         micPermissionState = 'granted';
+        healthState.micAvailable = true;
+        healthState.micOk = true;
         await enumerateMicDevices();
         updateMicDiagnostics();
+        await reportFrontendMediaStatus(
+          'microphone',
+          keepStreamAlive ? 'listening' : 'ready',
+          keepStreamAlive ? 'Microphone permission granted and keep-alive stream active.' : 'Microphone permission granted.',
+        );
         return true;
       } catch (error) {
         noteMicEvent('permission-error', String(error?.name || error?.message || 'unknown'));
         micPermissionState = 'denied';
-        statusEl.textContent = 'Mic permission blocked. Allow microphone access for MIM Desktop.';
+        healthState.micAvailable = false;
+        const failureDetail = describeMediaStartupFailure('microphone', error);
+        const failureStatus = deriveMediaFailureStatus(error);
+        statusEl.textContent = failureStatus === 'insecure_context'
+          ? 'Microphone blocked because this page is not running in a secure context.'
+          : 'Mic permission blocked. Allow microphone access for mim.mimtod.com, then rerun the self-test.';
         healthState.micOk = false;
+        updateConnectionChrome();
         updateIconGlow();
+        await reportFrontendMediaStatus('microphone', failureStatus, failureDetail);
         return false;
       }
     }
@@ -6535,6 +12260,271 @@ async def mim_ui_page() -> str:
       }, 1000);
     }
 
+    function updateConnectionChrome() {
+      if (connectionChip) {
+        connectionChip.textContent = healthState.backendOk ? 'Connected' : 'Backend offline';
+        connectionChip.classList.toggle('strong', healthState.backendOk);
+      }
+      const voiceReady = Boolean(window.SpeechRecognition || window.webkitSpeechRecognition || window.speechSynthesis);
+      if (voiceAvailabilityChip) {
+        const label = !voiceReady
+          ? 'Voice unavailable'
+          : speechInterruptionPending
+            ? 'Checking interruption'
+            : speechPlaybackActive || activeSpeechOwner
+            ? 'Speaking back'
+            : speechInFlight || micStartInFlight
+              ? 'Processing'
+              : micListening || micAutoMode
+                ? 'Listening'
+            : 'Voice ready';
+        voiceAvailabilityChip.textContent = label;
+        voiceAvailabilityChip.classList.toggle('strong', voiceReady);
+      }
+      if (voiceAvailabilityText) {
+        if (!voiceReady) {
+          voiceAvailabilityText.textContent = 'Browser speech APIs are unavailable in this client.';
+        } else if (!window.isSecureContext && !healthState.micAvailable) {
+          voiceAvailabilityText.textContent = 'Microphone capture needs a secure origin such as https or localhost.';
+        } else if (!healthState.micAvailable) {
+          voiceAvailabilityText.textContent = 'Microphone permission or hardware is not currently available.';
+        } else if (speechInterruptionPending) {
+          voiceAvailabilityText.textContent = 'MIM paused speech briefly to confirm whether you are interrupting with a new request.';
+        } else if (speechPlaybackActive || activeSpeechOwner) {
+          voiceAvailabilityText.textContent = 'MIM is speaking its latest reply aloud while keeping the same primary thread in sync.';
+        } else if (speechInFlight || micStartInFlight) {
+          voiceAvailabilityText.textContent = 'Voice input is processing and will append to the same primary thread.';
+        } else if (micListening || micAutoMode) {
+          voiceAvailabilityText.textContent = 'Full-time listening is active. Transcripts will append into the primary thread.';
+        } else {
+          voiceAvailabilityText.textContent = 'Voice is ready. Turn the full-time listener on when you want open mic input.';
+        }
+      }
+      if (voiceHintChip) {
+        voiceHintChip.textContent = speechInterruptionPending
+          ? 'Speech is paused for a moment while MIM checks for a real interruption.'
+          : micListening || micAutoMode
+          ? 'Listening, transcribing, and routing replies into this thread.'
+          : 'Voice transcripts and replies stay in the same thread.';
+      }
+      updateVoiceStateUi();
+      renderSelfTestPanel();
+    }
+
+    function renderPrimaryStatus(data = {}) {
+      const context = data && typeof data.conversation_context === 'object' ? data.conversation_context : {};
+      const initiative = data && typeof data.initiative_driver === 'object' ? data.initiative_driver : {};
+      const systemActivity = data && typeof data.system_activity === 'object' ? data.system_activity : {};
+      const todTruthReconciliation = data && typeof data.tod_truth_reconciliation === 'object'
+        ? data.tod_truth_reconciliation
+        : systemActivity && typeof systemActivity.tod_truth_reconciliation === 'object'
+        ? systemActivity.tod_truth_reconciliation
+        : {};
+      const todState = String(todTruthReconciliation.state || '').trim().toLowerCase();
+      const todOk = !todState || ['confirmed', 'aligned', 'idle', 'not_applicable'].includes(todState) || Boolean(todTruthReconciliation.execution_confirmed);
+      updateConsoleNavLights({ mimOk: !hasCriticalHealthError(), todOk });
+      const initiativeObjective = initiative && typeof initiative.active_objective === 'object' ? initiative.active_objective : {};
+      const initiativeTask = initiative && typeof initiative.active_task === 'object' ? initiative.active_task : {};
+      const initiativeNextTask = initiative && typeof initiative.next_task === 'object' ? initiative.next_task : {};
+      const activity = initiative && typeof initiative.activity === 'object' ? initiative.activity : {};
+      const progress = initiative && typeof initiative.progress === 'object' ? initiative.progress : {};
+      const objective = resolveInitiativeLabel(initiativeObjective, safeText(context.initiative_active_objective || context.active_goal, 'No active objective'));
+      const activeTask = resolveInitiativeLabel(initiativeTask, safeText(context.initiative_active_task, 'No active task'));
+      const nextTaskFallback = ['working', 'stale'].includes(String(activity.state || '').trim().toLowerCase())
+        ? 'Still working current task'
+        : 'No next task';
+      const nextTask = resolveInitiativeLabel(initiativeNextTask, safeText(context.initiative_next_task, nextTaskFallback));
+      const openQuestion = safeText(context.open_question, 'None');
+      const memoryHint = safeText(context.memory_hint, 'None');
+      const recentInput = safeText(context.recent_user_input, 'Waiting for input…');
+      const healthSummary = safeText(context.runtime_health_summary || data.latest_output_text, 'Runtime summary unavailable');
+      const blockerCount = Array.isArray(initiative.blockers) ? initiative.blockers.length : 0;
+      const activityLabel = safeText(systemActivity.status_label || systemActivity.label || activity.label || initiative.status, 'Idle').replace(/_/g, ' ');
+      const activityAge = formatAgeSummary(activity.stale_seconds);
+      const activitySummary = safeText(
+        systemActivity.summary || activity.summary || context.initiative_activity_summary || initiative.summary,
+        safeText(context.operator_reasoning_summary, 'No active initiative summary yet.'),
+      );
+      const completedTaskCount = Math.max(0, Number(progress.completed_task_count || 0));
+      const taskCount = Math.max(0, Number(progress.task_count || 0));
+      const progressPercent = Math.max(0, Math.min(100, Number(progress.percent || 0)));
+      const movementPercent = Math.max(0, Math.min(100, Number((progress.movement_percent ?? progress.percent) || 0)));
+      const movementSummary = safeText(
+        progress.movement_summary,
+        'Small-movement marker tracks bounded task creation, dispatch, execution, and result evidence.',
+      );
+      const systemState = safeText(systemActivity.status_code || activity.state, 'idle').toLowerCase();
+      const shouldBeWorking = Boolean(systemActivity.should_be_working);
+      const truthReasonCode = safeText(todTruthReconciliation.reason_code || todTruthReconciliation.decision_reason).toLowerCase();
+      const boundaryBlocked = Boolean(
+        todTruthReconciliation.requires_human
+        || todState === 'hard_boundary_requires_human'
+        || todState === 'hard_boundary_escalated'
+        || truthReasonCode === 'hard_boundary_requires_human'
+      );
+      let progressLabel = taskCount ? `${progressPercent}% complete · ${movementPercent}% moving` : 'No tasks yet';
+      let progressDetail = taskCount
+        ? `${completedTaskCount}/${taskCount} bounded tasks completed. ${movementSummary}`
+        : safeText(progress.summary, 'No bounded tasks are registered yet.');
+      if (!shouldBeWorking && ['idle', 'ready'].includes(systemState)) {
+        progressLabel = taskCount ? `${completedTaskCount}/${taskCount} complete` : 'Idle';
+        progressDetail = taskCount
+          ? 'This is queue completion, not a live activity meter. MIM is currently idle.'
+          : 'No bounded tasks are registered and no live task requires motion.';
+      } else if (shouldBeWorking && !['active', 'working'].includes(systemState) && taskCount) {
+        progressDetail = `${completedTaskCount}/${taskCount} bounded tasks complete, but live activity is waiting on coordination. ${movementSummary}`;
+      }
+      if (Boolean(todTruthReconciliation.should_override_completion) || safeText(todTruthReconciliation.state).toLowerCase() === 'coordination_response_missing') {
+        progressLabel = `${safeText(todTruthReconciliation.progress_label, 'Execution unconfirmed')} · ${movementPercent}% moving`;
+        progressDetail = `${safeText(todTruthReconciliation.progress_detail || todTruthReconciliation.summary, progressDetail)} ${movementSummary}`.trim();
+      }
+      setTextWithTitle(activeObjectiveText, objective, 'No active objective');
+      setTextWithTitle(activeTaskText, activeTask, 'No active task');
+      setTextWithTitle(activityStateText, activityLabel, 'Idle');
+      setTextWithTitle(nextTaskText, nextTask, nextTaskFallback);
+      setTextWithTitle(blockerCountText, blockerCount ? `${blockerCount} active` : '0 visible', '0 visible');
+      if (activityStateDetailText) {
+        const explicitDetail = safeText(systemActivity.execution_allowed_reason || systemActivity.stall_reason);
+        const detail = explicitDetail
+          ? `${activitySummary} ${explicitDetail}`.trim()
+          : activityAge && String(activity.state || '').trim().toLowerCase() === 'stale'
+          ? `${activitySummary} Last bounded start was about ${activityAge} ago.`
+          : activitySummary;
+        activityStateDetailText.textContent = detail;
+        activityStateDetailText.title = detail;
+      }
+      setTextWithTitle(progressText, progressLabel, 'No tasks yet');
+      if (progressDetailText) {
+        progressDetailText.textContent = progressDetail;
+        progressDetailText.title = progressDetail;
+      }
+      if (progressFill) {
+        progressFill.style.width = `${progressPercent}%`;
+      }
+      if (initiativeSummaryText) {
+        initiativeSummaryText.textContent = activitySummary;
+        initiativeSummaryText.title = activitySummary;
+      }
+      if (initiativeChip) {
+        initiativeChip.textContent = blockerCount && !['working', 'stale'].includes(String(activity.state || '').trim().toLowerCase())
+          ? `Initiative stuck (${blockerCount})`
+          : `Initiative ${activityLabel.toLowerCase()}`;
+        initiativeChip.title = activitySummary;
+      }
+      if (initiativeChipSecondary) {
+        initiativeChipSecondary.textContent = boundaryBlocked
+          ? 'Blocked by boundary'
+          : initiativeChip
+          ? initiativeChip.textContent
+          : `Initiative ${activityLabel.toLowerCase()}`;
+        initiativeChipSecondary.title = boundaryBlocked
+          ? safeText(todTruthReconciliation.summary || todTruthReconciliation.progress_detail, activitySummary)
+          : activitySummary;
+        initiativeChipSecondary.dataset.tone = boundaryBlocked ? 'error' : activityToneFromState(systemState, shouldBeWorking);
+      }
+      if (contextChip) {
+        const contextLine = [
+          `Activity: ${activityLabel}`,
+          `Objective: ${objective}`,
+          `Active task: ${activeTask}`,
+        ].filter(Boolean).join(' | ');
+        contextChip.textContent = contextLine;
+        contextChip.title = contextLine;
+      }
+      setTextWithTitle(recentInputText, recentInput, 'Waiting for input…');
+      setTextWithTitle(openQuestionText, openQuestion, 'None');
+      setTextWithTitle(memoryHintText, memoryHint, 'None');
+      setTextWithTitle(runtimeHealthText, healthSummary, 'Runtime summary unavailable');
+      renderSystemActivityTruth(systemActivity);
+      renderProgramQueue(initiative);
+    }
+
+    function renderProgramQueue(initiative = {}) {
+      const programStatus = initiative && typeof initiative.program_status === 'object' ? initiative.program_status : {};
+      const activeProject = initiative && typeof initiative.active_project === 'object' ? initiative.active_project : {};
+      const projects = Array.isArray(programStatus.projects) ? programStatus.projects : [];
+      const activeProjectId = safeText(activeProject.project_id, '').toLowerCase();
+      if (programQueueSummaryText) {
+        programQueueSummaryText.textContent = safeText(programStatus.summary, projects.length ? 'Ordered project queue loaded.' : 'No ordered project queue is registered yet.');
+        programQueueSummaryText.title = programQueueSummaryText.textContent;
+      }
+      if (!programQueueList) {
+        return;
+      }
+      programQueueList.innerHTML = '';
+      if (!projects.length) {
+        const empty = document.createElement('div');
+        empty.className = 'status-subtext';
+        empty.textContent = 'Program registration is not available yet.';
+        programQueueList.appendChild(empty);
+        if (programQueueMetaText) {
+          programQueueMetaText.textContent = 'No program steps are registered yet.';
+        }
+        if (programQueueToggleBtn) {
+          programQueueToggleBtn.hidden = true;
+        }
+        return;
+      }
+      const activeIndex = projects.findIndex((project) => safeText(project && project.project_id, '').toLowerCase() === activeProjectId);
+      const visibleProjects = showFullProgramQueue
+        ? projects
+        : projects.filter((project, index) => {
+          if (index < 3) return true;
+          if (activeIndex >= 0 && Math.abs(index - activeIndex) <= 2) return true;
+          if (index >= projects.length - 2) return true;
+          return false;
+        });
+      if (programQueueMetaText) {
+        const hiddenCount = Math.max(0, projects.length - visibleProjects.length);
+        programQueueMetaText.textContent = hiddenCount > 0
+          ? `${visibleProjects.length} visible now, ${hiddenCount} hidden to keep the queue readable.`
+          : 'Showing all registered steps.';
+      }
+      if (programQueueToggleBtn) {
+        programQueueToggleBtn.hidden = projects.length <= visibleProjects.length;
+        programQueueToggleBtn.textContent = showFullProgramQueue ? 'Show less' : 'Show all';
+      }
+      visibleProjects.forEach((project) => {
+        const index = projects.indexOf(project);
+        const projectId = safeText(project && project.project_id, `Project ${index + 1}`);
+        const status = safeText(project && project.status, 'ready');
+        const objective = safeText(project && project.objective, 'No objective recorded.');
+        const normalizedStatus = status.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+        const isActive = activeProjectId && projectId.toLowerCase() === activeProjectId;
+        const item = document.createElement('div');
+        item.className = `program-queue-item${isActive ? ' active' : ''}`;
+
+        const heading = document.createElement('div');
+        heading.className = 'program-queue-heading';
+
+        const order = document.createElement('span');
+        order.className = 'program-queue-order';
+        order.textContent = `Step ${index + 1}`;
+
+        const title = document.createElement('strong');
+        title.textContent = projectId;
+        title.title = projectId;
+
+        heading.appendChild(order);
+        heading.appendChild(title);
+
+        const badge = document.createElement('div');
+        badge.className = `program-queue-status ${isActive ? 'active' : normalizedStatus.includes('complete') ? 'completed' : normalizedStatus.includes('block') || normalizedStatus.includes('stale') ? 'blocked' : ''}`.trim();
+        badge.textContent = status.replace(/_/g, ' ');
+        badge.title = status;
+
+        const objectiveText = document.createElement('div');
+        objectiveText.className = 'program-queue-objective';
+        objectiveText.textContent = objective;
+        objectiveText.title = objective;
+
+        item.appendChild(heading);
+        item.appendChild(badge);
+        item.appendChild(objectiveText);
+        programQueueList.appendChild(item);
+      });
+    }
+
     async function refreshState() {
       if (refreshInFlight) {
         refreshPending = true;
@@ -6553,8 +12543,8 @@ async def mim_ui_page() -> str:
         const data = await res.json();
         latestUiState = data;
         if (buildTagEl) {
-          const runtimeBuild = String(data.runtime_build || 'mim-ui');
-          buildTagEl.textContent = `Build: ${runtimeBuild}`;
+          const runtimeBuild = String(data.runtime_build || 'unified-console-recovery-v1');
+          buildTagEl.textContent = `UI_BUILD_ID = ${runtimeBuild}`;
         }
         setSpeaking(Boolean(data.speaking));
         const spokeFromState = await maybeSpeakFromState(data).catch(() => false);
@@ -6566,7 +12556,16 @@ async def mim_ui_page() -> str:
         const inquiryPrompt = String(data.inquiry_prompt || '').trim();
         const conversationContext = (data && typeof data.conversation_context === 'object') ? data.conversation_context : {};
         const operatorReasoning = (data && typeof data.operator_reasoning === 'object') ? data.operator_reasoning : {};
+        const chatThread = data && typeof data.chat_thread === 'object' ? data.chat_thread : {};
+        const threadMessages = Array.isArray(chatThread.messages) ? chatThread.messages : [];
+        chatThreadMessages = threadMessages;
+        if (threadStatusChip) {
+          threadStatusChip.textContent = `Primary thread: ${safeText(chatThread.primary_thread, textChatSessionId)}`;
+        }
+        renderChatThread(threadMessages);
+        renderPrimaryStatus(data);
         renderObjectMemoryPanel(conversationContext);
+        renderRoutineTrainingPanel((data && typeof data.routine_training === 'object') ? data.routine_training : {});
         renderSystemReasoningPanel(operatorReasoning);
         await maybeRecoverRuntimeHealth(data);
         const cameraIdentityKnown = !isUnknownOrMissingIdentity(cameraLabel);
@@ -6592,9 +12591,11 @@ async def mim_ui_page() -> str:
         }
         lastVisualIdentity = activeVisualIdentity;
 
+        updateConnectionChrome();
         updateIconGlow();
       } catch (_) {
         markBackendReachability(false);
+        updateConnectionChrome();
         updateIconGlow();
       } finally {
         refreshInFlight = false;
@@ -6661,6 +12662,8 @@ async def mim_ui_page() -> str:
         healthState.micAvailable = false;
         healthState.micOk = false;
         micAutoMode = false;
+        persistMicAutoMode();
+        syncListenButtonLabel();
         updateIconGlow();
         return;
       }
@@ -6668,7 +12671,8 @@ async def mim_ui_page() -> str:
       const micReady = await ensureMicPermission({ keepStreamAlive: FORCE_FALLBACK_STT });
       if (!micReady) {
         micAutoMode = false;
-        listenBtn.textContent = 'Listening Off';
+        persistMicAutoMode();
+        syncListenButtonLabel();
         return;
       }
 
@@ -6764,6 +12768,7 @@ async def mim_ui_page() -> str:
           noteMicLifecycleEvent();
           noteMicEvent('recognition', 'onspeechstart');
           micLastSpeechEventAt = Date.now();
+          pauseSpeechForInterruption('speechstart');
         };
 
         recognition.onspeechend = () => {
@@ -6785,6 +12790,25 @@ async def mim_ui_page() -> str:
           const transcript = (last?.transcript || '').trim();
           const confidence = Number(last?.confidence || 0.8);
           if (!transcript) return;
+          if (speechInterruptionPending) {
+            if (isLikelyEchoTranscript(transcript)) {
+              noteMicEvent('recognition-resume', 'echo-after-pause');
+              addMicDebug('recognition:resume-echo', transcript.slice(0, 48));
+              logTranscriptDrop('echo_after_pause', transcript, 'interruption_probe');
+              resumeSpeechAfterInterruption('echo');
+              return;
+            }
+            if (!isLikelyIntentionalInterruption(transcript, confidence)) {
+              noteMicEvent('recognition-resume', 'weak-after-pause');
+              addMicDebug('recognition:resume-weak', transcript.slice(0, 48));
+              logTranscriptDrop('weak_after_pause', transcript, 'interruption_probe');
+              resumeSpeechAfterInterruption('weak-transcript');
+              return;
+            }
+            noteMicEvent('recognition-interrupt', transcript.slice(0, 24));
+            addMicDebug('recognition:confirmed-interrupt', transcript.slice(0, 48));
+            cancelSpeechForInterruption('confirmed-transcript');
+          }
           if (isMicSuppressedNow()) {
             noteMicEvent('recognition-drop', 'tts-suppressed');
             addMicDebug('recognition:drop-suppressed', transcript.slice(0, 48));
@@ -6887,6 +12911,9 @@ async def mim_ui_page() -> str:
             }
           }
 
+          await submitConversationTurn(transcript, 'voice');
+          syncListenButtonLabel();
+          updateConnectionChrome();
           refreshState();
         };
 
@@ -6997,7 +13024,7 @@ async def mim_ui_page() -> str:
             scheduleMicRetry(backoffMs);
           } else {
             micRestartPending = false;
-            listenBtn.textContent = 'Listening Off';
+            syncListenButtonLabel();
             statusEl.textContent = 'Listening paused. Press Listen to start.';
           }
         };
@@ -7030,7 +13057,7 @@ async def mim_ui_page() -> str:
           if (micAutoMode) {
             scheduleMicRetry(Math.min(12000, 1800 + micErrorStreak * 900));
           } else {
-            listenBtn.textContent = 'Listening Off';
+            syncListenButtonLabel();
             statusEl.textContent = 'Mic did not start. Press Listen to retry.';
           }
         }, 2600);
@@ -7069,7 +13096,7 @@ async def mim_ui_page() -> str:
         if (micAutoMode) {
           scheduleMicRetry(Math.min(12000, 1200 + micErrorStreak * 900));
         } else {
-          listenBtn.textContent = 'Listening Off';
+          syncListenButtonLabel();
         }
       }
     }
@@ -7120,10 +13147,17 @@ async def mim_ui_page() -> str:
     async function startCameraWatcher() {
       if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
         cameraEl.textContent = 'Camera: browser camera API not available';
-        cameraSettingsStatus.textContent = 'Camera API is unavailable in this runtime.';
+        cameraSettingsStatus.textContent = window.isSecureContext
+          ? 'Camera API is unavailable in this runtime.'
+          : 'Camera blocked because this page is not running in a secure context.';
         healthState.cameraOk = false;
         updateCameraSettingsUi();
         updateIconGlow();
+        await reportFrontendMediaStatus(
+          'camera',
+          deriveMediaFailureStatus(null, true),
+          describeMediaStartupFailure('camera', null, true),
+        );
         return;
       }
 
@@ -7246,7 +13280,13 @@ async def mim_ui_page() -> str:
         healthState.cameraOk = true;
         updateCameraSettingsUi();
         updateIconGlow();
-      } catch (_) {
+        await reportFrontendMediaStatus(
+          'camera',
+          'watching',
+          activeLabel ? `Camera watcher active${activeLabel}.` : 'Camera watcher active.',
+          { selected_device_label: firstTrack?.label || null },
+        );
+      } catch (error) {
         if (runtimeRecoveryPending.camera) {
           await postRuntimeRecoveryEvent(
             'camera',
@@ -7264,15 +13304,32 @@ async def mim_ui_page() -> str:
         }
         stopCameraWatcher();
         cameraEl.textContent = 'Camera permission denied or unavailable';
-        cameraSettingsStatus.textContent = 'Unable to start camera. Check permission and selected device.';
+        const failureDetail = describeMediaStartupFailure('camera', error);
+        const failureStatus = deriveMediaFailureStatus(error);
+        cameraSettingsStatus.textContent = failureStatus === 'insecure_context'
+          ? 'Camera blocked because this page is not running in a secure context.'
+          : 'Unable to start camera. Allow camera access for mim.mimtod.com, then rerun the self-test.';
         healthState.cameraOk = false;
         updateCameraSettingsUi();
         updateIconGlow();
+        await reportFrontendMediaStatus('camera', failureStatus, failureDetail);
       }
     }
 
     document.getElementById('speakBtn').addEventListener('click', speakNow);
     document.getElementById('cameraBtn').addEventListener('click', sendCameraEvent);
+    if (operatorModeBtn) {
+      operatorModeBtn.addEventListener('click', () => setUiMode('operator'));
+    }
+    if (debugModeBtn) {
+      debugModeBtn.addEventListener('click', () => setUiMode('debug'));
+    }
+    if (openDebugModeBtn) {
+      openDebugModeBtn.addEventListener('click', () => {
+        setUiMode('debug');
+        setSecondaryTab('diagnostics');
+      });
+    }
     settingsBtn.addEventListener('click', () => {
       settingsPanel.classList.toggle('open');
     });
@@ -7326,9 +13383,10 @@ async def mim_ui_page() -> str:
     voiceDepthInput.addEventListener('input', applyVoiceSettings);
     voiceVolumeInput.addEventListener('input', applyVoiceSettings);
     listenBtn.addEventListener('click', () => {
-      if (micAutoMode || micListening || micStartInFlight) {
+      if (micAutoMode || micListening || micStartInFlight || micRestartPending) {
+        const shouldStopRecognition = Boolean(recognition && (micListening || micStartInFlight));
         micAutoMode = false;
-        listenBtn.textContent = 'Listening Off';
+        persistMicAutoMode();
         micListening = false;
         micStartInFlight = false;
         micRestartPending = false;
@@ -7340,28 +13398,51 @@ async def mim_ui_page() -> str:
         clearMicStartTimeout();
         stopMicFallbackLoop();
         stopMicPermissionStream();
-        if (recognition && micListening) {
+        resetSpeechInterruptionState();
+        if (shouldStopRecognition) {
           recognition.stop();
         }
         statusEl.textContent = 'Listening paused.';
+        syncListenButtonLabel();
+        updateConnectionChrome();
         updateIconGlow();
         return;
       }
 
       micAutoMode = true;
-      listenBtn.textContent = 'Listening On';
+      persistMicAutoMode();
       micRestartPending = false;
       micStartTimeoutStreak = 0;
       micStartFailureStreak = 0;
       micShortRunStreak = 0;
       micUnstableCycleCount = 0;
+      syncListenButtonLabel();
+      updateConnectionChrome();
       listenOnce();
     });
     chatSendBtn.addEventListener('click', sendTextChat);
+    if (trainingRoutineStartBtn) {
+      trainingRoutineStartBtn.addEventListener('click', () => postRoutineTrainingAction('start'));
+    }
+    if (trainingRoutineRestartBtn) {
+      trainingRoutineRestartBtn.addEventListener('click', () => postRoutineTrainingAction('restart'));
+    }
+    if (trainingRoutineStopBtn) {
+      trainingRoutineStopBtn.addEventListener('click', () => postRoutineTrainingAction('stop'));
+    }
     chatClearBtn.addEventListener('click', () => {
-      if (!chatLog) return;
-      chatLog.innerHTML = '';
-      appendChatMessage('mim', 'Text chat cleared. Ready for your next message.');
+      chatLocallyCleared = true;
+      chatLocalClearCutoffIso = new Date().toISOString();
+      chatLocalClearNotice = {
+        role: 'mim',
+        content: 'Text chat cleared. Ready for your next message.',
+        created_at: chatLocalClearCutoffIso,
+        interaction_mode: 'text',
+        message_type: 'system_summary',
+        attachment: null,
+      };
+      chatThreadMessages = [];
+      renderChatThread([], { force: true });
     });
     chatInput.addEventListener('keydown', (event) => {
       if (event.key === 'Enter' && !event.shiftKey) {
@@ -7369,11 +13450,124 @@ async def mim_ui_page() -> str:
         sendTextChat();
       }
     });
+    if (chatMicBtn) {
+      chatMicBtn.addEventListener('click', async () => {
+        listenBtn.click();
+      });
+    }
+    if (autoListenToggle) {
+      autoListenToggle.checked = micAutoMode;
+      autoListenToggle.addEventListener('change', () => {
+        if (autoListenToggle.checked) {
+          micAutoMode = true;
+          persistMicAutoMode();
+          syncListenButtonLabel();
+          updateConnectionChrome();
+          listenOnce();
+        } else {
+          micAutoMode = false;
+          persistMicAutoMode();
+          if (recognition && micListening) recognition.stop();
+          syncListenButtonLabel();
+          updateConnectionChrome();
+        }
+      });
+    }
+    if (imageUploadBtn && imageUploadInput) {
+      imageUploadBtn.addEventListener('click', () => imageUploadInput.click());
+      imageUploadInput.addEventListener('change', () => {
+        const file = imageUploadInput.files && imageUploadInput.files[0] ? imageUploadInput.files[0] : null;
+        if (file) {
+          setComposerImage(file);
+        }
+      });
+    }
+    if (imageRemoveBtn) {
+      imageRemoveBtn.addEventListener('click', resetComposerImage);
+    }
+    if (chatDropzone) {
+      ['dragenter', 'dragover'].forEach((eventName) => {
+        chatDropzone.addEventListener(eventName, (event) => {
+          event.preventDefault();
+          chatDropzone.classList.add('active');
+        });
+      });
+      ['dragleave', 'drop'].forEach((eventName) => {
+        chatDropzone.addEventListener(eventName, (event) => {
+          event.preventDefault();
+          if (eventName !== 'drop') {
+            chatDropzone.classList.remove('active');
+          }
+        });
+      });
+      chatDropzone.addEventListener('drop', (event) => {
+        chatDropzone.classList.remove('active');
+        const file = event.dataTransfer && event.dataTransfer.files && event.dataTransfer.files[0] ? event.dataTransfer.files[0] : null;
+        if (file) {
+          setComposerImage(file);
+        }
+      });
+    }
+    secondaryTabs.forEach((button) => {
+      button.addEventListener('click', () => setSecondaryTab(String(button.dataset.tab || 'status')));
+    });
+    if (programQueueToggleBtn) {
+      programQueueToggleBtn.addEventListener('click', () => {
+        showFullProgramQueue = !showFullProgramQueue;
+        const initiative = latestUiState && typeof latestUiState.initiative_driver === 'object'
+          ? latestUiState.initiative_driver
+          : {};
+        renderProgramQueue(initiative);
+      });
+    }
+    quickActionButtons.forEach((button) => {
+      button.addEventListener('click', async () => {
+        const quickMessage = buildQuickActionMessage(button);
+        if (!quickMessage) return;
+        const priorText = button.textContent;
+        button.disabled = true;
+        button.textContent = 'Working...';
+        try {
+          if (chatInput) {
+            chatInput.value = quickMessage;
+          }
+          await submitConversationTurn(quickMessage, 'quick_action');
+        } finally {
+          button.disabled = false;
+          button.textContent = priorText;
+          if (chatInput) {
+            chatInput.value = '';
+          }
+        }
+      });
+    });
+    if (selfTestToggleListenerBtn) {
+      selfTestToggleListenerBtn.addEventListener('click', () => {
+        listenBtn.click();
+      });
+    }
+    if (selfTestRunBtn) {
+      selfTestRunBtn.addEventListener('click', async () => {
+        setSelfTestSummary('Running self-test...', 'warn');
+        if (selfTestTimestamp) {
+          selfTestTimestamp.textContent = 'Running self-test now…';
+        }
+        await enumerateMicDevices();
+        await enumerateCameraDevices();
+        await ensureMicPermission({ keepStreamAlive: Boolean(micAutoMode || FORCE_FALLBACK_STT) });
+        if (!cameraStream || !cameraStream.active) {
+          await startCameraWatcher();
+        }
+        selfTestLastRunAt = Date.now();
+        await refreshState();
+        renderSelfTestPanel();
+      });
+    }
 
     updateIconGlow();
     addMicDebug('ui-boot', 'mim-ui-tightened-v1');
     if (micEventEl) {
-      micEventEl.textContent = `Mic event: ui-boot @ ${new Date().toLocaleTimeString()}`;
+      micEventEl.textContent = `Recent voice event: ui-boot @ ${new Date().toLocaleTimeString()}`;
     }
     defaultLangInput.value = normalizeLangCode(defaultListenLang || SYSTEM_DEFAULT_LANG);
     autoLangToggle.checked = autoLanguageMode;
@@ -7397,22 +13591,163 @@ async def mim_ui_page() -> str:
       };
     }
     setSettingsTab('voice');
+    setUiMode(uiMode);
     updateCameraSettingsUi();
     applyVoiceSettings();
+    if (threadStatusChip) {
+      threadStatusChip.textContent = `Primary thread: ${safeText(preloadedChatThread.primary_thread, textChatSessionId)}`;
+    }
+    renderChatThread(chatThreadMessages, { force: true });
     refreshState();
-    listenBtn.textContent = 'Listening Off';
-    statusEl.textContent = 'Listening paused. Press Listen to start.';
-    ensureMicPermission().then(() => enumerateMicDevices());
+    syncListenButtonLabel();
+    updateConnectionChrome();
+    renderSelfTestPanel();
+    if (micAutoMode) {
+      statusEl.textContent = 'Restoring full-time listener...';
+      listenOnce();
+    } else {
+      statusEl.textContent = 'Listening paused. Press Turn Listener On to begin.';
+      ensureMicPermission().then(() => enumerateMicDevices());
+    }
     startCameraWatcher();
     setInterval(refreshState, 2000);
   </script>
 </body>
 </html>
-"""
+""".replace("__MIM_PRELOADED_CHAT_THREAD__", json.dumps(preloaded_chat_thread, default=str))
+
+@router.get("/mim/ui/media/{asset_name}")
+async def mim_ui_media(request: Request, asset_name: str) -> FileResponse:
+  ensure_authenticated_mimtod_api_request(request)
+  safe_name = Path(str(asset_name or "")).name
+  if not safe_name or safe_name != str(asset_name or ""):
+    raise HTTPException(status_code=404, detail="media_not_found")
+  path = _ensure_mim_ui_media_root() / safe_name
+  if not path.exists() or not path.is_file():
+    raise HTTPException(status_code=404, detail="media_not_found")
+  return FileResponse(path)
+
+@router.post("/mim/ui/chat/upload-image")
+async def mim_ui_upload_image(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    ensure_authenticated_mimtod_api_request(request)
+    fields, upload = _parse_mim_ui_multipart_form(
+        content_type=request.headers.get("content-type", ""),
+        body=await request.body(),
+    )
+    prompt = str(fields.get("prompt") or "")
+    session_key = str(fields.get("session_key") or MIM_PRIMARY_THREAD_KEY)
+    normalized_session_key = (
+        str(session_key or _mim_ui_primary_thread_key()).strip()
+        or _mim_ui_primary_thread_key()
+    )
+    normalized_prompt = str(prompt or "").strip()
+    raw_bytes = bytes(upload.get("content") or b"")
+    if not raw_bytes:
+        raise HTTPException(status_code=400, detail="empty_image_upload")
+    if len(raw_bytes) > MIM_UI_MAX_IMAGE_BYTES:
+        raise HTTPException(status_code=413, detail="image_too_large")
+
+    filename = str(upload.get("filename") or "upload").strip() or "upload"
+    content_type = str(upload.get("content_type") or "").strip().lower()
+    extension = _mim_ui_image_extension(content_type, filename)
+    media_root = _ensure_mim_ui_media_root()
+    asset_name = f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid4().hex}{extension}"
+    asset_path = media_root / asset_name
+    asset_path.write_bytes(raw_bytes)
+    digest = sha256(raw_bytes).hexdigest()
+    attachment = {
+      "kind": "image",
+      "url": _mim_ui_media_url(asset_name),
+      "thumbnail_url": _mim_ui_media_url(asset_name),
+      "mime_type": content_type or mimetypes.guess_type(asset_name)[0] or "image/png",
+      "filename": filename or asset_name,
+      "size_bytes": len(raw_bytes),
+      "sha256": digest,
+    }
+
+    session = await upsert_interface_session(
+      session_key=normalized_session_key,
+      actor="operator",
+      source="mim_ui",
+      channel="chat",
+      status="active",
+      context_json={"primary_thread": True},
+      metadata_json={"conversation_session_id": normalized_session_key},
+      db=db,
+    )
+
+    prompt_text = normalized_prompt or "Please inspect this image and describe what stands out."
+    operator_content = normalized_prompt or f"Shared image: {attachment['filename']}"
+    _, image_message = await append_interface_message(
+      session_key=normalized_session_key,
+      actor="operator",
+      source="mim_ui",
+      direction="inbound",
+      role="operator",
+      content=operator_content,
+      parsed_intent="image_message",
+      confidence=1.0,
+      requires_approval=False,
+      metadata_json={
+        "message_type": "user",
+        "interaction_mode": "image",
+        "attachment": attachment,
+        "image_prompt": normalized_prompt,
+      },
+      db=db,
+    )
+
+    reply_text = (
+      "Image received and attached to the primary thread. "
+      "Multimodal analysis is not configured in this runtime yet."
+    )
+    analysis_status = "stored"
+    try:
+      analysis_text = await _analyze_image_with_openai(
+        image_bytes=raw_bytes,
+        mime_type=str(attachment["mime_type"]),
+        prompt=prompt_text,
+      )
+      if analysis_text:
+        reply_text = analysis_text
+        analysis_status = "analyzed"
+    except Exception as exc:  # noqa: BLE001
+      analysis_status = str(exc) or "analysis_unavailable"
+
+    _, reply_message = await append_interface_message(
+      session_key=normalized_session_key,
+      actor="mim",
+      source="mim_ui",
+      direction="outbound",
+      role="mim",
+      content=reply_text,
+      parsed_intent="image_analysis",
+      confidence=1.0,
+      requires_approval=False,
+      metadata_json={
+        "message_type": "mim_reply",
+        "interaction_mode": "image",
+        "attachment": attachment,
+        "analysis_status": analysis_status,
+        "linked_message_id": int(image_message.id),
+      },
+      db=db,
+    )
+
+    await db.commit()
+    return {
+      "session": to_interface_session_out(session),
+      "message": _serialize_chat_message(to_interface_message_out(image_message)),
+      "reply": _serialize_chat_message(to_interface_message_out(reply_message)),
+      "attachment": attachment,
+    }
 
 
-@router.get("/mim/ui/state")
-async def mim_ui_state(db: AsyncSession = Depends(get_db)) -> dict:
+async def _build_live_mim_ui_state(request: Request, db: AsyncSession) -> dict:
+    ensure_authenticated_mimtod_api_request(request)
     now = datetime.now(timezone.utc)
 
     speech_row = (
@@ -8264,6 +14599,19 @@ async def mim_ui_state(db: AsyncSession = Depends(get_db)) -> dict:
     latest_input_event = (
         recent_input_events[0] if recent_input_events else latest_input_event
     )
+    latest_input_resolution = None
+    if latest_input_event is not None:
+      latest_input_resolution = (
+        (
+          await db.execute(
+            select(InputEventResolution)
+            .where(InputEventResolution.input_event_id == int(latest_input_event.id))
+            .limit(1)
+          )
+        )
+        .scalars()
+        .first()
+      )
     latest_input_text = ""
     if latest_input_event:
         latest_input_text = _compact_sentence(
@@ -8441,6 +14789,12 @@ async def mim_ui_state(db: AsyncSession = Depends(get_db)) -> dict:
         environment_now=environment_now,
         memory_summary=memory_summary,
     )
+    latest_conversation_reply = _conversation_reply_text_from_resolution(
+        latest_input_resolution
+    )
+    if latest_conversation_reply:
+        inquiry_prompt = latest_conversation_reply
+        latest_output_text = latest_conversation_reply
     gateway_governance_snapshot = await _latest_gateway_governance_snapshot(
       db=db,
       managed_scope=operator_reasoning_scope,
@@ -8452,6 +14806,14 @@ async def mim_ui_state(db: AsyncSession = Depends(get_db)) -> dict:
         mic_row=mic_row,
         db_ok=True,
     )
+    frontend_media = _frontend_media_snapshot(now=now)
+    frontend_media_issue_summary = _frontend_media_issue_summary(frontend_media)
+    if frontend_media_issue_summary:
+      runtime_health = dict(runtime_health)
+      runtime_health["status"] = "degraded"
+      summary_prefix = str(runtime_health.get("summary") or "Runtime health requires attention.").strip()
+      runtime_health["summary"] = f"{summary_prefix} Frontend media: {frontend_media_issue_summary}."
+    runtime_health["frontend_media"] = frontend_media
     collaboration_progress = _operator_collaboration_progress_snapshot()
     dispatch_telemetry = _operator_dispatch_telemetry_snapshot()
     tod_decision_process = _operator_tod_decision_process_snapshot()
@@ -8471,6 +14833,8 @@ async def mim_ui_state(db: AsyncSession = Depends(get_db)) -> dict:
       else {}
     )
     runtime_recovery = runtime_recovery_service.get_summary()
+    initiative_driver = await build_initiative_status(db=db)
+    chat_thread = await _load_mim_ui_chat_thread(db=db)
 
     operator_reasoning = _build_operator_reasoning_payload(
         goal_row=latest_goal,
@@ -8507,6 +14871,38 @@ async def mim_ui_state(db: AsyncSession = Depends(get_db)) -> dict:
         latest_execution_row=latest_recovery_execution,
         strategy_plan_row=latest_strategy_plan,
     )
+    operator_reasoning["initiative_driver"] = initiative_driver
+    operator_reasoning["program_status"] = (
+      initiative_driver.get("program_status")
+      if isinstance(initiative_driver.get("program_status"), dict)
+      else {}
+    )
+    authoritative_request = load_authoritative_request_status(shared_root=SHARED_RUNTIME_ROOT)
+    tod_truth_reconciliation = _build_tod_truth_reconciliation_snapshot(
+      initiative_driver=initiative_driver,
+      authoritative_request=authoritative_request,
+      shared_root=SHARED_RUNTIME_ROOT,
+    )
+    operator_reasoning["tod_truth_reconciliation"] = tod_truth_reconciliation
+    system_activity = _build_system_activity_snapshot(
+      initiative_driver=initiative_driver,
+      operator_reasoning=operator_reasoning,
+      runtime_health=runtime_health,
+      runtime_recovery=runtime_recovery,
+      authoritative_request=authoritative_request,
+      collaboration_progress=collaboration_progress,
+      dispatch_telemetry=dispatch_telemetry,
+      tod_decision_process=tod_decision_process,
+    )
+    operator_reasoning["system_activity"] = system_activity
+    chat_thread = _append_mim_live_worklog(
+      chat_thread,
+      system_activity=system_activity,
+      initiative_driver=initiative_driver,
+      operator_reasoning=operator_reasoning,
+      generated_at=now.isoformat(),
+    )
+    routine_training = build_training_routine_snapshot()
 
     return {
         "speaking": speaking,
@@ -8516,7 +14912,7 @@ async def mim_ui_state(db: AsyncSession = Depends(get_db)) -> dict:
         "camera_source_count": camera_source_count,
         "voice_listen_hint": voice_listen_hint,
         "conversation_policy_profile": "tightened_v1",
-        "runtime_build": "mim-ui-tightened-v1",
+        "runtime_build": UI_BUILD_ID,
         "runtime_features": [
             "voice_listen_hint",
             "camera_scene_context",
@@ -8537,18 +14933,73 @@ async def mim_ui_state(db: AsyncSession = Depends(get_db)) -> dict:
             "tod_collaboration_progress",
             "mim_arm_dispatch_telemetry",
             "tod_decision_process_visibility",
+            "tod_truth_reconciliation_visibility",
             "self_evolution_operator_visibility",
             "self_evolution_operator_actionability",
             "self_evolution_operator_commands",
             "self_evolution_operator_command_context",
+            "self_evolution_natural_language_development",
             "runtime_health_visibility",
+            "initiative_driver_visibility",
+            "activity_truth_visibility",
+            "routine_training_status",
+            "routine_training_controls",
         ],
         "inquiry_prompt": inquiry_prompt,
         "operator_reasoning": operator_reasoning,
-          "mim_arm_dispatch_telemetry": dispatch_telemetry,
+        "system_activity": system_activity,
+        "tod_truth_reconciliation": system_activity.get("tod_truth_reconciliation") if isinstance(system_activity.get("tod_truth_reconciliation"), dict) else tod_truth_reconciliation,
+          "initiative_driver": initiative_driver,
+        "collaboration_progress": collaboration_progress,
+        "dispatch_telemetry": dispatch_telemetry,
+        "mim_arm_dispatch_telemetry": dispatch_telemetry,
+        "primitive_request": authoritative_request,
+        "chat_thread": chat_thread,
+        "routine_training": routine_training,
+        "frontend_media": frontend_media,
         "conversation_context": {
             "environment_now": environment_now,
+          "program_status_summary": str(
+            (
+              initiative_driver.get("program_status")
+              if isinstance(initiative_driver.get("program_status"), dict)
+              else {}
+            ).get("summary")
+            or ""
+          ).strip(),
+          "program_status": (
+            initiative_driver.get("program_status")
+            if isinstance(initiative_driver.get("program_status"), dict)
+            else {}
+          ),
             "active_goal": goal_summary,
+            "initiative_active_objective": str(
+              initiative_driver.get("active_objective", {}).get("display_title")
+              or initiative_driver.get("active_objective", {}).get("title")
+              or ""
+            ).strip(),
+            "initiative_active_task": str(
+              initiative_driver.get("active_task", {}).get("display_title")
+              or initiative_driver.get("active_task", {}).get("title")
+              or ""
+            ).strip(),
+            "initiative_next_task": str(
+              initiative_driver.get("next_task", {}).get("display_title")
+              or initiative_driver.get("next_task", {}).get("title")
+              or ""
+            ).strip(),
+            "initiative_activity_state": str(
+              initiative_driver.get("activity", {}).get("state") or ""
+            ).strip(),
+            "initiative_activity_label": str(
+              initiative_driver.get("activity", {}).get("label") or ""
+            ).strip(),
+            "initiative_activity_summary": str(
+              initiative_driver.get("activity", {}).get("summary") or ""
+            ).strip(),
+            "initiative_progress_summary": str(
+              initiative_driver.get("progress", {}).get("summary") or ""
+            ).strip(),
             "open_question": open_question_summary,
             "memory_hint": memory_summary,
             "recent_user_input": latest_user_input,
@@ -8618,6 +15069,51 @@ async def mim_ui_state(db: AsyncSession = Depends(get_db)) -> dict:
             ).strip()
             if isinstance(operator_reasoning.get("self_evolution", {}).get("primary_operator_command", {}), dict)
             else "",
+            "self_evolution_natural_language_development_summary": str(
+              operator_reasoning.get("self_evolution", {}).get("natural_language_development_summary") or ""
+            ).strip()
+            if isinstance(operator_reasoning.get("self_evolution", {}), dict)
+            else "",
+            "self_evolution_natural_language_development_active_slice": str(
+              operator_reasoning.get("self_evolution", {}).get("natural_language_development_active_slice") or ""
+            ).strip()
+            if isinstance(operator_reasoning.get("self_evolution", {}), dict)
+            else "",
+            "self_evolution_natural_language_development_progress": str(
+              operator_reasoning.get("self_evolution", {}).get("natural_language_development_progress") or ""
+            ).strip()
+            if isinstance(operator_reasoning.get("self_evolution", {}), dict)
+            else "",
+            "self_evolution_natural_language_development_next_step": str(
+              operator_reasoning.get("self_evolution", {}).get("natural_language_development_next_step") or ""
+            ).strip()
+            if isinstance(operator_reasoning.get("self_evolution", {}), dict)
+            else "",
+            "self_evolution_natural_language_development_pass_bar": str(
+              operator_reasoning.get("self_evolution", {}).get("natural_language_development_pass_bar") or ""
+            ).strip()
+            if isinstance(operator_reasoning.get("self_evolution", {}), dict)
+            else "",
+            "self_evolution_natural_language_development_continuation": str(
+              operator_reasoning.get("self_evolution", {}).get("natural_language_development_continuation") or ""
+            ).strip()
+            if isinstance(operator_reasoning.get("self_evolution", {}), dict)
+            else "",
+            "self_evolution_natural_language_development_whats_next": str(
+              operator_reasoning.get("self_evolution", {}).get("natural_language_development_whats_next") or ""
+            ).strip()
+            if isinstance(operator_reasoning.get("self_evolution", {}), dict)
+            else "",
+            "self_evolution_natural_language_development_skill_id": str(
+              operator_reasoning.get("self_evolution", {}).get("natural_language_development_skill_id") or ""
+            ).strip()
+            if isinstance(operator_reasoning.get("self_evolution", {}), dict)
+            else "",
+            "self_evolution_natural_language_development_skill_title": str(
+              operator_reasoning.get("self_evolution", {}).get("natural_language_development_skill_title") or ""
+            ).strip()
+            if isinstance(operator_reasoning.get("self_evolution", {}), dict)
+            else "",
             "trust_signal_summary": str(operator_reasoning.get("trust_signal_summary") or "").strip(),
             "lightweight_autonomy_summary": str(operator_reasoning.get("lightweight_autonomy", {}).get("summary") or "").strip()
             if isinstance(operator_reasoning.get("lightweight_autonomy", {}), dict)
@@ -8631,6 +15127,8 @@ async def mim_ui_state(db: AsyncSession = Depends(get_db)) -> dict:
             "runtime_health_summary": str(operator_reasoning.get("runtime_health", {}).get("summary") or "").strip()
             if isinstance(operator_reasoning.get("runtime_health", {}), dict)
             else "",
+            "routine_training_summary": str(routine_training.get("summary") or "").strip(),
+            "frontend_media_summary": frontend_media_issue_summary,
             "runtime_recovery_summary": str(operator_reasoning.get("runtime_recovery", {}).get("summary") or "").strip()
             if isinstance(operator_reasoning.get("runtime_recovery", {}), dict)
             else "",
@@ -8689,13 +15187,43 @@ async def mim_ui_state(db: AsyncSession = Depends(get_db)) -> dict:
     }
 
 
+@router.get("/mim/ui/state")
+async def mim_ui_state(request: Request, db: AsyncSession = Depends(get_db)) -> dict:
+  try:
+    return await _build_live_mim_ui_state(request, db)
+  except Exception as exc:  # noqa: BLE001
+    if not _is_mim_ui_db_unavailable(exc):
+      raise
+    logger.warning("MIM UI state degraded because database connectivity is unavailable: %s", exc)
+    ensure_authenticated_mimtod_api_request(request)
+    return _build_mim_ui_degraded_state(db_error_text=str(exc))
+
+
 @router.get("/mim/ui/runtime-recovery")
-async def get_runtime_recovery_summary() -> dict:
+async def get_runtime_recovery_summary(request: Request) -> dict:
+  ensure_authenticated_mimtod_api_request(request)
   return runtime_recovery_service.get_summary()
 
 
+@router.get("/mim/ui/training")
+async def get_mim_ui_training_status(request: Request) -> dict:
+  ensure_authenticated_mimtod_api_request(request)
+  return {"training": build_training_routine_snapshot()}
+
+
+@router.post("/mim/ui/training/action")
+async def post_mim_ui_training_action(request: Request, payload: MimUiTrainingActionRequest) -> dict:
+  ensure_authenticated_mimtod_api_request(request)
+  try:
+    result = control_training_routine(payload.action)
+  except ValueError as exc:
+    raise HTTPException(status_code=400, detail=str(exc)) from exc
+  return result
+
+
 @router.post("/mim/ui/runtime-recovery-events")
-async def record_runtime_recovery_event(request: RuntimeRecoveryEventRequest) -> dict:
+async def record_runtime_recovery_event(http_request: Request, request: RuntimeRecoveryEventRequest) -> dict:
+  ensure_authenticated_mimtod_api_request(http_request)
   event = runtime_recovery_service.record_event(
     lane=request.lane,
     event_type=request.event_type,
@@ -8710,6 +15238,35 @@ async def record_runtime_recovery_event(request: RuntimeRecoveryEventRequest) ->
   }
 
 
+@router.post("/mim/ui/frontend-media-status")
+async def record_frontend_media_status(http_request: Request, request: FrontendMediaStatusRequest) -> dict:
+  ensure_authenticated_mimtod_api_request(http_request)
+  lane = str(request.lane or "").strip().lower()
+  if lane not in {"camera", "microphone"}:
+    raise HTTPException(status_code=400, detail="lane must be camera or microphone")
+  event = _record_frontend_media_status(request)
+  return {
+    "status": "recorded",
+    "event": event,
+    "frontend_media": _frontend_media_snapshot(),
+  }
+
+
 @router.get("/mim/ui/health")
-async def mim_ui_health(db: AsyncSession = Depends(get_db)) -> dict:
-  return await build_mim_ui_health_snapshot(db=db)
+async def mim_ui_health(request: Request, db: AsyncSession = Depends(get_db)) -> dict:
+  ensure_authenticated_mimtod_api_request(request)
+  snapshot = await build_mim_ui_health_snapshot(db=db)
+  frontend_media = _frontend_media_snapshot()
+  issue_summary = _frontend_media_issue_summary(frontend_media)
+  snapshot["frontend_media"] = frontend_media
+  if issue_summary:
+    snapshot["status"] = "degraded" if str(snapshot.get("status") or "").strip().lower() == "healthy" else snapshot.get("status")
+    summary_prefix = str(snapshot.get("summary") or "Runtime health requires attention.").strip()
+    snapshot["summary"] = f"{summary_prefix} Frontend media: {issue_summary}."
+  latest = snapshot.get("latest") if isinstance(snapshot.get("latest"), dict) else {}
+  if frontend_media.get("camera") and isinstance(latest.get("camera"), dict):
+    latest["camera"]["frontend_status"] = frontend_media.get("camera")
+  if frontend_media.get("microphone") and isinstance(latest.get("microphone"), dict):
+    latest["microphone"]["frontend_status"] = frontend_media.get("microphone")
+  snapshot["latest"] = latest
+  return snapshot

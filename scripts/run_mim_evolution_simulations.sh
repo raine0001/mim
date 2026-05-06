@@ -7,6 +7,7 @@ BASE_URL="${MIM_TEST_BASE_URL:-http://127.0.0.1:18001}"
 REPORT_DIR="${REPORT_DIR:-$ROOT_DIR/runtime/reports}"
 SEED="${SEED:-20260317}"
 TARGET_CONVERSATIONS="${TARGET_CONVERSATIONS:-320}"
+REQUEST_TIMEOUT_SECONDS="${REQUEST_TIMEOUT_SECONDS:-90}"
 
 SCENARIOS="${SCENARIOS:-$ROOT_DIR/conversation_scenarios/mim_evolution_training_set.json}"
 PROFILES="${PROFILES:-$ROOT_DIR/conversation_profiles_evolution.json}"
@@ -24,6 +25,7 @@ echo "[mim-evolution] running conversation training simulations"
   --seed "$SEED" \
   --randomize \
   --turn-delay-ms 0 \
+  --request-timeout-seconds "$REQUEST_TIMEOUT_SECONDS" \
   --target-conversations "$TARGET_CONVERSATIONS" \
   --output "$CONVERSATION_REPORT"
 

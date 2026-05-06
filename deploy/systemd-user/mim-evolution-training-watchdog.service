@@ -1,0 +1,20 @@
+[Unit]
+Description=MIM Continuous Evolution Training Watchdog
+After=default.target mim-evolution-training.service
+Wants=mim-evolution-training.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/testpilot/mim
+Environment=MIM_TRAINING_SERVICE_SCOPE=user
+Environment=MIM_TRAINING_SERVICE_NAME=mim-evolution-training.service
+Environment=MIM_TRAINING_WATCHDOG_POLL_SECONDS=30
+Environment=MIM_TRAINING_STALE_AFTER_SECONDS=180
+Environment=MIM_TRAINING_RECOVERY_COOLDOWN_SECONDS=180
+Environment=MIM_TRAINING_STARTUP_GRACE_SECONDS=30
+ExecStart=/home/testpilot/mim/.venv/bin/python /home/testpilot/mim/scripts/watch_mim_evolution_training_supervisor.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
