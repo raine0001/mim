@@ -4145,6 +4145,50 @@ def _ensure_request_id(metadata_json: object) -> tuple[dict[str, object], str]:
     return metadata, request_id
 
 
+def _runtime_git_sha() -> str:
+    configured = str(getattr(settings, "build_git_sha", "") or "").strip()
+    if configured and configured.lower() != "unknown":
+        return configured
+    git_dir = Path(__file__).resolve().parents[2] / ".git"
+    head_path = git_dir / "HEAD"
+    try:
+        head = head_path.read_text(encoding="utf-8").strip()
+        if head.startswith("ref:"):
+            ref_path = git_dir / head.split(":", 1)[1].strip()
+            return ref_path.read_text(encoding="utf-8").strip()[:12]
+        return head[:12]
+    except OSError:
+        return configured or "unknown"
+
+
+def _runtime_build_id() -> str:
+    release = str(getattr(settings, "release_tag", "") or "").strip() or "dev"
+    git_sha = _runtime_git_sha()
+    return f"{release}:{git_sha}"
+
+
+def _console_route_diagnostics(
+    *,
+    route_name: str,
+    local_route: object,
+    web_fallback_blocked: bool,
+    web_search_attempted: bool = False,
+) -> dict[str, object]:
+    return {
+        "route_name": route_name,
+        "classifier_outcome": str(
+            getattr(local_route, "classifier_outcome", "") or ""
+        ).strip(),
+        "capability_name": str(
+            getattr(local_route, "capability_name", "") or ""
+        ).strip(),
+        "web_fallback_blocked": bool(web_fallback_blocked),
+        "web_search_attempted": bool(web_search_attempted),
+        "git_sha": _runtime_git_sha(),
+        "runtime_build_id": _runtime_build_id(),
+    }
+
+
 GATEWAY_INTAKE_DIAGNOSTIC_PATH = (
     Path(__file__).resolve().parents[2]
     / "runtime"
@@ -15149,6 +15193,12 @@ async def intake_text(
         else payload.parsed_intent
     )
     metadata_json = payload.metadata_json if isinstance(payload.metadata_json, dict) else {}
+    web_fallback_blocked = bool(robotics_web_guard_blocks_search(payload.text))
+    route_diagnostics = _console_route_diagnostics(
+        route_name="gateway.intake_text",
+        local_route=local_route,
+        web_fallback_blocked=web_fallback_blocked,
+    )
     capability_metadata = (
         {"capability": local_route.capability_name}
         if local_route.capability_name
@@ -15167,12 +15217,30 @@ async def intake_text(
             **capability_metadata,
             "adapter": "text",
             "classifier_outcome": classifier_outcome,
-            "web_search_guarded": bool(robotics_web_guard_blocks_search(payload.text)),
+            "web_search_guarded": web_fallback_blocked,
             "routing_path": list(local_route.routing_path),
             "route_preference": route_preference,
+            "route_diagnostics": route_diagnostics,
         },
     )
-    return await _store_normalized(normalized, db)
+    response = await _store_normalized(normalized, db)
+    if isinstance(response, dict):
+        resolution = response.get("resolution") if isinstance(response.get("resolution"), dict) else {}
+        resolution_meta = (
+            resolution.get("metadata_json")
+            if isinstance(resolution.get("metadata_json"), dict)
+            else {}
+        )
+        web_search_attempted = bool(
+            resolution_meta.get("web_research")
+            if isinstance(resolution_meta, dict)
+            else False
+        )
+        response["route_diagnostics"] = {
+            **route_diagnostics,
+            "web_search_attempted": web_search_attempted,
+        }
+    return response
 
 
 @router.post("/intake/ui")

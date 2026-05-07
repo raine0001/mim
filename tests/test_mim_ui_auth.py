@@ -116,7 +116,72 @@ class MimUiPublicAuthTest(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json(), {"status": "accepted"})
+        self.assertEqual(response.json().get("status"), "accepted")
+        self.assertEqual(
+            response.json().get("route_diagnostics", {}).get("route_name"),
+            "gateway.intake_text",
+        )
+
+    def test_mim_console_text_route_keeps_servo_probe_on_local_execution_path(self) -> None:
+        captured_payloads = []
+
+        async def fake_store(payload, db):
+            captured_payloads.append(payload)
+            return {
+                "status": "accepted",
+                "resolution": {
+                    "internal_intent": "execute_capability",
+                    "capability_name": "mim_arm.supervised_probe",
+                    "metadata_json": {},
+                },
+            }
+
+        with self._auth_settings(), patch(
+            "core.routers.gateway._store_normalized",
+            new=AsyncMock(side_effect=fake_store),
+        ), patch(
+            "core.routers.mim_ui._load_mim_ui_chat_thread",
+            new=AsyncMock(return_value={"session": {}, "messages": []}),
+        ), self._build_client(base_url="https://mim.mimtod.com") as client:
+            page_response = client.get("/mim", headers=self._basic_auth_header())
+            response = client.post(
+                "/gateway/intake/text",
+                headers=self._basic_auth_header(),
+                json={
+                    "text": "MIM-ARM-MULTI-SERVO-ENVELOPE-PROBE-PREP",
+                    "parsed_intent": "discussion",
+                    "confidence": 0.95,
+                    "target_system": "mim",
+                    "requested_goal": "",
+                    "safety_flags": [],
+                    "metadata_json": {
+                        "source": "mim_ui_text_chat",
+                        "interaction_mode": "text",
+                        "message_type": "user",
+                        "conversation_session_id": "test-console-route",
+                        "route_preference": "conversation_layer",
+                    },
+                },
+            )
+
+        self.assertEqual(page_response.status_code, 200)
+        self.assertIn("fetch('/gateway/intake/text'", page_response.text)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(captured_payloads[0].parsed_intent, "robotics_supervised_probe")
+        self.assertEqual(
+            captured_payloads[0].metadata_json.get("capability"),
+            "mim_arm.supervised_probe",
+        )
+        self.assertEqual(
+            captured_payloads[0].metadata_json.get("route_preference"),
+            "goal_system",
+        )
+        diagnostics = response.json().get("route_diagnostics", {})
+        self.assertEqual(diagnostics.get("route_name"), "gateway.intake_text")
+        self.assertEqual(diagnostics.get("classifier_outcome"), "robotics_supervised_probe")
+        self.assertEqual(diagnostics.get("capability_name"), "mim_arm.supervised_probe")
+        self.assertTrue(diagnostics.get("web_fallback_blocked"))
+        self.assertFalse(diagnostics.get("web_search_attempted"))
 
     def test_training_action_requires_auth(self) -> None:
         with self._auth_settings(), self._build_client(base_url="https://mim.mimtod.com") as client:
