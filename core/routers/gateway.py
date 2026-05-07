@@ -4248,8 +4248,13 @@ def _write_gateway_intake_diagnostic(
 def _should_force_deterministic_conversation_reply(event: InputEvent) -> bool:
     metadata = event.metadata_json if isinstance(event.metadata_json, dict) else {}
     adapter = str(metadata.get("adapter") or "").strip().lower()
+    source = str(metadata.get("source") or "").strip().lower()
     requested_goal = str(event.requested_goal or "").strip().lower()
-    return adapter == "conversation_eval_runner" or requested_goal == "conversation_eval"
+    return (
+        adapter == "conversation_eval_runner"
+        or requested_goal == "conversation_eval"
+        or source in {"mim_ui_text_chat", "mim_ui_voice_chat", "mim_ui_quick_action"}
+    )
 
 
 def _compact_interface_text(value: object, limit: int = 160) -> str:
@@ -10411,13 +10416,11 @@ async def _build_live_operational_context(
     runtime_health = await _await_gateway_context_snapshot(
         build_mim_ui_health_snapshot(db=db),
         label="runtime_health_snapshot",
-        db=db,
     )
     runtime_recovery = runtime_recovery_service.get_summary()
     initiative_status = await _await_gateway_context_snapshot(
         build_initiative_status(db=db),
         label="initiative_status",
-        db=db,
     )
     program_status = (
         initiative_status.get("program_status")
@@ -12584,6 +12587,7 @@ async def _resolve_event(event: InputEvent, db: AsyncSession) -> InputEventResol
     initiative_auto_execute = False
     initiative_boundary_mode = ""
     initiative_boundary_reason = ""
+    resolution_meta: dict[str, object] = {}
 
     if conversation_override:
         force_deterministic_conversation = _should_force_deterministic_conversation_reply(
@@ -13710,6 +13714,8 @@ async def _store_normalized(payload: NormalizedInputCreate, db: AsyncSession) ->
             "safety_flags": event.safety_flags,
         },
     )
+    await db.commit()
+    await db.refresh(event)
 
     try:
         _append_gateway_trace_event(trace, "resolve_start")
