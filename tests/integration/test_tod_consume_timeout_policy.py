@@ -1,6 +1,7 @@
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -19,6 +20,66 @@ def iso_now(offset_seconds: int = 0) -> str:
 
 
 class TodConsumeTimeoutPolicyTest(unittest.TestCase):
+    def test_reissue_active_task_skips_completed_promotion_ready_request(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            shared = root / "shared"
+            shared.mkdir(parents=True, exist_ok=True)
+
+            request_path = shared / "MIM_TOD_TASK_REQUEST.latest.json"
+            request_path.write_text(
+                json.dumps(
+                    {
+                        "generated_at": iso_now(-300),
+                        "emitted_at": iso_now(-300),
+                        "sequence": 1,
+                        "request_id": "objective-152-task-smoke-20260418214904",
+                        "task_id": "objective-152-task-smoke-20260418214904",
+                        "objective_id": "152",
+                        "correlation_id": "obj152-smoke",
+                        "title": "Completed request",
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            original_request = request_path.read_text(encoding="utf-8")
+            (shared / "MIM_TASK_STATUS_REVIEW.latest.json").write_text(
+                json.dumps(
+                    {
+                        "state": "completed",
+                        "task": {
+                            "active_task_id": "objective-152-task-smoke-20260418214904",
+                            "authoritative_task_id": "objective-152-task-smoke-20260418214904",
+                            "objective_id": "152",
+                        },
+                        "gate": {"pass": True, "promotion_ready": True},
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            completed = subprocess.run(
+                ["bash", str(REISSUE_SCRIPT)],
+                cwd=ROOT,
+                env={
+                    **os.environ,
+                    "SHARED_DIR": str(shared),
+                    "REMOTE_PUBLISH": "0",
+                },
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+            self.assertIn("objective-152-task-smoke-20260418214904", completed.stdout)
+            self.assertIn("already completed and gate-passing", completed.stderr)
+            self.assertEqual(request_path.read_text(encoding="utf-8"), original_request)
+            self.assertFalse((shared / "MIM_TO_TOD_TRIGGER.latest.json").exists())
+
     def test_reissue_active_task_refreshes_request_and_trigger(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
@@ -211,6 +272,100 @@ class TodConsumeTimeoutPolicyTest(unittest.TestCase):
             self.assertEqual(trigger["task_id"], task_id)
             self.assertEqual(state["handled_task_id"], task_id)
             self.assertEqual(state["last_action"], "auto_reissue_and_republish_task")
+
+    def test_timeout_policy_submits_direct_execution_handoff_after_sustained_silence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            shared = root / "shared"
+            logs = root / "logs"
+            handoff_root = root / "handoff"
+            shared.mkdir(parents=True, exist_ok=True)
+            logs.mkdir(parents=True, exist_ok=True)
+
+            task_id = "objective-97-task-policy-timeout"
+            (shared / "MIM_TASK_STATUS_REVIEW.latest.json").write_text(
+                json.dumps(
+                    {
+                        "generated_at": iso_now(),
+                        "task": {"active_task_id": task_id, "objective_id": "97"},
+                        "blocking_reason_codes": ["consume_watch_timeout"],
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (shared / "MIM_TOD_CONSUME_EVIDENCE.latest.json").write_text(
+                json.dumps(
+                    {
+                        "generated_at": iso_now(),
+                        "task_id": task_id,
+                        "watch": {
+                            "started_at": iso_now(-180),
+                            "window_seconds": 180,
+                            "elapsed_seconds": 180,
+                            "phase": "timeout",
+                            "timed_out": True,
+                        },
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (logs / "mim_tod_consume_timeout_policy.state.json").write_text(
+                json.dumps(
+                    {
+                        "handled_task_id": task_id,
+                        "handled_watch_started_at": iso_now(-180),
+                        "last_action": "auto_reissue_and_republish_task",
+                        "last_result": "success",
+                        "last_updated_at": iso_now(-120),
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            completed = subprocess.run(
+                ["bash", str(POLICY_SCRIPT)],
+                cwd=ROOT,
+                env={
+                    **os.environ,
+                    "SHARED_DIR": str(shared),
+                    "LOG_DIR": str(logs),
+                    "MIM_HANDOFF_ROOT": str(handoff_root),
+                    "MIM_SHARED_ROOT": str(shared),
+                    "PYTHON_BIN": sys.executable,
+                    "RUN_ONCE": "1",
+                    "REMOTE_PUBLISH": "0",
+                    "DIRECT_EXECUTION_TIMEOUT_SECONDS": "120",
+                },
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+
+            escalation = json.loads(
+                (shared / "MIM_TOD_AUTO_ESCALATION.latest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            state = json.loads(
+                (logs / "mim_tod_consume_timeout_policy.state.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+            self.assertEqual(
+                escalation["action"]["code"],
+                "submit_codex_direct_execution_handoff",
+            )
+            self.assertEqual(state["direct_execution_task_id"], task_id)
+            self.assertEqual(state["last_action"], "submit_codex_direct_execution_handoff")
+            self.assertTrue(str(escalation["action"]["handoff_id"]).startswith("tod-silence-"))
 
 
 if __name__ == "__main__":

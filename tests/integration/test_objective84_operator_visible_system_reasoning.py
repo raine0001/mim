@@ -59,6 +59,40 @@ def get_text(path: str) -> tuple[int, str]:
         return resp.status, resp.read().decode("utf-8")
 
 
+def post_multipart(path: str, *, fields: dict[str, str], files: list[dict]) -> tuple[int, dict]:
+    boundary = f"----mim-boundary-{uuid4().hex}"
+    body = bytearray()
+    for key, value in fields.items():
+        body.extend(f"--{boundary}\r\n".encode("utf-8"))
+        body.extend(f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode("utf-8"))
+        body.extend(str(value).encode("utf-8"))
+        body.extend(b"\r\n")
+    for item in files:
+        body.extend(f"--{boundary}\r\n".encode("utf-8"))
+        body.extend(
+            (
+                f'Content-Disposition: form-data; name="{item["field"]}"; '
+                f'filename="{item["filename"]}"\r\n'
+            ).encode("utf-8")
+        )
+        body.extend(f'Content-Type: {item["content_type"]}\r\n\r\n'.encode("utf-8"))
+        body.extend(item["content"])
+        body.extend(b"\r\n")
+    body.extend(f"--{boundary}--\r\n".encode("utf-8"))
+    req = urllib.request.Request(
+        f"{BASE_URL}{path}",
+        data=bytes(body),
+        method="POST",
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return resp.status, json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body_text = exc.read().decode("utf-8")
+        return exc.code, json.loads(body_text) if body_text else {}
+
+
 def _probe_current_source_runtime() -> None:
     issues: list[str] = []
 
@@ -398,6 +432,71 @@ class Objective84OperatorVisibleSystemReasoningTest(unittest.TestCase):
         self.assertIn("Lightweight autonomy", html)
         self.assertIn("Human feedback loop", html)
         self.assertIn("Stability guard", html)
+
+    def test_mim_page_contains_chat_first_operator_surface_hooks(self) -> None:
+        status, html = get_text("/mim")
+        self.assertEqual(status, 200)
+        self.assertIn('id="chatLog"', html)
+        self.assertIn('id="chatDropzone"', html)
+        self.assertIn('id="imageUploadBtn"', html)
+        self.assertIn('id="chatMicBtn"', html)
+        self.assertIn('id="secondaryTabDiagnostics"', html)
+        self.assertIn('id="secondaryTabMedia"', html)
+        self.assertIn('id="activeObjectiveText"', html)
+        self.assertIn('One persistent primary thread', html)
+
+    def test_state_exposes_primary_chat_thread_payload(self) -> None:
+        status, payload = get_json("/mim/ui/state")
+        self.assertEqual(status, 200, payload)
+        self.assertIsInstance(payload, dict)
+        chat_thread = payload.get("chat_thread", {})
+        self.assertIsInstance(chat_thread, dict)
+        self.assertEqual(str(chat_thread.get("primary_thread", "")).strip(), "primary_operator")
+        self.assertIn("messages", chat_thread)
+        self.assertIsInstance(chat_thread.get("messages"), list)
+
+    def test_image_upload_appends_into_primary_chat_thread(self) -> None:
+        png_bytes = (
+            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+            b"\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDAT\x08\x99c``\x00\x00\x00\x04"
+            b"\x00\x01\x0b\xe7\x02\x9d\x00\x00\x00\x00IEND\xaeB`\x82"
+        )
+        prompt = f"what is wrong here? {uuid4().hex[:8]}"
+        status, payload = post_multipart(
+            "/mim/ui/chat/upload-image",
+            fields={"prompt": prompt, "session_key": "primary_operator"},
+            files=[
+                {
+                    "field": "file",
+                    "filename": "objective84-upload.png",
+                    "content_type": "image/png",
+                    "content": png_bytes,
+                }
+            ],
+        )
+        self.assertEqual(status, 200, payload)
+        self.assertIsInstance(payload, dict)
+        attachment = payload.get("attachment", {})
+        self.assertIsInstance(attachment, dict)
+        self.assertIn("/mim/ui/media/", str(attachment.get("url", "")))
+
+        state_status, state_payload = get_json("/mim/ui/state")
+        self.assertEqual(state_status, 200, state_payload)
+        self.assertIsInstance(state_payload, dict)
+        chat_thread = state_payload.get("chat_thread", {})
+        self.assertIsInstance(chat_thread, dict)
+        messages = chat_thread.get("messages", [])
+        self.assertIsInstance(messages, list)
+        self.assertTrue(
+            any(
+                isinstance(message, dict)
+                and isinstance(message.get("attachment"), dict)
+                and str(message.get("attachment", {}).get("url", "")).strip()
+                == str(attachment.get("url", "")).strip()
+                for message in messages
+            ),
+            state_payload,
+        )
 
     def test_state_exposes_operator_visible_reasoning_bundle(self) -> None:
         run_id = uuid4().hex[:8]

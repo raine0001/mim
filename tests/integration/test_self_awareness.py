@@ -4,9 +4,10 @@ Demonstrates how to test and validate the self-awareness system.
 """
 
 import json
+import signal
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from pathlib import Path
 
@@ -16,19 +17,24 @@ except ImportError:
     httpx = None
 
 
+def _utc_now_iso() -> str:
+    import datetime
+
+    return datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
 class TestSelfHealthMonitor(unittest.TestCase):
     """Test MIM's self-health monitoring capabilities."""
 
     def test_health_metric_recording(self):
         """Test recording health metrics."""
         from core.self_health_monitor import HealthMetric, SelfHealthMonitor
-        import datetime
 
         monitor = SelfHealthMonitor()
 
         # Record a metric
         metric = HealthMetric(
-            timestamp=datetime.datetime.utcnow().isoformat() + "Z",
+            timestamp=_utc_now_iso(),
             memory_percent=45.2,
             cpu_percent=28.5,
             api_latency_ms=125.3,
@@ -41,14 +47,13 @@ class TestSelfHealthMonitor(unittest.TestCase):
     def test_trend_analysis_stable(self):
         """Test trend analysis for stable metrics."""
         from core.self_health_monitor import HealthMetric, SelfHealthMonitor
-        import datetime
 
         monitor = SelfHealthMonitor()
 
         # Record stable metrics
         for i in range(5):
             metric = HealthMetric(
-                timestamp=datetime.datetime.utcnow().isoformat() + "Z",
+                timestamp=_utc_now_iso(),
                 memory_percent=50.0,  # stable
             )
             monitor.record_metric(metric)
@@ -60,13 +65,12 @@ class TestSelfHealthMonitor(unittest.TestCase):
     def test_degradation_detection_memory(self):
         """Test detection of memory degradation."""
         from core.self_health_monitor import HealthMetric, SelfHealthMonitor
-        import datetime
 
         monitor = SelfHealthMonitor()
 
         # Record high memory usage
         metric = HealthMetric(
-            timestamp=datetime.datetime.utcnow().isoformat() + "Z",
+            timestamp=_utc_now_iso(),
             memory_percent=85.0,  # Above threshold
         )
         monitor.record_metric(metric)
@@ -77,14 +81,13 @@ class TestSelfHealthMonitor(unittest.TestCase):
     def test_recommendation_generation(self):
         """Test that recommendations are generated for degradation."""
         from core.self_health_monitor import HealthMetric, SelfHealthMonitor
-        import datetime
 
         monitor = SelfHealthMonitor()
 
         # Record degraded metrics
         for i in range(5):
             metric = HealthMetric(
-                timestamp=datetime.datetime.utcnow().isoformat() + "Z",
+                timestamp=_utc_now_iso(),
                 memory_percent=85.0 + i,  # Increasing and high
                 api_latency_ms=150.0 + (i * 25),  # Increasing
             )
@@ -96,7 +99,6 @@ class TestSelfHealthMonitor(unittest.TestCase):
     def test_health_summary_status_calculation(self):
         """Test overall health status is correctly calculated."""
         from core.self_health_monitor import HealthMetric, SelfHealthMonitor
-        import datetime
 
         with tempfile.TemporaryDirectory() as tmpdir:
             monitor = SelfHealthMonitor(state_dir=Path(tmpdir))
@@ -128,7 +130,7 @@ class TestSelfHealthMonitor(unittest.TestCase):
 
             # Record healthy metrics
             metric = HealthMetric(
-                timestamp=datetime.datetime.utcnow().isoformat() + "Z",
+                timestamp=_utc_now_iso(),
                 memory_percent=45.0,
                 api_latency_ms=100.0,
                 api_error_rate=0.005,
@@ -185,10 +187,111 @@ class TestSelfHealthMonitor(unittest.TestCase):
             summary = monitor.get_health_summary()
             runtime_codes = {item["code"] for item in summary["runtime_diagnostics"]}
             recommendation_actions = {item["proposed_action"] for item in summary["recommendations"]}
+            recovery_recommendation = next(
+                item for item in summary["recommendations"] if item["proposed_action"] == "recover_bridge_coordination"
+            )
 
             self.assertIn("shared_export_stale_or_misaligned", runtime_codes)
             self.assertIn(summary["status"], {"degraded", "critical"})
             self.assertIn("refresh_shared_export_artifacts", recommendation_actions)
+            self.assertIn("recover_bridge_coordination", recommendation_actions)
+            self.assertFalse(recovery_recommendation["requires_approval"])
+
+    def test_runtime_diagnostics_recommend_bridge_coordination_recovery_for_stale_ack(self):
+        """Test stale coordination ACKs trigger no-approval bridge recovery."""
+        from core.self_health_monitor import SelfHealthMonitor
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_dir = Path(tmpdir)
+            monitor = SelfHealthMonitor(state_dir=state_dir)
+            monitor.runtime_process_patterns = {}
+
+            (state_dir / "TOD_MIM_COORDINATION_REQUEST.latest.json").write_text(
+                json.dumps(
+                    {
+                        "generated_at": "2026-05-02T14:49:00Z",
+                        "request_id": "coordination-objective-2900-task-008-publication_surface_divergence",
+                        "task_id": "coordination-objective-2900-task-008-publication_surface_divergence",
+                        "status": "pending",
+                        "issue_code": "publication_surface_divergence",
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (state_dir / "MIM_TOD_COORDINATION_ACK.latest.json").write_text(
+                json.dumps(
+                    {
+                        "generated_at": "2026-05-02T14:48:00Z",
+                        "request_id": "coordination-objective-2899-task-008-publication_surface_divergence",
+                        "ack_status": "pending",
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            summary = monitor.get_health_summary()
+
+        runtime_codes = {item["code"] for item in summary["runtime_diagnostics"]}
+        recovery_recommendation = next(
+            item for item in summary["recommendations"] if item["proposed_action"] == "recover_bridge_coordination"
+        )
+
+        self.assertIn("coordination_ack_stale_or_misaligned", runtime_codes)
+        self.assertFalse(recovery_recommendation["requires_approval"])
+
+    def test_runtime_diagnostics_recommend_direct_execution_takeover_after_tod_silence(self):
+        """Test task-status direct execution readiness becomes a no-approval takeover recommendation."""
+        from core.self_health_monitor import SelfHealthMonitor
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_dir = Path(tmpdir)
+            monitor = SelfHealthMonitor(state_dir=state_dir)
+            monitor.runtime_process_patterns = {}
+
+            (state_dir / "MIM_TASK_STATUS_REVIEW.latest.json").write_text(
+                json.dumps(
+                    {
+                        "task": {
+                            "active_task_id": "objective-2900-task-7117",
+                            "objective_id": "objective-2900",
+                        },
+                        "idle": {
+                            "direct_execution_ready": True,
+                            "latest_progress_age_seconds": 181,
+                        },
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (state_dir / "MIM_TASK_STATUS_NEXT_ACTION.latest.json").write_text(
+                json.dumps(
+                    {
+                        "selected_action": {
+                            "code": "fallback_to_codex_direct_execution",
+                            "detail": "Stop waiting on TOD and continue locally.",
+                        }
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            summary = monitor.get_health_summary()
+
+        runtime_codes = {item["code"] for item in summary["runtime_diagnostics"]}
+        takeover_recommendation = next(
+            item for item in summary["recommendations"] if item["proposed_action"] == "fallback_to_codex_direct_execution"
+        )
+
+        self.assertIn("tod_direct_execution_takeover_ready", runtime_codes)
+        self.assertFalse(takeover_recommendation["requires_approval"])
 
     def test_runtime_diagnostics_detect_duplicate_watchers(self):
         """Test duplicate bridge watcher detection from process scan."""
@@ -588,6 +691,336 @@ class TestSelfOptimizerService(unittest.TestCase):
 
         self.assertEqual(result["action"], "monitor_runtime_recovery_evidence")
         self.assertEqual(result["status"], "observation_recommended")
+
+    def test_deduplicate_bridge_watchers_disables_overlapping_system_unit_when_enabled(self):
+        """Test duplicate TOD watcher cleanup can disable the overlapping system unit through the bounded bridge."""
+        from core.self_optimizer_service import SelfOptimizerService
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            service = SelfOptimizerService(Path(tmpdir))
+
+            def _pgrep_side_effect(args, **kwargs):
+                pattern = args[-1]
+
+                class Result:
+                    returncode = 0
+                    stderr = ""
+
+                result = Result()
+                if pattern == "watch_tod_liveness.sh":
+                    result.stdout = "101 bash /home/testpilot/mim/scripts/watch_tod_liveness.sh\n202 bash /home/testpilot/mim/scripts/watch_tod_liveness.sh\n"
+                else:
+                    result.stdout = ""
+                return result
+
+            with patch("core.self_optimizer_service.subprocess.run", side_effect=_pgrep_side_effect), patch(
+                "core.self_optimizer_service.os.kill"
+            ) as kill_mock, patch(
+                "core.self_optimizer_service.run_privileged_action",
+                return_value={"action": "disable-system-tod-liveness-watcher", "status": "completed"},
+            ) as privileged_mock:
+                result = service._execute_action("deduplicate_bridge_watchers")
+
+        privileged_mock.assert_called_once_with("disable-system-tod-liveness-watcher")
+        kill_mock.assert_called_once_with(202, signal.SIGTERM)
+        self.assertEqual(result["kept"]["watch_tod_liveness.sh"], 101)
+        self.assertEqual(result["privileged_coordination"]["status"], "completed")
+
+    def test_restart_bridge_watchers_prefers_user_managed_units(self):
+        """Test bridge watcher restart uses user systemd units instead of manual duplicate spawns when available."""
+        from core.self_optimizer_service import SelfOptimizerService
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            shared_dir = Path(tmpdir) / "runtime" / "shared"
+            scripts_dir = Path(tmpdir) / "scripts"
+            shared_dir.mkdir(parents=True, exist_ok=True)
+            scripts_dir.mkdir(parents=True, exist_ok=True)
+            for name in ("watch_shared_triggers.sh", "watch_mim_coordination_responder.sh"):
+                (scripts_dir / name).write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+
+            service = SelfOptimizerService(shared_dir)
+
+            def _run_side_effect(args, **kwargs):
+                class Result:
+                    returncode = 0
+                    stdout = ""
+                    stderr = ""
+
+                return Result()
+
+            with patch("core.self_optimizer_service.shutil.which", return_value="/bin/systemctl"), patch(
+                "core.self_optimizer_service.subprocess.run",
+                side_effect=_run_side_effect,
+            ) as run_mock, patch("core.self_optimizer_service.subprocess.Popen") as popen_mock:
+                result = service._restart_bridge_watchers()
+
+        self.assertIn("mim-watch-shared-triggers.service", result["restarted"])
+        self.assertIn("mim-watch-mim-coordination-responder.service", result["restarted"])
+        popen_mock.assert_not_called()
+        restart_calls = [call.args[0] for call in run_mock.call_args_list if call.args and call.args[0][:3] == ["/bin/systemctl", "--user", "restart"]]
+        self.assertIn(["/bin/systemctl", "--user", "restart", "mim-watch-shared-triggers.service"], restart_calls)
+        self.assertIn(["/bin/systemctl", "--user", "restart", "mim-watch-mim-coordination-responder.service"], restart_calls)
+
+
+class TestSelfAwarenessRouter(unittest.IsolatedAsyncioTestCase):
+    """Focused async router regressions for self-optimization execution."""
+
+    async def test_execute_optimization_awaits_async_service(self):
+        """Test execute endpoint uses the optimizer's async execution path."""
+        from core.routers import self_awareness_router
+        from core.self_optimizer_service import OptimizationProposal, OptimizationStatus
+
+        proposal = OptimizationProposal(
+            proposal_id="opt-1",
+            recommendation_id="rec-1",
+            title="Recover bridge",
+            description="Recover bridge coordination",
+            proposed_action="recover_bridge_coordination",
+            rollback_action=None,
+            requires_approval=False,
+            severity="high",
+            estimated_impact_percent=35,
+            status=OptimizationStatus.COMPLETED,
+        )
+
+        with patch.object(
+            self_awareness_router.optimizer_service,
+            "execute_proposal_async",
+            AsyncMock(return_value=proposal),
+        ) as execute_mock:
+            response = await self_awareness_router.execute_optimization("opt-1")
+
+        self.assertEqual(response.status, "completed")
+        execute_mock.assert_awaited_once_with("opt-1")
+
+
+class TestSelfOptimizerServiceContinuation(unittest.TestCase):
+    """Additional optimizer action regressions."""
+
+    def test_authoritative_stale_guard_request_is_never_promoted(self):
+        """Stale-guard metadata is diagnostic only and cannot become authoritative request lineage."""
+        from core.self_optimizer_service import SelfOptimizerService
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            shared_dir = Path(tmpdir) / "runtime" / "shared"
+            shared_dir.mkdir(parents=True, exist_ok=True)
+            service = SelfOptimizerService(shared_dir)
+
+            (shared_dir / "MIM_CONTEXT_EXPORT.latest.json").write_text(
+                json.dumps(
+                    {
+                        "source_of_truth": {
+                            "terminal_request_review": {
+                                "reason": "stale_guard_higher_authoritative_request"
+                            }
+                        }
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (shared_dir / "TOD_MIM_COMMAND_STATUS.latest.json").write_text(
+                json.dumps(
+                    {
+                        "stale_guard": {
+                            "detected": True,
+                            "reason": "higher_authoritative_task_ordinal_active",
+                            "high_watermark": {
+                                "request_id": "objective-2912-task-7141-implement-bounded-work"
+                            },
+                        }
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            result = service._authoritative_stale_guard_request()
+
+        self.assertIsNone(result)
+
+    def test_authoritative_stale_guard_request_is_none_without_terminal_review(self):
+        """Stale-guard remains non-authoritative even when export review metadata is absent."""
+        from core.self_optimizer_service import SelfOptimizerService
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            shared_dir = Path(tmpdir) / "runtime" / "shared"
+            shared_dir.mkdir(parents=True, exist_ok=True)
+            service = SelfOptimizerService(shared_dir)
+
+            (shared_dir / "TOD_MIM_COMMAND_STATUS.latest.json").write_text(
+                json.dumps(
+                    {
+                        "stale_guard": {
+                            "detected": True,
+                            "reason": "higher_authoritative_task_ordinal_active",
+                            "current_request": {
+                                "request_id": "objective-2912-task-008",
+                            },
+                            "high_watermark": {
+                                "request_id": "objective-2912-task-7141-implement-bounded-work"
+                            },
+                        }
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            result = service._authoritative_stale_guard_request()
+
+        self.assertIsNone(result)
+
+    def test_recover_bridge_coordination_action_repairs_and_verifies(self):
+        """Test bridge coordination recovery composes republish, refresh, verification, and watcher restart."""
+        from core.self_optimizer_service import SelfOptimizerService
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            service = SelfOptimizerService(Path(tmpdir) / "runtime" / "shared")
+
+            with patch.object(
+                service,
+                "_republish_active_task_request_surface_async",
+                AsyncMock(return_value={"objective_id": 2900, "task_id": 7117, "request_id": "objective-2900-task-7117"}),
+            ), patch.object(
+                service,
+                "_refresh_publication_boundary",
+                return_value={"action": "refresh_publication_boundary", "status": "completed", "request_request_id": "objective-2900-task-7117"},
+            ), patch.object(
+                service,
+                "_action_refresh_shared_export_artifacts",
+                return_value={"action": "refresh_shared_export_artifacts", "status": "completed", "objective_active": "2900"},
+            ), patch.object(
+                service,
+                "_run_coordination_responder_once",
+                return_value={"action": "run_coordination_responder_once", "status": "completed"},
+            ), patch.object(
+                service,
+                "_restart_bridge_watchers",
+                return_value={"action": "restart_bridge_watchers", "status": "completed", "restarted": ["watch_shared_triggers.sh"]},
+            ), patch("core.self_health_monitor.SelfHealthMonitor") as monitor_cls:
+                monitor_cls.return_value.get_runtime_diagnostics.return_value = []
+                result = service._execute_action("recover_bridge_coordination")
+
+        self.assertEqual(result["action"], "recover_bridge_coordination")
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["republish"]["objective_id"], 2900)
+
+    def test_direct_execution_takeover_action_claims_fallback_and_dispatches(self):
+        """Test TOD silence takeover writes fallback activation and dispatches the active task."""
+        from core.self_optimizer_service import SelfOptimizerService
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            shared_dir = Path(tmpdir) / "runtime" / "shared"
+            shared_dir.mkdir(parents=True, exist_ok=True)
+            service = SelfOptimizerService(shared_dir)
+
+            (shared_dir / "MIM_TASK_STATUS_REVIEW.latest.json").write_text(
+                json.dumps(
+                    {
+                        "task": {
+                            "active_task_id": "objective-2900-task-7117",
+                            "objective_id": "objective-2900",
+                        },
+                        "idle": {"direct_execution_ready": True},
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (shared_dir / "MIM_TASK_STATUS_NEXT_ACTION.latest.json").write_text(
+                json.dumps(
+                    {
+                        "selected_action": {
+                            "code": "fallback_to_codex_direct_execution",
+                            "detail": "Stop waiting on TOD and continue locally.",
+                        }
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            with patch.object(
+                service,
+                "_dispatch_active_task_to_codex_direct_execution_async",
+                AsyncMock(return_value={
+                    "objective_id": "2900",
+                    "task_id": "7117",
+                    "request_id": "handoff-2900-7117",
+                    "dispatch_status": "running",
+                    "submission": {"status": "running"},
+                }),
+            ):
+                result = service._execute_action("fallback_to_codex_direct_execution")
+
+            fallback_activation = json.loads(
+                (shared_dir / "MIM_TOD_FALLBACK_ACTIVATION.latest.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(result["action"], "fallback_to_codex_direct_execution")
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(fallback_activation["decision_outcome"], "mim_direct_execution_takeover")
+        self.assertEqual(fallback_activation["execution_state"], "running")
+
+    def test_direct_execution_takeover_refuses_same_task_bridge_evidence(self):
+        """Same-task TOD bridge evidence should block direct-execution takeover."""
+        from core.self_optimizer_service import SelfOptimizerService
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            shared_dir = Path(tmpdir) / "runtime" / "shared"
+            shared_dir.mkdir(parents=True, exist_ok=True)
+            service = SelfOptimizerService(shared_dir)
+
+            (shared_dir / "MIM_TASK_STATUS_REVIEW.latest.json").write_text(
+                json.dumps(
+                    {
+                        "task": {
+                            "active_task_id": "objective-2900-task-7117",
+                            "objective_id": "objective-2900",
+                        },
+                        "idle": {"direct_execution_ready": True},
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (shared_dir / "MIM_TASK_STATUS_NEXT_ACTION.latest.json").write_text(
+                json.dumps(
+                    {
+                        "selected_action": {
+                            "code": "fallback_to_codex_direct_execution",
+                            "detail": "Stop waiting on TOD and continue locally.",
+                        }
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (shared_dir / "TOD_MIM_COMMAND_STATUS.latest.json").write_text(
+                json.dumps(
+                    {
+                        "bridge_runtime": {
+                            "current_processing": {
+                                "task_id": "objective-2900-task-7117",
+                            }
+                        }
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "same-task bridge evidence"):
+                service._execute_action("fallback_to_codex_direct_execution")
 
 
 class TestSelfAwarenessAPI(unittest.IsolatedAsyncioTestCase):

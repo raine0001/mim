@@ -95,6 +95,69 @@ def _event(*, raw_input: str, parsed_intent: str = "execute_capability", event_i
 
 
 class TestGatewayHealthGovernanceResolution(unittest.IsolatedAsyncioTestCase):
+    async def test_status_offer_followup_does_not_confirm_stale_pending_action(self):
+        event = _event(raw_input="yes please", parsed_intent="discussion")
+        event.metadata_json = {
+            "route_preference": "conversation_layer",
+            "conversation_session_id": "session-yes-please-status-offer",
+        }
+        db = _FakeDB()
+        conversation_context = {
+            "pending_action_request": "Smart recovery for handle that thing",
+            "last_prompt": "Objective 2 is not complete yet. Would you like a status update or details on next steps?",
+            "last_topic": "objective",
+            "last_control_state": "active",
+            "clarification_state": {
+                "active": True,
+                "reason": "conversation_override",
+                "pending_action_request": "Smart recovery for handle that thing",
+            },
+            "program_status_summary": "Objective 2 is still in progress while the active blocker is being cleared.",
+            "current_recommendation_summary": "Verify the blocker, complete the active slice, and report the updated state.",
+        }
+
+        with patch.object(
+            gateway,
+            "_build_live_operational_context",
+            AsyncMock(return_value={}),
+        ), patch.object(
+            gateway,
+            "_get_recent_text_conversation_context",
+            AsyncMock(return_value=conversation_context),
+        ), patch.object(
+            gateway,
+            "_latest_camera_observation_context",
+            AsyncMock(return_value={}),
+        ), patch.object(
+            gateway,
+            "_camera_object_inquiry_context",
+            AsyncMock(return_value={}),
+        ), patch.object(
+            gateway,
+            "_object_memory_context_for_query",
+            AsyncMock(return_value={}),
+        ), patch.object(
+            gateway,
+            "_learn_from_object_inquiry_reply",
+            AsyncMock(return_value=("", {})),
+        ), patch.object(
+            gateway,
+            "write_journal",
+            AsyncMock(),
+        ), patch.object(
+            gateway._mim_health_monitor,
+            "get_health_summary",
+            return_value={"status": "healthy"},
+        ):
+            resolution = await gateway._resolve_event(event, db)
+
+        self.assertEqual(resolution.internal_intent, "speak_response")
+        self.assertEqual(resolution.outcome, "store_only")
+        self.assertEqual(resolution.reason, "conversation_override")
+        self.assertIn("status update", resolution.clarification_prompt.lower())
+        self.assertIn("next steps", resolution.clarification_prompt.lower())
+        self.assertNotIn("smart recovery for handle that thing", resolution.clarification_prompt.lower())
+
     async def test_healthy_execution_keeps_auto_execute(self):
         event = _event(raw_input="run workspace check")
         db = _FakeDB(capability=SimpleNamespace(enabled=True, requires_confirmation=False))
@@ -214,6 +277,464 @@ class TestGatewayHealthGovernanceResolution(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(governance.get("primary_signal"), "benign_healthy_auto_execution")
         # Health code must distinguish suboptimal from fully healthy.
         self.assertEqual(governance.get("system_health_status"), "suboptimal")
+
+
+class TestGatewayAuthorizedInitiativeDispatch(unittest.IsolatedAsyncioTestCase):
+    async def test_training_request_auto_executes_authorized_initiative(self):
+        event = _event(raw_input="start training", parsed_intent="discussion")
+        db = _FakeDB()
+        initiative_result = {
+            "objective": {
+                "title": "Drive natural-language self-evolution training",
+                "priority": "high",
+            },
+            "human_prompt_required": False,
+            "continuation": {
+                "status": {
+                    "summary": "Training initiative is active.",
+                    "active_task": {"title": "Run the active training slice"},
+                }
+            },
+        }
+
+        with patch.object(
+            gateway,
+            "build_initiative_status",
+            AsyncMock(return_value={}),
+        ), patch.object(
+            gateway,
+            "drive_initiative_from_intent",
+            AsyncMock(return_value=initiative_result),
+        ):
+            result = await gateway._maybe_dispatch_authorized_text_initiative(
+                event=event,
+                request_id="req-training",
+                session_id="session-training",
+                db=db,
+            )
+
+        self.assertIsInstance(result, dict)
+        self.assertEqual(str(result.get("reason", "")).strip(), "authorized_initiative_auto_execute")
+        self.assertEqual(str(result.get("outcome", "")).strip(), "auto_execute")
+        self.assertTrue(bool(result.get("initiative_auto_execute")))
+        self.assertEqual(str(result.get("interface_status", "")).strip(), "doing")
+        self.assertIn("initiative", str(result.get("interface_result", "")).lower())
+        self.assertNotIn(
+            "waiting for explicit confirmation",
+            str(result.get("interface_reply", "")).lower(),
+        )
+
+    async def test_active_soft_initiative_request_reuses_initiative_authority(self):
+        event = _event(raw_input="continue with the next implementation step", parsed_intent="discussion")
+        db = _FakeDB()
+        status_payload = {
+            "active_objective": {
+                "title": "Drive natural-language self-evolution training",
+                "priority": "high",
+                "owner": "mim",
+                "boundary_mode": "soft",
+                "metadata_json": {"managed_scope": "workspace"},
+            }
+        }
+
+        with patch.object(
+            gateway,
+            "build_initiative_status",
+            AsyncMock(return_value=status_payload),
+        ), patch.object(
+            gateway,
+            "drive_initiative_from_intent",
+            AsyncMock(
+                return_value={
+                    "objective": {"title": "Drive natural-language self-evolution training"},
+                    "human_prompt_required": False,
+                    "continuation": {
+                        "status": {
+                            "summary": "The active initiative continues automatically.",
+                            "active_task": {"title": "Implement bounded work"},
+                        }
+                    },
+                }
+            ),
+        ) as drive_mock:
+            result = await gateway._maybe_dispatch_authorized_text_initiative(
+                event=event,
+                request_id="req-soft",
+                session_id="session-soft",
+                db=db,
+            )
+
+        self.assertIsInstance(result, dict)
+        self.assertEqual(str(result.get("outcome", "")).strip(), "auto_execute")
+        self.assertEqual(str(result.get("interface_status", "")).strip(), "doing")
+        self.assertEqual(drive_mock.await_args.kwargs.get("objective_title"), "Drive natural-language self-evolution training")
+        self.assertTrue(bool(drive_mock.await_args.kwargs.get("metadata_json", {}).get("resume_existing")))
+
+    async def test_explicit_initiative_id_does_not_reuse_active_soft_initiative(self):
+        event = _event(
+            raw_input=(
+                "INITIATIVE_ID: PLAN-ONLY-ISOLATION-002\n\n"
+                "OBJECTIVE:\nCreate a planning-only initiative that stays isolated from prior corrective work.\n\n"
+                "AUTHORITY:\nNo human confirmation required."
+            ),
+            parsed_intent="discussion",
+        )
+        db = _FakeDB()
+        status_payload = {
+            "active_objective": {
+                "title": "Create a bounded corrective implementation task in MIM's own workspace code",
+                "priority": "high",
+                "owner": "mim",
+                "boundary_mode": "soft",
+                "metadata_json": {
+                    "managed_scope": "workspace",
+                    "initiative_id": "OLDER-CORRECTIVE-ID",
+                },
+            }
+        }
+
+        with patch.object(
+            gateway,
+            "build_initiative_status",
+            AsyncMock(return_value=status_payload),
+        ), patch.object(
+            gateway,
+            "drive_initiative_from_intent",
+            AsyncMock(
+                return_value={
+                    "objective": {
+                        "title": "Create a planning-only initiative that stays isolated from prior corrective work.",
+                        "initiative_id": "PLAN-ONLY-ISOLATION-002",
+                    },
+                    "human_prompt_required": False,
+                    "continuation": {
+                        "status": {
+                            "summary": "Planning-only initiative remains isolated.",
+                            "active_task": {"title": "Implement bounded work"},
+                        }
+                    },
+                }
+            ),
+        ) as drive_mock:
+            result = await gateway._maybe_dispatch_authorized_text_initiative(
+                event=event,
+                request_id="req-isolation",
+                session_id="session-isolation",
+                db=db,
+            )
+
+        self.assertIsInstance(result, dict)
+        self.assertEqual(str(result.get("outcome", "")).strip(), "auto_execute")
+        self.assertEqual(str(result.get("interface_status", "")).strip(), "doing")
+        self.assertEqual(str(drive_mock.await_args.kwargs.get("objective_title") or "").strip(), "")
+        self.assertFalse(bool(drive_mock.await_args.kwargs.get("metadata_json", {}).get("resume_existing")))
+        self.assertEqual(
+            str(drive_mock.await_args.kwargs.get("metadata_json", {}).get("initiative_id") or "").strip(),
+            "PLAN-ONLY-ISOLATION-002",
+        )
+
+    async def test_fresh_non_resume_request_does_not_inherit_active_soft_initiative(self):
+        event = _event(raw_input="fix the unrelated mobile shell ui bug", parsed_intent="discussion")
+        db = _FakeDB()
+        status_payload = {
+            "active_objective": {
+                "title": "Drive natural-language self-evolution training",
+                "priority": "high",
+                "owner": "mim",
+                "boundary_mode": "soft",
+                "metadata_json": {"managed_scope": "workspace"},
+            }
+        }
+
+        with patch.object(
+            gateway,
+            "build_initiative_status",
+            AsyncMock(return_value=status_payload),
+        ), patch.object(
+            gateway,
+            "drive_initiative_from_intent",
+            AsyncMock(
+                return_value={
+                    "objective": {"title": "Fix the unrelated mobile shell ui bug"},
+                    "human_prompt_required": False,
+                    "continuation": {"status": {"summary": "Fresh initiative created."}},
+                }
+            ),
+        ) as drive_mock:
+            result = await gateway._maybe_dispatch_authorized_text_initiative(
+                event=event,
+                request_id="req-ui-bugfix",
+                session_id="session-ui-bugfix",
+                db=db,
+            )
+
+        self.assertIsInstance(result, dict)
+        self.assertEqual(str(result.get("outcome", "")).strip(), "auto_execute")
+        self.assertEqual(str(drive_mock.await_args.kwargs.get("objective_title") or "").strip(), "")
+        self.assertFalse(bool(drive_mock.await_args.kwargs.get("metadata_json", {}).get("resume_existing")))
+
+    async def test_single_line_explicit_initiative_id_is_sanitized_before_gateway_dispatch(self):
+        event = _event(
+            raw_input=(
+                "INITIATIVE_ID: MIM-EXECUTION-COMPLETION-CHECK OBJECTIVE: Dispatch one bounded executable task "
+                "GOAL: Verify completion only after execution evidence exists."
+            ),
+            parsed_intent="discussion",
+        )
+        db = _FakeDB()
+
+        with patch.object(
+            gateway,
+            "build_initiative_status",
+            AsyncMock(return_value={}),
+        ), patch.object(
+            gateway,
+            "drive_initiative_from_intent",
+            AsyncMock(
+                return_value={
+                    "objective": {
+                        "title": "Dispatch one bounded executable task",
+                        "initiative_id": "MIM-EXECUTION-COMPLETION-CHECK",
+                    },
+                    "human_prompt_required": False,
+                    "continuation": {
+                        "status": {
+                            "summary": "Queued bounded execution work.",
+                            "execution_state": "created",
+                            "active_task": {"title": "Implement bounded work"},
+                        }
+                    },
+                }
+            ),
+        ) as drive_mock:
+            result = await gateway._maybe_dispatch_authorized_text_initiative(
+                event=event,
+                request_id="req-single-line-id",
+                session_id="session-single-line-id",
+                db=db,
+            )
+
+        self.assertIsInstance(result, dict)
+        self.assertEqual(str(result.get("outcome", "")).strip(), "auto_execute")
+        self.assertEqual(
+            str(drive_mock.await_args.kwargs.get("metadata_json", {}).get("initiative_id") or "").strip(),
+            "MIM-EXECUTION-COMPLETION-CHECK",
+        )
+
+    async def test_planning_only_initiative_skips_continuation_dispatch(self):
+        event = _event(
+            raw_input=(
+                "INITIATIVE_ID: MIM-PLANNING-ONLY-CHECK\n\n"
+                "OBJECTIVE: Create a bounded implementation plan only. Do not dispatch code execution.\n\n"
+                "RULES:\n"
+                "- Create objective\n"
+                "- Create task\n"
+                "- Produce implementation plan\n"
+                "- Do NOT dispatch execution\n"
+                "- Do NOT create result artifact\n"
+                "- Do NOT mark complete"
+            ),
+            parsed_intent="discussion",
+        )
+        db = _FakeDB()
+
+        with patch.object(
+            gateway,
+            "build_initiative_status",
+            AsyncMock(return_value={}),
+        ), patch.object(
+            gateway,
+            "drive_initiative_from_intent",
+            AsyncMock(
+                return_value={
+                    "objective": {
+                        "title": "Create a bounded implementation plan only.",
+                        "initiative_id": "MIM-PLANNING-ONLY-CHECK",
+                    },
+                    "human_prompt_required": False,
+                    "continuation": {
+                        "status": {
+                            "summary": "Planning complete for objective Create a bounded implementation plan only. Awaiting execution dispatch.",
+                            "execution_state": "created",
+                            "active_task": {},
+                        }
+                    },
+                }
+            ),
+        ) as drive_mock:
+            result = await gateway._maybe_dispatch_authorized_text_initiative(
+                event=event,
+                request_id="req-planning-only",
+                session_id="session-planning-only",
+                db=db,
+            )
+
+        self.assertIsInstance(result, dict)
+        self.assertEqual(
+            str(result.get("reason", "")).strip(),
+            "authorized_planning_only_initiative_created",
+        )
+        self.assertEqual(str(result.get("interface_status", "")).strip(), "doing")
+        self.assertIn("hold execution dispatch", str(result.get("interface_next_action", "")).lower())
+        self.assertFalse(bool(drive_mock.await_args.kwargs.get("continue_chain")))
+        self.assertTrue(bool(drive_mock.await_args.kwargs.get("metadata_json", {}).get("planning_only")))
+
+    async def test_hard_boundary_initiative_keeps_confirmation_gate(self):
+        event = _event(raw_input="start training for production deployment", parsed_intent="discussion")
+        db = _FakeDB()
+
+        with patch.object(
+            gateway,
+            "build_initiative_status",
+            AsyncMock(return_value={}),
+        ), patch.object(
+            gateway,
+            "drive_initiative_from_intent",
+            AsyncMock(
+                return_value={
+                    "objective": {"title": "Start production deployment"},
+                    "human_prompt_required": True,
+                    "continuation": {
+                        "status": {
+                            "summary": "The requested initiative reached a hard boundary.",
+                        }
+                    },
+                }
+            ),
+        ):
+            result = await gateway._maybe_dispatch_authorized_text_initiative(
+                event=event,
+                request_id="req-hard",
+                session_id="session-hard",
+                db=db,
+            )
+
+        self.assertIsInstance(result, dict)
+        self.assertEqual(
+            str(result.get("reason", "")).strip(),
+            "initiative_hard_boundary_requires_confirmation",
+        )
+        self.assertEqual(str(result.get("outcome", "")).strip(), "requires_confirmation")
+        self.assertFalse(bool(result.get("initiative_auto_execute")))
+        self.assertEqual(str(result.get("interface_status", "")).strip(), "deferred")
+        self.assertIn("explicit confirmation", str(result.get("interface_next_action", "")).lower())
+
+    async def test_continuation_validation_request_uses_full_auto_step_budget(self):
+        event = _event(
+            raw_input=(
+                "INITIATIVE_ID: MIM-CONTINUOUS-EXECUTION-VALIDATION\n\n"
+                "OBJECTIVE:\nVerify that MIM and TOD can execute, recover, and continue work autonomously without human intervention.\n\n"
+                "EXECUTION MODEL:\nThis is a CONTROLLED CONTINUATION TEST\n\n"
+                "GOAL:\nDemonstrate sustained multi-step execution with automatic continuation after task completion, recovery events, and readiness transitions.\n\n"
+                "AUTHORITY:\n- No human confirmation required\n\n"
+                "Task 5: Validate auto-resume\n\n"
+                "SUCCESS CRITERIA:\n- 5+ tasks executed in sequence"
+            ),
+            parsed_intent="discussion",
+        )
+        db = _FakeDB()
+
+        with patch.object(
+            gateway,
+            "build_initiative_status",
+            AsyncMock(return_value={}),
+        ), patch.object(
+            gateway,
+            "drive_initiative_from_intent",
+            AsyncMock(
+                return_value={
+                    "objective": {"title": "Drive autonomous continuation validation [-GATEWAY]"},
+                    "human_prompt_required": False,
+                    "continuation": {"status": {"summary": "Validation initiative is active."}},
+                }
+            ),
+        ) as drive_mock:
+            result = await gateway._maybe_dispatch_authorized_text_initiative(
+                event=event,
+                request_id="req-validation",
+                session_id="session-validation",
+                db=db,
+            )
+
+        self.assertIsInstance(result, dict)
+        self.assertEqual(drive_mock.await_args.kwargs.get("max_auto_steps"), 8)
+
+    async def test_repeated_tod_status_loop_escalates_to_corrective_implementation(self):
+        event = _event(raw_input="check tod status", parsed_intent="discussion")
+        db = _FakeDB()
+
+        with patch.object(
+            gateway,
+            "_recent_tod_status_dispatch_loop_signal",
+            AsyncMock(
+                return_value={
+                    "detected": True,
+                    "count": 3,
+                    "reason": "tod_status_dispatch",
+                    "result_status": "succeeded",
+                    "result_reason": "TOD bridge accepted the bounded status check.",
+                }
+            ),
+        ), patch.object(
+            gateway,
+            "drive_initiative_from_intent",
+            AsyncMock(
+                return_value={
+                    "objective": {"title": "Correct repeated TOD status loop"},
+                    "human_prompt_required": False,
+                    "continuation": {
+                        "status": {
+                            "summary": "Corrective implementation initiative is active.",
+                            "active_task": {"title": "Implement corrective routing change"},
+                        }
+                    },
+                }
+            ),
+        ) as drive_mock:
+            result = await gateway._maybe_dispatch_repeated_tod_status_loop_recovery(
+                event=event,
+                request_id="req-status-loop",
+                session_id="session-status-loop",
+                db=db,
+            )
+
+        self.assertIsInstance(result, dict)
+        self.assertEqual(
+            str(result.get("reason", "")).strip(),
+            "stale_tod_status_loop_escalated_to_implementation",
+        )
+        self.assertTrue(bool(result.get("initiative_auto_execute")))
+        self.assertEqual(int(result.get("status_loop_repeat_count", 0)), 3)
+        self.assertIn("corrective implementation initiative", str(result.get("interface_result", "")).lower())
+        self.assertEqual(drive_mock.await_args.kwargs.get("managed_scope"), "workspace")
+        self.assertEqual(drive_mock.await_args.kwargs.get("max_auto_steps"), 3)
+        self.assertIn(
+            "prevent repeated tod status-check loops",
+            str(drive_mock.await_args.kwargs.get("user_intent", "")).lower(),
+        )
+
+    async def test_repeated_tod_status_loop_recovery_skips_when_no_stale_signal(self):
+        event = _event(raw_input="check tod status", parsed_intent="discussion")
+        db = _FakeDB()
+
+        with patch.object(
+            gateway,
+            "_recent_tod_status_dispatch_loop_signal",
+            AsyncMock(return_value={"detected": False, "count": 1}),
+        ), patch.object(
+            gateway,
+            "drive_initiative_from_intent",
+            AsyncMock(),
+        ) as drive_mock:
+            result = await gateway._maybe_dispatch_repeated_tod_status_loop_recovery(
+                event=event,
+                request_id="req-status-loop",
+                session_id="session-status-loop",
+                db=db,
+            )
+
+        self.assertIsNone(result)
+        drive_mock.assert_not_awaited()
 
 
 class TestGatewayDispatchGovernanceSurface(unittest.IsolatedAsyncioTestCase):

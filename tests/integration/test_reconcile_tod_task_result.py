@@ -202,6 +202,46 @@ class ReconcileTodTaskResultTest(unittest.TestCase):
             self.assertEqual(payload["status"], "failed")
             self.assertEqual(payload["result_status"], "failed")
 
+    def test_reconcile_preserves_distinct_request_id_when_live_request_uses_handoff_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            shared_dir = Path(tmp_dir)
+            self._write_json(
+                shared_dir / "MIM_TOD_TASK_REQUEST.latest.json",
+                {
+                    "generated_at": "2026-05-02T18:30:58Z",
+                    "request_id": "mim-day-02-live-resume-refresh-20260502",
+                    "task_id": "objective-2900-task-7117",
+                    "objective_id": "objective-2900",
+                    "correlation_id": "objective-2900-task-7117",
+                },
+            )
+            self._write_json(
+                shared_dir / "TOD_MIM_TASK_RESULT.latest.json",
+                {
+                    "generated_at": "2026-05-02T18:35:48Z",
+                    "source": "tod-mim-task-result-v1",
+                    "request_id": "objective-2900-task-7117",
+                    "task_id": "objective-2900-task-7117",
+                    "status": "failed",
+                    "result_status": "failed",
+                },
+            )
+
+            completed = subprocess.run(
+                [str(PYTHON), str(SCRIPT), "--shared-dir", str(shared_dir)],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+
+            payload = json.loads((shared_dir / "TOD_MIM_TASK_RESULT.latest.json").read_text(encoding="utf-8"))
+            self.assertEqual(payload["request_id"], "mim-day-02-live-resume-refresh-20260502")
+            self.assertEqual(payload["task_id"], "objective-2900-task-7117")
+            self.assertEqual(payload["task"], "objective-2900-task-7117")
+            self.assertEqual(payload["reconciliation"]["active_request_id"], "mim-day-02-live-resume-refresh-20260502")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

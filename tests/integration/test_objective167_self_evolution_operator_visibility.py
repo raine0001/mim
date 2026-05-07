@@ -113,6 +113,7 @@ class Objective167SelfEvolutionOperatorVisibilityTest(unittest.TestCase):
         self.assertEqual(status, 200, ui_state)
         runtime_features = ui_state.get("runtime_features", []) if isinstance(ui_state, dict) else []
         self.assertIn("self_evolution_operator_visibility", runtime_features)
+        self.assertIn("self_evolution_natural_language_development", runtime_features)
 
         operator_reasoning = ui_state.get("operator_reasoning", {}) if isinstance(ui_state, dict) else {}
         self_evolution = (
@@ -123,6 +124,21 @@ class Objective167SelfEvolutionOperatorVisibilityTest(unittest.TestCase):
         self.assertTrue(str(self_evolution.get("summary", "")).strip(), self_evolution)
         self.assertIn(str(self_evolution.get("status", "")), {"active", "operator_review_required", "quiet"})
         self.assertTrue(str(self_evolution.get("decision_type", "")).strip(), self_evolution)
+        self.assertTrue(str(self_evolution.get("natural_language_development_summary", "")).strip(), self_evolution)
+        self.assertTrue(str(self_evolution.get("natural_language_development_next_step", "")).strip(), self_evolution)
+        self.assertTrue(str(self_evolution.get("natural_language_development_pass_bar", "")).strip(), self_evolution)
+        self.assertTrue(str(self_evolution.get("natural_language_development_skill_id", "")).strip(), self_evolution)
+
+        natural_language_development = (
+            self_evolution.get("natural_language_development", {})
+            if isinstance(self_evolution.get("natural_language_development", {}), dict)
+            else {}
+        )
+        self.assertEqual(
+            str(self_evolution.get("natural_language_development_skill_id", "")).strip(),
+            str(natural_language_development.get("selected_skill_id", "")).strip(),
+            self_evolution,
+        )
 
         decision = self_evolution.get("decision", {}) if isinstance(self_evolution.get("decision", {}), dict) else {}
         snapshot = self_evolution.get("snapshot", {}) if isinstance(self_evolution.get("snapshot", {}), dict) else {}
@@ -139,6 +155,16 @@ class Objective167SelfEvolutionOperatorVisibilityTest(unittest.TestCase):
         self.assertEqual(
             str(conversation_context.get("self_evolution_summary", "")).strip(),
             str(self_evolution.get("summary", "")).strip(),
+            ui_state,
+        )
+        self.assertEqual(
+            str(conversation_context.get("self_evolution_natural_language_development_summary", "")).strip(),
+            str(self_evolution.get("natural_language_development_summary", "")).strip(),
+            ui_state,
+        )
+        self.assertEqual(
+            str(conversation_context.get("self_evolution_natural_language_development_skill_id", "")).strip(),
+            str(self_evolution.get("natural_language_development_skill_id", "")).strip(),
             ui_state,
         )
 

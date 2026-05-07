@@ -56,6 +56,45 @@ class TodStatusPublisherWarningTest(unittest.TestCase):
         self.assertIn("objective 80", warning["message"])
         self.assertIn("objective 75", warning["message"])
 
+    def test_build_publisher_warning_uses_normalized_promoted_objective(self) -> None:
+        module = load_module()
+        warning = module.build_publisher_warning(
+            integration={
+                "mim_refresh": {
+                    "attempted": True,
+                    "copied_json": True,
+                    "copied_yaml": True,
+                    "copied_manifest": True,
+                    "failure_reason": "",
+                    "resolved_source_root": "/home/testpilot/mim/runtime/shared",
+                },
+                "live_task_request": {
+                    "objective_id": "objective-663",
+                    "normalized_objective_id": "665",
+                    "promotion_applied": True,
+                    "promotion_reason": "request_objective_differs_from_canonical_export",
+                },
+            },
+            context_export={"objective_active": "665", "release_tag": "objective-665"},
+            handshake={
+                "truth": {"objective_active": "665", "release_tag": "objective-665"}
+            },
+            task_request={
+                "objective_id": "objective-663",
+                "task_id": "objective-663-task-008",
+                "source_service": "continuous_task_dispatch",
+                "source_instance_id": "continuous_task_dispatch:2239455",
+            },
+            coordination_ack={"objective_id": "objective-657"},
+        )
+
+        self.assertFalse(warning["active"])
+        self.assertEqual(warning["code"], "")
+        self.assertEqual(warning["canonical_objective_active"], "665")
+        self.assertEqual(warning["live_task_objective"], "665")
+        self.assertEqual(warning["coordination_objective"], "657")
+        self.assertEqual(warning["message"], "")
+
     def test_watch_tod_catchup_status_emits_publisher_warning(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             shared_dir = Path(tmp_dir) / "shared"

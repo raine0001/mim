@@ -28,6 +28,23 @@ class NextStepAdjudicationServiceTest(unittest.TestCase):
         self.assertTrue(decision.get("auto_approve"), decision)
         self.assertEqual(decision.get("decision"), "approved", decision)
 
+    def test_auto_approves_execution_routing_through_mim_first(self) -> None:
+        decision = build_interface_auto_approval_decision(
+            parsed_intent="next_step_request",
+            content="Restart the local worker and continue the next bounded execution step through MIM.",
+            metadata_json={
+                "owner_workspace": "TOD",
+                "action_type": "execute",
+                "risk": "medium",
+                "cross_system": True,
+                "approval_required": True,
+            },
+        )
+        self.assertTrue(decision.get("auto_approve"), decision)
+        self.assertEqual(decision.get("decision"), "approved", decision)
+        self.assertTrue(bool((decision.get("metadata_json") or {}).get("route_via_mim")), decision)
+        self.assertTrue(bool((decision.get("metadata_json") or {}).get("teach_mim_if_missing")), decision)
+
     def test_blocks_auto_approval_for_live_arm_execution(self) -> None:
         decision = build_interface_auto_approval_decision(
             parsed_intent="next_tod_tasks_inquiry",
@@ -42,6 +59,43 @@ class NextStepAdjudicationServiceTest(unittest.TestCase):
             },
         )
         self.assertFalse(decision.get("auto_approve"), decision)
+
+    def test_build_mim_adjudication_routes_non_live_approval_steps_without_human_gate(self) -> None:
+        next_steps = {
+            "source_workspace": "MIM",
+            "run_id": "mim_run_route_internal",
+            "objective_id": "98A",
+            "items": [
+                {
+                    "step_id": "step_approval_internal",
+                    "description": "Restart the bounded listener and continue the next execution step.",
+                    "owner_workspace": "TOD",
+                    "action_type": "execute",
+                    "risk": "medium",
+                    "cross_system": True,
+                    "approval_required": True,
+                }
+            ],
+        }
+        posture = {
+            "evaluated_at": "2026-04-19T20:00:00Z",
+            "active_task_id": "objective-98-task-1",
+            "objective_id": "98",
+            "review_state": "completed",
+            "review_reason": "task_result_current",
+            "gate_pass": True,
+            "promotion_ready": True,
+            "system_alerts_active": False,
+            "highest_severity": "none",
+            "blocking_reason_codes": [],
+            "arm_operator_approval_required": False,
+            "tod_execution_allowed": True,
+            "tod_execution_block_reason": "",
+        }
+        mim = build_mim_adjudication(next_steps, posture=posture)
+        step = mim["items"][0]
+        self.assertEqual(step["posture"], "proposal_only", mim)
+        self.assertEqual(step["mim_decision"], "approve", mim)
 
     def test_builds_mim_adjudication_and_consensus(self) -> None:
         next_steps = {

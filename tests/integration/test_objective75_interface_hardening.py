@@ -289,6 +289,95 @@ class Objective75InterfaceHardeningTest(unittest.TestCase):
             "non_authoritative_continuous_dispatch_loop",
         )
 
+    def test_build_payload_bundle_ignores_tod_ui_chat_request_for_objective_authority(self) -> None:
+        export_module = load_export_module()
+        current_runtime_manifest, workspace_runtime_manifest = workspace_manifest_sources(
+            export_module
+        )
+
+        workspace_manifest = {
+            "schema_version": "2026-03-12-67",
+            "release_tag": "workspace-dev",
+            "contract_version": "tod-mim-shared-contract-v1",
+            "capabilities": ["manifest", "status"],
+        }
+
+        def fake_fetch(url: str, timeout: float = 2.5):
+            if url == current_runtime_manifest:
+                return None
+            if url == workspace_runtime_manifest:
+                return workspace_manifest
+            if url.endswith("/health"):
+                return {"status": "ok"}
+            return None
+
+        with patch.object(
+            export_module,
+            "WORKSPACE_RUNTIME_MANIFEST_SOURCES",
+            [current_runtime_manifest, workspace_runtime_manifest],
+        ):
+            with patch.object(
+                export_module,
+                "_parse_objective_index",
+                return_value=("2", "implemented", "2900", "executing", "2900", "executing"),
+            ):
+                with patch.object(
+                    export_module,
+                    "_parse_objective_docs",
+                    return_value=("2", "implemented", "2900", "executing", "executing"),
+                ):
+                    with patch.object(
+                        export_module,
+                        "_active_formal_program_truth",
+                        return_value={
+                            "objective": "2900",
+                            "execution_state": "executing",
+                            "source": "runtime/formal_program_drive_response.json",
+                        },
+                    ):
+                        with patch.object(
+                            export_module,
+                            "_live_initiative_truth",
+                            return_value={
+                                "objective": "2900",
+                                "task_id": "7118",
+                                "source": "core.autonomy_driver_service.build_initiative_status",
+                            },
+                        ):
+                            with patch.object(
+                                export_module,
+                                "_latest_live_task_request_signal",
+                                return_value={
+                                    "source": "runtime/shared/MIM_TOD_TASK_REQUEST.latest.json",
+                                    "objective": "2",
+                                    "task_id": "2-task-1777907200979",
+                                    "available": True,
+                                    "source_service": "tod-ui-tod-operator-v1",
+                                    "title": "Make TOD communicate like an execution partner.",
+                                    "scope": "Continue phase 2 conversational operator behavior.",
+                                    "tod_action": "execute-chat-task",
+                                    "objective_authority_eligible": False,
+                                    "suppression_reason": "non_authoritative_tod_ui_chat_request",
+                                },
+                            ):
+                                with patch.object(export_module, "_fetch_json", side_effect=fake_fetch):
+                                    payload, _ = export_module.build_payload_bundle()
+
+        self.assertEqual(payload["objective_in_flight"], "2900")
+        self.assertEqual(payload["objective_active"], "2900")
+        self.assertEqual(payload["current_next_objective"], "2900")
+        self.assertEqual(
+            payload["source_of_truth"]["objective_active_source"],
+            "live_initiative_status",
+        )
+        self.assertFalse(
+            payload["source_of_truth"]["live_task_request_signal"]["objective_authority_eligible"]
+        )
+        self.assertEqual(
+            payload["source_of_truth"]["live_task_request_signal"]["suppression_reason"],
+            "non_authoritative_tod_ui_chat_request",
+        )
+
     def test_build_payload_bundle_honors_objective_authority_reset_ceiling(self) -> None:
         export_module = load_export_module()
         with tempfile.TemporaryDirectory() as tmp_dir:

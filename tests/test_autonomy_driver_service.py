@@ -630,6 +630,221 @@ class InitiativeIdentityRoutingTests(unittest.IsolatedAsyncioTestCase):
 
 
 class CodexDispatchEvidenceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_continue_initiative_requires_real_recovery_transition_for_auto_resume(self) -> None:
+        objective = SimpleNamespace(
+            id=205,
+            title="Continuation validation objective",
+            priority="high",
+            state="in_progress",
+            owner="mim",
+            constraints_json=[],
+            metadata_json={},
+            created_at="2026-05-05T00:00:00Z",
+        )
+        prior_step = SimpleNamespace(
+            id=2054,
+            objective_id=205,
+            title="Continuation validation step 4",
+            details="simulate recovery",
+            dependencies=[],
+            acceptance_criteria="record recovery transition",
+            state="completed",
+            assigned_to="mim",
+            readiness="completed",
+            boundary_mode="soft",
+            start_now=True,
+            human_prompt_required=False,
+            execution_scope="continuation_validation",
+            expected_outputs_json=[],
+            verification_commands_json=[],
+            dispatch_status="completed",
+            dispatch_artifact_json={
+                "mode": "continuation_validation_step",
+                "continuation_status": "continued",
+                "recovery_transition": {
+                    "type": "synthetic_monitor_only",
+                    "reason": "no_recent_blocked_task_found",
+                },
+            },
+            metadata_json={
+                "automation_kind": "continuation_validation_step",
+                "validation_step_number": 4,
+                "validation_step_count": 8,
+            },
+            created_at="2026-05-05T00:00:04Z",
+        )
+        step_five = SimpleNamespace(
+            id=2055,
+            objective_id=205,
+            title="Continuation validation step 5",
+            details="validate auto-resume",
+            dependencies=[2054],
+            acceptance_criteria="confirm execution resumed",
+            state="queued",
+            assigned_to="mim",
+            readiness="ready",
+            boundary_mode="soft",
+            start_now=True,
+            human_prompt_required=False,
+            execution_scope="continuation_validation",
+            expected_outputs_json=[],
+            verification_commands_json=[],
+            dispatch_status="pending",
+            dispatch_artifact_json={},
+            metadata_json={
+                "automation_kind": "continuation_validation_step",
+                "validation_step_number": 5,
+                "validation_step_count": 8,
+            },
+            created_at="2026-05-05T00:00:05Z",
+        )
+
+        execute_result = SimpleNamespace(
+            scalars=lambda: SimpleNamespace(all=lambda: [objective], first=lambda: objective)
+        )
+        fake_db = SimpleNamespace(execute=AsyncMock(return_value=execute_result))
+
+        with patch(
+            "core.autonomy_driver_service._tasks_for_objective",
+            new=AsyncMock(return_value=[prior_step, step_five]),
+        ), patch(
+            "core.autonomy_driver_service._select_next_ready_task",
+            new=AsyncMock(side_effect=[(objective, step_five), (None, None)]),
+        ), patch(
+            "core.autonomy_driver_service.refresh_task_readinesses",
+            new=AsyncMock(return_value=[]),
+        ), patch(
+            "core.autonomy_driver_service.recompute_objective_state",
+            new=AsyncMock(return_value="blocked"),
+        ), patch(
+            "core.autonomy_driver_service.write_journal",
+            new=AsyncMock(return_value=None),
+        ), patch(
+            "core.autonomy_driver_service.build_initiative_status",
+            new=AsyncMock(return_value={"status": "blocked"}),
+        ):
+            result = await continue_initiative(
+                fake_db,
+                objective_id=205,
+                actor="mim",
+                source="unit-test",
+                max_auto_steps=1,
+            )
+
+        self.assertEqual(step_five.state, "blocked")
+        self.assertEqual(step_five.dispatch_status, "blocked")
+        self.assertIn("recovery_transition_not_recorded", step_five.dispatch_artifact_json["blockers"])
+        self.assertEqual(result["executed_local"][0]["continuation_status"], "stalled")
+
+    async def test_continue_initiative_accepts_detected_recovery_transition_for_auto_resume(self) -> None:
+        objective = SimpleNamespace(
+            id=206,
+            title="Continuation validation objective",
+            priority="high",
+            state="in_progress",
+            owner="mim",
+            constraints_json=[],
+            metadata_json={},
+            created_at="2026-05-05T00:00:00Z",
+        )
+        prior_step = SimpleNamespace(
+            id=2064,
+            objective_id=206,
+            title="Continuation validation step 4",
+            details="simulate recovery",
+            dependencies=[],
+            acceptance_criteria="record recovery transition",
+            state="completed",
+            assigned_to="mim",
+            readiness="completed",
+            boundary_mode="soft",
+            start_now=True,
+            human_prompt_required=False,
+            execution_scope="continuation_validation",
+            expected_outputs_json=[],
+            verification_commands_json=[],
+            dispatch_status="completed",
+            dispatch_artifact_json={
+                "mode": "continuation_validation_step",
+                "continuation_status": "continued",
+                "recovery_transition": {
+                    "type": "detected_and_isolated",
+                    "source_objective_id": 88,
+                    "source_task_id": 990,
+                    "source_readiness": "blocked",
+                    "source_status": "blocked",
+                },
+            },
+            metadata_json={
+                "automation_kind": "continuation_validation_step",
+                "validation_step_number": 4,
+                "validation_step_count": 8,
+            },
+            created_at="2026-05-05T00:00:04Z",
+        )
+        step_five = SimpleNamespace(
+            id=2065,
+            objective_id=206,
+            title="Continuation validation step 5",
+            details="validate auto-resume",
+            dependencies=[2064],
+            acceptance_criteria="confirm execution resumed",
+            state="queued",
+            assigned_to="mim",
+            readiness="ready",
+            boundary_mode="soft",
+            start_now=True,
+            human_prompt_required=False,
+            execution_scope="continuation_validation",
+            expected_outputs_json=[],
+            verification_commands_json=[],
+            dispatch_status="pending",
+            dispatch_artifact_json={},
+            metadata_json={
+                "automation_kind": "continuation_validation_step",
+                "validation_step_number": 5,
+                "validation_step_count": 8,
+            },
+            created_at="2026-05-05T00:00:05Z",
+        )
+
+        execute_result = SimpleNamespace(
+            scalars=lambda: SimpleNamespace(all=lambda: [objective], first=lambda: objective)
+        )
+        fake_db = SimpleNamespace(execute=AsyncMock(return_value=execute_result))
+
+        with patch(
+            "core.autonomy_driver_service._tasks_for_objective",
+            new=AsyncMock(return_value=[prior_step, step_five]),
+        ), patch(
+            "core.autonomy_driver_service._select_next_ready_task",
+            new=AsyncMock(side_effect=[(objective, step_five), (None, None)]),
+        ), patch(
+            "core.autonomy_driver_service.refresh_task_readinesses",
+            new=AsyncMock(return_value=[]),
+        ), patch(
+            "core.autonomy_driver_service.recompute_objective_state",
+            new=AsyncMock(return_value="in_progress"),
+        ), patch(
+            "core.autonomy_driver_service.write_journal",
+            new=AsyncMock(return_value=None),
+        ), patch(
+            "core.autonomy_driver_service.build_initiative_status",
+            new=AsyncMock(return_value={"status": "active"}),
+        ):
+            result = await continue_initiative(
+                fake_db,
+                objective_id=206,
+                actor="mim",
+                source="unit-test",
+                max_auto_steps=1,
+            )
+
+        self.assertEqual(step_five.state, "completed")
+        self.assertEqual(step_five.dispatch_status, "completed")
+        self.assertEqual(result["executed_local"][0]["continuation_status"], "continued")
+        self.assertIn("Execution resumed after the recorded recovery transition", step_five.dispatch_artifact_json["result"])
+
     async def test_continue_initiative_recovers_false_blocked_codex_task(self) -> None:
         objective = SimpleNamespace(
             id=16,
@@ -1367,6 +1582,112 @@ class CodexDispatchEvidenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("local' failed", str(stale_tracking.get("execution_result") or ""))
         self.assertEqual(result["status"]["status"], "failed")
 
+    async def test_continue_initiative_prefers_bounded_analysis_completion_over_shared_failure(self) -> None:
+        objective = SimpleNamespace(
+            id=1321,
+            title="Execution completion recovery",
+            priority="high",
+            state="in_progress",
+            owner="mim",
+            constraints_json=[],
+            metadata_json={},
+            created_at="2026-04-20T00:00:00Z",
+        )
+        stale_task = SimpleNamespace(
+            id=7831,
+            objective_id=1321,
+            title="Inspect lifecycle completion conditions",
+            details="inspect lifecycle state",
+            dependencies=[],
+            acceptance_criteria="analysis result artifact exists",
+            state="in_progress",
+            assigned_to="codex",
+            readiness="in_progress",
+            boundary_mode="soft",
+            start_now=True,
+            human_prompt_required=False,
+            execution_scope="bounded_analysis",
+            expected_outputs_json=[],
+            verification_commands_json=[],
+            dispatch_status="queued",
+            dispatch_artifact_json={
+                "handoff_id": "handoff-analysis-7831",
+                "task_path": "/tmp/handoff-analysis-7831.task.json",
+                "status_path": "/tmp/handoff-analysis-7831.status.json",
+                "latest_result_summary": "Lifecycle inspection completed.",
+                "latest_result": {
+                    "broker_preparation": {
+                        "automatic_live_response": {
+                            "status": "completed",
+                            "result_artifact": "/tmp/handoff-analysis-7831.broker-result.json",
+                        },
+                        "automatic_live_interpretation": {
+                            "status": "completed",
+                            "classification": "model_response_text",
+                        },
+                    }
+                },
+            },
+            metadata_json={"execution_tracking": {"task_created": True, "task_dispatched": True}},
+            created_at="2026-04-20T00:00:00Z",
+        )
+        fake_db = SimpleNamespace(execute=AsyncMock(return_value=_FakeExecuteResult([objective])))
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            shared_root = Path(tmp_dir)
+            (shared_root / "TOD_MIM_TASK_RESULT.latest.json").write_text(
+                json.dumps(
+                    {
+                        "request_id": "handoff-analysis-7831",
+                        "task_id": "handoff-analysis-7831",
+                        "status": "failed",
+                        "result_status": "failed",
+                        "error": "Execution engine 'local' failed and fallback is unavailable.",
+                    },
+                    indent=2,
+                ) + "\n",
+                encoding="utf-8",
+            )
+
+            with patch(
+                "core.autonomy_driver_service._tasks_for_objective",
+                new=AsyncMock(return_value=[stale_task]),
+            ), patch(
+                "core.autonomy_driver_service._select_next_ready_task",
+                new=AsyncMock(return_value=(None, None)),
+            ), patch(
+                "core.autonomy_driver_service.refresh_task_readinesses",
+                new=AsyncMock(return_value=None),
+            ), patch(
+                "core.autonomy_driver_service.recompute_objective_state",
+                new=AsyncMock(return_value="completed"),
+            ), patch(
+                "core.autonomy_driver_service.write_journal",
+                new=AsyncMock(return_value=None),
+            ), patch(
+                "core.autonomy_driver_service.build_initiative_status",
+                new=AsyncMock(return_value={"status": "completed"}),
+            ), patch(
+                "core.autonomy_driver_service.RUNTIME_SHARED_DIR",
+                shared_root,
+            ):
+                result = await continue_initiative(
+                    fake_db,
+                    objective_id=1321,
+                    actor="mim",
+                    source="unit-test",
+                    max_auto_steps=1,
+                )
+
+        self.assertEqual(stale_task.state, "completed")
+        self.assertEqual(stale_task.dispatch_status, "completed")
+        stale_tracking = stale_task.metadata_json.get("execution_tracking", {})
+        self.assertEqual(
+            str(stale_tracking.get("result_artifact") or ""),
+            "/tmp/handoff-analysis-7831.broker-result.json",
+        )
+        self.assertEqual(result["status"]["status"], "completed")
+
     async def test_continue_initiative_recovers_bounded_development_completion_from_explicit_completion_artifact(self) -> None:
         objective = SimpleNamespace(
             id=133,
@@ -1464,6 +1785,114 @@ class CodexDispatchEvidenceTests(unittest.IsolatedAsyncioTestCase):
                 result = await continue_initiative(
                     fake_db,
                     objective_id=133,
+                    actor="mim",
+                    source="unit-test",
+                    max_auto_steps=1,
+                )
+
+        self.assertEqual(stale_task.state, "completed")
+        self.assertEqual(stale_task.dispatch_status, "completed")
+        stale_tracking = stale_task.metadata_json.get("execution_tracking", {})
+        self.assertTrue(str(stale_tracking.get("result_artifact") or "").endswith(".completion.json"))
+        self.assertEqual(result["status"]["status"], "completed")
+
+    async def test_continue_initiative_recovers_bounded_validation_completion_from_explicit_completion_artifact(self) -> None:
+        objective = SimpleNamespace(
+            id=134,
+            title="Validation completion recovery",
+            priority="high",
+            state="in_progress",
+            owner="mim",
+            constraints_json=[],
+            metadata_json={},
+            created_at="2026-04-20T00:00:00Z",
+        )
+        stale_task = SimpleNamespace(
+            id=785,
+            objective_id=134,
+            title="Validate bounded implementation",
+            details="verify bounded codex output",
+            dependencies=[],
+            acceptance_criteria="validation result recorded",
+            state="in_progress",
+            assigned_to="codex",
+            readiness="in_progress",
+            boundary_mode="soft",
+            start_now=True,
+            human_prompt_required=False,
+            execution_scope="bounded_validation",
+            expected_outputs_json=[],
+            verification_commands_json=[],
+            dispatch_status="queued",
+            dispatch_artifact_json={
+                "handoff_id": "objective-2900-task-7118-validate-the-bounded-implementation-and-summarize-the-result",
+                "task_path": "/tmp/objective-2900-task-7118.task.json",
+                "status_path": "/tmp/objective-2900-task-7118.status.json",
+                "latest_result_summary": "Queued bounded validation task.",
+                "latest_result": {
+                    "broker_preparation": {
+                        "automatic_live_response": {
+                            "status": "completed",
+                            "result_artifact": "/tmp/objective-2900-task-7118.broker-result.json",
+                        },
+                        "automatic_live_interpretation": {
+                            "status": "completed",
+                            "classification": "model_response_text",
+                        },
+                    }
+                },
+            },
+            metadata_json={"execution_tracking": {"task_created": True, "task_dispatched": True}},
+            created_at="2026-04-20T00:00:00Z",
+        )
+        fake_db = SimpleNamespace(execute=AsyncMock(return_value=_FakeExecuteResult([objective])))
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            temp_root = Path(tmp_dir)
+            task_path = temp_root / "objective-2900-task-7118.task.json"
+            status_path = temp_root / "objective-2900-task-7118.status.json"
+            completion_path = temp_root / "objective-2900-task-7118-validate-the-bounded-implementation-and-summarize-the-result.completion.json"
+            task_path.write_text("{}\n", encoding="utf-8")
+            status_path.write_text("{}\n", encoding="utf-8")
+            completion_path.write_text(
+                json.dumps(
+                    {
+                        "request_id": "objective-2900-task-7118-validate-the-bounded-implementation-and-summarize-the-result",
+                        "task_id": "785",
+                        "status": "completed",
+                        "result_status": "completed",
+                        "summary": "Bounded validation completed with explicit completion evidence.",
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            stale_task.dispatch_artifact_json["task_path"] = str(task_path)
+            stale_task.dispatch_artifact_json["status_path"] = str(status_path)
+
+            with patch(
+                "core.autonomy_driver_service._tasks_for_objective",
+                new=AsyncMock(return_value=[stale_task]),
+            ), patch(
+                "core.autonomy_driver_service._select_next_ready_task",
+                new=AsyncMock(return_value=(None, None)),
+            ), patch(
+                "core.autonomy_driver_service.refresh_task_readinesses",
+                new=AsyncMock(return_value=None),
+            ), patch(
+                "core.autonomy_driver_service.recompute_objective_state",
+                new=AsyncMock(return_value="completed"),
+            ), patch(
+                "core.autonomy_driver_service.write_journal",
+                new=AsyncMock(return_value=None),
+            ), patch(
+                "core.autonomy_driver_service.build_initiative_status",
+                new=AsyncMock(return_value={"status": "completed"}),
+            ):
+                result = await continue_initiative(
+                    fake_db,
+                    objective_id=134,
                     actor="mim",
                     source="unit-test",
                     max_auto_steps=1,
@@ -2166,6 +2595,68 @@ class AutonomyDriverStatusTests(unittest.IsolatedAsyncioTestCase):
             status["program_status"]["summary"],
         )
 
+    async def test_general_status_persists_program_status_snapshot(self) -> None:
+        objective = SimpleNamespace(
+            id=90,
+            title="Execution evidence objective",
+            description="Fresh bounded execution objective",
+            priority="high",
+            constraints_json=[],
+            success_criteria="done",
+            state="in_progress",
+            owner="mim",
+            execution_mode="auto",
+            auto_continue=True,
+            boundary_mode="soft",
+            metadata_json={
+                "initiative_id": "MIM-DAY-02-INITIATIVE-ISOLATION",
+                "program_id": "MIM-12-AUTONOMOUS-EVOLUTION",
+                "execution_tracking": {
+                    "task_created": True,
+                    "task_dispatched": True,
+                    "execution_started": True,
+                    "execution_result": "1_tasks_completed",
+                    "execution_state": "completed",
+                },
+            },
+            created_at="2999-01-01T00:00:00Z",
+        )
+        completed_task = SimpleNamespace(
+            id=3001,
+            objective_id=90,
+            title="Completed bounded task",
+            details="done",
+            dependencies=[],
+            acceptance_criteria="done",
+            state="completed",
+            assigned_to="mim",
+            readiness="completed",
+            boundary_mode="soft",
+            start_now=True,
+            human_prompt_required=False,
+            execution_scope="bounded_development",
+            expected_outputs_json=[],
+            verification_commands_json=[],
+            dispatch_status="completed",
+            dispatch_artifact_json={},
+            metadata_json=AutonomyDriverServiceTests._completed_tracking("completed-task-3001"),
+            created_at="2999-01-01T00:00:01Z",
+        )
+        execute_result = SimpleNamespace(
+            scalars=lambda: SimpleNamespace(all=lambda: [objective])
+        )
+        fake_db = SimpleNamespace(execute=AsyncMock(return_value=execute_result))
+
+        with patch(
+            "core.autonomy_driver_service.refresh_task_readinesses",
+            new=AsyncMock(return_value=[completed_task]),
+        ), patch(
+            "core.autonomy_driver_service.persist_program_status_snapshot"
+        ) as persist_snapshot:
+            await build_initiative_status(db=fake_db)
+
+        persist_snapshot.assert_called_once()
+
     async def test_general_status_marks_long_running_bounded_task_as_stale(self) -> None:
         objective = SimpleNamespace(
             id=61,
@@ -2353,6 +2844,78 @@ class AutonomyDriverStatusTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status["progress"]["completed_task_count"], 1)
         self.assertEqual(status["progress"]["task_count"], 2)
         self.assertEqual(status["progress"]["percent"], 50)
+        self.assertEqual(status["progress"]["movement_percent"], 80)
+
+    async def test_general_status_reports_partial_movement_before_completion(self) -> None:
+        objective = SimpleNamespace(
+            id=63,
+            title="Partial movement objective",
+            description="Track small progress before bounded completion evidence exists",
+            priority="high",
+            constraints_json=[],
+            success_criteria="done",
+            state="in_progress",
+            owner="mim",
+            execution_mode="auto",
+            auto_continue=True,
+            boundary_mode="soft",
+            metadata_json={
+                "execution_tracking": {
+                    "task_created": True,
+                    "task_dispatched": True,
+                    "execution_started": True,
+                    "execution_state": "executing",
+                },
+            },
+            created_at="2999-01-01T00:00:00Z",
+        )
+        active_task = SimpleNamespace(
+            id=1906,
+            objective_id=63,
+            title="Execute bounded step",
+            details="current task details",
+            dependencies=[],
+            acceptance_criteria="do work",
+            state="in_progress",
+            assigned_to="codex",
+            readiness="in_progress",
+            boundary_mode="soft",
+            start_now=True,
+            human_prompt_required=False,
+            execution_scope="bounded_development",
+            expected_outputs_json=[],
+            verification_commands_json=[],
+            dispatch_status="queued",
+            dispatch_artifact_json={},
+            metadata_json={
+                "execution_tracking": {
+                    "task_created": True,
+                    "task_dispatched": True,
+                    "execution_started": True,
+                    "execution_result": None,
+                    "request_id": "objective-63-task-1906",
+                    "execution_trace": "trace:objective-63-task-1906",
+                    "result_artifact": "",
+                }
+            },
+            created_at="2999-01-01T00:00:01Z",
+        )
+
+        execute_result = SimpleNamespace(
+            scalars=lambda: SimpleNamespace(all=lambda: [objective])
+        )
+        fake_db = SimpleNamespace(execute=AsyncMock(return_value=execute_result))
+
+        with patch(
+            "core.autonomy_driver_service.refresh_task_readinesses",
+            new=AsyncMock(return_value=[active_task]),
+        ):
+            status = await build_initiative_status(db=fake_db)
+
+        self.assertEqual(status["progress"]["completed_task_count"], 0)
+        self.assertEqual(status["progress"]["task_count"], 1)
+        self.assertEqual(status["progress"]["percent"], 0)
+        self.assertEqual(status["progress"]["movement_percent"], 60)
 
 
 if __name__ == "__main__":

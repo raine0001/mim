@@ -62,6 +62,62 @@ class MimUiGatewayGovernanceReasoningTest(unittest.TestCase):
         self.assertIn("Gateway governance", summary)
         self.assertIn("degraded", summary)
 
+    def test_active_work_snapshot_marks_reply_only_when_no_tracked_work_exists(self):
+        snapshot = mim_ui._operator_active_work_snapshot({}, {})
+
+        self.assertFalse(snapshot["tracked"])
+        self.assertEqual(snapshot["state"], "reply_only")
+        self.assertIn("No tracked work is active", snapshot["summary"])
+
+    def test_active_work_snapshot_marks_working_when_collaboration_request_exists(self):
+        snapshot = mim_ui._operator_active_work_snapshot(
+            {
+                "request_id": "mim-request-123",
+                "task_id": "handoff-task-conversation-mim-request-123",
+                "execution_id": "mim-request-123",
+                "execution_id_label": "request mim-request-123",
+                "summary": "request mim-request-123 | queued | decision_recorded",
+                "active_workstream": {
+                    "name": "conversation_handoff",
+                    "tod_status": "queued",
+                    "latest_observation": "Bounded implementation task staged.",
+                },
+            },
+            {},
+        )
+
+        self.assertTrue(snapshot["tracked"])
+        self.assertEqual(snapshot["state"], "working")
+        self.assertEqual(snapshot["badge"], "Working now")
+        self.assertEqual(snapshot["request_id"], "mim-request-123")
+        self.assertIn("Bounded implementation task staged", snapshot["summary"])
+
+    def test_summary_includes_active_work_signal(self):
+        summary = mim_ui._build_operator_reasoning_summary(
+            goal={},
+            inquiry={},
+            governance={},
+            gateway_governance={},
+            autonomy={},
+            stewardship={},
+            execution_readiness={},
+            execution_recovery={},
+            commitment={},
+            commitment_monitoring={},
+            commitment_outcome={},
+            learned_preferences=[],
+            proposal_policy={},
+            conflict_resolution={},
+            active_work={
+                "summary": "request mim-request-123 is working now.",
+            },
+            runtime_health={},
+            runtime_recovery={},
+        )
+
+        self.assertIn("Active work", summary)
+        self.assertIn("working now", summary)
+
         def test_summary_includes_tod_decision_process(self):
                 summary = mim_ui._build_operator_reasoning_summary(
                         goal={},

@@ -113,11 +113,45 @@ class Objective166SelfEvolutionBriefingTest(unittest.TestCase):
         snapshot = briefing.get("snapshot", {}) if isinstance(briefing.get("snapshot", {}), dict) else {}
         decision = briefing.get("decision", {}) if isinstance(briefing.get("decision", {}), dict) else {}
         target = briefing.get("target", {}) if isinstance(briefing.get("target", {}), dict) else {}
+        natural_language_development = (
+            briefing.get("natural_language_development", {})
+            if isinstance(briefing.get("natural_language_development", {}), dict)
+            else {}
+        )
         metadata = briefing.get("metadata_json", {}) if isinstance(briefing.get("metadata_json", {}), dict) else {}
 
         self.assertTrue(str(snapshot.get("summary", "")).strip())
         self.assertTrue(str(decision.get("decision_type", "")).strip())
         self.assertTrue(bool(metadata.get("objective166_self_evolution_briefing", False)))
+        self.assertTrue(bool(metadata.get("objective171_self_evolution_natural_language_development", False)))
+
+        self.assertTrue(str(natural_language_development.get("summary", "")).strip(), natural_language_development)
+        self.assertEqual(int(natural_language_development.get("metadata_json", {}).get("skill_count", 0) or 0), 10)
+        self.assertEqual(int(natural_language_development.get("metadata_json", {}).get("slice_count", 0) or 0), 6)
+        self.assertTrue(bool(natural_language_development.get("metadata_json", {}).get("auto_continue_on_pass", False)))
+        skills = natural_language_development.get("skills", []) if isinstance(natural_language_development.get("skills", []), list) else []
+        self.assertEqual(len(skills), 10, natural_language_development)
+        slices = natural_language_development.get("slices", []) if isinstance(natural_language_development.get("slices", []), list) else []
+        self.assertEqual(len(slices), 6, natural_language_development)
+        for slice_payload in slices:
+            tasks = slice_payload.get("tasks", []) if isinstance(slice_payload.get("tasks", []), list) else []
+            self.assertEqual(len(tasks), 10, slice_payload)
+        continuation_policy = natural_language_development.get("continuation_policy", {}) if isinstance(natural_language_development.get("continuation_policy", {}), dict) else {}
+        self.assertTrue(bool(continuation_policy.get("auto_continue_on_pass", False)), natural_language_development)
+        self.assertEqual(str(continuation_policy.get("operator_interaction_mode", "")).strip(), "none_until_stopped")
+        self.assertTrue(str(natural_language_development.get("active_slice_summary", "")).strip(), natural_language_development)
+        self.assertTrue(str(natural_language_development.get("progress_summary", "")).strip(), natural_language_development)
+        progress = natural_language_development.get("progress", {}) if isinstance(natural_language_development.get("progress", {}), dict) else {}
+        self.assertEqual(str(progress.get("status", "")).strip(), "running")
+        self.assertEqual(str(progress.get("active_slice_id", "")).strip(), str(natural_language_development.get("active_slice_id", "")).strip())
+        self.assertTrue(str(natural_language_development.get("whats_next_framework_summary", "")).strip(), natural_language_development)
+        selected_skill = natural_language_development.get("selected_skill", {}) if isinstance(natural_language_development.get("selected_skill", {}), dict) else {}
+        self.assertEqual(
+            str(natural_language_development.get("selected_skill_id", "")).strip(),
+            str(selected_skill.get("skill_id", "")).strip(),
+            natural_language_development,
+        )
+        self.assertTrue(str(natural_language_development.get("selected_skill_pass_bar_summary", "")).strip(), natural_language_development)
 
         self.assertEqual(str(target.get("target_kind", "")), str(decision.get("target_kind", "")))
         self.assertEqual(target.get("target_id"), decision.get("target_id"))
