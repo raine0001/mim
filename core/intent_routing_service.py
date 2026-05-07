@@ -15,6 +15,7 @@ CLASSIFIER_OUTCOMES = {
 ROBOTICS_LOCAL_GUARD_TERMS = (
     "servo",
     "gripper",
+    "claw",
     "arm",
     "safe_home",
     "supervised probe",
@@ -72,12 +73,31 @@ def looks_like_robotics_supervised_probe(text: str) -> bool:
     if not query:
         return False
     probe_markers = ("probe", "envelope", "learned bounds", "learned_bounds")
-    robotics_markers = ("servo", "multi servo", "arm", "gripper")
+    robotics_markers = ("servo", "multi servo", "arm", "gripper", "claw")
     bounded_markers = ("supervised", "bounded", "prep", "safe home", "safe_home")
     return (
         any(marker in query for marker in probe_markers)
         and any(marker in query for marker in robotics_markers)
         and (any(marker in query for marker in bounded_markers) or "mim arm" in query)
+    )
+
+
+def looks_like_gripper_or_claw_command(text: str) -> bool:
+    query = normalize_query(text)
+    if not query:
+        return False
+    if not any(marker in query for marker in {"gripper", "claw"}):
+        return False
+    return any(
+        re.search(pattern, query)
+        for pattern in (
+            r"\bopen\b",
+            r"\bclose\b",
+            r"\bset\b",
+            r"\bmove\b",
+            r"\bactuate\b",
+            r"\b\d+\s*(?:degree|degrees|deg)\b",
+        )
     )
 
 
@@ -87,6 +107,8 @@ def looks_like_execution_capability_request(text: str, parsed_intent: str = "") 
     if intent in {"execution_capability_request", "robotics_supervised_probe", "execute_capability"}:
         return True
     if looks_like_robotics_supervised_probe(text):
+        return True
+    if looks_like_gripper_or_claw_command(text):
         return True
     if contains_robotics_local_guard_term(text) and any(
         marker in query
@@ -101,6 +123,11 @@ def looks_like_execution_capability_request(text: str, parsed_intent: str = "") 
             "command",
             "bounded",
             "motion",
+            "open",
+            "close",
+            "set",
+            "move",
+            "actuate",
         }
     ):
         return True
@@ -149,7 +176,13 @@ def route_console_text_input(text: str, parsed_intent: str = "") -> ConsoleInten
         internal_intent = "execute_capability"
         route_preference = "goal_system"
         if contains_robotics_local_guard_term(text):
-            capability_name = "mim_arm.execute_safe_home" if "safe_home" in normalize_query(text) else "mim_arm.supervised_probe"
+            query = normalize_query(text)
+            if looks_like_gripper_or_claw_command(text):
+                capability_name = "mim_arm.execute_gripper"
+            elif "safe_home" in query:
+                capability_name = "mim_arm.execute_safe_home"
+            else:
+                capability_name = "mim_arm.supervised_probe"
             routing_path.extend(("robotics_capability_registry", "execution_binding"))
         else:
             routing_path.append("execution_binding")

@@ -278,6 +278,21 @@ MIM_ARM_CAPABILITY_DEFINITIONS = [
         },
     },
     {
+        "capability_name": "mim_arm.execute_gripper",
+        "category": "manipulation",
+        "description": "Prepare a governed gripper/claw motion request for TOD/operator review.",
+        "requires_confirmation": True,
+        "enabled": True,
+        "safety_policy": {
+            "stage": "bounded_execution",
+            "mode": "operator_guarded",
+            "executor": "tod",
+            "allowed_targets": ["open_gripper", "close_gripper", "set_gripper"],
+            "operator_approval_required_for_execution": True,
+            "guard_terms": ["gripper", "claw", "servo", "estop_ok", "motion_allowed"],
+        },
+    },
+    {
         "capability_name": "mim_arm.supervised_probe",
         "category": "manipulation",
         "description": "Prepare a governed supervised servo-envelope probe goal for TOD/operator review before any motion.",

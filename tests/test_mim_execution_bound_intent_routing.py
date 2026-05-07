@@ -108,6 +108,18 @@ class MimExecutionBoundIntentRoutingHarnessTest(unittest.TestCase):
         self.assertTrue(robotics_web_guard_blocks_search(text))
         self.assertFalse(_should_use_web_research(text.lower()))
 
+    def test_claw_open_command_routes_to_gripper_execution_not_conversation(self) -> None:
+        text = "can you open the claw 30 degrees"
+        route = route_console_text_input(text, "discussion")
+
+        self.assertEqual(route.classifier_outcome, "execution_capability_request")
+        self.assertEqual(route.route_preference, "goal_system")
+        self.assertEqual(route.internal_intent, "execute_capability")
+        self.assertEqual(route.capability_name, "mim_arm.execute_gripper")
+        self.assertFalse(route.web_search_allowed)
+        self.assertTrue(robotics_web_guard_blocks_search(text))
+        self.assertFalse(_should_use_web_research(text.lower()))
+
     def test_true_research_question_still_triggers_web_research(self) -> None:
         text = "Search the web for public ROS 2 gripper calibration examples."
         route = route_console_text_input(text, "discussion")

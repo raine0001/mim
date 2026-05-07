@@ -38,7 +38,9 @@ from core.communication_composer import (
 from core.db import get_db
 from core.config import settings
 from core.autonomy_driver_service import (
+    HARD_BOUNDARY,
     build_initiative_status,
+    classify_boundary_mode,
     drive_initiative_from_intent,
     extract_explicit_initiative_id,
 )
@@ -11538,6 +11540,35 @@ def _intent_capability(event: InputEvent, internal_intent: str) -> str:
 
 
 def _default_execution_arguments(event: InputEvent, capability_name: str) -> dict:
+    if capability_name == "mim_arm.execute_gripper":
+        raw = str(event.raw_input or "").strip().lower()
+        degree_match = re.search(r"\b(\d+(?:\.\d+)?)\s*(?:degree|degrees|deg)\b", raw)
+        requested_degrees = None
+        if degree_match:
+            try:
+                requested_degrees = float(degree_match.group(1))
+            except ValueError:
+                requested_degrees = None
+        if "close" in raw:
+            requested_action = "close_gripper"
+        elif "open" in raw:
+            requested_action = "open_gripper"
+        else:
+            requested_action = "set_gripper"
+        return {
+            "command_family": "mim_arm_gripper",
+            "requested_action": requested_action,
+            "requested_degrees": requested_degrees,
+            "servo_id": 5,
+            "safety_constraints": {
+                "requires_estop_ok": True,
+                "requires_serial_ready": True,
+                "requires_arm_online": True,
+                "requires_motion_allowed": True,
+                "operator_confirmation_required": True,
+            },
+        }
+
     if capability_name != "workspace_scan":
         return {}
 
