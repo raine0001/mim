@@ -27,8 +27,8 @@ echo "-- Manifest --"
 echo "prod git_sha: $(manifest_field http://127.0.0.1:8000/manifest git_sha)"
 echo "prod release_tag: $(manifest_field http://127.0.0.1:8000/manifest release_tag)"
 echo "prod build_timestamp: $(manifest_field http://127.0.0.1:8000/manifest build_timestamp)"
-echo "test git_sha: $(manifest_field http://127.0.0.1:8001/manifest git_sha)"
-echo "test release_tag: $(manifest_field http://127.0.0.1:8001/manifest release_tag)"
+echo "workspace git_sha: $(manifest_field http://127.0.0.1:18001/manifest git_sha)"
+echo "workspace release_tag: $(manifest_field http://127.0.0.1:18001/manifest release_tag)"
 echo
 
 echo "-- Backup --"

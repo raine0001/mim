@@ -16,6 +16,9 @@ from urllib.request import urlopen
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+from core.objective_history_service import sync_objective_history_from_export_payload
+
 DEFAULT_OUTPUT_DIR = ROOT / "runtime" / "shared"
 PUBLICATION_BOUNDARY_STATUS_PATH = DEFAULT_OUTPUT_DIR / "MIM_TOD_PUBLICATION_BOUNDARY.latest.json"
 DEFAULT_FORMAL_PROGRAM_DRIVE_RESPONSE_PATH = ROOT / "runtime" / "formal_program_drive_response.json"
@@ -70,6 +73,8 @@ FORMAL_PROGRAM_ACTIVE_STATES = {
     "working",
 }
 NON_AUTHORITATIVE_LIVE_TASK_SOURCES = {"continuous_task_dispatch"}
+NON_AUTHORITATIVE_LIVE_TASK_SOURCE_PREFIXES = ("tod-ui-",)
+NON_AUTHORITATIVE_LIVE_TASK_ACTIONS = {"execute-chat-task"}
 NON_AUTHORITATIVE_LIVE_TASK_TITLE_PREFIXES = ("continuous dispatch sample",)
 NON_AUTHORITATIVE_LIVE_TASK_SCOPES = {
     "execute one standard mim->tod loop cycle and publish ack/result.",
@@ -466,15 +471,19 @@ def _latest_live_task_request_signal(shared_dir: Path) -> dict:
     source_service = ""
     title = ""
     scope = ""
+    tod_action = ""
     objective_authority_eligible = True
     suppression_reason = ""
     if isinstance(payload, dict):
         objective = _normalize_objective_ref(
             payload.get("objective_id") or payload.get("task_id")
         )
-        source_service = str(payload.get("source_service") or "").strip()
+        source_service = str(
+            payload.get("source_service") or payload.get("source") or ""
+        ).strip()
         title = str(payload.get("title") or "").strip()
         scope = str(payload.get("scope") or "").strip()
+        tod_action = str(payload.get("tod_action") or "").strip()
         source_key = source_service.lower()
         title_key = title.lower()
         scope_key = scope.lower()
@@ -484,6 +493,11 @@ def _latest_live_task_request_signal(shared_dir: Path) -> dict:
         ):
             objective_authority_eligible = False
             suppression_reason = "non_authoritative_continuous_dispatch_loop"
+        elif any(source_key.startswith(prefix) for prefix in NON_AUTHORITATIVE_LIVE_TASK_SOURCE_PREFIXES) and (
+            tod_action.lower() in NON_AUTHORITATIVE_LIVE_TASK_ACTIONS
+        ):
+            objective_authority_eligible = False
+            suppression_reason = "non_authoritative_tod_ui_chat_request"
     try:
         source_label = str(request_path.relative_to(ROOT))
     except ValueError:
@@ -498,6 +512,7 @@ def _latest_live_task_request_signal(shared_dir: Path) -> dict:
         "source_service": source_service,
         "title": title,
         "scope": scope,
+        "tod_action": tod_action,
         "objective_authority_eligible": objective_authority_eligible,
         "suppression_reason": suppression_reason,
     }
@@ -542,10 +557,7 @@ def _terminal_request_review_details(
     next_objective = _normalize_objective_ref(next_objective)
 
     task_matches = bool(request_task_id and review_task_id and request_task_id == review_task_id)
-    objective_matches = bool(
-        request_objective and review_objective and request_objective == review_objective
-    )
-    if not task_matches and not objective_matches:
+    if not task_matches:
         return None
 
     state = str(review_payload.get("state") or "").strip().lower()
@@ -578,61 +590,7 @@ def _stale_guard_terminal_request_review_details(
     request_task_id: str | None,
     request_objective: str | None,
 ) -> dict | None:
-    if not isinstance(command_status_payload, dict):
-        return None
-
-    stale_guard = command_status_payload.get("stale_guard")
-    if not isinstance(stale_guard, dict) or stale_guard.get("detected") is not True:
-        return None
-
-    decision = str(stale_guard.get("decision") or "").strip().lower()
-    reason = str(stale_guard.get("reason") or "").strip().lower()
-    if decision != "stale_request_ignored" or reason != "higher_authoritative_task_ordinal_active":
-        return None
-
-    request_task_id = str(request_task_id or "").strip()
-    request_objective = _normalize_objective_ref(request_objective)
-
-    status_request_id = str(
-        command_status_payload.get("request_id") or command_status_payload.get("task_id") or ""
-    ).strip()
-    status_objective = _normalize_objective_ref(status_request_id)
-    current_request = stale_guard.get("current_request")
-    if not isinstance(current_request, dict):
-        current_request = {}
-    authoritative_objective = _normalize_objective_ref(
-        stale_guard.get("objective_id")
-        or current_request.get("request_id")
-        or current_request.get("task_id")
-    )
-    if not authoritative_objective:
-        return None
-
-    task_matches = bool(request_task_id and status_request_id and request_task_id == status_request_id)
-    objective_matches = bool(
-        request_objective and status_objective and request_objective == status_objective
-    )
-    if not task_matches and not objective_matches:
-        return None
-
-    if request_objective and (
-        _objective_sort_key(authoritative_objective)
-        <= _objective_sort_key(request_objective)
-    ):
-        return None
-
-    return {
-        "review_task_id": status_request_id,
-        "review_objective": request_objective or status_objective,
-        "state": "superseded",
-        "gate_pass": None,
-        "promotion_ready": None,
-        "next_objective": authoritative_objective,
-        "authoritative_objective": authoritative_objective,
-        "reason": "stale_guard_higher_authoritative_request",
-        "stale_guard_reason": reason,
-        "stale_guard_decision": decision,
-    }
+    return None
 
 
 def _fetch_json(
@@ -1252,6 +1210,38 @@ def build_payload_bundle(
             )
     live_task_objective = _normalize_objective_ref(live_task_signal.get("objective"))
     task_status_review = _load_task_status_review(output_dir)
+    listener_confirmed_live_task = False
+    if isinstance(task_status_review, dict):
+        review_task = task_status_review.get("task")
+        review_gate = task_status_review.get("gate")
+        review_state = str(task_status_review.get("state") or "").strip().lower()
+        if not isinstance(review_task, dict):
+            review_task = {}
+        if not isinstance(review_gate, dict):
+            review_gate = {}
+        review_objective = _normalize_objective_ref(
+            review_task.get("objective_id")
+            or review_task.get("request_task_id")
+            or review_task.get("authoritative_task_id")
+        )
+        review_task_id = str(
+            review_task.get("request_task_id")
+            or review_task.get("authoritative_task_id")
+            or review_task.get("active_task_id")
+            or ""
+        ).strip()
+        listener_confirmed_live_task = bool(
+            live_task_objective
+            and review_gate.get("pass") is True
+            and review_gate.get("promotion_ready") is True
+            and (
+                (
+                    review_task_id
+                    and review_task_id == str(live_task_signal.get("task_id") or "").strip()
+                )
+                or (review_objective and review_objective == live_task_objective)
+            )
+        )
     command_status = _load_command_status(output_dir)
     terminal_request_review = _terminal_request_review_details(
         task_status_review,
@@ -1264,10 +1254,14 @@ def build_payload_bundle(
         request_task_id=str(live_task_signal.get("task_id") or "").strip(),
         request_objective=live_task_objective,
     )
-    if stale_guard_request_review is not None and (
-        terminal_request_review is None
-        or _objective_sort_key(stale_guard_request_review.get("next_objective"))
-        > _objective_sort_key(terminal_request_review.get("next_objective"))
+    if (
+        stale_guard_request_review is not None
+        and not listener_confirmed_live_task
+        and (
+            terminal_request_review is None
+            or _objective_sort_key(stale_guard_request_review.get("next_objective"))
+            > _objective_sort_key(terminal_request_review.get("next_objective"))
+        )
     ):
         terminal_request_review = stale_guard_request_review
     if terminal_request_review is not None:
@@ -1404,7 +1398,8 @@ def build_payload_bundle(
         objective_active_source = "objective_authority_reset"
 
     if live_task_promotes_objective and (
-        _objective_sort_key(live_task_objective) > _objective_sort_key(objective_active)
+        listener_confirmed_live_task
+        or _objective_sort_key(live_task_objective) > _objective_sort_key(objective_active)
     ):
         objective_active = live_task_objective
         next_objective = live_task_objective
@@ -1755,6 +1750,10 @@ def write_exports(
     payload: dict, manifest: dict, output_dir: Path, mirror_root: bool
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    history_summary = sync_objective_history_from_export_payload(payload, output_dir)
+    if isinstance(history_summary, dict):
+        payload["objective_history_summary"] = history_summary
 
     json_path = output_dir / "MIM_CONTEXT_EXPORT.latest.json"
     yaml_path = output_dir / "MIM_CONTEXT_EXPORT.latest.yaml"

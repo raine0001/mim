@@ -4,7 +4,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LOG_DIR="${LOG_DIR:-${ROOT_DIR}/runtime/logs}"
-HEALTH_URL="${HEALTH_URL:-http://127.0.0.1:8001/mim/ui/health}"
+HEALTH_URL="${HEALTH_URL:-http://127.0.0.1:18001/mim/ui/health}"
 TARGET_SERVICE="${TARGET_SERVICE:-mim-desktop-shell.service}"
 
 POLL_SECONDS="${POLL_SECONDS:-8}"
@@ -60,7 +60,7 @@ service_active() {
 
 evaluate_health() {
   local payload
-  payload="$(curl -fsS --max-time 6 "${HEALTH_URL}" 2>/dev/null || true)"
+  payload="$(curl -fsS --max-time 10 "${HEALTH_URL}" 2>/dev/null || true)"
   if [[ -z "${payload}" ]]; then
     echo "1|endpoint_unreachable"
     return 0
@@ -172,6 +172,13 @@ while true; do
   should_restart=0
   if (( consecutive_actionable_degraded >= DEGRADED_THRESHOLD )) && (( cooldown_elapsed >= RESTART_COOLDOWN_SECONDS )); then
     should_restart=1
+  fi
+
+  # Suppress restart if a test-window lock file is present
+  SUPPRESS_FILE="${LOG_DIR}/.watcher_suppress_restart"
+  if (( should_restart == 1 )) && [[ -f "${SUPPRESS_FILE}" ]]; then
+    log_event "restart_suppressed" "${reason}|suppress_file_present" "${consecutive_actionable_degraded}" "${cooldown_elapsed}"
+    should_restart=0
   fi
 
   if (( should_restart == 1 )); then

@@ -22,6 +22,31 @@ REMOTE_PUBLISH_REQUEST_SOURCES = {
     "mim_arm_scan_pose_dispatch",
 }
 BOUNDARY_STATUS_ARTIFACT = "MIM_TOD_PUBLICATION_BOUNDARY.latest.json"
+AUTHORITY_RESET_ARTIFACT_CANDIDATES = (
+    ROOT / "objective_authority_reset.json",
+    ROOT / "runtime" / "shared" / "objective_authority_reset.json",
+    ROOT / "runtime" / "shared" / "OBJECTIVE_AUTHORITY_RESET.latest.json",
+)
+AUTHORITY_RESET_OBJECTIVE_KEYS = (
+    "objective_ceiling",
+    "reset_ceiling",
+    "ceiling_objective",
+    "ceiling",
+    "max_objective",
+    "max_authoritative_objective",
+    "rollback_to_objective",
+    "authoritative_objective",
+    "current_objective",
+    "objective",
+    "objective_id",
+)
+AUTHORITY_RESET_REWRITE_KEYS = (
+    "rewrite_completion_history",
+    "rewrite_latest_completed",
+    "rewrite_latest_completed_objective",
+    "force_latest_completed_to_ceiling",
+)
+TERMINAL_REVIEW_STATES = {"completed", "succeeded", "approved", "done"}
 
 
 def utc_now() -> datetime:
@@ -88,6 +113,151 @@ def as_int(value: object) -> int | None:
         return None
 
 
+def parse_boolish(value: object) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    text = str(value or "").strip().lower()
+    if not text:
+        return None
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return None
+
+
+def objective_exceeds_ceiling(objective_ref: object, ceiling_ref: object) -> bool:
+    objective = as_int(objective_ref)
+    ceiling = as_int(ceiling_ref)
+    if objective is None or ceiling is None:
+        return False
+    return objective > ceiling
+
+
+def cap_objective_to_ceiling(objective_ref: object, ceiling_ref: object) -> str:
+    objective = normalize_objective(objective_ref)
+    ceiling = normalize_objective(ceiling_ref)
+    if objective and ceiling and objective_exceeds_ceiling(objective, ceiling):
+        return ceiling
+    return objective
+
+
+def authority_reset_candidate_payloads(payload: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return []
+    candidates = [payload]
+    for key in (
+        "authority_reset",
+        "objective_authority_reset",
+        "rollback_authority",
+        "shared_state",
+        "metadata",
+    ):
+        nested = payload.get(key)
+        if isinstance(nested, dict):
+            candidates.append(nested)
+    return candidates
+
+
+def parse_objective_authority_reset(payload: dict[str, Any] | None, source: Path) -> dict[str, Any] | None:
+    candidates = authority_reset_candidate_payloads(payload)
+    top_level_enabled = None
+    if isinstance(payload, dict):
+        for key in ("active", "enabled", "applied"):
+            parsed = parse_boolish(payload.get(key))
+            if parsed is not None:
+                top_level_enabled = parsed
+                break
+
+    for index, candidate in enumerate(candidates):
+        ceiling_objective = ""
+        matched_key = ""
+        for key in AUTHORITY_RESET_OBJECTIVE_KEYS:
+            ceiling_objective = normalize_objective(candidate.get(key))
+            if ceiling_objective:
+                matched_key = key
+                break
+        if not ceiling_objective:
+            continue
+
+        enabled = None
+        for key in ("active", "enabled", "applied"):
+            parsed = parse_boolish(candidate.get(key))
+            if parsed is not None:
+                enabled = parsed
+                break
+        if enabled is False:
+            continue
+        if index > 0 and top_level_enabled is False and enabled is not True:
+            continue
+
+        rewrite_completion_history = False
+        for key in AUTHORITY_RESET_REWRITE_KEYS:
+            parsed = parse_boolish(candidate.get(key))
+            if parsed is not None:
+                rewrite_completion_history = parsed
+                break
+
+        return {
+            "objective_ceiling": ceiling_objective,
+            "rewrite_completion_history": rewrite_completion_history,
+            "source": str(source),
+            "matched_key": matched_key,
+        }
+    return None
+
+
+def load_objective_authority_reset(shared_dir: Path) -> dict[str, Any] | None:
+    candidates = [
+        shared_dir / "objective_authority_reset.json",
+        shared_dir / "OBJECTIVE_AUTHORITY_RESET.latest.json",
+        *AUTHORITY_RESET_ARTIFACT_CANDIDATES,
+    ]
+    for path in candidates:
+        payload = read_json(path)
+        details = parse_objective_authority_reset(payload, path)
+        if details is not None:
+            return details
+    return None
+
+
+def infer_publication_boundary_authority_reset(
+    *,
+    boundary_status: dict[str, Any],
+    latest_completed: str,
+    canonical_objective: str,
+    formal_program_objective: str = "",
+    formal_program_active: bool = False,
+) -> dict[str, Any] | None:
+    if not isinstance(boundary_status, dict):
+        return None
+    for request_key in ("authoritative_request", "local_request", "remote_request"):
+        request_payload = boundary_status.get(request_key)
+        if not isinstance(request_payload, dict):
+            continue
+        for field in ("objective_id", "task_id", "request_id"):
+            boundary_objective = normalize_objective(request_payload.get(field))
+            if not boundary_objective:
+                continue
+            if latest_completed and boundary_objective != latest_completed:
+                continue
+            if not objective_exceeds_ceiling(canonical_objective, boundary_objective):
+                continue
+            if formal_program_active and objective_exceeds_ceiling(
+                formal_program_objective,
+                boundary_objective,
+            ):
+                continue
+            return {
+                "objective_ceiling": boundary_objective,
+                "rewrite_completion_history": False,
+                "source": f"{BOUNDARY_STATUS_ARTIFACT}:{request_key}.{field}",
+                "matched_key": f"{request_key}.{field}",
+                "inferred_from": "publication_boundary_authoritative_request",
+            }
+    return None
+
+
 def live_task_request_is_stale(
     *,
     canonical_objective: str,
@@ -106,6 +276,72 @@ def live_task_request_is_stale(
     return request_generated_dt < canonical_generated_dt
 
 
+def load_task_status_review(shared_dir: Path) -> dict[str, Any]:
+    return read_json(shared_dir / "MIM_TASK_STATUS_REVIEW.latest.json")
+
+
+def terminal_request_review_details(
+    review_payload: dict[str, Any] | None,
+    *,
+    request_task_id: str,
+    request_objective: str,
+    next_objective: str,
+) -> dict[str, Any] | None:
+    if not isinstance(review_payload, dict):
+        return None
+
+    def first_text(payload: dict[str, Any], *keys: str) -> str:
+        for key in keys:
+            value = str(payload.get(key) or "").strip()
+            if value:
+                return value
+        return ""
+
+    task_payload = review_payload.get("task")
+    if not isinstance(task_payload, dict):
+        return None
+    gate_payload = review_payload.get("gate")
+    if not isinstance(gate_payload, dict):
+        gate_payload = {}
+
+    review_task_id = first_text(
+        task_payload,
+        "authoritative_task_id",
+        "active_task_id",
+        "request_task_id",
+        "task_id",
+    )
+    review_objective = normalize_objective(
+        task_payload.get("objective_id") or review_task_id
+    )
+    task_matches = bool(request_task_id and review_task_id and request_task_id == review_task_id)
+    if not task_matches:
+        return None
+
+    state = first_text(review_payload, "state").lower()
+    gate_pass = gate_payload.get("pass") is True
+    promotion_ready = gate_payload.get("promotion_ready") is True
+    later_objective_exists = bool(
+        next_objective
+        and review_objective
+        and as_int(next_objective) is not None
+        and as_int(review_objective) is not None
+        and as_int(next_objective) > as_int(review_objective)
+    )
+    if state not in TERMINAL_REVIEW_STATES or not gate_pass:
+        return None
+    if not later_objective_exists:
+        return None
+
+    return {
+        "review_task_id": review_task_id,
+        "review_objective": review_objective,
+        "state": state,
+        "promotion_ready": promotion_ready,
+        "reason": "completed_gate_passing_request",
+    }
+
+
 def build_payload(shared_dir: Path, output_path: Path) -> dict[str, Any]:
     reference = utc_now()
     existing = read_json(output_path)
@@ -121,16 +357,40 @@ def build_payload(shared_dir: Path, output_path: Path) -> dict[str, Any]:
     handshake = read_json(handshake_path)
     request = read_json(request_path)
     boundary_status = read_json(boundary_status_path)
+    objective_authority_reset = load_objective_authority_reset(shared_dir)
+    review = load_task_status_review(shared_dir)
     boundary_request = boundary_status.get("authoritative_request") if isinstance(boundary_status.get("authoritative_request"), dict) else {}
     effective_request = boundary_request if boundary_request else request
 
     manifest_payload = manifest.get("manifest") if isinstance(manifest.get("manifest"), dict) else {}
     truth = handshake.get("truth") if isinstance(handshake.get("truth"), dict) else {}
+    source_of_truth = context.get("source_of_truth") if isinstance(context.get("source_of_truth"), dict) else {}
+    formal_program_truth = source_of_truth.get("formal_program_truth") if isinstance(source_of_truth.get("formal_program_truth"), dict) else {}
 
-    canonical_objective = normalize_objective(
+    raw_canonical_objective = normalize_objective(
         context.get("objective_active")
         or truth.get("objective_active")
         or manifest_payload.get("objective_active")
+    )
+    raw_latest_completed = normalize_objective(
+        context.get("latest_completed_objective") or truth.get("latest_completed_objective")
+    )
+    formal_program_objective = normalize_objective(
+        formal_program_truth.get("objective")
+        or formal_program_truth.get("objective_id")
+    )
+    formal_program_execution_state = str(
+        formal_program_truth.get("execution_state")
+        or formal_program_truth.get("objective_status")
+        or formal_program_truth.get("project_status")
+        or ""
+    ).strip().lower()
+    formal_program_active = bool(
+        formal_program_objective
+        and formal_program_execution_state in {"executing", "working", "in_progress", "active", "queued", "created"}
+    )
+    canonical_objective = normalize_objective(
+        raw_canonical_objective
     )
     canonical_schema = str(
         context.get("schema_version")
@@ -145,7 +405,7 @@ def build_payload(shared_dir: Path, output_path: Path) -> dict[str, Any]:
         or ""
     ).strip()
     latest_completed = normalize_objective(
-        context.get("latest_completed_objective") or truth.get("latest_completed_objective")
+        raw_latest_completed
     )
     next_objective = normalize_objective(
         context.get("current_next_objective") or truth.get("current_next_objective")
@@ -156,6 +416,72 @@ def build_payload(shared_dir: Path, output_path: Path) -> dict[str, Any]:
     prod_smoke_status = str(truth.get("prod_smoke_status") or "").strip()
     blockers = truth.get("blockers") if isinstance(truth.get("blockers"), list) else []
 
+    local_request_task_id = str(request.get("task_id") or request.get("request_id") or "").strip()
+    local_request_objective = normalize_objective(
+        request.get("objective_id") or request.get("task_id") or request.get("request_id")
+    )
+    local_terminal_request_review = terminal_request_review_details(
+        review,
+        request_task_id=local_request_task_id,
+        request_objective=local_request_objective,
+        next_objective=next_objective,
+    )
+    boundary_task_id = str(
+        boundary_request.get("task_id") or boundary_request.get("request_id") or ""
+    ).strip()
+    boundary_objective = normalize_objective(
+        boundary_request.get("objective_id")
+        or boundary_request.get("task_id")
+        or boundary_request.get("request_id")
+    )
+    boundary_stale_against_local_terminal = bool(
+        boundary_request
+        and local_terminal_request_review is not None
+        and local_request_task_id
+        and boundary_task_id
+        and boundary_task_id != local_request_task_id
+    )
+    if boundary_stale_against_local_terminal:
+        effective_request = request
+        boundary_request = {}
+    terminal_request_review = local_terminal_request_review
+    if objective_authority_reset is None and terminal_request_review is None:
+        objective_authority_reset = infer_publication_boundary_authority_reset(
+            boundary_status=boundary_status,
+            latest_completed=raw_latest_completed,
+            canonical_objective=raw_canonical_objective,
+            formal_program_objective=formal_program_objective,
+            formal_program_active=formal_program_active,
+        )
+    authority_reset_ceiling = normalize_objective(
+        objective_authority_reset.get("objective_ceiling")
+        if isinstance(objective_authority_reset, dict)
+        else ""
+    )
+    rewrite_completion_history = bool(
+        objective_authority_reset.get("rewrite_completion_history")
+        if isinstance(objective_authority_reset, dict)
+        else False
+    )
+    if objective_exceeds_ceiling(canonical_objective, authority_reset_ceiling):
+        canonical_objective = authority_reset_ceiling
+    if rewrite_completion_history:
+        latest_completed = cap_objective_to_ceiling(
+            latest_completed,
+            authority_reset_ceiling,
+        )
+    if objective_exceeds_ceiling(next_objective, authority_reset_ceiling):
+        next_objective = authority_reset_ceiling
+    if boundary_stale_against_local_terminal:
+        if isinstance(objective_authority_reset, dict) and str(objective_authority_reset.get("inferred_from") or "") == "publication_boundary_authoritative_request":
+            objective_authority_reset = None
+            authority_reset_ceiling = ""
+            canonical_objective = normalize_objective(raw_canonical_objective)
+            latest_completed = normalize_objective(raw_latest_completed)
+            next_objective = normalize_objective(
+                context.get("current_next_objective") or truth.get("current_next_objective")
+            )
+
     objective_from_request = normalize_objective(
         effective_request.get("objective_id") or effective_request.get("task_id") or effective_request.get("request_id")
     )
@@ -164,6 +490,12 @@ def build_payload(shared_dir: Path, output_path: Path) -> dict[str, Any]:
     request_correlation_id = str(effective_request.get("correlation_id") or request.get("correlation_id") or "").strip()
     request_source_service = str(effective_request.get("source_service") or "").strip()
     request_source_instance_id = str(effective_request.get("source_instance_id") or "").strip()
+    terminal_request_review = terminal_request_review_details(
+        review,
+        request_task_id=request_task_id,
+        request_objective=objective_from_request,
+        next_objective=next_objective,
+    )
     request_source_key = request_source_service.strip().lower()
     publication_lane = "unknown"
     if request_source_key in LOCAL_ONLY_REQUEST_SOURCES:
@@ -188,14 +520,21 @@ def build_payload(shared_dir: Path, output_path: Path) -> dict[str, Any]:
         request_generated_at=request_generated_at,
         canonical_generated_at=canonical_generated_at,
     )
+    terminal_completed_request = terminal_request_review is not None
     original_live_task_objective = objective_from_request
-    if stale_live_task_request:
+    authority_reset_applied_to_request = objective_exceeds_ceiling(
+        objective_from_request,
+        authority_reset_ceiling,
+    )
+    if terminal_completed_request or stale_live_task_request or authority_reset_applied_to_request:
         objective_from_request = canonical_objective
 
     promotion_applied = bool(
         original_live_task_objective and canonical_objective and original_live_task_objective != canonical_objective
     )
-    if promotion_applied and as_int(original_live_task_objective) is not None and as_int(canonical_objective) is not None:
+    if authority_reset_applied_to_request:
+        promotion_reason = "request_objective_above_authority_reset_ceiling"
+    elif promotion_applied and as_int(original_live_task_objective) is not None and as_int(canonical_objective) is not None:
         promotion_reason = "request_objective_ahead_of_canonical_export" if as_int(original_live_task_objective) > as_int(canonical_objective) else "request_objective_differs_from_canonical_export"
     else:
         promotion_reason = ""
@@ -271,12 +610,24 @@ def build_payload(shared_dir: Path, output_path: Path) -> dict[str, Any]:
             "local_only_writer": publication_lane == "local_only",
             "promotion_applied": promotion_applied,
             "promotion_reason": promotion_reason,
-            "stale_prior_objective": stale_live_task_request,
+            "stale_prior_objective": stale_live_task_request or terminal_completed_request,
+            "terminal_completed_request": terminal_completed_request,
             "stale_reason": (
+                "request_already_completed_promotion_ready"
+                if terminal_completed_request
+                else
+                "objective_above_authority_reset_ceiling"
+                if authority_reset_applied_to_request
+                else
                 "live_task_request_older_than_canonical_export"
                 if stale_live_task_request
                 else ""
             ),
+        },
+        "objective_authority_reset": objective_authority_reset or {},
+        "task_status_review": {
+            "available": bool(review),
+            "terminal_request_review": terminal_request_review or {},
         },
         "publication_boundary": {
             "authoritative_surface": CANONICAL_COMMUNICATION_SURFACE,

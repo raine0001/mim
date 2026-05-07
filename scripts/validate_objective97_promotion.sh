@@ -7,7 +7,7 @@ SCOPE="${2:-objective97-validation}"
 if [[ "$TARGET" == "prod" ]]; then
   BASE_URL="http://127.0.0.1:8000"
 else
-  BASE_URL="http://127.0.0.1:8001"
+  BASE_URL="http://127.0.0.1:18001"
 fi
 
 echo "Running Objective 97 validation against $TARGET ($BASE_URL)"

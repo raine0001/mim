@@ -14,8 +14,9 @@ SYSTEM_ALERTS_FILE="${SYSTEM_ALERTS_FILE:-${SHARED_DIR}/MIM_SYSTEM_ALERTS.latest
 LATEST_MD_FILE="${LATEST_MD_FILE:-${LOG_DIR}/mim_task_status_review.latest.md}"
 EVENT_LOG_FILE="${EVENT_LOG_FILE:-${LOG_DIR}/mim_task_status_review.jsonl}"
 POLL_SECONDS="${POLL_SECONDS:-15}"
-IDLE_SECONDS="${IDLE_SECONDS:-120}"
+IDLE_SECONDS="${IDLE_SECONDS:-60}"
 TOD_CONSOLE_URL="${TOD_CONSOLE_URL:-http://192.168.1.161:8844}"
+FORMAL_PROGRAM_RESPONSE_FILE="${FORMAL_PROGRAM_RESPONSE_FILE:-${ROOT_DIR}/runtime/formal_program_drive_response.json}"
 RUN_ONCE="${RUN_ONCE:-0}"
 AUTO_REFRESH_ALIGNMENT="${AUTO_REFRESH_ALIGNMENT:-1}"
 
@@ -33,13 +34,14 @@ refresh_alignment_if_drifted() {
     should_run_flag "${AUTO_REFRESH_ALIGNMENT}" || return 0
 
     local decision
-    decision="$(python3 - <<'PY' "${SHARED_DIR}"
+    decision="$(python3 - <<'PY' "${SHARED_DIR}" "${FORMAL_PROGRAM_RESPONSE_FILE}"
 import json
 import re
 import sys
 from pathlib import Path
 
 shared_dir = Path(sys.argv[1])
+formal_program_path = Path(sys.argv[2])
 
 
 def read_json(path: Path) -> dict:
@@ -64,6 +66,16 @@ request = read_json(shared_dir / 'MIM_TOD_TASK_REQUEST.latest.json')
 context_export = read_json(shared_dir / 'MIM_CONTEXT_EXPORT.latest.json')
 integration = read_json(shared_dir / 'TOD_INTEGRATION_STATUS.latest.json')
 alignment_request = read_json(shared_dir / 'MIM_TOD_ALIGNMENT_REQUEST.latest.json')
+review = read_json(shared_dir / 'MIM_TASK_STATUS_REVIEW.latest.json')
+formal_program = read_json(formal_program_path)
+
+
+def first_text(payload: dict, *keys: str) -> str:
+    for key in keys:
+        value = str(payload.get(key) or '').strip()
+        if value:
+            return value
+    return ''
 
 live_objective = normalize_objective(
         request.get('objective_id') or request.get('objective') or request.get('task_id') or request.get('request_id')
@@ -77,25 +89,74 @@ integration_tod_objective = normalize_objective(alignment.get('tod_current_objec
 alignment_request_objective = normalize_objective(
         (alignment_request.get('mim_truth') or {}).get('objective_active') if isinstance(alignment_request.get('mim_truth'), dict) else ''
 )
+task_payload = review.get('task') if isinstance(review.get('task'), dict) else {}
+gate_payload = review.get('gate') if isinstance(review.get('gate'), dict) else {}
+review_task_id = first_text(
+    task_payload,
+    'authoritative_task_id',
+    'active_task_id',
+    'request_task_id',
+    'task_id',
+)
+review_objective = normalize_objective(task_payload.get('objective_id') or review_task_id)
+review_state = first_text(review, 'state').lower()
+gate_pass = gate_payload.get('pass') is True
+terminal_completed_request = bool(
+    live_objective
+    and review_objective
+    and live_objective == review_objective
+    and review_state in {'completed', 'succeeded', 'approved', 'done'}
+    and gate_pass
+    and export_objective
+    and export_objective != live_objective
+)
+formal_objective = normalize_objective(
+    ((formal_program.get('objective') or {}).get('objective_id') if isinstance(formal_program.get('objective'), dict) else '')
+    or ((((formal_program.get('continuation') or {}).get('status') or {}).get('active_task') or {}).get('objective_id') if isinstance((((formal_program.get('continuation') or {}).get('status') or {}).get('active_task')), dict) else '')
+)
+formal_execution_state = first_text(formal_program, 'execution_state').lower()
+formal_status = first_text(
+    formal_program.get('objective') if isinstance(formal_program.get('objective'), dict) else {},
+    'status',
+).lower()
+formal_active = bool(
+    formal_objective
+    and (formal_execution_state in {'executing', 'in_progress', 'working', 'queued', 'created'} or formal_status in {'executing', 'in_progress', 'working', 'queued', 'created'})
+)
 
 needs_refresh = bool(
+    (
         live_objective
+        and not terminal_completed_request
         and (
-                live_objective != export_objective
-                or live_objective != integration_mim_objective
-                or (integration_tod_objective and live_objective != integration_tod_objective)
-                or live_objective != alignment_request_objective
-                or not alignment_request
+            live_objective != export_objective
+            or live_objective != integration_mim_objective
+            or (integration_tod_objective and live_objective != integration_tod_objective)
+            or live_objective != alignment_request_objective
+            or not alignment_request
         )
+    )
+    or (
+        formal_active
+        and (
+            formal_objective != export_objective
+            or formal_objective != integration_mim_objective
+            or (integration_tod_objective and formal_objective != integration_tod_objective)
+            or formal_objective != alignment_request_objective
+            or not alignment_request
+        )
+    )
 )
 
 print(json.dumps({
         'needs_refresh': needs_refresh,
         'live_objective': live_objective,
+        'formal_objective': formal_objective,
         'export_objective': export_objective,
         'integration_mim_objective': integration_mim_objective,
         'integration_tod_objective': integration_tod_objective,
         'alignment_request_objective': alignment_request_objective,
+    'terminal_completed_request': terminal_completed_request,
 }))
 PY
 )"
@@ -113,11 +174,12 @@ PY
         return 0
     fi
 
-    if python3 "${ROOT_DIR}/scripts/export_mim_context.py" --output-dir "${SHARED_DIR}" >/dev/null 2>&1 \
+    if python3 "${ROOT_DIR}/scripts/refresh_formal_program_drive_response.py" --output "${FORMAL_PROGRAM_RESPONSE_FILE}" >/dev/null 2>&1 \
+        && python3 "${ROOT_DIR}/scripts/export_mim_context.py" --output-dir "${SHARED_DIR}" >/dev/null 2>&1 \
         && python3 "${ROOT_DIR}/scripts/rebuild_tod_integration_status.py" --shared-dir "${SHARED_DIR}" --mirror-legacy-alias >/dev/null 2>&1; then
-        echo "[tod-review] refreshed MIM/TOD alignment artifacts to match live request objective"
+        echo "[tod-review] refreshed formal and MIM/TOD alignment artifacts"
     else
-        echo "[tod-review] WARN failed to refresh MIM/TOD alignment artifacts" >&2
+        echo "[tod-review] WARN failed to refresh formal or MIM/TOD alignment artifacts" >&2
     fi
 }
 
@@ -135,7 +197,8 @@ emit_review() {
     "${LATEST_MD_FILE}" \
     "${EVENT_LOG_FILE}" \
     "${IDLE_SECONDS}" \
-    "${TOD_CONSOLE_URL}"
+    "${TOD_CONSOLE_URL}" \
+    "${FORMAL_PROGRAM_RESPONSE_FILE}"
 import json
 import sys
 from pathlib import Path
@@ -153,6 +216,7 @@ latest_md_file = Path(sys.argv[10])
 event_log_file = Path(sys.argv[11])
 idle_seconds = int(sys.argv[12])
 tod_console_url = str(sys.argv[13]).strip()
+formal_program_response_file = Path(sys.argv[14])
 
 sys.path.insert(0, str(root_dir / 'scripts'))
 
@@ -195,6 +259,7 @@ review = build_task_status_review(
     catchup_gate=read_json(shared_dir / 'TOD_CATCHUP_GATE.latest.json'),
     troubleshooting_authority=read_json(shared_dir / 'MIM_TOD_TROUBLESHOOTING_AUTHORITY.latest.json'),
     persistent_task=read_json(task_state_file),
+    formal_program_response=read_json(formal_program_response_file),
     system_alert_summary=system_alert_summary,
     idle_seconds=idle_seconds,
 )
@@ -256,13 +321,23 @@ pending_actions = review.get('pending_actions', [])
 selected_action = {}
 if isinstance(pending_actions, list) and pending_actions:
     highest_alert_severity = str((system_alert_summary or {}).get('highest_severity') or '').strip().lower()
+    priority_codes = []
     if highest_alert_severity == 'critical':
+        priority_codes.append('acknowledge_and_remediate_system_alerts')
+    priority_codes.extend([
+        'recouple_publisher_objective',
+        'fallback_to_codex_direct_execution',
+        'declare_tod_emergency',
+    ])
+    for priority_code in priority_codes:
         for candidate in pending_actions:
             if not isinstance(candidate, dict):
                 continue
-            if str(candidate.get('code') or '').strip() == 'acknowledge_and_remediate_system_alerts':
+            if str(candidate.get('code') or '').strip() == priority_code:
                 selected_action = candidate
                 break
+        if selected_action:
+            break
     if not selected_action:
         first = pending_actions[0]
         selected_action = first if isinstance(first, dict) else {}

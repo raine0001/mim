@@ -76,6 +76,13 @@ def build_payload(shared_dir: Path) -> dict:
         or first_text(task_ack, "request_id", "task_id")
         or first_text(ack_current_processing, "task_id", "request_id")
     )
+    active_request_id = (
+        first_text(request, "request_id")
+        or first_text(review_task, "request_id")
+        or first_text(task_ack, "request_id")
+        or active_task_id
+        or first_text(result, "request_id")
+    )
     objective_id = (
         normalize_objective(request.get("objective_id"))
         or normalize_objective(review_task.get("objective_id"))
@@ -92,13 +99,24 @@ def build_payload(shared_dir: Path) -> dict:
 
     decision_task_id = first_text(review_decision, "task_id")
     decision_value = first_text(review_decision, "decision").lower()
-    existing_request_id = first_text(result, "request_id", "task_id")
-    stale_result_rebound = bool(active_task_id and existing_request_id and existing_request_id != active_task_id)
-    existing_review_passed = existing_review_gate.get("passed") is True and existing_request_id == active_task_id
+    existing_request_id = first_text(result, "request_id")
+    existing_task_id = first_text(result, "task_id", "request_id")
+    stale_result_rebound = bool(
+        active_task_id
+        and (
+            (existing_task_id and existing_task_id != active_task_id)
+            or (active_request_id and existing_request_id and existing_request_id != active_request_id)
+        )
+    )
+    existing_review_passed = (
+        existing_review_gate.get("passed") is True
+        and existing_task_id == active_task_id
+        and (not active_request_id or not existing_request_id or existing_request_id == active_request_id)
+    )
     accepted_review = bool(active_task_id and decision_task_id == active_task_id and decision_value == "accepted")
     review_passed = existing_review_passed or accepted_review
 
-    request_id = active_task_id or existing_request_id
+    request_id = active_request_id or existing_request_id or active_task_id
 
     result_status = first_text(result, "result_status", "status")
     status = first_text(result, "status", "result_status")
@@ -130,8 +148,8 @@ def build_payload(shared_dir: Path) -> dict:
             "handshake_version": str(result.get("handshake_version") or "mim-tod-shared-export-v1"),
             "source": str(result.get("source") or "tod-mim-task-result-v1"),
             "request_id": request_id,
-            "task_id": request_id or active_task_id,
-            "task": request_id or active_task_id,
+            "task_id": active_task_id or existing_task_id or request_id,
+            "task": active_task_id or existing_task_id or request_id,
             "objective_id": objective_id,
             "objective": str(result.get("objective") or (f"objective-{objective_id}" if objective_id else "")),
             "correlation_id": correlation_id,
@@ -145,6 +163,8 @@ def build_payload(shared_dir: Path) -> dict:
                 "review_decision_task_id": decision_task_id,
                 "review_decision_current": accepted_review,
                 "existing_request_id": existing_request_id,
+                "existing_task_id": existing_task_id,
+                "active_request_id": active_request_id,
                 "stale_result_rebound": stale_result_rebound,
                 "review_passed": review_passed,
             },

@@ -13,6 +13,7 @@ SERVICE_NAME="${SERVICE_NAME:-continuous_task_dispatch}"
 AUDIT_SCRIPT="${AUDIT_SCRIPT:-${ROOT_DIR}/scripts/tod_bridge_audit.py}"
 CONTRACT_TOOL="${CONTRACT_TOOL:-${ROOT_DIR}/scripts/tod_mim_contract_tools.py}"
 ALLOW_LOCAL_ONLY_CANONICAL_WRITE="${ALLOW_LOCAL_ONLY_CANONICAL_WRITE:-0}"
+ALLOW_ACTIVE_INITIATIVE_OVERRIDE="${ALLOW_ACTIVE_INITIATIVE_OVERRIDE:-0}"
 
 if [[ -z "${OBJECTIVE_ID:-}" ]]; then
   OBJECTIVE_ID="$(python3 - <<'PY' "$ROOT_DIR"
@@ -37,6 +38,44 @@ mkdir -p "${SHARED_DIR}"
 allow_local_only="$(printf '%s' "${ALLOW_LOCAL_ONLY_CANONICAL_WRITE}" | tr '[:upper:]' '[:lower:]')"
 if [[ "${allow_local_only}" != "1" && "${allow_local_only}" != "true" && "${allow_local_only}" != "yes" ]]; then
   echo "[dispatch] local-only canonical writer blocked; continuous dispatch must not overwrite the canonical TOD-facing request lane at 192.168.1.120:/home/testpilot/mim/runtime/shared. Set ALLOW_LOCAL_ONLY_CANONICAL_WRITE=1 to opt in explicitly."
+  exit 0
+fi
+
+allow_active_initiative_override="$(printf '%s' "${ALLOW_ACTIVE_INITIATIVE_OVERRIDE}" | tr '[:upper:]' '[:lower:]')"
+active_initiative_guard="$(python3 - <<'PY' "$ROOT_DIR" "$SHARED_DIR"
+import importlib.util
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+shared_dir = Path(sys.argv[2])
+module_path = root / "scripts" / "export_mim_context.py"
+spec = importlib.util.spec_from_file_location("export_mim_context", module_path)
+module = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+spec.loader.exec_module(module)
+payload, _ = module.build_payload_bundle(output_dir=shared_dir)
+source_of_truth = payload.get("source_of_truth") if isinstance(payload, dict) else {}
+if not isinstance(source_of_truth, dict):
+    source_of_truth = {}
+formal = source_of_truth.get("formal_program_truth")
+live = source_of_truth.get("live_initiative_truth")
+objective_in_flight = str(payload.get("objective_in_flight") or "").strip()
+if objective_in_flight and (isinstance(formal, dict) or isinstance(live, dict)):
+    authority = formal if isinstance(formal, dict) and formal else live if isinstance(live, dict) else {}
+    print(json.dumps({
+        "objective_in_flight": objective_in_flight,
+        "objective_active": str(payload.get("objective_active") or "").strip(),
+        "authority_source": str(authority.get("source") or "").strip(),
+        "project_id": str(authority.get("project_id") or "").strip(),
+        "task_id": str(authority.get("task_id") or "").strip(),
+    }))
+PY
+)"
+if [[ -n "${active_initiative_guard}" && "${allow_active_initiative_override}" != "1" && "${allow_active_initiative_override}" != "true" && "${allow_active_initiative_override}" != "yes" ]]; then
+  echo "[dispatch] active initiative execution is in progress; continuous dispatch must not overwrite the canonical TOD-facing request lane while objective authority is owned by a live initiative. Set ALLOW_ACTIVE_INITIATIVE_OVERRIDE=1 to force this local-only writer."
+  echo "[dispatch] active authority: ${active_initiative_guard}"
   exit 0
 fi
 

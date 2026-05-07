@@ -6,7 +6,7 @@ TARGET="${1:-test}"
 if [[ "$TARGET" == "prod" ]]; then
   BASE_URL="http://127.0.0.1:8000"
 else
-  BASE_URL="http://127.0.0.1:8001"
+  BASE_URL="http://127.0.0.1:18001"
 fi
 
 echo "Running smoke tests against $TARGET ($BASE_URL)"

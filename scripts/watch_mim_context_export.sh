@@ -92,6 +92,7 @@ trigger_reason() {
   local handshake_file="${SHARED_DIR}/MIM_TOD_HANDSHAKE_PACKET.latest.json"
   local manifest_file="${SHARED_DIR}/MIM_MANIFEST.latest.json"
   local task_request_file="${SHARED_DIR}/MIM_TOD_TASK_REQUEST.latest.json"
+  local task_review_file="${SHARED_DIR}/MIM_TASK_STATUS_REVIEW.latest.json"
   local export_epoch
   export_epoch="$(mtime_or_zero "${export_file}")"
   local handshake_epoch
@@ -100,6 +101,8 @@ trigger_reason() {
   manifest_epoch="$(mtime_or_zero "${manifest_file}")"
   local task_request_epoch
   task_request_epoch="$(mtime_or_zero "${task_request_file}")"
+  local task_review_epoch
+  task_review_epoch="$(mtime_or_zero "${task_review_file}")"
   local export_script_epoch
   export_script_epoch="$(mtime_or_zero "${ROOT_DIR}/scripts/export_mim_context.py")"
   local rebuild_script_epoch
@@ -119,6 +122,10 @@ trigger_reason() {
   fi
   if (( task_request_epoch > export_epoch )); then
     echo "task_request_newer_than_export"
+    return 0
+  fi
+  if (( task_review_epoch > export_epoch )); then
+    echo "task_review_newer_than_export"
     return 0
   fi
   if (( export_script_epoch > export_epoch || rebuild_script_epoch > export_epoch )); then

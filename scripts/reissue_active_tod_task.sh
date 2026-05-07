@@ -140,6 +140,66 @@ then
   exit 1
 fi
 
+if python3 - <<'PY' "${SHARED_DIR}" "${OBJECTIVE_ID}" "${TASK_ID}"
+import json
+import re
+import sys
+from pathlib import Path
+
+
+TERMINAL_REVIEW_STATES = {"completed", "succeeded", "approved", "done"}
+
+
+def read_json(path: Path) -> dict:
+  if not path.exists():
+    return {}
+  try:
+    payload = json.loads(path.read_text(encoding="utf-8-sig"))
+  except Exception:
+    return {}
+  return payload if isinstance(payload, dict) else {}
+
+
+def normalize_objective(value: object) -> str:
+  text = str(value or "").strip().lower()
+  if not text:
+    return ""
+  match = re.search(r"(\d+(?:\.\d+)?)", text)
+  return match.group(1) if match else text
+
+
+shared_dir = Path(sys.argv[1])
+request_objective = normalize_objective(sys.argv[2])
+task_id = str(sys.argv[3]).strip()
+review = read_json(shared_dir / "MIM_TASK_STATUS_REVIEW.latest.json")
+task = review.get("task") if isinstance(review.get("task"), dict) else {}
+gate = review.get("gate") if isinstance(review.get("gate"), dict) else {}
+review_task_id = str(
+  task.get("authoritative_task_id")
+  or task.get("active_task_id")
+  or task.get("request_task_id")
+  or task.get("task_id")
+  or ""
+).strip()
+review_objective = normalize_objective(task.get("objective_id") or review_task_id)
+state = str(review.get("state") or "").strip().lower()
+gate_pass = gate.get("pass") is True
+promotion_ready = gate.get("promotion_ready") is True
+task_matches = bool(task_id and review_task_id and task_id == review_task_id)
+objective_matches = bool(request_objective and review_objective and request_objective == review_objective)
+if (task_matches or objective_matches) and state in TERMINAL_REVIEW_STATES and gate_pass:
+  print(
+    f"[reissue-active-task] request already completed and gate-passing; refusing to republish task_id={task_id or '<unknown>'}",
+    file=sys.stderr,
+  )
+  raise SystemExit(0)
+raise SystemExit(1)
+PY
+then
+  echo "${TASK_ID}"
+  exit 0
+fi
+
 if python3 - <<'PY' "${ROOT_DIR}" "${SHARED_DIR}"
 import sys
 from pathlib import Path
