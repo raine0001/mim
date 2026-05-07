@@ -27,12 +27,15 @@ from core.routers import (
     orchestration,
     policy_experiments,
     preferences,
+    public_chat,
     reasoning,
     results,
     reviews,
     routing,
     safety_router,
+    shell,
     self_awareness_router,
+    tod_ui,
     services,
     state_bus,
     status,
@@ -63,7 +66,10 @@ api_router.include_router(orchestration.router, prefix="", tags=["orchestration"
 api_router.include_router(state_bus.router, prefix="", tags=["state-bus"])
 api_router.include_router(interface.router, prefix="", tags=["interface"])
 api_router.include_router(mim_arm.router, prefix="", tags=["mim-arm"])
+api_router.include_router(public_chat.router, prefix="", tags=["public-chat"])
 api_router.include_router(mim_ui.router, prefix="", tags=["mim-ui"])
+api_router.include_router(tod_ui.router, prefix="", tags=["tod-ui"])
+api_router.include_router(shell.router, prefix="", tags=["shell"])
 api_router.include_router(constraints.router, prefix="", tags=["constraints"])
 api_router.include_router(
     constraint_learning.router, prefix="", tags=["constraints-learning"]

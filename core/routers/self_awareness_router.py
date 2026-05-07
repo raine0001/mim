@@ -5,6 +5,7 @@ Exposes MIM's awareness of its own operational state and optimization proposals.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -97,6 +98,17 @@ class RecordMetricRequest(BaseModel):
 class ApproveOptimizationRequest(BaseModel):
     """Request to approve an optimization proposal."""
     reason: str | None = None
+
+
+class ProposeOptimizationRequest(BaseModel):
+    """Request to create an optimization proposal from a recommendation."""
+    recommendation_id: str
+    title: str
+    description: str
+    proposed_action: str
+    severity: str = "medium"
+    requires_approval: bool = True
+    estimated_impact_percent: int | None = None
 
 
 class ExecuteOptimizationRequest(BaseModel):
@@ -200,12 +212,7 @@ async def record_health_metric(request: RecordMetricRequest) -> dict:
 
 @router.post("/optimize/propose", response_model=OptimizationProposalResponse, tags=["optimization"])
 async def propose_optimization(
-    recommendation_id: str,
-    title: str,
-    description: str,
-    proposed_action: str,
-    severity: str = "medium",
-    requires_approval: bool = True,
+    request: ProposeOptimizationRequest,
 ) -> OptimizationProposalResponse:
     """Create an optimization proposal from a recommendation.
 
@@ -213,12 +220,13 @@ async def propose_optimization(
     which are tracked and approved by operators.
     """
     proposal = optimizer_service.propose_optimization(
-        recommendation_id=recommendation_id,
-        title=title,
-        description=description,
-        proposed_action=proposed_action,
-        requires_approval=requires_approval,
-        severity=severity,
+        recommendation_id=request.recommendation_id,
+        title=request.title,
+        description=request.description,
+        proposed_action=request.proposed_action,
+        requires_approval=request.requires_approval,
+        severity=request.severity,
+        estimated_impact_percent=request.estimated_impact_percent,
     )
     return OptimizationProposalResponse(**dataclass_to_dict(proposal))
 
@@ -278,7 +286,7 @@ async def execute_optimization(proposal_id: str) -> OptimizationProposalResponse
     Actually applies the self-optimization. Requires approval for high-impact changes.
     """
     try:
-        proposal = optimizer_service.execute_proposal(proposal_id)
+        proposal = await optimizer_service.execute_proposal_async(proposal_id)
         return OptimizationProposalResponse(**dataclass_to_dict(proposal))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -291,7 +299,7 @@ async def rollback_optimization(proposal_id: str) -> OptimizationProposalRespons
     Reverses optimizations if they prove ineffective or cause issues.
     """
     try:
-        proposal = optimizer_service.rollback_proposal(proposal_id)
+        proposal = await asyncio.to_thread(optimizer_service.rollback_proposal, proposal_id)
         return OptimizationProposalResponse(**dataclass_to_dict(proposal))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

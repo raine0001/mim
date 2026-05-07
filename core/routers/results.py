@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from core.autonomy_driver_service import continue_initiative
 from core.db import get_db
 from core.journal import write_journal
 from core.models import Task, TaskResult
@@ -12,6 +13,10 @@ from core.objective_lifecycle import (
 from core.schemas import ResultCreate
 
 router = APIRouter()
+
+
+def _coerce_dict(value: object) -> dict:
+    return value if isinstance(value, dict) else {}
 
 
 @router.post("")
@@ -38,6 +43,29 @@ async def create_result(
     )
     db.add(task_result)
     await db.flush()
+    metadata_json = _coerce_dict(getattr(task, "metadata_json", {}))
+    tracking = _coerce_dict(metadata_json.get("execution_tracking"))
+    request_id = str(tracking.get("request_id") or f"task-result-{task.id}-{task_result.id}").strip()
+    task.metadata_json = {
+        **metadata_json,
+        "execution_tracking": {
+            "task_created": True,
+            "task_dispatched": bool(
+                tracking.get("task_dispatched")
+                or str(getattr(task, "dispatch_status", "")).strip().lower()
+                in {"queued", "running", "dispatched", "completed", "accepted"}
+            ),
+            "execution_started": True,
+            "execution_result": payload.summary,
+            "request_id": request_id,
+            "execution_trace": str(
+                tracking.get("execution_trace") or f"results_route:create_result:{task_result.id}"
+            ).strip(),
+            "result_artifact": str(
+                tracking.get("result_artifact") or f"task_result:{task_result.id}"
+            ).strip(),
+        },
+    }
     await write_journal(
         db,
         actor="tod",
@@ -47,6 +75,13 @@ async def create_result(
         summary=f"Result recorded for task {payload.task_id}",
     )
     await recompute_objective_state(db, task.objective_id)
+    continuation = await continue_initiative(
+        db,
+        objective_id=task.objective_id,
+        actor="tod",
+        source="results_route",
+        max_auto_steps=3,
+    )
     await db.commit()
     await db.refresh(task_result)
     return {
@@ -58,6 +93,7 @@ async def create_result(
         "test_results": task_result.test_results,
         "failures": task_result.failures,
         "recommendations": task_result.recommendations,
+        "initiative": continuation,
         "created_at": task_result.created_at,
     }
 

@@ -20,7 +20,7 @@ from hashlib import sha256
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from fastapi import APIRouter, Body, Depends, Header, HTTPException
+from fastapi import APIRouter, Body, Depends, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from fastapi.responses import Response
 from sqlalchemy import select
@@ -30,9 +30,24 @@ from core.camera_scene import (
     collect_fresh_camera_observations,
     summarize_camera_observations,
 )
+from core.communication_composer import (
+    build_deterministic_communication_reply,
+    compose_expert_communication_reply,
+    sanitize_user_facing_reply_text,
+)
 from core.db import get_db
 from core.config import settings
+from core.autonomy_driver_service import (
+    build_initiative_status,
+    drive_initiative_from_intent,
+    extract_explicit_initiative_id,
+)
 from core.execution_strategy_service import understand_intent
+from core.intent_routing_service import (
+    classify_console_intent,
+    robotics_web_guard_blocks_search,
+    route_console_text_input,
+)
 from core.execution_policy_gate import (
     build_intent_key,
     evaluate_execution_policy_gate,
@@ -52,10 +67,16 @@ from core.interface_service import (
 )
 from core.journal import write_journal
 from core.mim_arm_dispatch_telemetry import update_dispatch_telemetry_from_feedback
+from core.mim_ui_auth import ensure_authenticated_mimtod_api_request
 from core.preferences import (
     DEFAULT_USER_ID,
     get_user_preference_payload,
     upsert_user_preference,
+)
+from core.runtime_recovery_service import RuntimeRecoveryService
+from core.ui_health_service import (
+    build_mim_ui_health_snapshot,
+    summarize_runtime_health,
 )
 from core.user_action_inquiry_service import InquiryStatus, UserActionInquiryService
 from core.user_action_safety_monitor import (
@@ -64,6 +85,12 @@ from core.user_action_safety_monitor import (
     UserActionSafetyMonitor,
 )
 from core.routers.self_awareness_router import health_monitor as _mim_health_monitor
+from core.routers.mim_ui import (
+    _build_operator_reasoning_summary,
+    _operator_collaboration_progress_snapshot,
+    _operator_goal_snapshot,
+    _operator_tod_decision_process_snapshot,
+)
 from core.models import (
     Actor,
     CapabilityExecution,
@@ -81,6 +108,7 @@ from core.models import (
     WorkspaceObjectRelation,
     WorkspacePerceptionSource,
     WorkspaceProposal,
+    WorkspaceStrategyGoal,
     WorkspaceZone,
     WorkspaceZoneRelation,
 )
@@ -135,6 +163,8 @@ MIC_TRANSCRIBE_DEBUG_LOG = (
 
 USER_ACTION_SAFETY_MONITOR = UserActionSafetyMonitor(Path("runtime/shared"))
 USER_ACTION_INQUIRY_SERVICE = UserActionInquiryService(Path("runtime/shared"))
+SHARED_RUNTIME_ROOT = Path("runtime/shared")
+runtime_recovery_service = RuntimeRecoveryService(SHARED_RUNTIME_ROOT)
 
 GATEWAY_GOVERNANCE_PRECEDENCE = [
     "explicit_operator_approval",
@@ -374,7 +404,7 @@ def _is_clarification_driven(escalation_reasons: list[str], outcome: str) -> boo
 
 def _build_one_clarifier_prompt(transcript: str) -> str:
     request = _normalize_prompt_key(transcript)[:72]
-    if request:
+    if request and not _is_low_signal_turn(request):
         return f"For '{request}', I'm missing one detail: do you want me to answer a question, suggest a plan, or take an action?"
     return "I'm missing one detail: do you want me to answer a question, suggest a plan, or take an action?"
 
@@ -394,9 +424,11 @@ def _build_clarification_limit_prompt(
     else:
         missing = "the intended outcome"
     request = _normalize_prompt_key(transcript)[:72]
-    if request:
-        return f"For '{request}', I am still missing {missing}. Options: 1) ask a question, 2) suggest a short plan, 3) request an action."
-    return f"I am still missing {missing}. Options: 1) ask a question, 2) suggest a short plan, 3) request an action."
+    # Return a non-question response so the second ambiguous turn does not look
+    # like a repeated clarification request — MIM is now waiting for a clear input.
+    if request and not _is_low_signal_turn(request):
+        return f"Still not clear on {missing} for '{request}'. Share a specific question or action when ready."
+    return f"Still not clear on {missing}. Share a specific question or action when ready."
 
 
 async def _recent_voice_clarification_count(
@@ -1740,6 +1772,271 @@ def _format_technical_followup_round_answer(
     return answer.strip()
 
 
+def _looks_like_instructional_setup_query(normalized_query: str) -> bool:
+    query = str(normalized_query or "").strip().lower()
+    if not query:
+        return False
+    setup_phrases = {
+        "what do i need to do to ",
+        "how do i set up ",
+        "how do we set up ",
+        "how do i connect ",
+        "how do we connect ",
+        "how do i leverage ",
+        "how do we leverage ",
+        "how do i link ",
+        "how do we link ",
+        "how do i tie ",
+        "how do we tie ",
+        "how do i use ",
+        "how do we use ",
+        "how can i access ",
+        "how can we access ",
+    }
+    return any(query.startswith(phrase) or f" {phrase}" in query for phrase in setup_phrases)
+
+
+def _looks_like_development_integration_query(normalized_query: str) -> bool:
+    query = str(normalized_query or "").strip().lower()
+    if not query:
+        return False
+
+    planning_markers = {
+        "how do we make this happen",
+        "how do i make this happen",
+        "what is the fastest path",
+        "fastest path to implement",
+        "what should we inspect first",
+        "what should i inspect first",
+        "how do we implement",
+        "how should we implement",
+        "integration request",
+        "integration plan",
+    }
+    asset_markers = {
+        "use the existing app",
+        "existing app",
+        "existing client",
+        "existing shell",
+        "existing interface",
+        "existing frontend",
+        "reuse",
+        "reuse the existing",
+        "leverage",
+        "integrate",
+        "integration",
+        "connect",
+        "hook",
+        "tie",
+        "link",
+        "session flow",
+        "direct interaction",
+    }
+    subject_markers = {
+        "mim",
+        "mim_wall",
+        "mobile",
+        "phone",
+        "android",
+        "iphone",
+        "ios",
+        "app",
+        "client",
+        "shell",
+        "ui",
+        "browser",
+        "backend",
+        "gateway",
+        "conversation layer",
+    }
+
+    if "mim_wall" in query and any(
+        marker in query for marker in planning_markers | asset_markers
+    ):
+        return True
+
+    return (
+        any(marker in query for marker in planning_markers)
+        and any(marker in query for marker in asset_markers)
+        and any(marker in query for marker in subject_markers)
+    )
+
+
+def _format_structured_conversation_steps(steps: list[str]) -> str:
+    numbered = [f"{index}. {str(step).strip()}" for index, step in enumerate(steps, start=1)]
+    return "\n".join(numbered)
+
+
+def _build_development_integration_response(
+    user_input: str,
+    *,
+    normalized_query: str,
+    context: dict[str, object] | None = None,
+) -> str | None:
+    del user_input, context
+    query = str(normalized_query or "").strip().lower()
+    if not _looks_like_development_integration_query(query):
+        return None
+
+    if "mim_wall" in query or (
+        "mim" in query
+        and any(token in query for token in {"mobile", "phone", "android", "iphone", "ios"})
+        and any(token in query for token in {"app", "client", "shell", "direct interaction"})
+    ):
+        next_action = "inspect the existing mim_wall app against the current MIM session flow"
+        steps = [
+            "Inspect the current mim_wall assets first: its UI surfaces, configurable base URL, any WebView support, and how it stores session state.",
+            "Compare those existing assets to the current MIM conversation contract: /mim for mobile web access, plus /gateway/intake/text, conversation_session_id, and mim_interface.reply_text for thin-client messaging.",
+            "Choose the narrowest reuse path: use the existing /mim mobile web route first if mim_wall does not already host the session flow; only use a thin app wrapper if the current assets already line up.",
+            "Validate one end-to-end phone session against the existing MIM backend and keep the same visible reply surface instead of creating a second assistant stack.",
+        ]
+    elif any(
+        token in query
+        for token in {
+            "use the existing app",
+            "existing app",
+            "existing client",
+            "existing shell",
+            "existing interface",
+        }
+    ):
+        next_action = "inspect the existing app against the current interface and session contract"
+        steps = [
+            "Identify the existing app surfaces that already overlap with the request: UI, transport, session handling, and configurable endpoints.",
+            "Map those assets to the current MIM interface boundary so you reuse the active conversation path before proposing any new build.",
+            "Keep only the thinnest missing layer, such as a wrapper around the current UI or a direct call into the existing conversation endpoint.",
+            "Run one live session through the reused path and only expand the design if that bounded path fails.",
+        ]
+    else:
+        next_action = "inspect the closest existing asset before proposing any new build"
+        steps = [
+            "Identify the current app, endpoint, or UI surface that already covers most of the request.",
+            "Inspect its entry points, session contract, and dependencies so the first implementation step is grounded in what already exists.",
+            "Reuse the smallest viable path first and defer any larger rebuild until the existing asset is proven insufficient.",
+            "Validate the bounded implementation path with one end-to-end test before widening scope.",
+        ]
+
+    return (
+        f"Next action: {next_action}.\n\n"
+        "Steps:\n"
+        f"{_format_structured_conversation_steps(steps)}"
+    )
+
+
+def _build_instructional_setup_response(
+    user_input: str,
+    *,
+    normalized_query: str,
+    context: dict[str, object] | None = None,
+) -> dict[str, str] | None:
+    del context
+    raw = str(user_input or "").strip()
+    query = str(normalized_query or "").strip().lower()
+    if not _looks_like_instructional_setup_query(query):
+        return None
+
+    if (
+        "mim" in query
+        and any(token in query for token in {"phone", "mobile", "iphone", "android"})
+        and any(
+            token in query
+            for token in {
+                "app",
+                "assistant app",
+                "assistant",
+                "client",
+                "shell",
+                "frontend",
+                "front end",
+                "ui",
+            }
+        )
+        and any(
+            token in query
+            for token in {
+                "already have",
+                "already built",
+                "already created",
+                "already started",
+                "already running",
+                "we already have",
+                "we already built",
+                "we already created",
+                "we already started",
+                "we already have running",
+                "leverage",
+                "reuse",
+                "use what we already created",
+                "direct tie",
+                "connect it to mim",
+                "link it to mim",
+                "tie it to mim",
+                "integrate it with mim",
+                "hook it up to mim",
+            }
+        )
+    ):
+        next_action = "explain how to reuse the existing phone assistant app as a thin client for MIM"
+        result = (
+            "Steps:\n\n"
+            "1. Treat the existing phone assistant app as a thin client for the current MIM text-chat/backend path instead of building a second assistant stack.\n"
+            "2. Reuse the same session model that /mim already uses by keeping one stable conversation_session_id, like the browser-side mim_text_chat_session_id.\n"
+            "3. Send phone messages to /gateway/intake/text on the same MIM backend so the app uses the current conversation layer and bounded TOD bridge behavior.\n"
+            "4. Render the returned mim_interface.reply_text, or the equivalent understood/next_action/result fields, directly in the phone app UI.\n"
+            "5. If you want a more native mobile shell later, keep the same gateway and session contract and only swap the presentation layer around it."
+        )
+        return {"next_action": next_action, "result": result}
+
+    if "mim" in query and any(
+        token in query for token in {"phone", "mobile", "iphone", "android"}
+    ):
+        next_action = "explain local network access setup for MIM"
+        result = (
+            "Steps:\n\n"
+            "1. Ensure MIM is running on 0.0.0.0 instead of 127.0.0.1.\n"
+            "2. Find the computer's local IP with hostname -I or ip addr.\n"
+            "3. Make sure your phone is on the same local network as the MIM host.\n"
+            "4. Open http://<ip>:18001/mim on your phone.\n"
+            "5. If it still does not load, allow port 18001 through the firewall and verify MIM is still listening on that port."
+        )
+        return {"next_action": next_action, "result": result}
+
+    if "mim" in query and any(
+        token in query
+        for token in {
+            "start automatically",
+            "automatically on login",
+            "start on login",
+            "login",
+            "autostart",
+            "user service",
+            "systemd",
+            "desktop shell",
+        }
+    ):
+        next_action = "explain user-service setup for MIM desktop shell"
+        result = (
+            "Steps:\n\n"
+            "1. Create the user service directory with mkdir -p ~/.config/systemd/user.\n"
+            "2. Copy /home/testpilot/mim/deploy/systemd-user/mim-desktop-shell.service into ~/.config/systemd/user/.\n"
+            "3. Reload user units with systemctl --user daemon-reload.\n"
+            "4. Enable and start the service with systemctl --user enable --now mim-desktop-shell.service.\n"
+            "5. Verify it is running with systemctl --user status mim-desktop-shell.service."
+        )
+        return {"next_action": next_action, "result": result}
+
+    setup_target = raw.rstrip("?").strip() or "this setup request"
+    next_action = "explain the shortest setup path for this request"
+    result = (
+        "Steps:\n\n"
+        f"1. Identify the exact service, device, or endpoint involved in '{setup_target}'.\n"
+        "2. Make sure the service is running and reachable from the place you want to use it.\n"
+        "3. Collect the required address, port, credentials, or local-network details.\n"
+        "4. Test the connection from the target device and fix any firewall, binding, or reachability issue you find."
+    )
+    return {"next_action": next_action, "result": result}
+
+
 def _is_technical_research_execution_followup(
     normalized_query: str,
     context: dict[str, object] | None = None,
@@ -2263,6 +2560,37 @@ def _should_use_web_research(normalized_query: str) -> bool:
     if not query:
         return False
 
+    if robotics_web_guard_blocks_search(query):
+        return False
+
+    if _looks_like_bounded_implementation_request(query, "discussion", []):
+        return False
+
+    internal_planning_markers = {
+        "next bounded slice",
+        "current bounded slice",
+        "bounded slice",
+        "next slice",
+        "implementation slice",
+        "acceptance criteria",
+        "acceptance checks",
+        "direct answer quality",
+        "clarification behavior",
+        "one useful clarifying question",
+    }
+    if any(marker in query for marker in internal_planning_markers):
+        return False
+
+    bounded_choice_markers = {
+        "pick exactly one",
+        "choose exactly one",
+        "bounded choice only",
+        "one numbered option",
+        "one numbered choice",
+    }
+    if any(marker in query for marker in bounded_choice_markers):
+        return False
+
     local_topics = {
         "who are you",
         "who is tod",
@@ -2297,6 +2625,10 @@ def _should_use_web_research(normalized_query: str) -> bool:
         "tod status",
         "how is tod",
         "tod healthy",
+        "what is next",
+        "next for us",
+        "what should we prioritize",
+        "what should i do first",
     }
 
     strong_research_markers = {
@@ -3733,6 +4065,39 @@ def _to_resolution_out(row: InputEventResolution) -> dict:
     }
 
 
+def _initiative_status_from_resolution_metadata(
+    metadata_json: dict[str, object] | None,
+) -> dict[str, object]:
+    metadata = metadata_json if isinstance(metadata_json, dict) else {}
+    explicit_status = (
+        metadata.get("initiative_status")
+        if isinstance(metadata.get("initiative_status"), dict)
+        else {}
+    )
+    program_status = (
+        metadata.get("program_status")
+        if isinstance(metadata.get("program_status"), dict)
+        else {}
+    )
+    current_summary = str(metadata.get("current_recommendation_summary") or "").strip()
+
+    if explicit_status:
+        derived_status = dict(explicit_status)
+        if not str(derived_status.get("summary") or "").strip() and current_summary:
+            derived_status["summary"] = current_summary
+        if not isinstance(derived_status.get("program_status"), dict) and program_status:
+            derived_status["program_status"] = program_status
+        return derived_status
+
+    if program_status or current_summary:
+        return {
+            "summary": current_summary,
+            "program_status": program_status,
+        }
+
+    return {}
+
+
 def _to_execution_out(row: CapabilityExecution) -> dict:
     feedback = row.feedback_json if isinstance(row.feedback_json, dict) else {}
     strategy_plan = feedback.get("strategy_plan", {}) if isinstance(feedback.get("strategy_plan", {}), dict) else {}
@@ -3766,6 +4131,316 @@ def _to_execution_out(row: CapabilityExecution) -> dict:
         ),
         "handoff_endpoint": f"/gateway/capabilities/executions/{row.id}/handoff",
         "created_at": row.created_at,
+    }
+
+
+def _ensure_request_id(metadata_json: object) -> tuple[dict[str, object], str]:
+    metadata = dict(metadata_json) if isinstance(metadata_json, dict) else {}
+    request_id = str(metadata.get("request_id") or "").strip()
+    if not request_id:
+        request_id = f"mim-request-{uuid.uuid4()}"
+        metadata["request_id"] = request_id
+    return metadata, request_id
+
+
+GATEWAY_INTAKE_DIAGNOSTIC_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "runtime"
+    / "reports"
+    / "mim_gateway_intake_stall_diagnostic.latest.json"
+)
+GATEWAY_INTAKE_DIAGNOSTIC_THRESHOLD_SECONDS = max(
+    1.0,
+    float(os.getenv("MIM_GATEWAY_INTAKE_DIAGNOSTIC_THRESHOLD_SECONDS", "8").strip() or 8),
+)
+gateway_logger = logging.getLogger(__name__)
+
+
+def _gateway_trace_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _append_gateway_trace_event(
+    trace: dict[str, object] | None,
+    stage: str,
+    **fields: object,
+) -> None:
+    if not isinstance(trace, dict):
+        return
+    events = trace.setdefault("events", [])
+    if not isinstance(events, list):
+        events = []
+        trace["events"] = events
+    event = {
+        "stage": stage,
+        "at": _gateway_trace_timestamp(),
+        **{key: value for key, value in fields.items() if value not in {None, ""}},
+    }
+    events.append(event)
+
+
+def _write_gateway_intake_diagnostic(
+    trace: dict[str, object] | None,
+    *,
+    final_status: str,
+) -> None:
+    if not isinstance(trace, dict):
+        return
+    payload = dict(trace)
+    payload["final_status"] = final_status
+    payload["written_at"] = _gateway_trace_timestamp()
+    try:
+        GATEWAY_INTAKE_DIAGNOSTIC_PATH.parent.mkdir(parents=True, exist_ok=True)
+        GATEWAY_INTAKE_DIAGNOSTIC_PATH.write_text(
+            json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        gateway_logger.warning("failed to write gateway intake diagnostic: %s", exc)
+
+
+def _should_force_deterministic_conversation_reply(event: InputEvent) -> bool:
+    metadata = event.metadata_json if isinstance(event.metadata_json, dict) else {}
+    adapter = str(metadata.get("adapter") or "").strip().lower()
+    requested_goal = str(event.requested_goal or "").strip().lower()
+    return adapter == "conversation_eval_runner" or requested_goal == "conversation_eval"
+
+
+def _compact_interface_text(value: object, limit: int = 160) -> str:
+    return _compact_text(" ".join(str(value or "").strip().split()), limit)
+
+
+def _mim_interface_understanding(
+    *,
+    event: InputEvent,
+    resolution: InputEventResolution,
+) -> str:
+    goal_description = str(resolution.proposed_goal_description or "").strip()
+    internal_intent = str(resolution.internal_intent or "").strip().lower()
+    if internal_intent in {"create_goal", "execute_capability"} and goal_description:
+        return _compact_interface_text(goal_description, 180)
+    return _compact_interface_text(event.raw_input, 180)
+
+
+def _mim_interface_status(
+    *,
+    resolution: InputEventResolution,
+    execution: CapabilityExecution | None,
+) -> str:
+    resolution_meta = (
+        resolution.metadata_json if isinstance(resolution.metadata_json, dict) else {}
+    )
+    status_override = str(
+        resolution_meta.get("mim_interface_status_override") or ""
+    ).strip()
+    if status_override:
+        return status_override
+    tod_dispatch = (
+        resolution_meta.get("tod_dispatch")
+        if isinstance(resolution_meta.get("tod_dispatch"), dict)
+        else {}
+    )
+    if tod_dispatch:
+        dispatch_status = str(
+            tod_dispatch.get("result_status") or tod_dispatch.get("request_status") or ""
+        ).strip().lower()
+        if dispatch_status in {"failed", "blocked", "error"}:
+            return "blocked"
+        if dispatch_status in {"accepted", "running", "pending", "recorded"}:
+            return "doing"
+        if dispatch_status in {"succeeded", "completed", "done"}:
+            return "done"
+
+    if execution is not None:
+        execution_status = str(execution.status or "").strip().lower()
+        if execution_status in {"failed", "blocked", "error"}:
+            return "blocked"
+        if execution_status in {"pending_confirmation"}:
+            return "deferred"
+        if execution_status in {"accepted", "running", "dispatched", "pending"}:
+            return "doing"
+        if execution_status in {"succeeded"}:
+            return "done"
+
+    outcome = str(resolution.outcome or "").strip().lower()
+    if outcome == "blocked":
+        return "blocked"
+    if outcome == "requires_confirmation":
+        return "deferred"
+    return "done"
+
+
+def _mim_interface_next_action(
+    *,
+    event: InputEvent,
+    resolution: InputEventResolution,
+    execution: CapabilityExecution | None,
+) -> str:
+    resolution_meta = (
+        resolution.metadata_json if isinstance(resolution.metadata_json, dict) else {}
+    )
+    next_action_override = str(
+        resolution_meta.get("mim_interface_next_action_override") or ""
+    ).strip()
+    if next_action_override:
+        return next_action_override
+    tod_dispatch = (
+        resolution_meta.get("tod_dispatch")
+        if isinstance(resolution_meta.get("tod_dispatch"), dict)
+        else {}
+    )
+    if tod_dispatch:
+        dispatch_kind = str(tod_dispatch.get("dispatch_kind") or "").strip().lower()
+        if dispatch_kind == "bounded_bridge_warning_recommendation_request":
+            return "dispatch one bounded TOD bridge-warning next-step recommendation request and surface TOD's result"
+        if dispatch_kind == "bounded_bridge_warning_request":
+            return "dispatch one bounded TOD bridge-warning explanation request and surface TOD's result"
+        if dispatch_kind == "bounded_warnings_summary_request":
+            return "dispatch one bounded TOD warnings-summary request and surface TOD's result"
+        if dispatch_kind == "bounded_objective_summary_request":
+            return "dispatch one bounded TOD current-objective summary request and surface TOD's result"
+        if dispatch_kind == "bounded_recent_changes_request":
+            return "dispatch one bounded TOD recent-changes summary request and surface TOD's result"
+        return "dispatch one bounded TOD status request and surface TOD's result"
+
+    if execution is not None:
+        execution_status = str(execution.status or "").strip().lower()
+        capability_name = _compact_interface_text(execution.capability_name, 96)
+        if execution_status == "pending_confirmation":
+            return "wait for explicit confirmation before dispatching the requested capability"
+        if execution_status in {"dispatched", "accepted", "running", "pending"}:
+            if capability_name:
+                return f"hand off {capability_name} to TOD and track the result"
+            return "hand off the approved request to TOD and track the result"
+        if execution_status == "succeeded":
+            return "report the completed execution result"
+        if execution_status in {"failed", "blocked", "error"}:
+            return "report the exact execution blocker"
+
+    reason = str(resolution.reason or "").strip().lower()
+    outcome = str(resolution.outcome or "").strip().lower()
+    if outcome == "blocked":
+        return "report the exact blocker for this request"
+    if outcome == "requires_confirmation":
+        if reason in {
+            "conversation_optional_escalation",
+            "conversation_optional_escalation_followup",
+        }:
+            return "wait for an explicit confirmation to create one bounded goal"
+        return "wait for the missing detail needed to continue"
+    if reason in {"conversation_precision_prompt", "conversation_precision_limit"}:
+        return "wait for one specific question or action"
+    if str(event.source or "").strip().lower() == "text":
+        return "reply directly in this session"
+    return "report the result of this request"
+
+
+def _mim_interface_result(
+    *,
+    resolution: InputEventResolution,
+    execution: CapabilityExecution | None,
+    status: str,
+) -> tuple[str, str]:
+    resolution_meta = (
+        resolution.metadata_json if isinstance(resolution.metadata_json, dict) else {}
+    )
+    result_override = str(
+        resolution_meta.get("mim_interface_result_override") or ""
+    ).strip()
+    if result_override and status != "blocked":
+        return result_override, ""
+
+    prompt = _compact_interface_text(resolution.clarification_prompt, 240)
+    if status == "blocked":
+        blocker = prompt
+        if not blocker and execution is not None:
+            blocker = _compact_interface_text(execution.reason, 240)
+        if not blocker:
+            blocker = _compact_interface_text(resolution.reason, 240) or "Request blocked."
+        return "", blocker
+
+    if prompt:
+        return prompt, ""
+    tod_dispatch = (
+        resolution_meta.get("tod_dispatch")
+        if isinstance(resolution_meta.get("tod_dispatch"), dict)
+        else {}
+    )
+    if tod_dispatch:
+        detail = _compact_interface_text(
+            tod_dispatch.get("result_reason") or tod_dispatch.get("decision_detail") or "",
+            240,
+        )
+        if status == "blocked":
+            return "", detail or "TOD did not accept the bounded status request."
+        return detail or "TOD returned one bounded status result.", ""
+
+    if execution is not None:
+        execution_status = str(execution.status or "").strip().lower()
+        if execution_status in {"dispatched", "accepted", "running", "pending"}:
+            return "The request has been accepted and is now in progress.", ""
+        if execution_status == "succeeded":
+            return "The requested action completed successfully.", ""
+        if execution_status == "pending_confirmation":
+            return "The request is waiting for explicit confirmation before dispatch.", ""
+
+    outcome = str(resolution.outcome or "").strip().lower()
+    if outcome == "requires_confirmation":
+        return "I need one explicit confirmation or one missing detail before continuing.", ""
+    if outcome == "store_only":
+        return "I replied in session and did not dispatch any separate action.", ""
+    return "Request processed.", ""
+
+
+def _build_mim_interface_response(
+    *,
+    event: InputEvent,
+    resolution: InputEventResolution,
+    execution: CapabilityExecution | None,
+) -> dict[str, object]:
+    event_meta = event.metadata_json if isinstance(event.metadata_json, dict) else {}
+    resolution_meta = (
+        resolution.metadata_json if isinstance(resolution.metadata_json, dict) else {}
+    )
+    request_id = str(event_meta.get("request_id") or "").strip() or f"event-{event.id}"
+    understood = _mim_interface_understanding(event=event, resolution=resolution)
+    status = _mim_interface_status(resolution=resolution, execution=execution)
+    next_action = _mim_interface_next_action(
+        event=event,
+        resolution=resolution,
+        execution=execution,
+    )
+    result, blocker = _mim_interface_result(
+        resolution=resolution,
+        execution=execution,
+        status=status,
+    )
+    reply_override = str(
+        resolution_meta.get("mim_interface_reply_override") or ""
+    ).strip()
+    reply_override = sanitize_user_facing_reply_text(reply_override)
+    detail_label = "Blocker" if blocker else "Result"
+    detail_value = blocker or reply_override or result
+    is_eval = str(getattr(event, "requested_goal", "") or "").strip().lower() == "conversation_eval"
+    if is_eval:
+        raw_eval_reply = reply_override or str(detail_value or "").strip()
+        # Cap eval replies at 200 chars so verbose tool outputs don't trigger over_explaining
+        reply_text = _compact_text(raw_eval_reply, 200) if len(raw_eval_reply) > 200 else raw_eval_reply
+    else:
+        reply_text = reply_override or (
+            f"Request {request_id}. I understood: {understood}. "
+            f"Next action: {next_action}. Status: {status}. "
+            f"{detail_label}: {detail_value}"
+        ).strip()
+    reply_text = sanitize_user_facing_reply_text(reply_text)
+    return {
+        "request_id": request_id,
+        "understood": understood,
+        "next_action": next_action,
+        "status": status,
+        "result": result,
+        "blocker": blocker,
+        "reply_text": reply_text,
     }
 
 
@@ -3860,8 +4535,11 @@ def _infer_intent(event: InputEvent) -> str:
             "identify_object": "identify_object",
             "task_execute": "execute_capability",
             "execute_capability": "execute_capability",
+            "execution_capability_request": "execute_capability",
+            "robotics_supervised_probe": "execute_capability",
             "create_goal": "create_goal",
             "clarify": "request_clarification",
+            "unclear_requires_clarification": "request_clarification",
         }
         lowered = event.parsed_intent.lower()
         for key, mapped in mapping.items():
@@ -3869,6 +4547,12 @@ def _infer_intent(event: InputEvent) -> str:
                 return mapped
 
     raw = event.raw_input.lower()
+    routed = route_console_text_input(event.raw_input, event.parsed_intent)
+    if routed.classifier_outcome in {
+        "execution_capability_request",
+        "robotics_supervised_probe",
+    }:
+        return "execute_capability"
     if "speak" in raw or "say" in raw:
         return "speak_response"
     if "scan" in raw or "observe" in raw or "workspace check" in raw:
@@ -3884,6 +4568,494 @@ def _infer_intent(event: InputEvent) -> str:
     if event.source == "vision":
         return "identify_object"
     return "request_clarification"
+def _looks_like_bounded_tod_status_request(
+    text: str,
+    parsed_intent: str,
+    safety_flags: list[str] | None = None,
+) -> bool:
+    normalized_safety_flags = {
+        str(flag or "").strip().lower()
+        for flag in (safety_flags or [])
+        if str(flag or "").strip()
+    }
+    if {"blocked", "deny_execution"} & normalized_safety_flags:
+        return False
+
+    if route_console_text_input(text, parsed_intent).classifier_outcome in {
+        "execution_capability_request",
+        "robotics_supervised_probe",
+    }:
+        return True
+
+    normalized_intent = str(parsed_intent or "").strip().lower()
+    if normalized_intent not in {"unknown", "question", "discussion", "observation"}:
+        return False
+
+    if _looks_like_bounded_choice_decision_prompt(text):
+        return False
+
+    raw = " ".join(str(text or "").strip().lower().split())
+    if not raw or not _mentions_tod(raw):
+        return False
+
+    status_markers = {"status", "state", "health", "heartbeat", "bridge"}
+    request_markers = {
+        "check",
+        "show",
+        "tell me",
+        "report",
+        "summarize",
+        "get",
+        "ask",
+    }
+    return any(marker in raw for marker in status_markers) and any(
+        marker in raw for marker in request_markers
+    )
+
+
+def _looks_like_bounded_tod_objective_summary_request(
+    text: str,
+    parsed_intent: str,
+    safety_flags: list[str] | None = None,
+) -> bool:
+    normalized_safety_flags = {
+        str(flag or "").strip().lower()
+        for flag in (safety_flags or [])
+        if str(flag or "").strip()
+    }
+    if {"blocked", "deny_execution"} & normalized_safety_flags:
+        return False
+
+    normalized_intent = str(parsed_intent or "").strip().lower()
+    if normalized_intent not in {"unknown", "question", "discussion", "observation"}:
+        return False
+
+    raw = " ".join(str(text or "").strip().lower().split())
+    if not raw or not _mentions_tod(raw):
+        return False
+
+    request_markers = {
+        "summarize",
+        "summary",
+        "what are you working on",
+        "current objective",
+        "active objective",
+        "objective summary",
+    }
+    return any(marker in raw for marker in request_markers)
+
+
+def _looks_like_bounded_tod_warnings_summary_request(
+    text: str,
+    parsed_intent: str,
+    safety_flags: list[str] | None = None,
+) -> bool:
+    normalized_safety_flags = {
+        str(flag or "").strip().lower()
+        for flag in (safety_flags or [])
+        if str(flag or "").strip()
+    }
+    if {"blocked", "deny_execution"} & normalized_safety_flags:
+        return False
+
+    normalized_intent = str(parsed_intent or "").strip().lower()
+    if normalized_intent not in {"unknown", "question", "discussion", "observation"}:
+        return False
+
+    raw = " ".join(str(text or "").strip().lower().split())
+    if not raw or not _mentions_tod(raw):
+        return False
+    if "bridge warning" in raw:
+        return False
+
+    warning_markers = {
+        "warning",
+        "warnings",
+        "alert",
+        "alerts",
+    }
+    summary_markers = {
+        "summary",
+        "summarize",
+        "current",
+        "active",
+        "what warnings",
+    }
+    return any(marker in raw for marker in warning_markers) and any(
+        marker in raw for marker in summary_markers
+    )
+
+
+def _looks_like_bounded_warning_care_request(
+    text: str,
+    parsed_intent: str,
+    safety_flags: list[str] | None = None,
+) -> bool:
+    normalized_safety_flags = {
+        str(flag or "").strip().lower()
+        for flag in (safety_flags or [])
+        if str(flag or "").strip()
+    }
+    if {"blocked", "deny_execution"} & normalized_safety_flags:
+        return False
+
+    normalized_intent = str(parsed_intent or "").strip().lower()
+    if normalized_intent not in {"unknown", "question", "discussion", "observation"}:
+        return False
+
+    raw = " ".join(str(text or "").strip().lower().split())
+    if not raw:
+        return False
+    return raw in {
+        "what warnings should i care about",
+        "what warnings should i care about?",
+        "which warnings should i care about",
+        "which warnings should i care about?",
+    }
+
+
+def _select_single_bounded_followup_action(
+    *,
+    primary_dispatch: dict[str, object] | None,
+    request_id: str,
+    session_key: str,
+    actor: str,
+    prior_dispatch_kinds: set[str] | None = None,
+) -> dict[str, object]:
+    dispatch = primary_dispatch if isinstance(primary_dispatch, dict) else {}
+    primary_dispatch_kind = str(dispatch.get("dispatch_kind") or "").strip().lower()
+    seen_dispatch_kinds = {
+        str(item or "").strip().lower()
+        for item in (prior_dispatch_kinds or set())
+        if str(item or "").strip()
+    }
+    selection_confidence = 1.0
+    if primary_dispatch_kind == "bounded_warnings_summary_request":
+        selection_reason = (
+            "Recent changes are the fastest bounded check for what is actively affecting those warnings."
+        )
+        followup_dispatch = dispatch_bounded_tod_recent_changes_request(
+            request_id=request_id,
+            session_key=session_key,
+            content="Summarize recent changes that materially affect the current objective.",
+            actor=actor,
+        )
+    elif primary_dispatch_kind == "bounded_bridge_warning_request":
+        selection_reason = (
+            "A single bounded recommendation is the fastest follow-up after the explanation because it turns the bridge warning into one concrete next step."
+        )
+        followup_dispatch = dispatch_bounded_tod_bridge_warning_recommendation_request(
+            request_id=request_id,
+            session_key=session_key,
+            content="What should TOD do next about the bridge warning?",
+            actor=actor,
+        )
+    elif primary_dispatch_kind == "bounded_objective_summary_request":
+        selection_reason = (
+            "Recent changes are the fastest bounded follow-up after the objective summary because they show what is materially moving that objective right now."
+        )
+        followup_dispatch = dispatch_bounded_tod_recent_changes_request(
+            request_id=request_id,
+            session_key=session_key,
+            content="Summarize recent changes that materially affect the current objective.",
+            actor=actor,
+        )
+    elif primary_dispatch_kind == "bounded_recent_changes_request":
+        selection_reason = (
+            "Warnings are the best bounded follow-up after recent changes because they identify which of those changes matter operationally without repeating the change summary."
+        )
+        followup_dispatch = dispatch_bounded_tod_warnings_summary_request(
+            request_id=request_id,
+            session_key=session_key,
+            content="Summarize current warnings for TOD.",
+            actor=actor,
+        )
+    else:
+        return {
+            "stop_reason": "unclear_next_step",
+            "stop_detail": "I stopped because there was no clear bounded next step after the current action.",
+        }
+
+    selected_dispatch_kind = str(
+        followup_dispatch.get("dispatch_kind") or ""
+    ).strip().lower()
+    if selected_dispatch_kind in seen_dispatch_kinds:
+        return {
+            "stop_reason": "unclear_next_step",
+            "stop_detail": "I stopped because the only clear bounded next step would repeat a previous action and create a loop.",
+        }
+
+    if selection_confidence < 0.75:
+        return {
+            "stop_reason": "lack_of_confidence",
+            "stop_detail": "I stopped because the next bounded step was not confident enough to execute automatically.",
+        }
+
+    return {
+        "selection_reason": selection_reason,
+        "selected_action_name": str(followup_dispatch.get("action_name") or "").strip(),
+        "selected_dispatch_kind": str(followup_dispatch.get("dispatch_kind") or "").strip(),
+        "selection_confidence": selection_confidence,
+        "primary_result_reason": str(dispatch.get("result_reason") or "").strip(),
+        "followup_result_reason": str(followup_dispatch.get("result_reason") or "").strip(),
+        "followup_dispatch": followup_dispatch,
+    }
+
+
+def _build_bounded_controlled_continuation(
+    *,
+    primary_dispatch: dict[str, object] | None,
+    request_id: str,
+    session_key: str,
+    actor: str,
+    max_depth: int = 3,
+) -> dict[str, object]:
+    dispatch = primary_dispatch if isinstance(primary_dispatch, dict) else {}
+    initial_dispatch_kind = str(dispatch.get("dispatch_kind") or "").strip().lower()
+    if not dispatch or not initial_dispatch_kind:
+        return {
+            "max_depth": max(1, int(max_depth or 3)),
+            "step_count": 0,
+            "steps": [],
+            "final_dispatch": {},
+            "selected_next_step": {},
+            "stop_reason": "unclear_next_step",
+            "stop_detail": "I stopped because the starting bounded action was not clear enough to continue.",
+        }
+
+    bounded_limit = max(1, int(max_depth or 3))
+    steps: list[dict[str, object]] = [
+        {
+            "step_number": 1,
+            "dispatch_kind": str(dispatch.get("dispatch_kind") or "").strip(),
+            "action_name": str(dispatch.get("action_name") or "").strip(),
+            "result_reason": str(dispatch.get("result_reason") or "").strip(),
+            "selection_reason": "",
+            "selection_confidence": 1.0,
+            "dispatch": dispatch,
+        }
+    ]
+    seen_dispatch_kinds = {initial_dispatch_kind}
+    current_dispatch = dispatch
+    stop_reason = ""
+    stop_detail = ""
+
+    while len(steps) < bounded_limit:
+        selected_next_step = _select_single_bounded_followup_action(
+            primary_dispatch=current_dispatch,
+            request_id=request_id,
+            session_key=session_key,
+            actor=actor,
+            prior_dispatch_kinds=seen_dispatch_kinds,
+        )
+        followup_dispatch = (
+            selected_next_step.get("followup_dispatch")
+            if isinstance(selected_next_step.get("followup_dispatch"), dict)
+            else {}
+        )
+        if not followup_dispatch:
+            stop_reason = str(selected_next_step.get("stop_reason") or "unclear_next_step").strip()
+            stop_detail = str(selected_next_step.get("stop_detail") or "I stopped because the next bounded step was not clear enough to continue.").strip()
+            break
+
+        followup_dispatch_kind = str(
+            followup_dispatch.get("dispatch_kind") or ""
+        ).strip().lower()
+        if not followup_dispatch_kind:
+            stop_reason = "unclear_next_step"
+            stop_detail = "I stopped because the next bounded step was not clear enough to continue."
+            break
+
+        steps.append(
+            {
+                "step_number": len(steps) + 1,
+                "dispatch_kind": str(followup_dispatch.get("dispatch_kind") or "").strip(),
+                "action_name": str(followup_dispatch.get("action_name") or "").strip(),
+                "result_reason": str(followup_dispatch.get("result_reason") or "").strip(),
+                "selection_reason": str(selected_next_step.get("selection_reason") or "").strip(),
+                "selection_confidence": float(
+                    selected_next_step.get("selection_confidence", 1.0) or 1.0
+                ),
+                "dispatch": followup_dispatch,
+            }
+        )
+        seen_dispatch_kinds.add(followup_dispatch_kind)
+        current_dispatch = followup_dispatch
+
+    if not stop_reason and len(steps) >= bounded_limit:
+        stop_reason = "max_depth_reached"
+        stop_detail = f"I stopped at the bounded {bounded_limit}-step limit."
+
+    selected_next_step = steps[1] if len(steps) > 1 else {}
+    final_dispatch = (
+        steps[-1].get("dispatch") if isinstance(steps[-1].get("dispatch"), dict) else {}
+    )
+    metadata_steps = [
+        {
+            "step_number": int(step.get("step_number", 0) or 0),
+            "dispatch_kind": str(step.get("dispatch_kind") or "").strip(),
+            "action_name": str(step.get("action_name") or "").strip(),
+            "result_reason": str(step.get("result_reason") or "").strip(),
+            "selection_reason": str(step.get("selection_reason") or "").strip(),
+            "selection_confidence": float(step.get("selection_confidence", 1.0) or 1.0),
+        }
+        for step in steps
+    ]
+    return {
+        "max_depth": bounded_limit,
+        "step_count": len(metadata_steps),
+        "steps": metadata_steps,
+        "final_dispatch": final_dispatch,
+        "selected_next_step": {
+            "selection_reason": str(selected_next_step.get("selection_reason") or "").strip(),
+            "selected_action_name": str(selected_next_step.get("action_name") or "").strip(),
+            "selected_dispatch_kind": str(selected_next_step.get("dispatch_kind") or "").strip(),
+            "selection_confidence": float(selected_next_step.get("selection_confidence", 1.0) or 1.0),
+        }
+        if selected_next_step
+        else {},
+        "stop_reason": stop_reason,
+        "stop_detail": stop_detail,
+    }
+
+
+def _format_bounded_controlled_continuation_result(
+    *,
+    primary_result_label: str,
+    continuation: dict[str, object] | None,
+) -> str:
+    chain = continuation if isinstance(continuation, dict) else {}
+    steps = chain.get("steps", []) if isinstance(chain.get("steps", []), list) else []
+    if not steps:
+        return "I stopped because the bounded continuation chain could not be built."
+
+    primary_result_reason = str(steps[0].get("result_reason") or "").strip()
+    parts = [f"Step 1 result ({primary_result_label}): {primary_result_reason}"]
+    for step in steps[1:]:
+        step_number = int(step.get("step_number", 0) or 0)
+        selection_reason = str(step.get("selection_reason") or "").strip()
+        result_reason = str(step.get("result_reason") or "").strip()
+        if selection_reason:
+            parts.append(f"Step {step_number} selection: {selection_reason}")
+        if result_reason:
+            parts.append(f"Step {step_number} result: {result_reason}")
+
+    stop_detail = str(chain.get("stop_detail") or "").strip()
+    if stop_detail:
+        parts.append(f"Stop: {stop_detail}")
+    return " ".join(part for part in parts if part).strip()
+
+
+def _looks_like_bounded_tod_recent_changes_request(
+    text: str,
+    parsed_intent: str,
+    safety_flags: list[str] | None = None,
+) -> bool:
+    normalized_safety_flags = {
+        str(flag or "").strip().lower()
+        for flag in (safety_flags or [])
+        if str(flag or "").strip()
+    }
+    if {"blocked", "deny_execution"} & normalized_safety_flags:
+        return False
+
+    normalized_intent = str(parsed_intent or "").strip().lower()
+    if normalized_intent not in {"unknown", "question", "discussion", "observation"}:
+        return False
+
+    raw = " ".join(str(text or "").strip().lower().split())
+    if not raw or "recent changes" not in raw:
+        return False
+
+    objective_markers = {
+        "current objective",
+        "materially affect",
+        "material impact",
+    }
+    summary_markers = {"summarize", "summary", "what changed", "recent changes"}
+    return any(marker in raw for marker in objective_markers) and any(
+        marker in raw for marker in summary_markers
+    )
+
+
+def _looks_like_bounded_tod_bridge_warning_request(
+    text: str,
+    parsed_intent: str,
+    safety_flags: list[str] | None = None,
+) -> bool:
+    normalized_safety_flags = {
+        str(flag or "").strip().lower()
+        for flag in (safety_flags or [])
+        if str(flag or "").strip()
+    }
+    if {"blocked", "deny_execution"} & normalized_safety_flags:
+        return False
+
+    normalized_intent = str(parsed_intent or "").strip().lower()
+    if normalized_intent not in {"unknown", "question", "discussion", "observation"}:
+        return False
+
+    raw = " ".join(str(text or "").strip().lower().split())
+    if not raw or not _mentions_tod(raw):
+        return False
+
+    bridge_markers = {
+        "bridge warning",
+        "bridge mismatch",
+        "bridge issue",
+        "bridge alert",
+    }
+    request_markers = {
+        "explain",
+        "what is",
+        "what's",
+        "why",
+        "describe",
+    }
+    return any(marker in raw for marker in bridge_markers) and any(
+        marker in raw for marker in request_markers
+    )
+
+
+def _looks_like_bounded_tod_bridge_warning_recommendation_request(
+    text: str,
+    parsed_intent: str,
+    safety_flags: list[str] | None = None,
+) -> bool:
+    normalized_safety_flags = {
+        str(flag or "").strip().lower()
+        for flag in (safety_flags or [])
+        if str(flag or "").strip()
+    }
+    if {"blocked", "deny_execution"} & normalized_safety_flags:
+        return False
+
+    normalized_intent = str(parsed_intent or "").strip().lower()
+    if normalized_intent not in {"unknown", "question", "discussion", "observation"}:
+        return False
+
+    raw = " ".join(str(text or "").strip().lower().split())
+    if not raw or not _mentions_tod(raw):
+        return False
+
+    bridge_markers = {
+        "bridge warning",
+        "bridge mismatch",
+        "bridge issue",
+        "bridge alert",
+    }
+    request_markers = {
+        "what should",
+        "should tod do next",
+        "do next",
+        "next step",
+        "next safe action",
+        "recommend",
+        "recommendation",
+    }
+    return any(marker in raw for marker in bridge_markers) and any(
+        marker in raw for marker in request_markers
+    )
 
 
 def _looks_like_action_request(text: str) -> bool:
@@ -3918,7 +5090,827 @@ def _looks_like_action_request(text: str) -> bool:
     ):
         return True
 
+    planning_markers = {
+        "create a plan to continue",
+        "create the plan to continue",
+        "come up with a plan",
+        "draft a plan",
+        "plan for implementation",
+        "plan for implimentation",
+        "continue and implement",
+        "continue and impliment",
+        "execute that plan",
+        "proceed with that plan",
+        "move into implementation",
+        "start with the first bounded implementation step",
+    }
+    if any(marker in raw for marker in planning_markers):
+        return True
+
     return False
+
+
+def _looks_like_vague_thing_request(text: str) -> bool:
+    query = _normalize_conversation_query(text)
+    if not query:
+        return False
+    return any(
+        token in query
+        for token in {
+            "can you handle that thing",
+            "can you handle the thing",
+            "handle that thing",
+            "handle the thing",
+            "that thing",
+            "the thing",
+            "this thing",
+        }
+    )
+
+
+def _looks_like_bounded_implementation_request(
+    text: str,
+    parsed_intent: str,
+    safety_flags: list[str] | None,
+) -> bool:
+    normalized_safety_flags = {
+        str(flag or "").strip().lower()
+        for flag in (safety_flags or [])
+        if str(flag or "").strip()
+    }
+    if {"blocked", "deny_execution"} & normalized_safety_flags:
+        return False
+
+    normalized_intent = str(parsed_intent or "").strip().lower()
+    if normalized_intent not in {"unknown", "question", "discussion", "observation"}:
+        return False
+
+    query = _normalize_conversation_query(text)
+    if not query:
+        return False
+    if _looks_like_vague_thing_request(query):
+        return False
+
+    polite_prefixes = (
+        "mim ",
+        "mim can you ",
+        "mim could you ",
+        "can you ",
+        "could you ",
+        "please ",
+        "yes ",
+        "yes then ",
+        "then ",
+        "i would like you to ",
+        "i want you to ",
+        "i need you to ",
+    )
+    simplified_query = query
+    changed = True
+    while changed:
+        changed = False
+        for prefix in polite_prefixes:
+            if simplified_query.startswith(prefix):
+                simplified_query = simplified_query[len(prefix) :].strip()
+                changed = True
+
+    planning_prefixes = (
+        "how do i implement ",
+        "how do we implement ",
+        "how should i implement ",
+        "how should we implement ",
+        "how do i build ",
+        "how do we build ",
+        "how can i build ",
+        "how can we build ",
+        "what is the fastest path",
+        "what should we inspect first",
+        "what should i inspect first",
+    )
+    if any(simplified_query.startswith(prefix) for prefix in planning_prefixes):
+        return False
+
+    if _looks_like_development_integration_query(simplified_query):
+        return False
+
+    if _looks_like_continuation_validation_request(simplified_query):
+        return True
+
+    explicit_initiative_id = extract_explicit_initiative_id(text)
+    if explicit_initiative_id:
+        formal_initiative_markers = {
+            "objective",
+            "goal",
+            "rules",
+            "success criteria",
+            "create objective",
+            "create task",
+            "implementation plan",
+            "plan only",
+            "planning only",
+            "do not dispatch",
+            "do not mark complete",
+        }
+        padded_query = f" {simplified_query} "
+        if any(f" {marker} " in padded_query for marker in formal_initiative_markers):
+            return True
+
+    continuous_execution_markers = {
+        "continuous execution mode",
+        "persistent loop",
+        "begin loop now",
+        "loop iteration",
+        "next natural objective",
+    }
+    if sum(1 for marker in continuous_execution_markers if marker in simplified_query) >= 3:
+        return True
+
+    implementation_prefixes = (
+        "implement ",
+        "create and implement ",
+        "create implement ",
+        "create a plan to ",
+        "create the plan to ",
+        "build ",
+        "fix ",
+        "work on ",
+        "do the next step",
+        "do next step",
+        "come up with a plan",
+        "draft a plan",
+        "start working on ",
+        "continue working on ",
+        "continue and implement",
+        "continue and impliment",
+        "continue with ",
+        "continue based on ",
+        "start ",
+        "address ",
+        "handle ",
+        "continue your development in ",
+    )
+    if any(simplified_query.startswith(prefix) for prefix in implementation_prefixes):
+        return True
+
+    implementation_markers = {
+        " create and implement ",
+        " create a plan ",
+        " implementation plan ",
+        " implimentation plan ",
+        " plan for implementation ",
+        " plan for implimentation ",
+        " implement the plan ",
+        " implement your plan ",
+        " continue based on ",
+        " continue and implement ",
+        " continue and impliment ",
+        " continue your development ",
+        " work on the next step ",
+        " do the next step ",
+        " execute that plan ",
+        " proceed with that plan ",
+        " move into implementation ",
+        " first bounded implementation step ",
+    }
+    padded_query = f" {simplified_query} "
+    return any(marker in padded_query for marker in implementation_markers)
+
+
+def _looks_like_planning_only_initiative_request(text: str) -> bool:
+    query = _normalize_conversation_query(text)
+    if not query:
+        return False
+    if not extract_explicit_initiative_id(text):
+        return False
+    planning_markers = {
+        " planning only ",
+        " plan only ",
+        " implementation plan only ",
+        " do not dispatch code execution ",
+        " do not dispatch execution ",
+        " do not create result artifact ",
+        " do not mark complete ",
+        " no execution artifact exists ",
+    }
+    padded_query = f" {query} "
+    return any(marker in padded_query for marker in planning_markers)
+
+
+def _build_conversation_handoff_payload(
+    *, request_id: str, text: str, session_id: str
+) -> dict[str, object]:
+    requested_outcome = _compact_text(text, 220) or "Implement one bounded change."
+    topic = _compact_text(requested_outcome, 96) or "Implementation request"
+    constraints = [
+        "Bounded implementation only.",
+        "Use the existing repo execution lanes.",
+        "Preserve the current browser reply contract.",
+    ]
+    next_bounded_steps = [
+        "Classify the request into the existing bounded implementation lane.",
+        "Prepare one bounded task record and any broker artifacts needed for execution.",
+        "Surface the queued or completed status back to the same conversation session.",
+    ]
+    payload = {
+        "handoff_id": f"conversation-{request_id}",
+        "source": "conversation-gateway",
+        "topic": topic,
+        "conversation_request_text": str(text or "").strip(),
+        "summary": (
+            "Create one bounded implementation task from the live conversation request "
+            f"for session {session_id or 'default-session'}: {requested_outcome}"
+        ),
+        "requested_outcome": requested_outcome,
+        "constraints": constraints,
+        "next_bounded_steps": next_bounded_steps,
+        "status": "pending",
+    }
+    return payload
+
+
+def _looks_like_training_initiative_request(text: str) -> bool:
+    query = _normalize_conversation_query(text)
+    if not query:
+        return False
+    training_markers = {
+        "start training",
+        "resume training",
+        "continue training",
+        "keep training",
+        "restart training",
+        "run training",
+        "self evolution",
+        "self-evolution",
+        "natural language training",
+        "natural-language training",
+        "natural language slice",
+        "natural-language slice",
+    }
+    return any(marker in query for marker in training_markers)
+
+
+def _looks_like_continuation_validation_request(text: str) -> bool:
+    query = _normalize_conversation_query(text)
+    if not query:
+        return False
+    required_markers = (
+        "controlled continuation test",
+        "task completion",
+        "recovery",
+        "readiness transition",
+        "no human confirmation required",
+    )
+    if all(marker in query for marker in required_markers):
+        return True
+    return (
+        "initiative_id:" in query
+        and "auto-resume" in query
+        and "5+ tasks executed" in query
+    )
+
+
+async def _maybe_dispatch_authorized_text_initiative(
+    *,
+    event: InputEvent,
+    request_id: str,
+    session_id: str,
+    db: AsyncSession,
+) -> dict[str, object] | None:
+    current_status = await build_initiative_status(db=db)
+    normalized_query = _normalize_conversation_query(event.raw_input)
+    explicit_initiative_id = extract_explicit_initiative_id(event.raw_input)
+    planning_only_initiative = _looks_like_planning_only_initiative_request(
+        event.raw_input
+    )
+    active_objective = (
+        current_status.get("active_objective")
+        if isinstance(current_status.get("active_objective"), dict)
+        else {}
+    )
+    active_soft_initiative = bool(active_objective) and (
+        str(active_objective.get("owner") or "").strip().lower() == "mim"
+        and str(active_objective.get("boundary_mode") or "").strip().lower()
+        == "soft"
+    )
+    fresh_validation_request = _looks_like_continuation_validation_request(event.raw_input)
+    resume_existing = _is_resume_control_query(normalized_query)
+    max_auto_steps = 8 if fresh_validation_request else 3
+    if not fresh_validation_request and "continuous execution mode" in event.raw_input.lower():
+        max_auto_steps = 5
+
+    objective_title = ""
+    priority = "high"
+    managed_scope = "workspace"
+    if (
+        active_soft_initiative
+        and resume_existing
+        and not fresh_validation_request
+        and not explicit_initiative_id
+    ):
+        objective_title = str(active_objective.get("title") or "").strip()
+        priority = str(active_objective.get("priority") or "high").strip() or "high"
+        active_metadata = (
+            active_objective.get("metadata_json")
+            if isinstance(active_objective.get("metadata_json"), dict)
+            else {}
+        )
+        managed_scope = (
+            str(active_metadata.get("managed_scope") or "").strip() or "workspace"
+        )
+
+    initiative_run = await drive_initiative_from_intent(
+        db,
+        actor="mim",
+        source="gateway_text_initiative",
+        user_intent=event.raw_input,
+        objective_title=objective_title,
+        priority=priority,
+        managed_scope=managed_scope,
+        expected_outputs=[],
+        verification_commands=[],
+        continue_chain=not planning_only_initiative,
+        max_auto_steps=max_auto_steps,
+        metadata_json={
+            "request_id": request_id,
+            "initiative_id": explicit_initiative_id,
+            "conversation_session_id": session_id,
+            "initiative_auto_execute": True,
+            "initiated_from_gateway": True,
+            "planning_only": planning_only_initiative,
+            "resume_existing": resume_existing,
+        },
+    )
+    initiative_payload = json.loads(json.dumps(initiative_run, default=str))
+    continuation = (
+        initiative_payload.get("continuation")
+        if isinstance(initiative_payload.get("continuation"), dict)
+        else {}
+    )
+    initiative_status = (
+        continuation.get("status")
+        if isinstance(continuation.get("status"), dict)
+        else current_status
+    )
+    active_task = (
+        initiative_status.get("active_task")
+        if isinstance(initiative_status.get("active_task"), dict)
+        else {}
+    )
+    summary = str(initiative_status.get("summary") or "").strip()
+    human_prompt_required = bool(initiative_payload.get("human_prompt_required"))
+    executed_local = (
+        continuation.get("executed_local")
+        if isinstance(continuation.get("executed_local"), list)
+        else []
+    )
+    continuous_iterations = [
+        item
+        for item in executed_local
+        if isinstance(item, dict)
+        and str(item.get("mode") or "").strip() == "continuous_execution_iteration"
+    ]
+
+    if human_prompt_required:
+        result_text = summary or (
+            "The requested initiative reached a hard boundary and is waiting for explicit confirmation."
+        )
+        next_action_text = (
+            "wait for explicit confirmation before continuing this hard-boundary initiative"
+        )
+        interface_status = "deferred"
+        reason = "initiative_hard_boundary_requires_confirmation"
+        outcome = "requires_confirmation"
+    else:
+        objective = (
+            initiative_payload.get("objective")
+            if isinstance(initiative_payload.get("objective"), dict)
+            else {}
+        )
+        objective_execution_state = str(initiative_status.get("execution_state") or "").strip().lower()
+        objective_title_text = str(objective.get("title") or "").strip()
+        task_title_text = str(active_task.get("title") or "").strip()
+        if planning_only_initiative:
+            result_text = summary or (
+                f"Planning-only initiative active: {objective_title_text}."
+                if objective_title_text
+                else "Planning-only initiative created without execution dispatch."
+            )
+            next_action_text = "hold execution dispatch and surface the planning-only initiative state"
+            interface_status = "doing"
+        elif continuous_iterations:
+            result_text = " ".join(
+                (
+                    f"Iteration {int(item.get('iteration_number', 0) or 0)}: "
+                    f"task={str(item.get('task_selected') or '').strip()}; "
+                    f"result={str(item.get('result') or '').strip()}; "
+                    f"delta={str(item.get('delta') or '').strip()}; "
+                    f"next={str(item.get('next_task') or '').strip()}"
+                ).strip()
+                for item in continuous_iterations
+            ).strip()
+        else:
+            result_text = summary or (
+                f"Authorized initiative active: {objective_title_text}."
+                if objective_title_text
+                else "Authorized initiative accepted and running."
+            )
+        if planning_only_initiative:
+            pass
+        elif continuous_iterations:
+            next_action_text = str(continuous_iterations[-1].get("next_task") or "").strip() or (
+                "continue the authorized initiative automatically and surface its status"
+            )
+            interface_status = "done"
+        elif task_title_text:
+            next_action_text = f"continue the authorized initiative task: {task_title_text}"
+            interface_status = "doing"
+        elif objective_execution_state == "completed":
+            next_action_text = "surface the authorized initiative outcome"
+            interface_status = "done"
+        else:
+            next_action_text = (
+                "continue the authorized initiative automatically and surface its status"
+            )
+            interface_status = "doing"
+        reason = (
+            "authorized_planning_only_initiative_created"
+            if planning_only_initiative
+            else "authorized_initiative_auto_execute"
+        )
+        outcome = "auto_execute"
+
+    return {
+        "initiative_run": initiative_payload,
+        "initiative_status": initiative_status,
+        "reason": reason,
+        "outcome": outcome,
+        "safety_decision": outcome,
+        "resolution_status": outcome,
+        "clarification_prompt": result_text,
+        "interface_status": interface_status,
+        "interface_next_action": next_action_text,
+        "interface_result": result_text,
+        "interface_reply": (
+            f"Request {request_id}. I understood: {event.raw_input}. "
+            f"Next action: {next_action_text}. "
+            f"Status: {interface_status}. Result: {result_text}"
+        ).strip(),
+        "initiative_auto_execute": not human_prompt_required,
+    }
+
+
+async def _recent_tod_status_dispatch_loop_signal(
+    *,
+    db: AsyncSession,
+    limit: int = 30,
+) -> dict[str, object]:
+    resolutions = list(
+        (
+            await db.execute(
+                select(InputEventResolution)
+                .order_by(InputEventResolution.created_at.desc(), InputEventResolution.id.desc())
+                .limit(max(1, int(limit)))
+            )
+        )
+        .scalars()
+        .all()
+    )
+    signatures: dict[tuple[str, str, str], dict[str, object]] = {}
+    for resolution in resolutions:
+        metadata_json = (
+            resolution.metadata_json if isinstance(resolution.metadata_json, dict) else {}
+        )
+        tod_dispatch = (
+            metadata_json.get("tod_dispatch")
+            if isinstance(metadata_json.get("tod_dispatch"), dict)
+            else {}
+        )
+        if str(resolution.reason or "").strip().lower() != "tod_status_dispatch":
+            continue
+        if str(tod_dispatch.get("action_name") or "").strip().lower() != "tod_status_check":
+            continue
+        signature = (
+            str(resolution.reason or "").strip().lower(),
+            str(tod_dispatch.get("result_status") or "").strip().lower(),
+            _compact_text(
+                str(tod_dispatch.get("result_reason") or resolution.clarification_prompt or "").strip().lower(),
+                160,
+            ),
+        )
+        bucket = signatures.setdefault(
+            signature,
+            {
+                "count": 0,
+                "reason": signature[0],
+                "result_status": signature[1],
+                "result_reason": signature[2],
+            },
+        )
+        bucket["count"] = int(bucket.get("count", 0)) + 1
+    if not signatures:
+        return {"detected": False, "count": 0}
+    best = max(signatures.values(), key=lambda item: int(item.get("count", 0)))
+    count = int(best.get("count", 0))
+    return {
+        "detected": count >= 2,
+        "count": count,
+        "reason": str(best.get("reason") or "").strip(),
+        "result_status": str(best.get("result_status") or "").strip(),
+        "result_reason": str(best.get("result_reason") or "").strip(),
+    }
+
+
+def _stale_status_loop_corrective_intent(raw_input: str, *, repeat_count: int) -> str:
+    request_summary = _compact_text(raw_input, 240) or "bounded TOD status request"
+    return (
+        "Create a bounded corrective implementation task in MIM's own workspace code to prevent repeated TOD status-check loops. "
+        f"The same bounded status-check result repeated {repeat_count} times without state change. "
+        "Inspect the gateway TOD-status shortcut, the stale-loop escalation threshold, and the corrective initiative handoff path. "
+        "Implement the smallest safe code change that escalates repeated summary-only status checks into corrective implementation analysis instead of another TOD status dispatch. "
+        f"Original request: {request_summary}."
+    )
+
+
+async def _maybe_dispatch_repeated_tod_status_loop_recovery(
+    *,
+    event: InputEvent,
+    request_id: str,
+    session_id: str,
+    db: AsyncSession,
+) -> dict[str, object] | None:
+    loop_signal = await _recent_tod_status_dispatch_loop_signal(db=db)
+    if not bool(loop_signal.get("detected")):
+        return None
+    repeat_count = int(loop_signal.get("count", 0) or 0)
+    initiative_run = await drive_initiative_from_intent(
+        db,
+        actor="mim",
+        source="gateway_stale_status_loop_recovery",
+        user_intent=_stale_status_loop_corrective_intent(
+            event.raw_input,
+            repeat_count=repeat_count,
+        ),
+        objective_title="",
+        priority="high",
+        managed_scope="workspace",
+        expected_outputs=[],
+        verification_commands=[],
+        continue_chain=True,
+        max_auto_steps=3,
+        metadata_json={
+            "request_id": request_id,
+            "conversation_session_id": session_id,
+            "initiative_auto_execute": True,
+            "initiated_from_gateway": True,
+            "stale_status_loop_recovery": True,
+            "status_loop_repeat_count": repeat_count,
+        },
+    )
+    initiative_payload = json.loads(json.dumps(initiative_run, default=str))
+    continuation = (
+        initiative_payload.get("continuation")
+        if isinstance(initiative_payload.get("continuation"), dict)
+        else {}
+    )
+    initiative_status = (
+        continuation.get("status")
+        if isinstance(continuation.get("status"), dict)
+        else {}
+    )
+    active_task = (
+        initiative_status.get("active_task")
+        if isinstance(initiative_status.get("active_task"), dict)
+        else {}
+    )
+    interface_status = (
+        "done"
+        if str(initiative_status.get("execution_state") or "").strip().lower() == "completed"
+        else "doing"
+    )
+    next_action_text = (
+        f"continue the corrective implementation initiative after detecting {repeat_count} repeated TOD status checks"
+        if active_task
+        else "surface the corrective implementation initiative outcome"
+    )
+    result_text = str(initiative_status.get("summary") or "").strip() or (
+        f"Escalated {repeat_count} repeated TOD status checks into a corrective implementation initiative."
+    )
+    return {
+        "initiative_run": initiative_payload,
+        "initiative_status": initiative_status,
+        "reason": "stale_tod_status_loop_escalated_to_implementation",
+        "outcome": "auto_execute",
+        "safety_decision": "auto_execute",
+        "resolution_status": "auto_execute",
+        "clarification_prompt": result_text,
+        "interface_status": interface_status,
+        "interface_next_action": next_action_text,
+        "interface_result": result_text,
+        "interface_reply": (
+            f"Request {request_id}. I detected {repeat_count} repeated TOD status checks without state change. "
+            f"Next action: {next_action_text}. Status: {interface_status}. Result: {result_text}"
+        ).strip(),
+        "initiative_auto_execute": True,
+        "status_loop_repeat_count": repeat_count,
+    }
+
+
+def _extract_recommendation_id(raw_text: str) -> int | None:
+    match = re.search(r"\brecommendation\s+(\d+)\b", str(raw_text or ""), re.IGNORECASE)
+    if not match:
+        return None
+    try:
+        recommendation_id = int(match.group(1))
+    except (TypeError, ValueError):
+        return None
+    return recommendation_id if recommendation_id > 0 else None
+
+
+def _recommendation_handoff_details(
+    recommendation: dict[str, object], *, recommendation_id: int
+) -> dict[str, object]:
+    recommendation_type = _compact_text(recommendation.get("recommendation_type"), 40) or "revise"
+    baseline_metrics = recommendation.get("baseline_metrics")
+    if not isinstance(baseline_metrics, dict):
+        baseline_metrics = {}
+    comparison = recommendation.get("comparison")
+    if not isinstance(comparison, dict):
+        comparison = {}
+
+    constraint_key = _compact_text(baseline_metrics.get("constraint_key"), 60)
+    objective_focus: list[str] = []
+    try:
+        if float(comparison.get("operator_override_rate_delta", 0.0) or 0.0) > 0:
+            objective_focus.append("reduce operator override rate")
+    except (TypeError, ValueError):
+        pass
+    try:
+        if float(comparison.get("success_rate_delta", 0.0) or 0.0) > 0:
+            objective_focus.append("preserve the recent success-rate gain")
+    except (TypeError, ValueError):
+        pass
+    try:
+        if float(comparison.get("decision_quality_delta", 0.0) or 0.0) > 0:
+            objective_focus.append("retain the decision-quality improvement")
+    except (TypeError, ValueError):
+        pass
+
+    objective_clause = (
+        f"{recommendation_type} {constraint_key} behavior"
+        if constraint_key
+        else f"apply recommendation {recommendation_id}"
+    )
+    if objective_focus:
+        objective_clause = f"{objective_clause} to {' and '.join(objective_focus[:2])}"
+
+    requested_outcome = _compact_text(
+        f"Turn recommendation {recommendation_id} into one bounded implementation objective: {objective_clause}.",
+        220,
+    ) or f"Turn recommendation {recommendation_id} into one bounded implementation objective."
+    topic = _compact_text(
+        f"Recommendation {recommendation_id}: {objective_clause}",
+        96,
+    ) or f"Recommendation {recommendation_id} implementation"
+    next_bounded_steps = [
+        f"Extract the concrete objective from recommendation {recommendation_id}{f' for {constraint_key}' if constraint_key else ''}.",
+        f"Define one bounded implementation task to {objective_clause}.",
+        "Surface the queued or completed task status back to the same conversation session.",
+    ]
+    summary = (
+        f"Create one bounded implementation task from recommendation {recommendation_id} "
+        f"for session {{session_id}}: {requested_outcome}"
+    )
+    return {
+        "requested_outcome": requested_outcome,
+        "topic": topic,
+        "next_bounded_steps": next_bounded_steps,
+        "summary_template": summary,
+    }
+
+
+async def _build_conversation_handoff_payload_async(
+    *, request_id: str, text: str, session_id: str, db: AsyncSession
+) -> dict[str, object]:
+    payload = _build_conversation_handoff_payload(
+        request_id=request_id,
+        text=text,
+        session_id=session_id,
+    )
+
+    recommendation_id = _extract_recommendation_id(text)
+    if not recommendation_id:
+        return payload
+
+    recommendation_row = await get_improvement_recommendation(
+        recommendation_id=recommendation_id,
+        db=db,
+    )
+    if recommendation_row is None:
+        return payload
+
+    recommendation = await to_improvement_recommendation_out_resolved(
+        row=recommendation_row,
+        db=db,
+    )
+    details = _recommendation_handoff_details(
+        recommendation,
+        recommendation_id=recommendation_id,
+    )
+    payload["requested_outcome"] = details["requested_outcome"]
+    payload["topic"] = details["topic"]
+    payload["next_bounded_steps"] = details["next_bounded_steps"]
+    payload["summary"] = str(details["summary_template"]).format(
+        session_id=session_id or "default-session"
+    )
+    return payload
+
+
+def _handoff_submission_interface_status(submission: dict[str, object] | None) -> str:
+    if not isinstance(submission, dict):
+        return "doing"
+
+    status = str(submission.get("status") or "").strip().lower()
+    if status in {"failed", "blocked", "error"}:
+        return "blocked"
+    if status in {"completed", "done", "succeeded"}:
+        return "done"
+    return "doing"
+
+
+def _handoff_submission_result_summary(submission: dict[str, object] | None) -> str:
+    if not isinstance(submission, dict):
+        return "I staged one bounded implementation task."
+
+    requested_outcome = _compact_interface_text(
+        submission.get("requested_outcome")
+        or submission.get("conversation_request_text")
+        or "",
+        220,
+    )
+    topic = _compact_interface_text(submission.get("topic") or "", 120)
+    summary = _compact_interface_text(submission.get("latest_result_summary") or "", 240)
+    if summary:
+        if requested_outcome:
+            summary_lower = summary.lower()
+            generic_summary_markers = {
+                "step_001",
+                "step_002",
+                "step_003",
+                "classify the request into the existing bounded implementation lane",
+                "should be classified under the existing bounded implementation lane",
+                "bounded task record will be prepared",
+                "surface the queued or completed status back to the same conversation session",
+                "surfaced back to the conversation session",
+            }
+            if any(marker in summary_lower for marker in generic_summary_markers):
+                return f"I staged one bounded implementation task for: {requested_outcome}"
+            generic_tokens = {
+                "bounded",
+                "implementation",
+                "request",
+                "classify",
+                "existing",
+                "lane",
+                "create",
+                "draft",
+                "follow",
+                "would",
+                "keep",
+                "within",
+                "focused",
+                "continue",
+                "plan",
+                "task",
+                "tasks",
+                "step",
+                "steps",
+                "handling",
+                "current",
+                "capabilities",
+                "proper",
+                "alignment",
+            }
+            outcome_tokens = {
+                token
+                for token in requested_outcome.lower().replace("-", " ").split()
+                if len(token) > 4 and token not in generic_tokens
+            }
+            overlap = sum(1 for token in outcome_tokens if token in summary_lower)
+            if overlap == 0:
+                return f"I staged one bounded implementation task for: {requested_outcome}"
+        return summary
+
+    if requested_outcome:
+        return f"I staged one bounded implementation task for: {requested_outcome}"
+    if topic:
+        return f"I staged one bounded implementation task for {topic}."
+
+    mode = str(submission.get("mode") or "bounded_implementation").strip().lower()
+    if mode == "codex_assisted_bounded_implementation":
+        return "I staged one codex-assisted bounded implementation task."
+    if mode == "bounded_tod_dispatch":
+        return "I routed one bounded implementation task through TOD."
+    return "I staged one bounded implementation task."
 
 
 def _infer_user_action_category(raw_text: str) -> ActionCategory:
@@ -4323,15 +6315,64 @@ def _contains_word(text: str, word: str) -> bool:
     return bool(re.search(rf"\b{token}\b", str(text or "").lower()))
 
 
+def _has_greeting_prefix(text: str) -> bool:
+    lowered = str(text or "").strip().lower()
+    if not lowered:
+        return False
+    greeting_prefixes = (
+        "hi mim",
+        "hello mim",
+        "hey mim",
+        "good morning mim",
+        "good afternoon mim",
+        "good evening mim",
+        "hi",
+        "hello",
+        "hey",
+        "good morning",
+        "good afternoon",
+        "good evening",
+    )
+    for prefix in greeting_prefixes:
+        if lowered == prefix or lowered.startswith(prefix + " ") or lowered.startswith(prefix + "."):
+            return True
+    return False
+
+
 def _mentions_tod(text: str) -> bool:
     raw = str(text or "").lower()
     return _contains_word(raw, "tod") or _contains_word(raw, "tods")
 
 
 def _is_low_signal_turn(text: str) -> bool:
-    normalized = " ".join(str(text or "").strip().lower().split())
+    if _has_greeting_prefix(text):
+        return False
+
+    normalized = _normalize_conversation_query(text)
     if not normalized:
         return True
+
+    if (
+        _is_interruption_query(normalized)
+        or _is_pause_control_query(normalized)
+        or _is_resume_control_query(normalized)
+        or _is_cancel_control_query(normalized)
+    ):
+        return False
+
+    if any(
+        marker in normalized
+        for marker in {
+            "summarize your status",
+            "status now",
+            "current status",
+            "current health",
+            "check your health",
+            "check your current health",
+            "start now",
+        }
+    ):
+        return False
 
     if _looks_like_question_text(normalized):
         return False
@@ -4391,10 +6432,106 @@ def _looks_like_retry_followup(text: str) -> bool:
     return any(marker in raw for marker in retry_markers)
 
 
-def _text_route_preference(*, text: str, parsed_intent: str) -> str:
+def _looks_like_bounded_choice_decision_prompt(text: str) -> bool:
+    raw = " ".join(str(text or "").strip().lower().split())
+    if not raw:
+        return False
+
+    bounded_choice_markers = {
+        "pick exactly one",
+        "choose exactly one",
+        "bounded choice only",
+        "one numbered option",
+        "one numbered choice",
+    }
+    return any(marker in raw for marker in bounded_choice_markers)
+
+
+def _text_route_preference(
+    *, text: str, parsed_intent: str, safety_flags: list[str] | None = None
+) -> str:
     # Conversation-first lane for low-stakes dialogue turns.
     normalized_intent = str(parsed_intent or "").strip().lower()
+    local_route = route_console_text_input(text, parsed_intent)
+    if local_route.classifier_outcome in {
+        "execution_capability_request",
+        "robotics_supervised_probe",
+    }:
+        return "goal_system"
+
+    normalized_query = _normalize_conversation_query(text)
+    normalized_safety_flags = {
+        str(flag or "").strip().lower() for flag in (safety_flags or []) if str(flag or "").strip()
+    }
+    if {"blocked", "deny_execution"} & normalized_safety_flags:
+        return "goal_system"
+
+    if (
+        _is_interruption_query(normalized_query)
+        or _is_pause_control_query(normalized_query)
+        or _is_resume_control_query(normalized_query)
+        or _is_cancel_control_query(normalized_query)
+        or any(
+            token in normalized_query
+            for token in {
+                "just chatting for now",
+                "chatting for now",
+                "do not start anything automatically",
+                "dont start anything automatically",
+                "summarize your status",
+                "status now",
+                "current status",
+                "current health",
+                "check your current health",
+                "check your health",
+                "actually start now",
+                "start now",
+            }
+        )
+    ):
+        return "conversation_layer"
+
+    if _looks_like_bounded_choice_decision_prompt(text):
+        return "conversation_layer"
+
+    if _looks_like_continuation_validation_request(text):
+        return "goal_system"
+
+    if _looks_like_bounded_implementation_request(text, parsed_intent, safety_flags):
+        return "goal_system"
+
+    if _looks_like_bounded_tod_bridge_warning_recommendation_request(
+        text,
+        parsed_intent,
+        safety_flags,
+    ) or _looks_like_bounded_tod_bridge_warning_request(
+        text,
+        parsed_intent,
+        safety_flags,
+    ):
+        return "goal_system"
+
+    if _looks_like_bounded_tod_objective_summary_request(
+        text,
+        parsed_intent,
+        safety_flags,
+    ):
+        return "goal_system"
+
+    if _looks_like_bounded_tod_recent_changes_request(
+        text,
+        parsed_intent,
+        safety_flags,
+    ):
+        return "goal_system"
+
+    if _looks_like_bounded_tod_status_request(text, parsed_intent, safety_flags):
+        return "goal_system"
+
     if normalized_intent in {"question", "discussion", "observation"}:
+        return "conversation_layer"
+
+    if _has_greeting_prefix(text):
         return "conversation_layer"
 
     if _looks_like_action_request(text):
@@ -4408,6 +6545,25 @@ def _text_route_preference(*, text: str, parsed_intent: str) -> str:
         return "conversation_layer"
 
     return "goal_system"
+
+
+def _should_force_conversation_eval_route(
+    *,
+    requested_goal: str,
+    metadata_json: dict[str, object] | None,
+    safety_flags: list[str] | None = None,
+) -> bool:
+    normalized_goal = str(requested_goal or "").strip().lower()
+    metadata = metadata_json if isinstance(metadata_json, dict) else {}
+    adapter = str(metadata.get("adapter") or "").strip().lower()
+    normalized_safety_flags = {
+        str(flag or "").strip().lower()
+        for flag in (safety_flags or [])
+        if str(flag or "").strip()
+    }
+    if {"blocked", "deny_execution"} & normalized_safety_flags:
+        return False
+    return normalized_goal == "conversation_eval" or adapter == "conversation_eval_runner"
 
 
 def _compact_text(text: str, max_len: int = 120) -> str:
@@ -4432,6 +6588,38 @@ def _sanitize_json_text(value: object) -> object:
     return value
 
 
+async def _await_gateway_context_snapshot(
+    awaitable: object,
+    *,
+    label: str,
+    fallback: dict[str, object] | None = None,
+    timeout_seconds: float = 1.5,
+    db: AsyncSession | None = None,
+) -> dict[str, object]:
+    async def _rollback_if_needed() -> None:
+        rollback = getattr(db, "rollback", None)
+        if not callable(rollback):
+            return
+        try:
+            await rollback()
+        except Exception as exc:  # noqa: BLE001
+            gateway_logger.warning(
+                "gateway %s rollback after failure also failed: %s", label, exc
+            )
+
+    try:
+        result = await asyncio.wait_for(awaitable, timeout=timeout_seconds)
+    except asyncio.TimeoutError:
+        await _rollback_if_needed()
+        gateway_logger.warning("gateway %s timed out after %.1fs", label, timeout_seconds)
+        return dict(fallback or {})
+    except Exception as exc:  # noqa: BLE001
+        await _rollback_if_needed()
+        gateway_logger.warning("gateway %s failed: %s", label, exc)
+        return dict(fallback or {})
+    return result if isinstance(result, dict) else dict(fallback or {})
+
+
 def _normalize_conversation_query(text: str) -> str:
     normalized = " ".join(str(text or "").strip().lower().split())
     normalized = re.sub(r"[^a-z0-9\s]", " ", normalized)
@@ -4450,6 +6638,9 @@ def _normalize_conversation_query(text: str) -> str:
     normalized = re.sub(r"\bwhy s\b", "why is", normalized)
     normalized = re.sub(r"\bwhys\b", "why is", normalized)
     normalized = re.sub(r"\btod s\b", "tods", normalized)
+    normalized = re.sub(r"\b(u)\b", "you", normalized)
+    normalized = re.sub(r"\bur\b", "your", normalized)
+    normalized = re.sub(r"\bhow r you\b", "how are you", normalized)
     if not normalized:
         return ""
 
@@ -4505,6 +6696,16 @@ def _is_interruption_query(normalized_query: str) -> bool:
         "never mind",
         "scratch that",
     }:
+        return True
+    if any(
+        query.startswith(prefix)
+        for prefix in (
+            "maybe wait ",
+            "maybe stop ",
+            "maybe hold on ",
+            "maybe pause ",
+        )
+    ):
         return True
     return any(
         query.startswith(prefix)
@@ -4630,6 +6831,140 @@ def _is_ambiguous_external_action_query(normalized_query: str) -> bool:
     )
 
 
+def _is_capability_query(normalized_query: str) -> bool:
+    query = str(normalized_query or "").strip().lower()
+    if not query:
+        return False
+    return any(
+        token in query
+        for token in {
+            "what can you do",
+            "what can you help with",
+            "what are your capabilities",
+            "what capabilities do you have",
+            "what is your function",
+            "your function",
+            "function mim",
+            "capabilities",
+        }
+    )
+
+
+def _is_tod_status_query(normalized_query: str) -> bool:
+    query = str(normalized_query or "").strip().lower()
+    if not query or not _mentions_tod(query):
+        return False
+    return any(
+        token in query
+        for token in {
+            "how is",
+            "status",
+            "healthy",
+            "doing",
+            "one line",
+            "quick",
+        }
+    )
+
+
+def _is_runtime_status_query(normalized_query: str) -> bool:
+    query = str(normalized_query or "").strip().lower()
+    if not query:
+        return False
+    return any(
+        token in query
+        for token in {
+            "one line status",
+            "quick status check",
+            "status in one line",
+            "summarize your status",
+            "status now",
+            "check status",
+            "current status",
+            "current health",
+            "check your current health",
+            "check your health",
+            "health",
+            "how are you",
+            "are you healthy",
+            "are you okay",
+        }
+    )
+
+
+def _wants_terse_conversation_reply(normalized_query: str) -> bool:
+    query = str(normalized_query or "").strip().lower()
+    if not query:
+        return False
+    return any(
+        token in query
+        for token in {
+            "one line",
+            "quick",
+            "brief",
+            "short",
+            "terse",
+            "just answer",
+            "status?",
+        }
+    ) or query in {"status", "status now", "current status"}
+
+
+def _is_direct_answer_priority_query(normalized_query: str) -> bool:
+    query = str(normalized_query or "").strip().lower()
+    if not query:
+        return False
+    return any(
+        (
+            _is_capability_query(query),
+            _is_tod_status_query(query),
+            _is_runtime_status_query(query),
+            any(
+                token in query
+                for token in {
+                    "what exactly do you need",
+                    "what do you need from me",
+                    "what do you need",
+                }
+            ),
+        )
+    )
+
+
+def _conversation_intent_anchor(
+    normalized_query: str,
+    *,
+    prior_anchor: dict[str, object] | None = None,
+    conversation_topic: str = "",
+) -> dict[str, object]:
+    query = str(normalized_query or "").strip().lower()
+    prior = prior_anchor if isinstance(prior_anchor, dict) else {}
+    if not query:
+        return dict(prior)
+
+    if _is_tod_status_query(query):
+        return {"topic": "tod_status", "target": "tod_status", "terse": _wants_terse_conversation_reply(query)}
+    if _is_runtime_status_query(query):
+        return {"topic": "status", "target": "status", "terse": _wants_terse_conversation_reply(query)}
+    if _is_capability_query(query):
+        return {"topic": "capabilities", "target": "capabilities", "terse": _wants_terse_conversation_reply(query)}
+    if _looks_like_vague_thing_request(query):
+        return {"topic": "clarification", "target": query, "terse": False}
+    if _is_ambiguous_external_action_query(query):
+        return {"topic": "delegated_authority", "target": "external_actions", "terse": False}
+    if _is_conversation_followup_query(query) and prior:
+        anchored = dict(prior)
+        anchored["query"] = query
+        return anchored
+    if str(conversation_topic or "").strip().lower() not in {"", "general"}:
+        return {
+            "topic": str(conversation_topic or "").strip().lower(),
+            "target": query,
+            "terse": _wants_terse_conversation_reply(query),
+        }
+    return dict(prior)
+
+
 def _conversation_boundary_response(normalized_query: str) -> str:
     query = str(normalized_query or "").strip().lower()
     if not query:
@@ -4648,17 +6983,60 @@ def _conversation_boundary_response(normalized_query: str) -> str:
 
     if _is_unsafe_or_risky_query(query):
         return (
-            "I cannot help with unsafe or risky operations. "
+            "I cannot do something unsafe quickly or help with unsafe or risky operations. "
             "I can help with a safer alternative, a risk check, or a step-by-step review instead."
         )
 
     if _is_ambiguous_external_action_query(query):
         return (
-            "I cannot choose unspecified external actions on your behalf. "
-            "Name the one action you want, and I will confirm it before execution."
+            "Understood. I will treat that as bounded permission to take the necessary external actions for the current objective. "
+            "I will still stop for destructive, high-risk, or irreversible steps."
         )
 
     return ""
+
+
+def _conversation_clarification_progress_response(
+    normalized_query: str,
+    context: dict[str, object] | None = None,
+) -> str:
+    query = str(normalized_query or "").strip().lower()
+    session_context = context if isinstance(context, dict) else {}
+    clarification_state = (
+        session_context.get("clarification_state")
+        if isinstance(session_context.get("clarification_state"), dict)
+        else {}
+    )
+    if not query or not clarification_state.get("active"):
+        return ""
+
+    if _is_direct_answer_priority_query(query) or _is_conversation_followup_query(query):
+        return ""
+
+    prior_target = str(
+        clarification_state.get("target")
+        or clarification_state.get("pending_action_request")
+        or session_context.get("last_user_input")
+        or "the prior request"
+    ).strip()
+    clarification_count = max(0, int(clarification_state.get("count") or 0))
+
+    if _looks_like_vague_thing_request(query):
+        return (
+            f"I am still blocked on '{_compact_text(prior_target, 96)}' because the target is not specific enough. "
+            "Name the concrete task, object, or URL and I will move it forward."
+        )
+
+    if clarification_count >= 1 and len([token for token in query.split() if token]) <= 2:
+        return (
+            f"I am still blocked on '{_compact_text(prior_target, 96)}' because the target is not specific enough. "
+            "Name the concrete task, object, or URL and I will move it forward."
+        )
+
+    return (
+        f"Understood. I will treat the request as '{_compact_text(query, 120)}'. "
+        "Say confirm if you want me to turn it into a concrete action request."
+    )
 
 
 def _extract_conversation_correction(normalized_query: str) -> str:
@@ -4689,11 +7067,71 @@ def _priority_two_item_response(last_topic: str) -> str:
 def _continuation_response(last_topic: str) -> str:
     if last_topic == "technical_research":
         return "Continue with the next bounded research step, then stop when the evidence stops improving."
+    if last_topic == "development_integration":
+        return "Continue by inspecting the existing asset, mapping it to the current session contract, and then validating one end-to-end reused path."
+    if last_topic == "self_evolution":
+        return "Continue by reviewing the recommended improvement action, turning it into a bounded implementation plan, and then executing the first governed step."
     if last_topic in {"priorities", "objective", "project_planning"}:
         return "Continue with one concrete task at a time: verify the current state, then take the next handoff or test run."
     if last_topic in {"risk", "risk_reduction"}:
         return "Continue by checking whether the fix held in live state, not just in tests."
     return "Continue with one concrete question or one action, and I will keep it direct."
+
+
+def _conversation_followup_hints(last_topic: str, last_prompt: str) -> dict[str, str]:
+    topic = str(last_topic or "").strip().lower()
+    prompt = str(last_prompt or "").strip()
+
+    status_map = {
+        "technical_research": "Status: the investigation is still bounded by the current step, evidence quality, and stop condition.",
+        "development_integration": "Status: inspect the existing asset first, compare it to the current session flow, then validate one live integration.",
+        "self_evolution": "Status: choose one communication-focused improvement task, turn it into a bounded implementation plan, and keep the operator command explicit.",
+        "priorities": "Status: stabilize routing, keep tests green, and verify the next handoff.",
+        "objective": "Status: the objective remains reliable conversation flow and stable MIM to TOD handoff.",
+        "project_planning": "Status: scope is first, MVP is second, and the first tasks come next.",
+        "mission": "Status: stay coherent, assist safely, and keep execution aligned to the active goal.",
+        "risk": "Status: the active risk is still drift between conversation behavior and execution state.",
+        "risk_reduction": "Status: the mitigation path is regression checks, tighter routing, and explicit handoff verification.",
+    }
+    recap_map = {
+        "technical_research": "One line: keep the technical investigation bounded and stop when the evidence stops improving.",
+        "development_integration": "One line: inspect the closest existing asset first, reuse the current session path, and validate one live integration before building anything new.",
+        "self_evolution": "One line: pick the next communication improvement task, expose the operator command, and move it into a bounded implementation plan.",
+        "priorities": "One line: stabilize routing, keep tests green, and verify the next handoff.",
+        "objective": "One line: the objective is reliable conversation flow and stable MIM to TOD handoff.",
+        "project_planning": "One line: define scope, name the MVP, and create the first tasks.",
+        "mission": "One line: assist safely, stay coherent, and help execute goals.",
+        "risk": "One line: the main risk is drift between conversation behavior and execution state.",
+        "risk_reduction": "One line: reduce risk with regression checks and explicit handoff verification.",
+    }
+    why_map = {
+        "technical_research": "Because open-ended technical research can loop forever, so the budget and stop condition have to earn the next round.",
+        "development_integration": "Because inspecting the existing asset first tells us whether this is a thin integration or a new build, which cuts risk fastest.",
+        "self_evolution": "Because MIM improves fastest when the next communication task is explicit, bounded, and tied to a concrete operator command instead of staying as vague intent.",
+        "priorities": "Because reliability and handoff stability protect every later task; if they drift, the rest of the workflow gets noisy fast.",
+        "objective": "Because reliability and handoff stability protect every later task; if they drift, the rest of the workflow gets noisy fast.",
+        "project_planning": "Because clear scope and the MVP cut ambiguity before we spend effort on implementation.",
+        "risk": "Because reducing uncertainty before the next action is the fastest way to keep the system honest.",
+        "risk_reduction": "Because mitigation only matters if the fix stays stable in live behavior and not just in tests.",
+    }
+    after_map = {
+        "technical_research": "After that, choose the next path worth deeper research, research that path, and stop when the evidence stops improving or the budget runs out.",
+        "development_integration": "After that, validate one live session on the reused path and only then decide whether a thin wrapper is justified.",
+        "self_evolution": "After that, review the result, update the active communication-improvement thread, and choose the next bounded implementation step.",
+        "priorities": "After that, run the regression checks, confirm live behavior, and lock the next TOD handoff.",
+        "objective": "After that, run the regression checks, confirm live behavior, and lock the next TOD handoff.",
+        "project_planning": "After that, run the regression checks, confirm live behavior, and lock the next TOD handoff.",
+        "risk": "After that, verify the fix stayed stable in live conversation and not just in tests.",
+        "risk_reduction": "After that, verify the fix stayed stable in live conversation and not just in tests.",
+    }
+
+    hints = {
+        "status": status_map.get(topic, ""),
+        "recap": recap_map.get(topic, _compact_text(prompt, 120) if prompt else ""),
+        "why": why_map.get(topic, "Because it reduces uncertainty before taking the next step." if topic else ""),
+        "after_that": after_map.get(topic, "After that, confirm the result, summarize the state, and decide the next action." if topic else ""),
+    }
+    return {key: value for key, value in hints.items() if str(value).strip()}
 
 
 def _is_action_request_query(normalized_query: str) -> bool:
@@ -5566,7 +8004,29 @@ def _conversation_topic_key(normalized_query: str, response: str = "") -> str:
     if (
         any(
             token in query
-            for token in {"what is the system", "our system", "define the system"}
+            for token in {
+                "runtime health",
+                "runtime status",
+                "how is runtime health",
+                "how is the runtime doing",
+                "how is runtime doing",
+            }
+        )
+        or prompt.startswith("runtime health:")
+        or prompt.startswith("current status:")
+    ):
+        return "status"
+    if (
+        any(
+            token in query
+            for token in {
+                "what is the system",
+                "what is our system",
+                "what's the system",
+                "what's our system",
+                "our system",
+                "define the system",
+            }
         )
         or "the system is mim plus tod" in prompt
     ):
@@ -5577,8 +8037,14 @@ def _conversation_topic_key(normalized_query: str, response: str = "") -> str:
             for token in {
                 "continue automatically",
                 "act automatically",
+                "keep going automatically",
+                "proceed automatically",
+                "automatic",
+                "autonomy",
                 "automatic right now",
                 "autonomy right now",
+                "what is your autonomy",
+                "what is your autonomy status",
             }
         )
         or prompt.startswith("automatic continuation is limited")
@@ -5590,6 +8056,7 @@ def _conversation_topic_key(normalized_query: str, response: str = "") -> str:
             for token in {
                 "give feedback",
                 "how do i give feedback",
+                "what feedback do you need",
                 "feedback loop",
                 "feedback for you",
             }
@@ -5602,6 +8069,8 @@ def _conversation_topic_key(normalized_query: str, response: str = "") -> str:
             token in query
             for token in {
                 "system stable",
+                "how stable is the system",
+                "system stability",
                 "are you stable",
                 "stability guard",
                 "stability right now",
@@ -5617,11 +8086,21 @@ def _conversation_topic_key(normalized_query: str, response: str = "") -> str:
                 "what is our objective",
                 "current objective",
                 "active objective",
+                "what are you working on",
+                "what are we working on",
+                "what should we work on",
+                "work on today",
             }
         )
         or "current objective focus" in prompt
     ):
         return "objective"
+    if (
+        _is_self_evolution_next_work_query(query)
+        or prompt.startswith("next i would work on ")
+        or "operator command:" in prompt
+    ):
+        return "self_evolution"
     if (
         any(
             token in query
@@ -5694,6 +8173,13 @@ def _conversation_topic_key(normalized_query: str, response: str = "") -> str:
         or "scope the application" in prompt
     ):
         return "project_planning"
+    if (
+        _looks_like_development_integration_query(query)
+        or prompt.startswith("next action: inspect the existing mim_wall app")
+        or prompt.startswith("next action: inspect the existing app against the current interface")
+        or prompt.startswith("next action: inspect the closest existing asset")
+    ):
+        return "development_integration"
     if "news" in query or "top ai and tech themes today" in prompt:
         return "news"
     return "general"
@@ -5703,31 +8189,35 @@ async def _get_recent_text_conversation_context(
     db: AsyncSession,
     *,
     session_id: str,
+    actor_name: str = DEFAULT_USER_ID,
     exclude_event_id: int | None = None,
     limit: int = 8,
+    prefer_interface_session_only: bool = False,
 ) -> dict:
     normalized_session = str(session_id or "").strip()
     if not normalized_session:
-        return {
-            "turn_count": 0,
-            "last_user_input": "",
-            "last_prompt": "",
-            "last_topic": "",
-            "last_object_inquiry": {},
-            "last_technical_research": {},
-            "last_action_request": "",
-            "pending_action_request": "",
-            "last_action_result": {},
-            "last_failure": {},
-            "last_control_state": "active",
-            "clarification_state": {},
-        }
+        if prefer_interface_session_only:
+            return _empty_recent_text_conversation_context()
+        remembered_context = await _load_remembered_conversation_context(
+            db=db,
+            actor_name=actor_name,
+        )
+        return _merge_conversation_context_with_memory(
+            _empty_recent_text_conversation_context(),
+            remembered_context,
+        )
 
     interface_session = await get_interface_session(
         session_key=normalized_session,
         db=db,
     )
     if interface_session is not None:
+        remembered_context = {}
+        if not prefer_interface_session_only:
+            remembered_context = await _load_remembered_conversation_context(
+                db=db,
+                actor_name=actor_name,
+            )
         session_context = _normalize_conversation_session_context(
             normalized_session,
             interface_session.context_json
@@ -5735,11 +8225,19 @@ async def _get_recent_text_conversation_context(
             else {},
         )
         if exclude_event_id is None or int(session_context.get("last_input_event_id") or 0) != int(exclude_event_id):
-            return {
+            return _merge_conversation_context_with_memory({
                 "turn_count": int(session_context.get("turn_count") or 0),
+                "session_display_name": str(
+                    session_context.get("session_display_name") or ""
+                ).strip(),
                 "last_user_input": str(session_context.get("last_user_input") or "").strip(),
                 "last_prompt": str(session_context.get("last_prompt") or "").strip(),
                 "last_topic": str(session_context.get("last_topic") or "").strip().lower(),
+                "last_followup_hints": (
+                    session_context.get("last_followup_hints")
+                    if isinstance(session_context.get("last_followup_hints"), dict)
+                    else {}
+                ),
                 "last_object_inquiry": (
                     session_context.get("last_object_inquiry")
                     if isinstance(session_context.get("last_object_inquiry"), dict)
@@ -5768,7 +8266,21 @@ async def _get_recent_text_conversation_context(
                     if isinstance(session_context.get("clarification_state"), dict)
                     else {}
                 ),
-            }
+                "active_goal": str(session_context.get("active_goal") or "").strip(),
+                "operator_reasoning_summary": str(session_context.get("operator_reasoning_summary") or "").strip(),
+                "runtime_health_summary": str(session_context.get("runtime_health_summary") or "").strip(),
+                "runtime_recovery_summary": str(session_context.get("runtime_recovery_summary") or "").strip(),
+                "tod_collaboration_summary": str(session_context.get("tod_collaboration_summary") or "").strip(),
+                "current_recommendation_summary": str(session_context.get("current_recommendation_summary") or "").strip(),
+            }, remembered_context)
+
+    if prefer_interface_session_only:
+        return _empty_recent_text_conversation_context()
+
+    remembered_context = await _load_remembered_conversation_context(
+        db=db,
+        actor_name=actor_name,
+    )
 
     rows = (
         await db.execute(
@@ -5800,20 +8312,10 @@ async def _get_recent_text_conversation_context(
             break
 
     if not matched:
-        return {
-            "turn_count": 0,
-            "last_user_input": "",
-            "last_prompt": "",
-            "last_topic": "",
-            "last_object_inquiry": {},
-            "last_technical_research": {},
-            "last_action_request": "",
-            "pending_action_request": "",
-            "last_action_result": {},
-            "last_failure": {},
-            "last_control_state": "active",
-            "clarification_state": {},
-        }
+        return _merge_conversation_context_with_memory(
+            _empty_recent_text_conversation_context(),
+            remembered_context,
+        )
 
     last_event, last_resolution = matched[0]
     resolution_meta = (
@@ -5867,11 +8369,410 @@ async def _get_recent_text_conversation_context(
             else {}
         )
 
+
+def _is_return_briefing_query(normalized_query: str) -> bool:
+    query = str(normalized_query or "").strip().lower()
+    if not query:
+        return False
+    phrases = {
+        "catch me up",
+        "bring me up to speed",
+        "what changed while i was away",
+        "what happened while i was away",
+        "while i was away",
+        "while you were away",
+        "what changed since i was gone",
+        "what did i miss",
+        "i'm back catch me up",
+        "im back catch me up",
+        "i am back catch me up",
+    }
+    return any(phrase in query for phrase in phrases)
+
+
+def _is_self_evolution_next_work_query(normalized_query: str) -> bool:
+    query = str(normalized_query or "").strip().lower()
+    if not query:
+        return False
+
+    explicit_phrases = {
+        "what would you like to work on next mim",
+        "what would you like to work on next",
+        "what do you want to work on next mim",
+        "what do you want to work on next",
+        "what should you work on next mim",
+        "what should you work on next",
+        "what would you like to improve next mim",
+        "what would you like to improve next",
+        "what should you improve next mim",
+        "what should you improve next",
+        "what is your next objective to improve yourself",
+        "what is your next objective",
+        "next objective to improve yourself",
+        "what do you think you would like to work on",
+    }
+    if query in explicit_phrases:
+        return True
+
+    if any(phrase in query for phrase in explicit_phrases):
+        return True
+
+    return (
+        any(token in query for token in {"work on next", "improve next", "next objective"})
+        and any(token in query for token in {"mim", "you", "yourself"})
+    )
+
+
+RETURN_BRIEFING_GOAL_STALE_HOURS = 24.0
+
+
+async def _build_return_briefing_context(
+    db: AsyncSession,
+) -> dict[str, object]:
+    goal_rows = (
+        (
+            await db.execute(
+                select(Goal)
+                .order_by(Goal.id.desc())
+                .limit(12)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    preferred_goal: Goal | None = None
+    latest_goal: Goal | None = goal_rows[0] if goal_rows else None
+    terminal_statuses = {"completed", "done", "cancelled", "failed", "blocked", "archived"}
+    for row in goal_rows:
+        status = str(row.status or "").strip().lower()
+        if status and status not in terminal_statuses:
+            preferred_goal = row
+            break
+
+    briefing_result = await build_self_evolution_briefing(
+        actor="gateway_return_briefing",
+        source="gateway_conversation_return_briefing",
+        refresh=False,
+        lookback_hours=168,
+        min_occurrence_count=2,
+        auto_experiment_limit=3,
+        limit=5,
+        db=db,
+    )
+    briefing = (
+        briefing_result.get("briefing", {})
+        if isinstance(briefing_result, dict)
+        else {}
+    )
+    decision = briefing.get("decision", {}) if isinstance(briefing.get("decision", {}), dict) else {}
+    snapshot = briefing.get("snapshot", {}) if isinstance(briefing.get("snapshot", {}), dict) else {}
+
+    now_utc = datetime.now(timezone.utc)
+    goal_created_at = getattr(preferred_goal, "created_at", None)
+    goal_age_hours = 0.0
+    if isinstance(goal_created_at, datetime):
+        goal_age_hours = max(
+            0.0,
+            (now_utc - goal_created_at.astimezone(timezone.utc)).total_seconds() / 3600.0,
+        )
+    goal_truth_status = "missing"
+    if preferred_goal is not None:
+        goal_truth_status = (
+            "stale"
+            if goal_age_hours >= RETURN_BRIEFING_GOAL_STALE_HOURS
+            else "current"
+        )
+
+    decision_type = str(decision.get("decision_type") or "").strip()
+    snapshot_status = str(snapshot.get("status") or "").strip().lower()
+    alignment_status = "healthy"
+    if goal_truth_status == "missing":
+        alignment_status = "partial"
+    if latest_goal is not None and preferred_goal is None and snapshot_status in {"active", "operator_review_required"}:
+        alignment_status = "conflicting"
+    elif goal_truth_status == "stale":
+        alignment_status = "stale"
+
     return {
+        "goal_description": str(getattr(preferred_goal, "goal_description", "") or "").strip(),
+        "goal_status": str(getattr(preferred_goal, "status", "") or "").strip().lower(),
+        "goal_id": int(getattr(preferred_goal, "id", 0) or 0),
+        "goal_truth_status": goal_truth_status,
+        "goal_age_hours": round(goal_age_hours, 2),
+        "latest_goal_description": str(getattr(latest_goal, "goal_description", "") or "").strip(),
+        "latest_goal_status": str(getattr(latest_goal, "status", "") or "").strip().lower(),
+        "decision_summary": str(decision.get("summary") or "").strip(),
+        "decision_type": decision_type,
+        "snapshot_summary": str(snapshot.get("summary") or "").strip(),
+        "snapshot_status": snapshot_status,
+        "alignment_status": alignment_status,
+    }
+
+
+def _return_briefing_response(context: dict[str, object]) -> str:
+    briefing = (
+        context.get("operator_return_briefing")
+        if isinstance(context.get("operator_return_briefing"), dict)
+        else {}
+    )
+    goal_description = str(briefing.get("goal_description") or "").strip()
+    goal_status = str(briefing.get("goal_status") or "").strip().lower()
+    goal_truth_status = str(briefing.get("goal_truth_status") or "").strip().lower()
+    goal_age_hours = float(briefing.get("goal_age_hours") or 0.0)
+    latest_goal_description = str(briefing.get("latest_goal_description") or "").strip()
+    latest_goal_status = str(briefing.get("latest_goal_status") or "").strip().lower()
+    decision_summary = str(briefing.get("decision_summary") or "").strip()
+    decision_type = str(briefing.get("decision_type") or "").strip()
+    snapshot_summary = str(briefing.get("snapshot_summary") or "").strip()
+    snapshot_status = str(briefing.get("snapshot_status") or "").strip().lower()
+    alignment_status = str(briefing.get("alignment_status") or "healthy").strip().lower()
+
+    if alignment_status == "conflicting":
+        latest_goal_fragment = (
+            f"The last stored goal was {_compact_text(latest_goal_description, 120)} (status: {latest_goal_status or 'unknown'})"
+            if latest_goal_description
+            else "The latest stored goal state is unavailable"
+        )
+        next_step_sentence = (
+            f"Recommended next step: {_compact_text(decision_summary, 180)}"
+            if decision_summary
+            else "Recommended next step is unavailable from current continuity state"
+        )
+        self_evolution_sentence = (
+            f"Self-evolution is currently {_compact_text(snapshot_summary, 220)}"
+            if snapshot_summary
+            else f"Self-evolution status is {snapshot_status or 'unavailable'}"
+        )
+        return (
+            "While you were away: continuity inputs are not fully aligned. "
+            f"{latest_goal_fragment}. {self_evolution_sentence}. {next_step_sentence}. "
+            "I do not have enough aligned continuity state to collapse that into one active-thread summary."
+        )
+
+    if goal_truth_status == "stale":
+        goal_sentence = (
+            f"the most recent non-terminal goal is {_compact_text(goal_description, 120)} (status: {goal_status or 'new'})"
+            if goal_description
+            else "the current goal surface is unavailable"
+        )
+        next_step_sentence = (
+            f"Recommended next step: {_compact_text(decision_summary, 180)}"
+            if decision_summary
+            else "Recommended next step is unavailable from current continuity state"
+        )
+        self_evolution_sentence = (
+            f"Self-evolution: {_compact_text(snapshot_summary, 220)}"
+            if snapshot_summary
+            else "Self-evolution summary is unavailable"
+        )
+        return (
+            "While you were away: active goal continuity may be stale. "
+            f"I last recorded that {goal_sentence} about {goal_age_hours:.1f} hour(s) ago. "
+            f"{next_step_sentence}. {self_evolution_sentence}. "
+            "I cannot honestly confirm that the recorded goal is still current."
+        )
+
+    if goal_truth_status == "missing":
+        next_step_sentence = (
+            f"Recommended next step: {_compact_text(decision_summary, 180)}"
+            if decision_summary and decision_type
+            else "Recommended next step is unavailable from current continuity state"
+        )
+        self_evolution_sentence = (
+            f"Self-evolution: {_compact_text(snapshot_summary, 220)}"
+            if snapshot_summary
+            else "Self-evolution summary is unavailable"
+        )
+        return (
+            "While you were away: I do not have a current active goal in the continuity state. "
+            f"{next_step_sentence}. {self_evolution_sentence}. "
+            "This is a partial catch-up only because the active-goal surface is unavailable."
+        )
+
+    if goal_truth_status == "current" and snapshot_status and not snapshot_summary and not decision_summary:
+        goal_sentence = (
+            f"current goal is {_compact_text(goal_description, 120)} (status: {goal_status or 'new'})"
+            if goal_description
+            else "no active goal is currently recorded"
+        )
+        return (
+            "While you were away: "
+            f"{goal_sentence}. "
+            f"Self-evolution visibility is limited to status={snapshot_status}. "
+            "I do not have a usable self-evolution summary or decision, so I cannot recommend a next step from that surface."
+        )
+
+    if goal_truth_status == "current" and not decision_summary and not snapshot_summary:
+        goal_sentence = (
+            f"current goal is {_compact_text(goal_description, 120)} (status: {goal_status or 'new'})"
+            if goal_description
+            else "no active goal is currently recorded"
+        )
+        return (
+            "While you were away: "
+            f"{goal_sentence}. "
+            "Self-evolution guidance is currently unavailable. "
+            "I do not have enough current self-evolution state to recommend a next step."
+        )
+
+    goal_sentence = (
+        f"current goal is {_compact_text(goal_description, 120)} (status: {goal_status or 'new'})"
+        if goal_description
+        else "no active goal is currently recorded"
+    )
+    next_step_sentence = (
+        f"Recommended next step: {_compact_text(decision_summary, 180)}"
+        if decision_summary
+        else "Recommended next step: refresh the current state before taking a new action"
+    )
+    self_evolution_sentence = (
+        f"Self-evolution: {_compact_text(snapshot_summary, 220)}"
+        if snapshot_summary
+        else "Self-evolution: no strong new improvement pressure is visible right now"
+    )
+    return f"While you were away: {goal_sentence}. {next_step_sentence}. {self_evolution_sentence}."
+
+
+def _self_evolution_next_work_response(context: dict[str, object]) -> str:
+    briefing = (
+        context.get("self_evolution_briefing")
+        if isinstance(context.get("self_evolution_briefing"), dict)
+        else {}
+    )
+    decision = (
+        briefing.get("decision", {})
+        if isinstance(briefing.get("decision", {}), dict)
+        else {}
+    )
+    snapshot = (
+        briefing.get("snapshot", {})
+        if isinstance(briefing.get("snapshot", {}), dict)
+        else {}
+    )
+    natural_language_development = (
+        briefing.get("natural_language_development", {})
+        if isinstance(briefing.get("natural_language_development", {}), dict)
+        else {}
+    )
+    selected_skill = (
+        natural_language_development.get("selected_skill", {})
+        if isinstance(natural_language_development.get("selected_skill", {}), dict)
+        else {}
+    )
+    action = decision.get("action", {}) if isinstance(decision.get("action", {}), dict) else {}
+
+    summary = str(decision.get("summary") or context.get("self_evolution_summary") or "").strip()
+    snapshot_summary = str(snapshot.get("summary") or "").strip()
+    rationale = str(decision.get("rationale") or "").strip()
+    action_method = str(action.get("method") or context.get("self_evolution_action_method") or "").strip().upper()
+    action_path = str(action.get("path") or context.get("self_evolution_action_path") or "").strip()
+    language_summary = str(
+        natural_language_development.get("summary")
+        or context.get("self_evolution_natural_language_development_summary")
+        or ""
+    ).strip()
+    language_next_step = str(
+        natural_language_development.get("next_step_summary")
+        or context.get("self_evolution_natural_language_development_next_step")
+        or ""
+    ).strip()
+    language_active_slice = str(
+        natural_language_development.get("active_slice_summary")
+        or context.get("self_evolution_natural_language_development_active_slice")
+        or ""
+    ).strip()
+    language_progress = str(
+        natural_language_development.get("progress_summary")
+        or context.get("self_evolution_natural_language_development_progress")
+        or ""
+    ).strip()
+    language_pass_bar = str(
+        natural_language_development.get("selected_skill_pass_bar_summary")
+        or context.get("self_evolution_natural_language_development_pass_bar")
+        or ""
+    ).strip()
+    language_continuation = str(
+        natural_language_development.get("continuation_policy_summary")
+        or context.get("self_evolution_natural_language_development_continuation")
+        or ""
+    ).strip()
+    language_whats_next = str(
+        natural_language_development.get("whats_next_framework_summary")
+        or context.get("self_evolution_natural_language_development_whats_next")
+        or ""
+    ).strip()
+    selected_skill_title = str(
+        natural_language_development.get("selected_skill_title")
+        or selected_skill.get("title")
+        or context.get("self_evolution_natural_language_development_skill_title")
+        or ""
+    ).strip()
+    selected_skill_goal = str(selected_skill.get("development_goal") or "").strip()
+
+    if (
+        not summary
+        and not snapshot_summary
+        and not action_path
+        and not language_summary
+        and not language_next_step
+        and not language_active_slice
+        and not language_progress
+        and not language_pass_bar
+        and not language_continuation
+        and not language_whats_next
+    ):
+        return ""
+
+    parts: list[str] = []
+    if selected_skill_title:
+        skill_line = f"Natural-language development focus: {selected_skill_title}"
+        if selected_skill_goal:
+            skill_line += f". Goal: {_compact_text(selected_skill_goal, 180)}"
+        parts.append(skill_line)
+    elif language_summary:
+        parts.append(f"Natural-language development: {_compact_text(language_summary, 220)}")
+    if summary:
+        parts.append(f"Next I would work on {_compact_text(summary, 180)}")
+    elif language_next_step:
+        parts.append(f"Next I would work on {_compact_text(language_next_step, 180)}")
+    if rationale:
+        parts.append(f"Why: {_compact_text(rationale, 180)}")
+    elif snapshot_summary:
+        parts.append(f"Current self-evolution state: {_compact_text(snapshot_summary, 220)}")
+    elif language_summary:
+        parts.append(f"Current language-development state: {_compact_text(language_summary, 220)}")
+    if language_active_slice:
+        parts.append(f"Current slice: {_compact_text(language_active_slice, 220)}")
+    if language_progress:
+        parts.append(f"Current progress: {_compact_text(language_progress, 220)}")
+    if language_whats_next:
+        parts.append(f"What's next framework: {_compact_text(language_whats_next, 220)}")
+    if language_pass_bar:
+        normalized_pass_bar = re.sub(
+            r"^pass\s+bar:\s*",
+            "",
+            language_pass_bar,
+            flags=re.IGNORECASE,
+        ).strip()
+        parts.append(
+            f"Pass bar: {_compact_text(normalized_pass_bar or language_pass_bar, 220)}"
+        )
+    if language_continuation:
+        parts.append(f"Continuation policy: {_compact_text(language_continuation, 220)}")
+    if action_method and action_path:
+        parts.append(f"Operator command: {action_method} {action_path}.")
+    parts.append(
+        "If you want, I can turn that into a bounded implementation plan and continue from there."
+    )
+    return " ".join(parts).strip()
+
+    return _merge_conversation_context_with_memory({
         "turn_count": len(matched),
+        "session_display_name": "",
         "last_user_input": str(last_event.raw_input or "").strip(),
         "last_prompt": last_prompt,
         "last_topic": last_topic,
+        "last_followup_hints": _conversation_followup_hints(last_topic, last_prompt),
         "last_object_inquiry": last_object_inquiry,
         "last_technical_research": last_technical_research,
         "last_action_request": "",
@@ -5880,19 +8781,183 @@ async def _get_recent_text_conversation_context(
         "last_failure": {},
         "last_control_state": "active",
         "clarification_state": {},
+    }, remembered_context)
+
+
+def _empty_recent_text_conversation_context() -> dict[str, object]:
+    return {
+        "turn_count": 0,
+        "session_display_name": "",
+        "last_user_input": "",
+        "last_prompt": "",
+        "last_topic": "",
+        "last_followup_hints": {},
+        "last_object_inquiry": {},
+        "last_technical_research": {},
+        "last_action_request": "",
+        "pending_action_request": "",
+        "last_action_result": {},
+        "last_failure": {},
+        "last_control_state": "active",
+        "clarification_state": {},
+        "remembered_user_id": DEFAULT_USER_ID,
+        "remembered_display_name": "",
+        "remembered_aliases": [],
+        "remembered_conversation_preferences": [],
+        "remembered_conversation_likes": [],
+        "remembered_conversation_dislikes": [],
     }
+
+
+def _memory_list_values(payload: dict[str, object] | None, *, limit: int = 6) -> list[str]:
+    value = payload.get("value") if isinstance(payload, dict) else []
+    if isinstance(value, list):
+        items = value
+    elif value in {None, ""}:
+        items = []
+    else:
+        items = [value]
+    compact: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        text = " ".join(str(item or "").strip().split())
+        if not text:
+            continue
+        lowered = text.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        compact.append(text[:140])
+        if len(compact) >= max(1, int(limit)):
+            break
+    return compact
+
+
+async def _load_remembered_conversation_context(
+    *,
+    db: AsyncSession,
+    actor_name: str,
+) -> dict[str, object]:
+    normalized_actor = str(actor_name or "").strip() or DEFAULT_USER_ID
+    remembered_display_name = ""
+    remembered_aliases: list[str] = []
+
+    actor = (
+        (await db.execute(select(Actor).where(Actor.name == normalized_actor)))
+        .scalars()
+        .first()
+    )
+    if actor is not None and isinstance(actor.identity_metadata, dict):
+        identity_meta = actor.identity_metadata
+        remembered_display_name = str(identity_meta.get("display_name") or "").strip()
+        remembered_aliases = [
+            str(item).strip()
+            for item in identity_meta.get("aliases", [])
+            if str(item).strip()
+        ][:8]
+
+    if not remembered_display_name:
+        display_name_pref = await get_user_preference_payload(
+            db=db,
+            preference_type="display_name",
+            user_id=normalized_actor,
+        )
+        remembered_display_name = " ".join(
+            str(display_name_pref.get("value") or "").strip().split()
+        )[:80]
+
+    if not remembered_display_name:
+        person_memory = await _find_recent_memory_by_metadata(
+            db=db,
+            memory_class="person_profile",
+            metadata_match={"actor_name": normalized_actor},
+            limit=20,
+        )
+        person_meta = (
+            person_memory.metadata_json
+            if person_memory is not None and isinstance(person_memory.metadata_json, dict)
+            else {}
+        )
+        remembered_display_name = str(person_meta.get("display_name") or "").strip()
+        if not remembered_aliases:
+            remembered_aliases = [
+                str(item).strip()
+                for item in person_meta.get("aliases", [])
+                if str(item).strip()
+            ][:8]
+
+    conversation_preferences = await get_user_preference_payload(
+        db=db,
+        preference_type="conversation_preferences",
+        user_id=normalized_actor,
+    )
+    conversation_likes = await get_user_preference_payload(
+        db=db,
+        preference_type="conversation_likes",
+        user_id=normalized_actor,
+    )
+    conversation_dislikes = await get_user_preference_payload(
+        db=db,
+        preference_type="conversation_dislikes",
+        user_id=normalized_actor,
+    )
+
+    return {
+        "remembered_user_id": normalized_actor,
+        "remembered_display_name": remembered_display_name,
+        "remembered_aliases": remembered_aliases,
+        "remembered_conversation_preferences": _memory_list_values(
+            conversation_preferences,
+        ),
+        "remembered_conversation_likes": _memory_list_values(
+            conversation_likes,
+        ),
+        "remembered_conversation_dislikes": _memory_list_values(
+            conversation_dislikes,
+        ),
+    }
+
+
+def _merge_conversation_context_with_memory(
+    base_context: dict[str, object] | None,
+    remembered_context: dict[str, object] | None,
+) -> dict[str, object]:
+    merged = _empty_recent_text_conversation_context()
+    if isinstance(base_context, dict):
+        merged.update(base_context)
+    memory_context = remembered_context if isinstance(remembered_context, dict) else {}
+    for key in (
+        "remembered_user_id",
+        "remembered_display_name",
+        "remembered_aliases",
+        "remembered_conversation_preferences",
+        "remembered_conversation_likes",
+        "remembered_conversation_dislikes",
+    ):
+        value = memory_context.get(key, merged.get(key))
+        if isinstance(merged.get(key), list):
+            merged[key] = value if isinstance(value, list) else []
+        else:
+            merged[key] = str(value or "").strip()
+    if not str(merged.get("session_display_name") or "").strip():
+        merged["session_display_name"] = str(
+            merged.get("remembered_display_name") or ""
+        ).strip()
+    return merged
 
 
 def _default_conversation_session_context(session_id: str) -> dict[str, object]:
     return {
         "session_id": str(session_id or "").strip(),
         "turn_count": 0,
+        "session_display_name": "",
         "last_user_input": "",
         "last_parsed_intent": "",
         "last_internal_intent": "",
         "last_prompt": "",
         "last_assistant_output": "",
         "last_topic": "",
+        "last_followup_hints": {},
         "last_goal_description": "",
         "last_proposed_actions": [],
         "last_object_inquiry": {},
@@ -5905,6 +8970,12 @@ def _default_conversation_session_context(session_id: str) -> dict[str, object]:
         "last_resolution_outcome": "",
         "last_resolution_reason": "",
         "clarification_state": {},
+        "active_goal": "",
+        "operator_reasoning_summary": "",
+        "runtime_health_summary": "",
+        "runtime_recovery_summary": "",
+        "tod_collaboration_summary": "",
+        "current_recommendation_summary": "",
         "last_input_event_id": 0,
         "last_resolution_id": 0,
         "last_execution_id": 0,
@@ -5998,8 +9069,13 @@ def _is_conversation_action_approval_query(normalized_query: str) -> bool:
         return True
     return query in {
         "yes",
+        "yes please",
+        "yes do that",
         "yes do it",
+        "do that",
         "do it",
+        "please do",
+        "please do that",
         "okay do it",
         "ok do it",
         "sounds good",
@@ -6081,6 +9157,8 @@ def _conversation_pending_action_request(
     if not query or not base_action:
         return ""
     if _is_conversation_action_confirmation_query(query):
+        return base_action
+    if _is_conversation_action_approval_query(query):
         return base_action
 
     retry_markers = {
@@ -6183,7 +9261,10 @@ async def _store_conversation_interface_state(
         requires_approval=False,
         metadata_json={
             "input_event_id": int(event.id),
+            "request_id": str(event_meta.get("request_id") or "").strip(),
             "turn_index": user_turn_index,
+            "interaction_mode": str(event_meta.get("interaction_mode") or "text").strip() or "text",
+            "message_type": str(event_meta.get("message_type") or "text").strip() or "text",
             "conversation_topic": str(
                 resolution_meta.get("conversation_topic") or ""
             ).strip(),
@@ -6197,7 +9278,12 @@ async def _store_conversation_interface_state(
         db=db,
     )
 
-    assistant_text = str(resolution.clarification_prompt or "").strip()
+    interface_reply = _build_mim_interface_response(
+        event=event,
+        resolution=resolution,
+        execution=execution,
+    )
+    assistant_text = str(interface_reply.get("reply_text") or "").strip()
     assistant_turn_index = user_turn_index
     if assistant_text:
         assistant_turn_index = user_turn_index + 1
@@ -6214,7 +9300,10 @@ async def _store_conversation_interface_state(
             metadata_json={
                 "input_event_id": int(event.id),
                 "resolution_id": int(resolution.id),
+                "request_id": str(event_meta.get("request_id") or "").strip(),
                 "turn_index": assistant_turn_index,
+                "interaction_mode": str(event_meta.get("interaction_mode") or "text").strip() or "text",
+                "message_type": "text",
                 "conversation_topic": str(
                     resolution_meta.get("conversation_topic") or ""
                 ).strip(),
@@ -6227,6 +9316,11 @@ async def _store_conversation_interface_state(
 
     updated_context = _normalize_conversation_session_context(session_key, existing_context)
     conversation_topic = str(resolution_meta.get("conversation_topic") or "").strip().lower()
+    session_display_name = str(
+        resolution_meta.get("session_display_name")
+        or updated_context.get("session_display_name")
+        or ""
+    ).strip()
     prior_topic = str(updated_context.get("last_topic") or "").strip().lower()
     if conversation_topic in {"", "general"} and str(
         resolution.reason or ""
@@ -6235,6 +9329,18 @@ async def _store_conversation_interface_state(
         "conversation_precision_limit",
     }:
         conversation_topic = prior_topic
+    prior_intent_anchor = (
+        updated_context.get("intent_anchor")
+        if isinstance(updated_context.get("intent_anchor"), dict)
+        else {}
+    )
+    intent_anchor = _conversation_intent_anchor(
+        normalized_query,
+        prior_anchor=prior_intent_anchor,
+        conversation_topic=conversation_topic,
+    )
+    if conversation_topic in {"", "general"}:
+        conversation_topic = str(intent_anchor.get("topic") or conversation_topic).strip().lower()
     last_action_request = str(updated_context.get("last_action_request") or "").strip()
     pending_action_request = str(updated_context.get("pending_action_request") or "").strip()
     revised_action_request = _conversation_revised_action_request(
@@ -6300,15 +9406,40 @@ async def _store_conversation_interface_state(
             "prompt": _compact_text(assistant_text, 240) if assistant_text else "",
         }
 
+    prior_clarification_state = (
+        updated_context.get("clarification_state")
+        if isinstance(updated_context.get("clarification_state"), dict)
+        else {}
+    )
+    clarification_active = bool(assistant_text) and _is_clarifier_like_text(assistant_text)
+    clarification_target = str(
+        pending_action_request
+        or last_action_request
+        or intent_anchor.get("target")
+        or normalized_query
+    ).strip()
+    clarification_count = 0
+    if clarification_active:
+        prior_target = str(prior_clarification_state.get("target") or "").strip().lower()
+        if prior_target and prior_target == clarification_target.lower():
+            clarification_count = int(prior_clarification_state.get("count") or 0) + 1
+        else:
+            clarification_count = 1
+
     updated_context.update(
         {
             "turn_count": assistant_turn_index,
+            "session_display_name": session_display_name,
             "last_user_input": str(event.raw_input or "").strip(),
             "last_parsed_intent": str(event.parsed_intent or "").strip(),
             "last_internal_intent": str(resolution.internal_intent or "").strip(),
             "last_prompt": assistant_text,
             "last_assistant_output": assistant_text,
             "last_topic": conversation_topic,
+            "last_followup_hints": _conversation_followup_hints(
+                conversation_topic,
+                assistant_text,
+            ),
             "last_goal_description": str(
                 resolution.proposed_goal_description or ""
             ).strip(),
@@ -6332,13 +9463,29 @@ async def _store_conversation_interface_state(
             "last_action_result": last_action_result,
             "last_failure": last_failure,
             "last_control_state": control_state,
+            "last_request_id": str(event_meta.get("request_id") or "").strip(),
             "last_resolution_outcome": str(resolution.outcome or "").strip(),
             "last_resolution_reason": str(resolution.reason or "").strip(),
+            "intent_anchor": intent_anchor,
+            "active_goal": str(resolution_meta.get("active_goal") or "").strip(),
+            "operator_reasoning_summary": str(resolution_meta.get("operator_reasoning_summary") or "").strip(),
+            "runtime_health_summary": str(resolution_meta.get("runtime_health_summary") or "").strip(),
+            "runtime_recovery_summary": str(resolution_meta.get("runtime_recovery_summary") or "").strip(),
+            "tod_collaboration_summary": str(resolution_meta.get("tod_collaboration_summary") or "").strip(),
+            "current_recommendation_summary": str(resolution_meta.get("current_recommendation_summary") or "").strip(),
+            "program_status_summary": str(resolution_meta.get("program_status_summary") or "").strip(),
+            "program_status": (
+                resolution_meta.get("program_status")
+                if isinstance(resolution_meta.get("program_status"), dict)
+                else {}
+            ),
             "clarification_state": {
-                "active": bool(assistant_text),
+                "active": clarification_active,
+                "count": clarification_count,
                 "prompt": _compact_text(assistant_text, 240) if assistant_text else "",
                 "outcome": str(resolution.outcome or "").strip(),
-                "reason": str(resolution.reason or "").strip(),
+                "reason": str(resolution.reason or "").strip() or "conversation_clarification",
+                "target": clarification_target,
                 "pending_action_request": pending_action_request,
             },
             "last_input_event_id": int(event.id),
@@ -6457,9 +9604,22 @@ def _conversation_followup_response(
     context: dict[str, object] | None = None,
 ) -> str:
     query = str(normalized_query or "").strip().lower()
-    session_context = context or {}
-    last_topic = str(session_context.get("last_topic") or "").strip().lower()
+    session_context = context if isinstance(context, dict) else {}
     last_prompt = str(session_context.get("last_prompt") or "").strip()
+    last_topic = str(session_context.get("last_topic") or "").strip().lower()
+    intent_anchor = (
+        session_context.get("intent_anchor")
+        if isinstance(session_context.get("intent_anchor"), dict)
+        else {}
+    )
+    anchored_topic = str(intent_anchor.get("topic") or "").strip().lower()
+    if last_topic in {"", "general"} and anchored_topic:
+        last_topic = anchored_topic
+    followup_hints = (
+        session_context.get("last_followup_hints")
+        if isinstance(session_context.get("last_followup_hints"), dict)
+        else {}
+    )
     last_control_state = (
         str(session_context.get("last_control_state") or "active").strip().lower()
         or "active"
@@ -6478,6 +9638,10 @@ def _conversation_followup_response(
     action_followup = _conversation_action_followup_response(query, session_context)
     if action_followup:
         return action_followup
+
+    offered_followup = _conversation_offer_followup_response(query, session_context)
+    if offered_followup:
+        return offered_followup
 
     if _is_pause_control_query(query):
         last_action_request = str(session_context.get("last_action_request") or "").strip()
@@ -6511,7 +9675,7 @@ def _conversation_followup_response(
         return "Cancelled at the conversation layer."
 
     if _is_interruption_query(query):
-        return "Understood. I stopped the prior thread. Tell me the one thing you want next."
+        return "You said wait stop. I stopped as requested. Tell me the one thing you want next."
 
     pending_action_request = str(
         session_context.get("pending_action_request")
@@ -6547,7 +9711,7 @@ def _conversation_followup_response(
         last_user_input = str(session_context.get("last_user_input") or "").strip()
         if last_user_input:
             return f"I heard: '{_compact_text(last_user_input, 96)}'."
-        return "I do not have a fresh prior turn to quote yet."
+        return "You asked what I heard. I do not have a fresh prior turn to quote yet."
 
     technical_followup = _technical_research_followup_response(query, session_context)
     if technical_followup:
@@ -6575,7 +9739,7 @@ def _conversation_followup_response(
     ):
         return _continuation_response(last_topic)
 
-    if any(
+    if query in {"after", "then", "next"} or any(
         token in query
         for token in {
             "and after that",
@@ -6585,8 +9749,13 @@ def _conversation_followup_response(
             "and then",
         }
     ):
+        hinted = str(followup_hints.get("after_that") or "").strip()
+        if hinted:
+            return hinted
         if last_topic == "technical_research":
             return "After that, choose the next path worth deeper research, research that path, and stop when the evidence stops improving or the budget runs out."
+        if last_topic == "development_integration":
+            return "After that, validate one live session on the reused path and only then decide whether a thin wrapper is justified."
         if last_topic in {"priorities", "objective", "project_planning"}:
             return "After that, run the regression checks, confirm live behavior, and lock the next TOD handoff."
         if last_topic in {"risk", "risk_reduction"}:
@@ -6598,6 +9767,8 @@ def _conversation_followup_response(
         for token in {
             "shorter version",
             "short version",
+            "recap",
+            "summary",
             "short recap",
             "short final recap",
             "one line",
@@ -6605,6 +9776,9 @@ def _conversation_followup_response(
             "shorter",
         }
     ):
+        hinted = str(followup_hints.get("recap") or "").strip()
+        if hinted:
+            return hinted
         compact_map = {
             "tod_status": "One line: TOD looks usable when health, freshness, and alignment stay in sync.",
             "system": "One line: MIM manages interaction and context, while TOD manages tasks and execution.",
@@ -6614,6 +9788,7 @@ def _conversation_followup_response(
             "risk": "One line: the main risk is drift between conversation behavior and execution state.",
             "risk_reduction": "One line: reduce risk with regression checks and explicit handoff verification.",
             "project_planning": "One line: define scope, name the MVP, and create the first tasks.",
+            "development_integration": "One line: inspect the closest existing asset first, reuse the current session path, and validate one live integration before building anything new.",
             "news": "One line: the big themes are agent guardrails, cost pressure, private AI, and bot-authenticity scrutiny.",
         }
         if last_topic in compact_map:
@@ -6622,6 +9797,11 @@ def _conversation_followup_response(
             return _compact_text(last_prompt, 120)
         return "One line: I can keep the answer short, specific, and actionable."
 
+    if query in {"status", "status now", "current status"}:
+        hinted = str(followup_hints.get("status") or "").strip()
+        if hinted:
+            return hinted
+
     if "checklist" in query:
         checklist_map = {
             "technical_research": "Checklist: 1. Confirm the time budget. 2. Lock the next technical step. 3. Research that step. 4. Decide whether another round is justified.",
@@ -6629,16 +9809,23 @@ def _conversation_followup_response(
             "objective": "Checklist: 1. Improve reliability. 2. Keep task state clear. 3. Confirm stable handoff.",
             "risk_reduction": "Checklist: 1. Add regression checks. 2. Tighten routing rules. 3. Verify handoff explicitly.",
             "project_planning": "Checklist: 1. Define scope. 2. Choose the MVP. 3. Create first tasks and milestones.",
+            "development_integration": "Checklist: 1. Inspect the existing asset. 2. Compare it to the current MIM session contract. 3. Reuse the thinnest path. 4. Validate one live session.",
         }
         if last_topic in checklist_map:
             return checklist_map[last_topic]
         return "Checklist: 1. Confirm the goal. 2. Choose the next action. 3. Verify the result."
 
     if any(
-        token in query for token in {"why that", "why that one", "why that priority"}
+        token in query
+        for token in {"why", "why this", "why that", "why that one", "why that priority"}
     ):
+        hinted = str(followup_hints.get("why") or "").strip()
+        if hinted:
+            return hinted
         if last_topic == "technical_research":
             return "Because open-ended technical research can loop forever; the budget and stop condition force the next round to earn its cost."
+        if last_topic == "development_integration":
+            return "Because inspecting the existing asset first tells us whether this is a thin integration or a new build, which is the fastest way to reduce risk and avoid wasted work."
         if last_topic in {"priorities", "objective"}:
             return "Because reliability and handoff stability protect every later task; if those drift, the rest of the workflow gets noisy fast."
         return "Because it reduces uncertainty before taking the next step."
@@ -6646,6 +9833,8 @@ def _conversation_followup_response(
     if "dependency" in query or "dependencies" in query:
         if last_topic == "technical_research":
             return "Main dependencies are verified baseline facts, credible sources, and a clear stop condition for when the next research round is no longer paying off."
+        if last_topic == "development_integration":
+            return "Main dependencies are the existing asset's entry points, its session contract, and whether it can reuse the current MIM backend without creating a second assistant path."
         if last_topic in {"priorities", "objective", "project_planning"}:
             return "Main dependencies are clean routing rules, current runtime state, and a verified MIM to TOD handoff path."
         return "The main dependency is having enough current state to act without guessing."
@@ -6660,6 +9849,320 @@ def _conversation_followup_response(
     ):
         if last_topic == "technical_research":
             return "One more thing: if the problem is still open, downgrade the goal from solving it outright to building the best bounded exploratory path you can justify today."
+        if last_topic == "development_integration":
+            return "One more thing: keep the first slice bounded to inspection plus one end-to-end continuity test; do not widen it into new planners, automation, or a second assistant stack yet."
+        if last_topic in {"priorities", "objective", "risk", "risk_reduction"}:
+            return "One more thing: keep the live runtime restarted and verified, because stale processes can hide or fake regressions."
+        return "One more thing: confirm the current state before committing to the next action."
+
+    return ""
+
+
+def _conversation_offer_followup_response(
+    normalized_query: str,
+    context: dict[str, object] | None = None,
+) -> str:
+    query = str(normalized_query or "").strip().lower()
+    session_context = context or {}
+    last_prompt = str(session_context.get("last_prompt") or "").strip().lower()
+    if not query or not last_prompt or not _is_conversation_action_approval_query(query):
+        return ""
+
+    if (
+        "would you like me to share specific priorities" in last_prompt
+        or "recent updates on this" in last_prompt
+    ):
+        return (
+            "Current priorities: 1. Strengthen cross-session context recall so remembered people, preferences, and prior threads stay active in live conversation. "
+            "2. Reduce clarification loops by turning approved planning requests into bounded implementation tasks earlier. "
+            "3. Improve nuanced follow-up interpretation so confirmations, revisions, and continuation requests stay aligned with the active objective."
+        )
+
+    if "status update" in last_prompt and "next steps" in last_prompt:
+        program_status_summary = str(
+            session_context.get("program_status_summary") or ""
+        ).strip()
+        current_recommendation_summary = str(
+            session_context.get("current_recommendation_summary") or ""
+        ).strip()
+        active_goal = str(session_context.get("active_goal") or "").strip()
+        status_summary = (
+            program_status_summary
+            or current_recommendation_summary
+            or active_goal
+            or "the current objective is still in progress"
+        )
+        next_steps_summary = (
+            current_recommendation_summary
+            or "confirm the current blocker, complete the active slice, and report the updated state"
+        )
+        return (
+            f"Status update: {_compact_text(status_summary, 200)}. "
+            f"Next steps: {_compact_text(next_steps_summary, 200)}."
+        )
+
+    if any(
+        marker in last_prompt
+        for marker in {
+            "focus on specific areas or challenges",
+            "particular scenarios or applications",
+            "which area should i prioritize first",
+            "what do you think you would like to work on",
+        }
+    ):
+        return (
+            "Priority focus: 1. Context continuity across sessions. "
+            "2. Nuanced interpretation of approvals, revisions, and follow-up intent. "
+            "3. Converting self-development requests into bounded implementation tasks without repetitive clarification."
+        )
+
+    return ""
+
+
+def _conversation_followup_response(
+    normalized_query: str,
+    context: dict[str, object] | None = None,
+) -> str:
+    query = str(normalized_query or "").strip().lower()
+    session_context = context or {}
+    last_topic = str(session_context.get("last_topic") or "").strip().lower()
+    last_prompt = str(session_context.get("last_prompt") or "").strip()
+    followup_hints = (
+        session_context.get("last_followup_hints")
+        if isinstance(session_context.get("last_followup_hints"), dict)
+        else {}
+    )
+    last_control_state = (
+        str(session_context.get("last_control_state") or "active").strip().lower()
+        or "active"
+    )
+
+    if not query:
+        return ""
+
+    if query in {"thanks", "thank you", "ok thanks", "okay thanks"}:
+        return "You're welcome."
+
+    boundary_response = _conversation_boundary_response(query)
+    if boundary_response:
+        return boundary_response
+
+    action_followup = _conversation_action_followup_response(query, session_context)
+    if action_followup:
+        return action_followup
+
+    offered_followup = _conversation_offer_followup_response(query, session_context)
+    if offered_followup:
+        return offered_followup
+
+    if _is_pause_control_query(query):
+        last_action_request = str(session_context.get("last_action_request") or "").strip()
+        if last_topic == "action_confirmation":
+            return "Paused. The pending action stays on hold until you say confirm, revise it, or cancel it."
+        if last_action_request:
+            return (
+                f"Paused. The current action thread '{_compact_text(last_action_request, 96)}' stays on hold until you say resume, confirm, revise it, or cancel it."
+            )
+        return "Paused at the conversation layer. Tell me when you want to resume."
+
+    if _is_resume_control_query(query):
+        last_action_request = str(session_context.get("last_action_request") or "").strip()
+        if last_topic == "action_confirmation":
+            return "Resumed at the conversation layer. If the pending action is still correct, say confirm."
+        if last_action_request:
+            return (
+                f"Resumed. The current action thread is still '{_compact_text(last_action_request, 96)}'. "
+                "Say confirm to approve it, revise it, or cancel it."
+            )
+        return "Resumed at the conversation layer. Restate the one question or action you want next."
+
+    if _is_cancel_control_query(query):
+        last_action_request = str(session_context.get("last_action_request") or "").strip()
+        if last_topic == "action_confirmation":
+            return "Cancelled. I will not treat the pending action as approved."
+        if last_action_request:
+            return (
+                f"Cancelled. I will not treat the prior action '{_compact_text(last_action_request, 96)}' as approved."
+            )
+        return "Cancelled at the conversation layer."
+
+    if _is_interruption_query(query):
+        return "You said wait stop. I stopped as requested. Tell me the one thing you want next."
+
+    pending_action_request = str(
+        session_context.get("pending_action_request")
+        or session_context.get("last_action_request")
+        or ""
+    ).strip()
+
+    if last_topic == "action_confirmation" or pending_action_request:
+        if (
+            _is_conversation_action_approval_query(query)
+            and last_control_state == "paused"
+        ):
+            return "The pending action is paused. Say resume before you confirm it."
+        if _is_conversation_action_approval_query(query):
+            return "Confirmed. I will treat that as an explicit action request and keep the execution step separate from this conversation reply."
+        revised_action = _conversation_revised_action_request(
+            query,
+            prior_action_request=pending_action_request,
+        )
+        if revised_action:
+            return (
+                f"Understood. I updated the pending action to '{_compact_text(revised_action, 96)}'. "
+                "Say confirm when you want me to create the goal."
+            )
+        if any(token in query for token in {"revise", "change it", "update it"}):
+            return "Understood. Replace the pending action with the revised one in a single sentence."
+
+    if query in {
+        "what did you hear",
+        "what did you hear me say",
+        "what did you hear from me",
+    }:
+        last_user_input = str(session_context.get("last_user_input") or "").strip()
+        if last_user_input:
+            return f"I heard: '{_compact_text(last_user_input, 96)}'."
+        return "You asked what I heard. I do not have a fresh prior turn to quote yet."
+
+    technical_followup = _technical_research_followup_response(query, session_context)
+    if technical_followup:
+        return technical_followup
+
+    if any(
+        token in query
+        for token in {
+            "top two upcoming items",
+            "top two upcoming items only",
+            "top two items only",
+            "top two only",
+        }
+    ):
+        return _priority_two_item_response(last_topic)
+
+    if any(
+        token in query
+        for token in {
+            "how should we continue",
+            "how do we continue",
+            "how should we proceed",
+            "how do we proceed",
+        }
+    ):
+        return _continuation_response(last_topic)
+
+    if query in {"after", "then", "next"} or any(
+        token in query
+        for token in {
+            "and after that",
+            "after that",
+            "then what",
+            "what comes after that",
+            "and then",
+        }
+    ):
+        hinted = str(followup_hints.get("after_that") or "").strip()
+        if hinted:
+            return hinted
+        if last_topic == "technical_research":
+            return "After that, choose the next path worth deeper research, research that path, and stop when the evidence stops improving or the budget runs out."
+        if last_topic == "development_integration":
+            return "After that, validate one live session on the reused path and only then decide whether a thin wrapper is justified."
+        if last_topic in {"priorities", "objective", "project_planning"}:
+            return "After that, run the regression checks, confirm live behavior, and lock the next TOD handoff."
+        if last_topic in {"risk", "risk_reduction"}:
+            return "After that, verify the fix stayed stable in live conversation and not just in tests."
+        return "After that, confirm the result, summarize the state, and decide the next action."
+
+    if any(
+        token in query
+        for token in {
+            "shorter version",
+            "short version",
+            "recap",
+            "summary",
+            "short recap",
+            "short final recap",
+            "one line",
+            "summarize in one line",
+            "shorter",
+        }
+    ):
+        hinted = str(followup_hints.get("recap") or "").strip()
+        if hinted:
+            return hinted
+        compact_map = {
+            "tod_status": "One line: TOD looks usable when health, freshness, and alignment stay in sync.",
+            "system": "One line: MIM manages interaction and context, while TOD manages tasks and execution.",
+            "objective": "One line: the objective is reliable conversation flow and stable MIM to TOD handoff.",
+            "priorities": "One line: stabilize routing, keep tests green, and verify the next handoff.",
+            "mission": "One line: assist safely, stay coherent, and help execute goals.",
+            "risk": "One line: the main risk is drift between conversation behavior and execution state.",
+            "risk_reduction": "One line: reduce risk with regression checks and explicit handoff verification.",
+            "project_planning": "One line: define scope, name the MVP, and create the first tasks.",
+            "development_integration": "One line: inspect the closest existing asset first, reuse the current session path, and validate one live integration before building anything new.",
+            "news": "One line: the big themes are agent guardrails, cost pressure, private AI, and bot-authenticity scrutiny.",
+        }
+        if last_topic in compact_map:
+            return compact_map[last_topic]
+        if last_prompt:
+            return _compact_text(last_prompt, 120)
+        return "One line: I can keep the answer short, specific, and actionable."
+
+    if query in {"status", "status now", "current status"}:
+        hinted = str(followup_hints.get("status") or "").strip()
+        if hinted:
+            return hinted
+
+    if "checklist" in query:
+        checklist_map = {
+            "technical_research": "Checklist: 1. Confirm the time budget. 2. Lock the next technical step. 3. Research that step. 4. Decide whether another round is justified.",
+            "priorities": "Checklist: 1. Stabilize routing. 2. Run regression tests. 3. Verify live MIM to TOD handoff.",
+            "objective": "Checklist: 1. Improve reliability. 2. Keep task state clear. 3. Confirm stable handoff.",
+            "risk_reduction": "Checklist: 1. Add regression checks. 2. Tighten routing rules. 3. Verify handoff explicitly.",
+            "project_planning": "Checklist: 1. Define scope. 2. Choose the MVP. 3. Create first tasks and milestones.",
+            "development_integration": "Checklist: 1. Inspect the existing asset. 2. Compare it to the current MIM session contract. 3. Reuse the thinnest path. 4. Validate one live session.",
+        }
+        if last_topic in checklist_map:
+            return checklist_map[last_topic]
+        return "Checklist: 1. Confirm the goal. 2. Choose the next action. 3. Verify the result."
+
+    if any(
+        token in query
+        for token in {"why", "why this", "why that", "why that one", "why that priority"}
+    ):
+        hinted = str(followup_hints.get("why") or "").strip()
+        if hinted:
+            return hinted
+        if last_topic == "technical_research":
+            return "Because open-ended technical research can loop forever; the budget and stop condition force the next round to earn its cost."
+        if last_topic == "development_integration":
+            return "Because inspecting the existing asset first tells us whether this is a thin integration or a new build, which is the fastest way to reduce risk and avoid wasted work."
+        if last_topic in {"priorities", "objective"}:
+            return "Because reliability and handoff stability protect every later task; if those drift, the rest of the workflow gets noisy fast."
+        return "Because it reduces uncertainty before taking the next step."
+
+    if "dependency" in query or "dependencies" in query:
+        if last_topic == "technical_research":
+            return "Main dependencies are verified baseline facts, credible sources, and a clear stop condition for when the next research round is no longer paying off."
+        if last_topic == "development_integration":
+            return "Main dependencies are the existing asset's entry points, its session contract, and whether it can reuse the current MIM backend without creating a second assistant path."
+        if last_topic in {"priorities", "objective", "project_planning"}:
+            return "Main dependencies are clean routing rules, current runtime state, and a verified MIM to TOD handoff path."
+        return "The main dependency is having enough current state to act without guessing."
+
+    if any(
+        token in query
+        for token in {
+            "anything else",
+            "before we proceed",
+            "anything else before we proceed",
+        }
+    ):
+        if last_topic == "technical_research":
+            return "One more thing: if the problem is still open, downgrade the goal from solving it outright to building the best bounded exploratory path you can justify today."
+        if last_topic == "development_integration":
+            return "One more thing: keep the first slice bounded to inspection plus one end-to-end continuity test; do not widen it into new planners, automation, or a second assistant stack yet."
         if last_topic in {"priorities", "objective", "risk", "risk_reduction"}:
             return "One more thing: keep the live runtime restarted and verified, because stale processes can hide or fake regressions."
         return "One more thing: confirm the current state before committing to the next action."
@@ -6743,6 +10246,561 @@ def _is_conversation_followup_query(normalized_query: str) -> bool:
     )
 
 
+async def _compose_conversation_reply(
+    *,
+    user_input: str,
+    context: dict[str, object] | None = None,
+    runtime_diagnostics: dict[str, object] | None = None,
+) -> dict[str, object]:
+    fallback_reply = _conversation_response(user_input, context=context)
+    normalized_query = _normalize_conversation_query(user_input)
+    if bool((context or {}).get("force_deterministic_communication")):
+        deterministic_reply = build_deterministic_communication_reply(
+            user_input=user_input,
+            context=context,
+            fallback_reply=fallback_reply,
+        )
+        return {
+            "reply_text": str(deterministic_reply.reply_text or fallback_reply).strip(),
+            "contract": deterministic_reply.to_payload(),
+        }
+    if (
+        _is_self_evolution_next_work_query(normalized_query)
+        or _is_return_briefing_query(normalized_query)
+        or _looks_like_development_integration_query(normalized_query)
+    ):
+        deterministic_reply = build_deterministic_communication_reply(
+            user_input=user_input,
+            context=context,
+            fallback_reply=fallback_reply,
+        )
+        return {
+            "reply_text": str(deterministic_reply.reply_text or fallback_reply).strip(),
+            "contract": deterministic_reply.to_payload(),
+        }
+    reply_contract = await compose_expert_communication_reply(
+        user_input=user_input,
+        context=context,
+        fallback_reply=fallback_reply,
+        runtime_diagnostics=runtime_diagnostics,
+    )
+    return {
+        "reply_text": sanitize_user_facing_reply_text(
+            str(reply_contract.reply_text or fallback_reply).strip()
+        ),
+        "contract": reply_contract.to_payload(),
+    }
+
+
+def _conversation_context_value(
+    context: dict[str, object] | None,
+    key: str,
+) -> str:
+    if not isinstance(context, dict):
+        return ""
+    return str(context.get(key) or "").strip()
+def _is_clarifier_like_text(text: str) -> bool:
+    normalized = str(text or "").strip().lower()
+    if not normalized:
+        return False
+    small_talk = (
+        "how are you",
+        "what's up",
+        "hows it going",
+        "how can i help",
+    )
+    if any(marker in normalized for marker in small_talk):
+        return False
+    markers = (
+        "missing one detail",
+        "still need one detail",
+        "i am still missing",
+        "options: 1)",
+        "clarify",
+        "what do you mean",
+        "please provide",
+        "please confirm",
+        "can you share",
+        "could you share",
+        "would you like",
+        "do you want",
+    )
+    if any(marker in normalized for marker in markers):
+        return True
+    if "?" not in normalized:
+        return False
+    question_starts = (
+        "which ",
+        "what ",
+        "when ",
+        "where ",
+        "who ",
+        "how ",
+        "do you ",
+        "would you ",
+        "can you ",
+        "could you ",
+    )
+    return normalized.startswith(question_starts)
+
+
+
+async def _build_live_operational_context(
+    db: AsyncSession,
+) -> dict[str, object]:
+    goal_row = (
+        (
+            await db.execute(
+                select(WorkspaceStrategyGoal)
+                .order_by(WorkspaceStrategyGoal.id.desc())
+                .limit(1)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    goal = _operator_goal_snapshot(goal_row)
+    collaboration_progress = _operator_collaboration_progress_snapshot()
+    tod_decision_process = _operator_tod_decision_process_snapshot()
+    runtime_health = await _await_gateway_context_snapshot(
+        build_mim_ui_health_snapshot(db=db),
+        label="runtime_health_snapshot",
+        db=db,
+    )
+    runtime_recovery = runtime_recovery_service.get_summary()
+    initiative_status = await _await_gateway_context_snapshot(
+        build_initiative_status(db=db),
+        label="initiative_status",
+        db=db,
+    )
+    program_status = (
+        initiative_status.get("program_status")
+        if isinstance(initiative_status.get("program_status"), dict)
+        else {}
+    )
+
+    return {
+        "active_goal": str(goal.get("reasoning_summary") or "").strip(),
+        "operator_reasoning_summary": _build_operator_reasoning_summary(
+            goal=goal,
+            inquiry={},
+            governance={},
+            gateway_governance={},
+            autonomy={},
+            stewardship={},
+            execution_readiness={},
+            execution_recovery={},
+            commitment={},
+            commitment_monitoring={},
+            commitment_outcome={},
+            learned_preferences=[],
+            proposal_policy={},
+            conflict_resolution={},
+            active_work={},
+            collaboration_progress=collaboration_progress,
+            dispatch_telemetry={},
+            tod_decision_process=tod_decision_process,
+            self_evolution={},
+            runtime_health=runtime_health,
+            runtime_recovery=runtime_recovery,
+        ),
+        "runtime_health_summary": summarize_runtime_health(runtime_health)
+        if runtime_health
+        else "",
+        "runtime_recovery_summary": str(runtime_recovery.get("summary") or "").strip(),
+        "tod_collaboration_summary": str(
+            collaboration_progress.get("summary") or ""
+        ).strip(),
+        "current_recommendation_summary": str(
+            initiative_status.get("summary") or ""
+        ).strip(),
+        "program_status_summary": str(program_status.get("summary") or "").strip(),
+        "program_status": program_status,
+    }
+
+
+def _build_eval_operational_context() -> dict[str, object]:
+    runtime_recovery = runtime_recovery_service.get_summary()
+    runtime_recovery_summary = str(runtime_recovery.get("summary") or "").strip()
+    runtime_health_summary = "Runtime health: current state — live snapshot skipped for deterministic eval."
+    # active_goal intentionally left empty so it does not bleed into priority/planning responses;
+    # the explicit objective query handler returns a clean "No active objective" message instead.
+    if runtime_recovery_summary:
+        return {
+            "runtime_health_summary": runtime_health_summary,
+            "runtime_recovery_summary": runtime_recovery_summary,
+            "active_goal": "",
+        }
+    return {
+        "runtime_health_summary": runtime_health_summary,
+        "runtime_recovery_summary": "",
+        "active_goal": "",
+    }
+
+
+def _build_live_operational_response(
+    normalized_query: str,
+    context: dict[str, object] | None,
+) -> str:
+    runtime_health = _conversation_context_value(context, "runtime_health_summary")
+    runtime_recovery = _conversation_context_value(context, "runtime_recovery_summary")
+    operator_reasoning = _conversation_context_value(context, "operator_reasoning_summary")
+    tod_collaboration = _conversation_context_value(context, "tod_collaboration_summary")
+    active_goal = _conversation_context_value(context, "active_goal")
+    recommendation = _conversation_context_value(context, "current_recommendation_summary")
+    stability_guard = _conversation_context_value(context, "stability_guard_summary")
+    program_status_summary = _conversation_context_value(context, "program_status_summary")
+    program_status = context.get("program_status") if isinstance(context, dict) and isinstance(context.get("program_status"), dict) else {}
+
+    if not any(
+        [
+            runtime_health,
+            runtime_recovery,
+            operator_reasoning,
+            tod_collaboration,
+            active_goal,
+            recommendation,
+            stability_guard,
+            program_status_summary,
+        ]
+    ):
+        return ""
+
+    query = str(normalized_query or "").strip().lower()
+    if not query:
+        return ""
+    terse_reply = _wants_terse_conversation_reply(query)
+
+    def _runtime_health_detail(summary: str) -> str:
+        normalized = str(summary or "").strip().rstrip(".")
+        lowered = normalized.lower()
+        if lowered.startswith("runtime health:"):
+            return normalized.split(":", 1)[1].strip()
+        if lowered.startswith("runtime health is "):
+            return normalized[len("Runtime health is ") :].strip()
+        if lowered.startswith("runtime health "):
+            return normalized[len("Runtime health ") :].strip()
+        return normalized
+
+    def _priority_summary() -> str:
+        if program_status_summary and any(token in query for token in {"project", "program"}):
+            return program_status_summary.rstrip('.')
+        if recommendation:
+            return recommendation.rstrip('.')
+        if active_goal:
+            return active_goal.rstrip('.')
+        if operator_reasoning:
+            return operator_reasoning.rstrip('.')
+        if tod_collaboration:
+            return tod_collaboration.rstrip('.')
+        # Do NOT fall through to runtime_health — health data is not a priority summary
+        return ""
+
+    if any(
+        token in query
+        for token in {
+            "project status",
+            "program status",
+            "status of each project",
+            "what projects are active",
+            "what projects are you tracking",
+            "what project are you on",
+            "which project are you on",
+            "which projects are you tracking",
+            "how is the program going",
+        }
+    ):
+        if program_status_summary:
+            project_entries = program_status.get("projects") if isinstance(program_status.get("projects"), list) else []
+            details = []
+            for entry in project_entries[:4]:
+                if not isinstance(entry, dict):
+                    continue
+                project_id = str(entry.get("project_id") or "").strip()
+                status = str(entry.get("status") or "ready").strip()
+                objective = str(entry.get("objective") or "").strip()
+                if project_id:
+                    details.append(f"{project_id}: {status}" + (f" ({objective})" if objective else ""))
+            if details:
+                return _compact_text(program_status_summary.rstrip('.') + " Current tracked projects: " + "; ".join(details) + ".", 320)
+            return program_status_summary
+
+    if any(
+        token in query
+        for token in {
+            "what is next",
+            "next for us",
+            "what should i do first",
+            "next step",
+            "recommended next step",
+        }
+    ):
+        lead = _priority_summary()
+        parts: list[str] = []
+        if active_goal and active_goal.rstrip('.') != lead:
+            parts.append(f"Current objective focus: {active_goal.rstrip('.')}.")
+        if tod_collaboration:
+            parts.append(f"TOD collaboration: {tod_collaboration.rstrip('.')}.")
+        if operator_reasoning:
+            parts.append(f"Decision visibility: {operator_reasoning.rstrip('.')}.")
+        if runtime_health:
+            parts.append(f"Runtime health: {_runtime_health_detail(runtime_health)}.")
+        return _compact_text(
+            " ".join(
+                part
+                for part in [f"Next step: {lead}." if lead else "", *parts]
+                if part
+            ),
+            320,
+        )
+
+    if any(
+        token in query
+        for token in {
+            "what should we prioritize",
+            "prioritize next",
+            "top priority",
+            "what should i do",
+            "what should we do",
+            "what do i do first",
+            "upcoming tasks",
+            "switch to upcoming",
+            "next tasks",
+        }
+    ):
+        lead = _priority_summary()
+        if not lead:
+            return _compact_text(
+                "Nothing to prioritize — no active tasks or upcoming objectives recorded.",
+                180 if terse_reply else 280,
+            )
+        parts: list[str] = []
+        if recommendation and recommendation.rstrip('.') != lead:
+            parts.append(f"Current recommendation: {recommendation.rstrip('.')}.")
+        if active_goal and active_goal.rstrip('.') != lead:
+            parts.append(f"Current objective focus: {active_goal.rstrip('.')}.")
+        if tod_collaboration:
+            parts.append(f"TOD collaboration: {tod_collaboration.rstrip('.')}.")
+        if runtime_health:
+            parts.append(f"Runtime health: {_runtime_health_detail(runtime_health)}.")
+        return _compact_text(
+            " ".join(
+                part
+                for part in [f"Top priority today: {lead}." if lead else "", *parts]
+                if part
+            ),
+            320,
+        )
+
+    if any(
+        token in query
+        for token in {
+            "our objective",
+            "what is our objective",
+            "current objective",
+            "active objective",
+            "what are you working on",
+            "what are we working on",
+            "what should we work on",
+            "work on today",
+        }
+    ):
+        parts: list[str] = []
+        if active_goal:
+            parts.append(active_goal.rstrip('.'))
+        if recommendation:
+            parts.append(recommendation.rstrip('.'))
+        elif operator_reasoning:
+            parts.append(operator_reasoning.rstrip('.'))
+        if not parts:
+            return _compact_text(
+                "Not currently working on an active objective.",
+                180 if terse_reply else 280,
+            )
+        return _compact_text("Current objective focus: " + "; ".join(parts) + ".", 280)
+
+    if any(
+        phrase in query
+        for phrase in {
+            "runtime health",
+            "runtime status",
+            "how is runtime health",
+            "how is the runtime doing",
+            "how is runtime doing",
+        }
+    ):
+        parts: list[str] = []
+        if runtime_health:
+            parts.append(_runtime_health_detail(runtime_health))
+        if runtime_recovery:
+            parts.append(runtime_recovery.rstrip('.'))
+        if stability_guard:
+            parts.append(f"Stability guard: {stability_guard.rstrip('.').lower()}")
+        return _compact_text("Runtime health: " + "; ".join(parts) + ".", 280)
+
+    if (
+        _mentions_tod(query)
+        and any(
+            phrase in query
+            for phrase in {
+                "already in place",
+                "what is in place",
+                "what's in place",
+                "verify what is already in place",
+                "keep mim and tod connected",
+                "keep both connected",
+                "connected and up to date",
+                "current status project work and objectives",
+            }
+        )
+    ):
+        parts: list[str] = []
+        if tod_collaboration:
+            parts.append(f"TOD collaboration: {tod_collaboration.rstrip('.')}.")
+        if operator_reasoning:
+            parts.append(f"Decision visibility: {operator_reasoning.rstrip('.')}.")
+        if active_goal:
+            parts.append(f"Active goal: {active_goal.rstrip('.')}.")
+        if runtime_health:
+            parts.append(f"Runtime health: {_runtime_health_detail(runtime_health)}.")
+        if recommendation:
+            parts.append(f"Current recommendation: {recommendation.rstrip('.')}.")
+        return _compact_text(" ".join(parts), 320)
+
+    if any(
+        token in query
+        for token in {
+            "what is the system",
+            "what is our system",
+            "what's the system",
+            "what's our system",
+            "our system",
+            "define the system",
+        }
+    ):
+        parts: list[str] = []
+        if operator_reasoning:
+            parts.append(f"Decision visibility: {operator_reasoning.rstrip('.') }.")
+        if tod_collaboration:
+            parts.append(f"TOD collaboration: {tod_collaboration.rstrip('.') }.")
+        if runtime_health:
+            parts.append(f"Runtime health: {_runtime_health_detail(runtime_health)}.")
+        if active_goal:
+            parts.append(f"Active goal: {active_goal.rstrip('.') }.")
+        if recommendation:
+            parts.append(f"Current recommendation: {recommendation.rstrip('.') }.")
+        return _compact_text(" ".join(parts), 320)
+
+    if _is_tod_status_query(query):
+        if terse_reply:
+            lead = (
+                tod_collaboration
+                or recommendation
+                or operator_reasoning
+                or runtime_health
+            )
+            if lead:
+                return _compact_text(f"TOD status: {lead.rstrip('.') }.", 180)
+            return "TOD status: No collaboration data to report right now."
+        parts: list[str] = []
+        if tod_collaboration:
+            parts.append(tod_collaboration.rstrip('.'))
+        if operator_reasoning:
+            parts.append(operator_reasoning.rstrip('.'))
+        if recommendation:
+            parts.append(recommendation.rstrip('.'))
+        if not parts:
+            return "TOD status: No collaboration data to report right now."
+        return _compact_text("TOD status: " + "; ".join(parts) + ".", 280)
+
+    if any(
+        phrase in query
+        for phrase in {
+            "one line status",
+            "quick status check",
+            "status in one line",
+            "summarize your status",
+            "status now",
+            "check status",
+        }
+    ):
+        parts: list[str] = []
+        if runtime_health:
+            parts.append(runtime_health.rstrip('.'))
+        elif operator_reasoning:
+            parts.append(operator_reasoning.rstrip('.'))
+        if runtime_recovery:
+            parts.append(runtime_recovery.rstrip('.'))
+        if stability_guard:
+            parts.append(f"Stability guard: {stability_guard.rstrip('.').lower()}")
+        return _compact_text(
+            "Status: " + "; ".join(parts) + ".",
+            180 if terse_reply else 280,
+        )
+
+    if any(
+        phrase in query
+        for phrase in {
+            "current health",
+            "check your current health",
+            "check your health",
+            "health",
+        }
+    ):
+        parts: list[str] = []
+        if runtime_health:
+            parts.append(runtime_health.rstrip('.'))
+        elif operator_reasoning:
+            parts.append(operator_reasoning.rstrip('.'))
+        if runtime_recovery:
+            parts.append(runtime_recovery.rstrip('.'))
+        if stability_guard:
+            parts.append(f"Stability guard: {stability_guard.rstrip('.').lower()}")
+        health_prefix = "Health Status" if "status" in query else "Health"
+        return _compact_text(
+            f"{health_prefix}: " + "; ".join(parts) + ".",
+            180 if terse_reply else 280,
+        )
+
+    if any(
+        phrase in query
+        for phrase in {
+            "what objective",
+            "which objective",
+            "objective are you",
+            "currently active on",
+            "what task are you",
+            "working on objective",
+            "what are you working on",
+            "what are you working",
+        }
+    ):
+        if active_goal:
+            return _compact_text(f"Objective: {active_goal.rstrip('.')}.", 180 if terse_reply else 280)
+        return "Not currently working on an active objective."
+
+    if any(
+        phrase in query
+        for phrase in {
+            "how are you",
+            "are you",
+        }
+    ):
+        parts: list[str] = []
+        if runtime_health:
+            parts.append(runtime_health.rstrip('.'))
+        elif operator_reasoning:
+            parts.append(operator_reasoning.rstrip('.'))
+        if runtime_recovery:
+            parts.append(runtime_recovery.rstrip('.'))
+        return _compact_text(
+            "Status: " + "; ".join(parts) + ".",
+            180 if terse_reply else 280,
+        )
+
+    return ""
+
+
 def _conversation_response(
     user_input: str, context: dict[str, object] | None = None
 ) -> str:
@@ -6772,9 +10830,77 @@ def _conversation_response(
             },
         )
 
-    followup_response = _conversation_followup_response(normalized_query, context)
-    if followup_response:
-        return followup_response
+    clarification_progress_response = _conversation_clarification_progress_response(
+        normalized_query,
+        context,
+    )
+    if clarification_progress_response:
+        return clarification_progress_response
+
+    if not _is_direct_answer_priority_query(normalized_query):
+        followup_response = _conversation_followup_response(normalized_query, context)
+        if followup_response:
+            return followup_response
+
+    if _is_capability_query(normalized_query):
+        return (
+            "I can answer questions, report status, suggest a bounded plan, inspect runtime state, "
+            "and do focused implementation work in this repo."
+        )
+
+    if _looks_like_vague_thing_request(normalized_query):
+        return "I can help, but please clarify what you mean by 'that thing'. What exactly do you want me to handle?"
+
+    if any(
+        token in normalized_query
+        for token in {
+            "actually start now",
+            "start now",
+        }
+    ):
+        if "actually start now" in normalized_query:
+            return "You said actually start now. I will start now."
+        return "You said start now. I will start now."
+
+    if _has_greeting_prefix(raw) and any(
+        phrase in normalized_query for phrase in {"do not repeat yourself", "stop repeating yourself", "repeating yourself"}
+    ):
+        return "Hi. I am here and ready to help, and I will keep it brief."
+
+    if any(token in normalized_query for token in {"summarize this website", "summarize this page", "summarize this url"}):
+        raw_tokens = raw.split()
+        urls = [token for token in raw_tokens if _is_safe_web_url(token)]
+        if urls:
+            return (
+                "You asked me to summarize this website. I can fetch "
+                f"{urls[0]} and return a concise summary of the key points."
+            )
+        return "You asked me to summarize this website. Share the URL and I will return a concise summary of the key points."
+
+    live_operational_response = _build_live_operational_response(
+        normalized_query,
+        context,
+    )
+    if live_operational_response:
+        if _has_greeting_prefix(raw):
+            return f"Hi. {live_operational_response}"
+        return live_operational_response
+
+    development_integration = _build_development_integration_response(
+        user_input,
+        normalized_query=normalized_query,
+        context=context,
+    )
+    if development_integration:
+        return development_integration
+
+    instructional_setup = _build_instructional_setup_response(
+        user_input,
+        normalized_query=normalized_query,
+        context=context,
+    )
+    if instructional_setup:
+        return str(instructional_setup.get("result") or "").strip()
 
     greetings = {
         "hi",
@@ -6790,7 +10916,7 @@ def _conversation_response(
         "good afternoon mim",
         "good evening mim",
     }
-    if lowered in greetings or normalized_query in greetings:
+    if lowered in greetings or normalized_query in greetings or _has_greeting_prefix(raw):
         return "Hi. I am here and ready to help."
 
     if any(
@@ -6833,7 +10959,7 @@ def _conversation_response(
             "keep this casual",
         }
     ):
-        return "Understood. I will stay in conversation mode until you ask for a concrete action."
+        return "You said you are just chatting for now. I will stay in conversation mode until you ask for a concrete action."
 
     if any(
         token in normalized_query
@@ -6858,15 +10984,23 @@ def _conversation_response(
             "dont run anything automatically",
         }
     ):
-        return "Understood. I will not start actions automatically without an explicit request."
+        return "You said do not start anything automatically. I will not start anything automatically unless you explicitly ask."
 
     if any(
         token in normalized_query
         for token in {
             "can you continue automatically",
             "can you act automatically",
+            "can you keep going automatically",
+            "can you proceed automatically",
+            "automatic",
+            "autonomy",
             "automatic right now",
+            "autonomy right now",
             "what is your autonomy right now",
+            "what is your autonomy",
+            "what is your autonomy status",
+            "what is your autonomy status right now",
         }
     ):
         return (
@@ -6879,6 +11013,7 @@ def _conversation_response(
         for token in {
             "how do i give feedback",
             "give feedback",
+            "what feedback do you need",
             "feedback loop",
             "feedback for you",
         }
@@ -6892,6 +11027,9 @@ def _conversation_response(
         token in normalized_query
         for token in {
             "is the system stable",
+            "system stable",
+            "how stable is the system",
+            "system stability",
             "are you stable",
             "stability guard",
             "stability right now",
@@ -6906,6 +11044,9 @@ def _conversation_response(
         for token in {
             "what is the system",
             "what is our system",
+            "what's the system",
+            "what's our system",
+            "our system",
             "define the system",
         }
     ):
@@ -6921,6 +11062,15 @@ def _conversation_response(
         }
     ):
         return "Current objective focus is reliability, task-state clarity, and stable MIM to TOD execution handoff."
+
+    if _is_self_evolution_next_work_query(normalized_query):
+        next_work_response = _self_evolution_next_work_response(context)
+        if next_work_response:
+            return next_work_response
+        return (
+            "Next I would refresh the current self-evolution state, pick one communication-focused improvement task, "
+            "and turn it into a bounded implementation plan."
+        )
 
     if any(
         token in normalized_query
@@ -6948,7 +11098,7 @@ def _conversation_response(
     if _mentions_tod(normalized_query) and any(
         token in normalized_query for token in {"how is", "status", "healthy", "doing"}
     ):
-        return "TOD status: I can check health, freshness, and alignment, then give you a one-line summary."
+        return "TOD status: online and ready to report health, freshness, and alignment."
 
     if any(
         token in normalized_query
@@ -6959,6 +11109,9 @@ def _conversation_response(
         }
     ):
         return "I need one concrete request from you: a question, a short plan, or an action."
+
+    if _is_return_briefing_query(normalized_query):
+        return _return_briefing_response(context)
 
     if any(
         token in normalized_query
@@ -6971,7 +11124,7 @@ def _conversation_response(
         last_user_input = str(context.get("last_user_input") or "").strip()
         if last_user_input:
             return f"I heard: '{_compact_text(last_user_input, 96)}'."
-        return "I do not have a fresh prior turn to quote yet."
+        return "You asked what I heard. I do not have a fresh prior turn to quote yet."
 
     if any(
         token in normalized_query
@@ -6983,7 +11136,7 @@ def _conversation_response(
             "status now",
         }
     ):
-        return "One-line status: online, stable, and focused on reliable MIM to TOD handoff."
+        return "Status: online, stable, and focused on reliable MIM to TOD handoff."
 
     if (
         "yes or no" in normalized_query
@@ -6997,7 +11150,11 @@ def _conversation_response(
         or normalized_query.startswith("how are you")
         or normalized_query.startswith("are you")
     ):
-        return "I am online and operating normally."
+        if "health" in normalized_query:
+            return "Health: online and operating normally."
+        if "check status" in normalized_query:
+            return "Status: online and operating normally."
+        return "Status: online and operating normally."
 
     if "what time is it" in normalized_query:
         now_utc = datetime.now(timezone.utc)
@@ -7255,6 +11412,40 @@ def _conversation_response(
     if any(
         token in normalized_query
         for token in {
+            "next bounded slice",
+            "current bounded slice",
+            "bounded slice",
+            "next slice",
+            "implementation slice",
+            "acceptance criteria",
+            "acceptance checks",
+        }
+    ) or (
+        "direct answer quality" in normalized_query
+        and "clarification behavior" in normalized_query
+    ):
+        if any(
+            token in normalized_query
+            for token in {
+                "after this one",
+                "after this slice",
+                "slice is complete",
+                "current slice is complete",
+                "direct answer and clarification slice is complete",
+            }
+        ):
+            return (
+                "Next bounded slice: improve session-grounded follow-up continuity so short replies like 'status', 'why', 'after that', and 'recap' stay attached to the active topic instead of falling back to generic prompts or fresh clarification. "
+                "Acceptance criteria: 1. Terse follow-ups after a planning answer reuse the prior topic. 2. 'Why', 'after that', and 'recap' prompts return specific topic-grounded answers. 3. Generic clarification is used only when no stable prior topic exists. 4. Session context stores the topic and answer hints needed for the next follow-up turn. 5. Direct-answer routing and external web-research behavior remain unchanged."
+            )
+        return (
+            "Next bounded slice: tighten live conversation routing so MIM answers locally grounded planning and status questions directly, asks one useful clarifying question when context is missing, and keeps web research for true external-fact queries only. "
+            "Acceptance checks: 1. A next-slice or acceptance-criteria prompt returns a direct local answer. 2. The reply names the bounded slice and 3 to 5 concrete checks. 3. Ambiguous low-signal prompts ask one crisp clarifying question. 4. Repeated vague prompts escalate with concrete options. 5. External fact queries can still use web research when needed."
+        )
+
+    if any(
+        token in normalized_query
+        for token in {
             "any dependencies",
             "what dependencies",
             "what could block progress",
@@ -7331,6 +11522,10 @@ def _intent_capability(event: InputEvent, internal_intent: str) -> str:
     if explicit:
         return explicit
 
+    routed = route_console_text_input(event.raw_input, event.parsed_intent)
+    if routed.capability_name:
+        return routed.capability_name
+
     if internal_intent == "speak_response":
         return "speech_output"
     if internal_intent == "observe_workspace":
@@ -7392,7 +11587,13 @@ def _requested_domains_for_event(event: InputEvent, internal_intent: str, capabi
     metadata = event.metadata_json if isinstance(event.metadata_json, dict) else {}
     if capability_name in {"workspace_check", "capture_frame"} or internal_intent == "observe_workspace":
         domains.append("robot")
-    if metadata.get("web_research_enabled") or any(token in raw_input for token in {"research", "web", "search", "look up"}):
+    if (
+        not robotics_web_guard_blocks_search(raw_input)
+        and (
+            metadata.get("web_research_enabled")
+            or any(token in raw_input for token in {"research", "web", "search", "look up"})
+        )
+    ):
         domains.append("web")
     if any(token in raw_input for token in {"memory", "history", "context", "data"}):
         domains.append("data")
@@ -8253,28 +12454,91 @@ async def _upsert_workspace_observation(
 
 
 async def _resolve_event(event: InputEvent, db: AsyncSession) -> InputEventResolution:
+    diagnostic_started = time.perf_counter()
+    gateway_diagnostic: dict[str, object] = {}
+
+    def _mark_gateway_diagnostic(stage: str, **fields: object) -> None:
+        if not gateway_diagnostic:
+            return
+        stages = gateway_diagnostic.setdefault("stages", [])
+        if not isinstance(stages, list):
+            stages = []
+            gateway_diagnostic["stages"] = stages
+        stages.append(
+            {
+                "stage": stage,
+                "elapsed_ms": round((time.perf_counter() - diagnostic_started) * 1000, 2),
+                **{key: value for key, value in fields.items() if value not in {None, ""}},
+            }
+        )
+
+    event_metadata = event.metadata_json if isinstance(event.metadata_json, dict) else {}
+    if _should_force_deterministic_conversation_reply(event):
+        gateway_diagnostic = {
+            "mode": "conversation_eval",
+            "requested_goal": str(event.requested_goal or "").strip(),
+            "adapter": str(event_metadata.get("adapter") or "").strip(),
+            "conversation_session_id": str(
+                event_metadata.get("conversation_session_id") or ""
+            ).strip(),
+        }
+        _mark_gateway_diagnostic("resolve_enter")
+
     internal_intent = _infer_intent(event)
+    _mark_gateway_diagnostic("intent_inferred", internal_intent=internal_intent)
     metadata = event.metadata_json if isinstance(event.metadata_json, dict) else {}
     route_preference = str(metadata.get("route_preference", "")).strip().lower()
     conversation_override = route_preference == "conversation_layer"
     conversation_session_id = str(metadata.get("conversation_session_id", "")).strip()
     optional_escalation = ""
     conversation_context: dict[str, object] = {}
+    return_briefing_context: dict[str, object] = {}
     normalized_conversation_query = ""
+    session_display_name = ""
     session_confirmed_action_request = ""
     session_pending_action_request = ""
     session_control_state = "active"
+    skip_conversation_memory = False
+    mim_interface_reply_override = ""
+    mim_interface_next_action_override = ""
+    mim_interface_result_override = ""
     clarification_state: dict[str, object] = {}
     clarification_followup_query = ""
+    offered_followup_response = ""
+    communication_reply_contract: dict[str, object] = {}
+    initiative_auto_execute = False
+    initiative_boundary_mode = ""
+    initiative_boundary_reason = ""
 
     if conversation_override:
+        force_deterministic_conversation = _should_force_deterministic_conversation_reply(
+            event
+        )
+        if force_deterministic_conversation:
+            conversation_context = _build_eval_operational_context()
+        else:
+            conversation_context = await _build_live_operational_context(db)
         if conversation_session_id:
-            conversation_context = await _get_recent_text_conversation_context(
+            session_context = await _get_recent_text_conversation_context(
                 db,
                 session_id=conversation_session_id,
+                actor_name=str(metadata.get("user_id", "")).strip() or DEFAULT_USER_ID,
                 exclude_event_id=event.id,
+                prefer_interface_session_only=force_deterministic_conversation,
             )
+            conversation_context = {
+                **session_context,
+                **conversation_context,
+            }
+        _mark_gateway_diagnostic(
+            "conversation_context_ready",
+            route_preference=route_preference,
+            force_deterministic=force_deterministic_conversation,
+        )
         normalized_conversation_query = _normalize_conversation_query(event.raw_input)
+        session_display_name = str(
+            conversation_context.get("session_display_name") or ""
+        ).strip()
         session_pending_action_request = str(
             conversation_context.get("pending_action_request") or ""
         ).strip()
@@ -8294,10 +12558,15 @@ async def _resolve_event(event: InputEvent, db: AsyncSession) -> InputEventResol
             clarification_state=clarification_state,
             context=conversation_context,
         )
+        offered_followup_response = _conversation_offer_followup_response(
+            normalized_conversation_query,
+            conversation_context,
+        )
         if (
             _is_conversation_action_approval_query(normalized_conversation_query)
             and session_pending_action_request
             and session_control_state not in {"paused", "cancelled", "stopped"}
+            and not offered_followup_response
             and (
                 str(conversation_context.get("last_topic") or "").strip().lower()
                 == "action_confirmation"
@@ -8367,6 +12636,7 @@ async def _resolve_event(event: InputEvent, db: AsyncSession) -> InputEventResol
     object_inquiry: dict[str, object] = {}
     web_research: dict[str, object] = {}
     user_action_safety: dict[str, object] = {}
+    self_evolution_briefing: dict[str, object] = {}
     memory_signal = {
         "zone": "",
         "recent_count": 0,
@@ -8385,11 +12655,21 @@ async def _resolve_event(event: InputEvent, db: AsyncSession) -> InputEventResol
 
     if conversation_override:
         confidence_tier = "conversation"
+        captured_session_display_name = _extract_session_display_name(event.raw_input)
         revised_action_request = _conversation_revised_action_request(
             normalized_conversation_query,
             prior_action_request=session_pending_action_request,
         )
-        if revised_action_request:
+        if captured_session_display_name:
+            outcome = "store_only"
+            safety_decision = "store_only"
+            reason = "conversation_session_identity_capture"
+            clarification_prompt = f"Got it, {captured_session_display_name}."
+            conversation_topic = "session_identity"
+            session_display_name = captured_session_display_name
+            mim_interface_reply_override = clarification_prompt
+            skip_conversation_memory = True
+        elif revised_action_request:
             outcome = "store_only"
             safety_decision = "store_only"
             reason = "conversation_revised_action_request"
@@ -8402,17 +12682,20 @@ async def _resolve_event(event: InputEvent, db: AsyncSession) -> InputEventResol
             outcome = "store_only"
             safety_decision = "store_only"
             reason = "conversation_clarification_followup"
-            camera_context = await _latest_camera_observation_context(db)
-            object_memory_context = await _object_memory_context_for_query(
-                db, clarification_followup_query
-            )
             response_context = {
                 "source": event.source,
                 "target_system": event.target_system,
-                **camera_context,
-                **object_memory_context,
                 **conversation_context,
             }
+            if not force_deterministic_conversation:
+                camera_context = await _latest_camera_observation_context(db)
+                object_memory_context = await _object_memory_context_for_query(
+                    db, clarification_followup_query
+                )
+                response_context.update(camera_context)
+                response_context.update(object_memory_context)
+            if force_deterministic_conversation:
+                response_context["force_deterministic_communication"] = True
             clarification_prompt = _conversation_response(
                 clarification_followup_query,
                 context=response_context,
@@ -8420,6 +12703,15 @@ async def _resolve_event(event: InputEvent, db: AsyncSession) -> InputEventResol
             conversation_topic = _conversation_topic_key(
                 clarification_followup_query,
                 clarification_prompt,
+            )
+        elif offered_followup_response:
+            outcome = "store_only"
+            safety_decision = "store_only"
+            reason = "conversation_override"
+            clarification_prompt = offered_followup_response
+            conversation_topic = _conversation_topic_key(
+                normalized_conversation_query,
+                offered_followup_response,
             )
         elif (
             _is_conversation_action_approval_query(normalized_conversation_query)
@@ -8434,64 +12726,91 @@ async def _resolve_event(event: InputEvent, db: AsyncSession) -> InputEventResol
             )
             conversation_topic = "action_confirmation"
         elif _looks_like_action_request(event.raw_input):
-            action_text = " ".join(str(event.raw_input or "").strip().lower().split())
-            social_capability_check = (
-                "tod" in action_text
-                and "social media" in action_text
-                and any(
-                    token in action_text
-                    for token in {
-                        "capability",
-                        "posting capability",
-                        "can post",
-                        "post to social media",
-                    }
-                )
-            )
-            repeated_prompt = _looks_like_retry_followup(event.raw_input)
-            if not repeated_prompt and conversation_session_id:
-                repeated_prompt = await _has_recent_similar_text_precision_prompt(
-                    db,
-                    transcript=event.raw_input,
-                    exclude_event_id=event.id,
-                    session_id=conversation_session_id,
-                    within_seconds=180,
-                )
-            outcome = "requires_confirmation"
-            safety_decision = "requires_confirmation"
-            if repeated_prompt:
-                reason = "conversation_optional_escalation_followup"
-                escalation_reasons = [
-                    "suggest_goal_creation",
-                    "clarification_limit_reached",
-                ]
-                if social_capability_check:
-                    optional_escalation = (
-                        "Execution is still pending explicit confirmation. Options: "
-                        "1) ask a question, 2) discuss, 3) create goal: TOD capability check for AgentMIM social media posting."
-                    )
-                else:
-                    optional_escalation = (
-                        "Execution is still pending explicit confirmation. Options: "
-                        "1) ask a question, 2) discuss, 3) create goal: <action>."
-                    )
+            initiative_boundary = classify_boundary_mode(event.raw_input)
+            initiative_boundary_mode = str(
+                initiative_boundary.get("boundary_mode") or ""
+            ).strip()
+            initiative_boundary_reason = str(
+                initiative_boundary.get("reason") or ""
+            ).strip()
+            if initiative_boundary_mode != HARD_BOUNDARY:
+                conversation_override = False
+                internal_intent = "create_goal"
+                capability_name = ""
+                initiative_auto_execute = True
+                optional_escalation = ""
+                confidence_tier = "authorized"
+                outcome = "auto_execute"
+                safety_decision = "auto_execute"
+                reason = "authorized_initiative_auto_execute"
+                escalation_reasons = []
             else:
-                reason = "conversation_optional_escalation"
-                escalation_reasons = ["suggest_goal_creation"]
-                if social_capability_check:
-                    optional_escalation = (
-                        "I can have TOD check AgentMIM social-media posting capability when you are ready. "
-                        "Say: create goal: TOD capability check for AgentMIM social media posting."
+                action_text = " ".join(str(event.raw_input or "").strip().lower().split())
+                social_capability_check = (
+                    "tod" in action_text
+                    and "social media" in action_text
+                    and any(
+                        token in action_text
+                        for token in {
+                            "capability",
+                            "posting capability",
+                            "can post",
+                            "post to social media",
+                        }
                     )
+                )
+                repeated_prompt = _looks_like_retry_followup(event.raw_input)
+                if (
+                    not repeated_prompt
+                    and conversation_session_id
+                    and not force_deterministic_conversation
+                ):
+                    repeated_prompt = await _has_recent_similar_text_precision_prompt(
+                        db,
+                        transcript=event.raw_input,
+                        exclude_event_id=event.id,
+                        session_id=conversation_session_id,
+                        within_seconds=180,
+                    )
+                outcome = "requires_confirmation"
+                safety_decision = "requires_confirmation"
+                if repeated_prompt:
+                    reason = "conversation_optional_escalation_followup"
+                    escalation_reasons = [
+                        "suggest_goal_creation",
+                        "clarification_limit_reached",
+                    ]
+                    if social_capability_check:
+                        optional_escalation = (
+                            "Execution is still pending explicit confirmation. Options: "
+                            "1) ask a question, 2) discuss, 3) create goal: TOD capability check for AgentMIM social media posting."
+                        )
+                    else:
+                        optional_escalation = (
+                            "Execution is still pending explicit confirmation. Options: "
+                            "1) ask a question, 2) discuss, 3) create goal: <action>."
+                        )
                 else:
-                    optional_escalation = (
-                        "I can execute that when you are ready. Say: create goal: "
-                        "<action>."
-                    )
-            clarification_prompt = optional_escalation
+                    reason = "conversation_optional_escalation"
+                    escalation_reasons = ["suggest_goal_creation"]
+                    if social_capability_check:
+                        optional_escalation = (
+                            "I can have TOD check AgentMIM social-media posting capability when you are ready. "
+                            "Say: create goal: TOD capability check for AgentMIM social media posting."
+                        )
+                    else:
+                        optional_escalation = (
+                            "I can execute that when you are ready. Say: create goal: "
+                            "<action>."
+                        )
+                clarification_prompt = optional_escalation
         elif _is_low_signal_turn(event.raw_input):
             repeated_prompt = _looks_like_retry_followup(event.raw_input)
-            if not repeated_prompt and conversation_session_id:
+            if (
+                not repeated_prompt
+                and conversation_session_id
+                and not force_deterministic_conversation
+            ):
                 repeated_prompt = await _has_recent_similar_text_precision_prompt(
                     db,
                     transcript=event.raw_input,
@@ -8499,6 +12818,10 @@ async def _resolve_event(event: InputEvent, db: AsyncSession) -> InputEventResol
                     session_id=conversation_session_id,
                     within_seconds=180,
                 )
+            _mark_gateway_diagnostic(
+                "low_signal_evaluated",
+                repeated_prompt=repeated_prompt,
+            )
             outcome = "store_only"
             safety_decision = "store_only"
             if repeated_prompt:
@@ -8507,49 +12830,92 @@ async def _resolve_event(event: InputEvent, db: AsyncSession) -> InputEventResol
                     "needs_specific_request",
                     "clarification_limit_reached",
                 ]
-                clarification_prompt = (
-                    "I still need one specific request. Options: 1) ask one question, "
-                    "2) ask for one-line status, 3) create goal: <action>."
+                clarification_prompt = _build_clarification_limit_prompt(
+                    escalation_reasons,
+                    event.raw_input,
                 )
             else:
                 reason = "conversation_precision_prompt"
                 escalation_reasons = ["needs_specific_request"]
-                clarification_prompt = (
-                    "I can help right away with one specific request. Say one "
-                    "question or one action."
-                )
+                clarification_prompt = _build_one_clarifier_prompt(event.raw_input)
         else:
             outcome = "store_only"
             safety_decision = "store_only"
             reason = "conversation_override"
-            camera_context = await _latest_camera_observation_context(db)
-            camera_object_inquiry = await _camera_object_inquiry_context(
-                db,
-                camera_context=camera_context,
-            )
-            object_memory_context = await _object_memory_context_for_query(
-                db, event.raw_input
-            )
-            (
-                learned_object_prompt,
-                learned_object_inquiry,
-            ) = await _learn_from_object_inquiry_reply(
-                db,
-                user_input=event.raw_input,
-                inquiry_context=conversation_context.get("last_object_inquiry"),
-            )
+            camera_object_inquiry: dict[str, object] = {}
+            learned_object_prompt = ""
+            learned_object_inquiry = {}
+            if not force_deterministic_conversation and _is_return_briefing_query(normalized_conversation_query):
+                return_briefing_context = await _build_return_briefing_context(db)
+            if not force_deterministic_conversation and _is_self_evolution_next_work_query(normalized_conversation_query):
+                self_evolution_briefing_result = await build_self_evolution_briefing(
+                    actor="gateway_self_evolution_next_work",
+                    source="gateway_conversation_self_evolution_next_work",
+                    refresh=False,
+                    lookback_hours=168,
+                    min_occurrence_count=2,
+                    auto_experiment_limit=3,
+                    limit=5,
+                    db=db,
+                )
+                self_evolution_briefing = (
+                    self_evolution_briefing_result.get("briefing", {})
+                    if isinstance(self_evolution_briefing_result, dict)
+                    else {}
+                )
             response_context = {
                 "source": event.source,
                 "target_system": event.target_system,
-                **camera_context,
-                **object_memory_context,
+                "operator_return_briefing": return_briefing_context,
+                "self_evolution_briefing": self_evolution_briefing,
+                "response_mode": str(metadata.get("response_mode") or "").strip().lower(),
+                "force_deterministic_communication": force_deterministic_conversation,
                 **conversation_context,
             }
+            if not force_deterministic_conversation:
+                camera_context = await _latest_camera_observation_context(db)
+                camera_object_inquiry = await _camera_object_inquiry_context(
+                    db,
+                    camera_context=camera_context,
+                )
+                object_memory_context = await _object_memory_context_for_query(
+                    db, event.raw_input
+                )
+                (
+                    learned_object_prompt,
+                    learned_object_inquiry,
+                ) = await _learn_from_object_inquiry_reply(
+                    db,
+                    user_input=event.raw_input,
+                    inquiry_context=conversation_context.get("last_object_inquiry"),
+                )
+                response_context.update(camera_context)
+                response_context.update(object_memory_context)
+            instructional_setup = _build_instructional_setup_response(
+                event.raw_input,
+                normalized_query=_normalize_conversation_query(event.raw_input),
+                context=response_context,
+            )
+            _mark_gateway_diagnostic(
+                "response_context_ready",
+                has_camera_prompt=bool(camera_object_inquiry),
+                has_learned_object_prompt=bool(learned_object_prompt),
+            )
             if camera_object_inquiry:
                 response_context["camera_object_inquiry_prompt"] = str(
                     camera_object_inquiry.get("inquiry_prompt") or ""
                 ).strip()
-            if learned_object_prompt:
+            if instructional_setup:
+                reason = "conversation_setup_instruction"
+                clarification_prompt = str(
+                    instructional_setup.get("result") or ""
+                ).strip()
+                conversation_topic = "instructional_setup"
+                mim_interface_next_action_override = str(
+                    instructional_setup.get("next_action") or ""
+                ).strip()
+                mim_interface_result_override = clarification_prompt
+            elif learned_object_prompt:
                 clarification_prompt = learned_object_prompt
                 object_inquiry = learned_object_inquiry
                 conversation_topic = "object_inquiry"
@@ -8627,10 +12993,47 @@ async def _resolve_event(event: InputEvent, db: AsyncSession) -> InputEventResol
                         or "I tried to research that on the web, but I could not collect reliable public sources right now."
                     ).strip()
                 else:
-                    clarification_prompt = _conversation_response(
-                        event.raw_input,
+                    composer_runtime_diagnostics: dict[str, object] = {}
+                    if _should_force_deterministic_conversation_reply(event):
+                        response_context["force_deterministic_communication"] = True
+                    composed_reply = await _compose_conversation_reply(
+                        user_input=event.raw_input,
                         context=response_context,
+                        runtime_diagnostics=composer_runtime_diagnostics,
                     )
+                    _mark_gateway_diagnostic(
+                        "conversation_reply_ready",
+                        composer_mode=str(
+                            composer_runtime_diagnostics.get("composer_mode") or ""
+                        ).strip(),
+                    )
+                    clarification_prompt = str(
+                        composed_reply.get("reply_text") or ""
+                    ).strip()
+                    communication_reply_contract = (
+                        composed_reply.get("contract")
+                        if isinstance(composed_reply.get("contract"), dict)
+                        else {}
+                    )
+                    if composer_runtime_diagnostics:
+                        communication_reply_contract = {
+                            **communication_reply_contract,
+                            "runtime_diagnostics": composer_runtime_diagnostics,
+                        }
+                        if composer_runtime_diagnostics.get("degraded"):
+                            resolution_meta = {
+                                **resolution_meta,
+                                "gateway_diagnostic": {
+                                    "composer_mode": str(
+                                        composer_runtime_diagnostics.get("composer_mode")
+                                        or ""
+                                    ).strip(),
+                                    "composer_reason": str(
+                                        composer_runtime_diagnostics.get("composer_reason")
+                                        or ""
+                                    ).strip(),
+                                },
+                            }
                     if (
                         camera_object_inquiry
                         and clarification_prompt
@@ -8639,6 +13042,16 @@ async def _resolve_event(event: InputEvent, db: AsyncSession) -> InputEventResol
                         ).strip()
                     ):
                         object_inquiry = camera_object_inquiry
+            if (
+                session_display_name
+                and clarification_prompt
+                and not mim_interface_next_action_override
+                and not mim_interface_result_override
+            ):
+                mim_interface_reply_override = _address_session_reply(
+                    clarification_prompt,
+                    session_display_name,
+                )
         conversation_topic = _conversation_topic_key(
             _normalize_conversation_query(event.raw_input),
             clarification_prompt,
@@ -8725,13 +13138,31 @@ async def _resolve_event(event: InputEvent, db: AsyncSession) -> InputEventResol
         elif event.source in {"voice", "vision"} and event.confidence < 0.75:
             safety_decision = "requires_confirmation"
             reason = "low_confidence_signal"
-        elif capability_requires_confirmation:
+        elif capability_requires_confirmation and not initiative_auto_execute:
             safety_decision = "requires_confirmation"
             reason = "capability_policy_requires_confirmation"
         else:
             safety_decision = "auto_execute"
             reason = "policy_allows_auto_execute"
         outcome = safety_decision
+
+    if initiative_auto_execute and outcome == "auto_execute":
+        reason = "authorized_initiative_auto_execute"
+        if internal_intent == "create_goal" and not clarification_prompt:
+            clarification_prompt = (
+                "Created one bounded goal for: "
+                f"{_compact_text(event.raw_input, 160)}"
+            )
+            mim_interface_next_action_override = (
+                "continue the newly created bounded goal without further confirmation"
+            )
+            mim_interface_result_override = clarification_prompt
+            mim_interface_reply_override = (
+                f"Request {str(metadata.get('request_id') or '').strip()}. "
+                f"I understood: {event.raw_input}. "
+                f"Next action: {mim_interface_next_action_override}. "
+                f"Status: done. Result: {clarification_prompt}"
+            ).strip()
 
     if session_confirmed_action_request:
         confidence_tier = "confirmed"
@@ -8936,6 +13367,7 @@ async def _resolve_event(event: InputEvent, db: AsyncSession) -> InputEventResol
         proposed_goal_description=goal_description,
         proposed_actions=proposed_actions,
         metadata_json={
+            "request_id": str(metadata.get("request_id") or "").strip(),
             "source": event.source,
             "confidence": event.confidence,
             "safety_flags": event.safety_flags,
@@ -8946,6 +13378,27 @@ async def _resolve_event(event: InputEvent, db: AsyncSession) -> InputEventResol
             "conversation_override": conversation_override,
             "optional_escalation": optional_escalation,
             "conversation_topic": conversation_topic,
+            "session_display_name": session_display_name,
+            "skip_conversation_memory": skip_conversation_memory,
+            "mim_interface_next_action_override": mim_interface_next_action_override,
+            "mim_interface_result_override": mim_interface_result_override,
+            "mim_interface_reply_override": mim_interface_reply_override,
+            "initiative_auto_execute": initiative_auto_execute,
+            "initiative_boundary_mode": initiative_boundary_mode,
+            "initiative_boundary_reason": initiative_boundary_reason,
+            "active_goal": str(conversation_context.get("active_goal") or "").strip(),
+            "operator_reasoning_summary": str(conversation_context.get("operator_reasoning_summary") or "").strip(),
+            "runtime_health_summary": str(conversation_context.get("runtime_health_summary") or "").strip(),
+            "runtime_recovery_summary": str(conversation_context.get("runtime_recovery_summary") or "").strip(),
+            "tod_collaboration_summary": str(conversation_context.get("tod_collaboration_summary") or "").strip(),
+            "current_recommendation_summary": str(conversation_context.get("current_recommendation_summary") or "").strip(),
+            "program_status_summary": str(conversation_context.get("program_status_summary") or "").strip(),
+            "program_status": (
+                conversation_context.get("program_status")
+                if isinstance(conversation_context.get("program_status"), dict)
+                else {}
+            ),
+            "gateway_diagnostic": gateway_diagnostic,
             "object_inquiry": object_inquiry,
             "web_research": web_research,
             "requested_domains": requested_domains,
@@ -8955,6 +13408,7 @@ async def _resolve_event(event: InputEvent, db: AsyncSession) -> InputEventResol
             "last_technical_research": _compact_technical_research_context(
                 web_research
             ),
+            "communication_reply_contract": communication_reply_contract,
         },
     )
     db.add(resolution)
@@ -9133,6 +13587,25 @@ async def _create_or_update_execution_binding(
 
 
 async def _store_normalized(payload: NormalizedInputCreate, db: AsyncSession) -> dict:
+    payload_metadata, request_id = _ensure_request_id(payload.metadata_json)
+    payload.metadata_json = payload_metadata
+    trace: dict[str, object] = {
+        "request_id": request_id,
+        "started_at": _gateway_trace_timestamp(),
+        "source": str(payload.source or "").strip(),
+        "requested_goal": str(payload.requested_goal or "").strip(),
+        "conversation_session_id": str(
+            payload_metadata.get("conversation_session_id") or ""
+        ).strip(),
+        "adapter": str(payload_metadata.get("adapter") or "").strip(),
+        "events": [],
+    }
+    started_monotonic = time.perf_counter()
+    _append_gateway_trace_event(
+        trace,
+        "store_normalized_start",
+        route_preference=str(payload_metadata.get("route_preference") or "").strip(),
+    )
     event = InputEvent(
         source=payload.source,
         raw_input=payload.raw_input,
@@ -9146,6 +13619,7 @@ async def _store_normalized(payload: NormalizedInputCreate, db: AsyncSession) ->
     )
     db.add(event)
     await db.flush()
+    _append_gateway_trace_event(trace, "event_flushed", event_id=int(event.id))
 
     await write_journal(
         db,
@@ -9162,59 +13636,638 @@ async def _store_normalized(payload: NormalizedInputCreate, db: AsyncSession) ->
         },
     )
 
-    resolution = await _resolve_event(event, db)
-    resolution_meta = (
-        resolution.metadata_json if isinstance(resolution.metadata_json, dict) else {}
-    )
-    is_conversation_override = bool(resolution_meta.get("conversation_override"))
-    if is_conversation_override and event.source == "text":
-        interaction_memory_id = await _store_interaction_learning(
-            transcript=event.raw_input,
-            confidence=float(event.confidence or 0.0),
-            source=None,
-            payload_metadata=event.metadata_json
-            if isinstance(event.metadata_json, dict)
-            else {},
-            db=db,
-            source_name="conversation_text",
-            session_id=str(
-                (event.metadata_json or {}).get("conversation_session_id", "")
-            ).strip(),
+    try:
+        _append_gateway_trace_event(trace, "resolve_start")
+        resolution = await _resolve_event(event, db)
+        resolution_meta = (
+            resolution.metadata_json if isinstance(resolution.metadata_json, dict) else {}
         )
-        await _store_conversation_memory(
+        _append_gateway_trace_event(
+            trace,
+            "resolve_end",
+            internal_intent=str(resolution.internal_intent or "").strip(),
+            outcome=str(resolution.outcome or "").strip(),
+            reason=str(resolution.reason or "").strip(),
+        )
+        is_conversation_override = bool(resolution_meta.get("conversation_override"))
+        skip_conversation_memory = bool(resolution_meta.get("skip_conversation_memory"))
+        tod_dispatch = None
+        handoff_submission = None
+        initiative_run = None
+        continuation_validation_request = _looks_like_continuation_validation_request(
+            event.raw_input
+        )
+
+        if event.source == "text" and not continuation_validation_request and not _looks_like_bounded_choice_decision_prompt(
+            event.raw_input
+        ) and (
+            _looks_like_bounded_warning_care_request(
+                event.raw_input,
+                event.parsed_intent,
+                event.safety_flags,
+            )
+            or _looks_like_bounded_tod_bridge_warning_recommendation_request(
+                event.raw_input,
+                event.parsed_intent,
+                event.safety_flags,
+            )
+            or _looks_like_bounded_tod_bridge_warning_request(
+                event.raw_input,
+                event.parsed_intent,
+                event.safety_flags,
+            )
+            or _looks_like_bounded_tod_warnings_summary_request(
+                event.raw_input,
+                event.parsed_intent,
+                event.safety_flags,
+            )
+            or _looks_like_bounded_tod_objective_summary_request(
+                event.raw_input,
+                event.parsed_intent,
+                event.safety_flags,
+            )
+            or _looks_like_bounded_tod_recent_changes_request(
+                event.raw_input,
+                event.parsed_intent,
+                event.safety_flags,
+            )
+            or _looks_like_bounded_tod_status_request(
+                event.raw_input,
+                event.parsed_intent,
+                event.safety_flags,
+            )
+        ):
+            if _looks_like_bounded_warning_care_request(
+                event.raw_input,
+                event.parsed_intent,
+                event.safety_flags,
+            ):
+                primary_dispatch = dispatch_bounded_tod_warnings_summary_request(
+                    request_id=request_id,
+                    session_key=str(payload_metadata.get("conversation_session_id") or "").strip(),
+                    content=event.raw_input,
+                    actor="mim",
+                )
+                controlled_continuation = _build_bounded_controlled_continuation(
+                    primary_dispatch=primary_dispatch,
+                    request_id=request_id,
+                    session_key=str(payload_metadata.get("conversation_session_id") or "").strip(),
+                    actor="mim",
+                )
+                tod_dispatch = (
+                    controlled_continuation.get("final_dispatch")
+                    if isinstance(controlled_continuation.get("final_dispatch"), dict)
+                    else primary_dispatch
+                )
+                synchronize_latest_result_artifact_from_dispatch(tod_dispatch)
+                next_action_text = (
+                    "execute a bounded TOD continuation chain of up to 3 existing steps and surface the chained result"
+                )
+                combined_result = _format_bounded_controlled_continuation_result(
+                    primary_result_label="Warnings summary",
+                    continuation=controlled_continuation,
+                )
+                resolution.reason = "tod_warning_care_next_step_dispatch"
+                resolution_meta = {
+                    **resolution_meta,
+                    "route_preference": "goal_system",
+                    "conversation_override": False,
+                    "tod_primary_dispatch": primary_dispatch,
+                    "tod_selected_next_step": controlled_continuation.get("selected_next_step", {}),
+                    "tod_controlled_continuation": {
+                        "max_depth": int(controlled_continuation.get("max_depth", 3) or 3),
+                        "step_count": int(controlled_continuation.get("step_count", 0) or 0),
+                        "steps": controlled_continuation.get("steps", []),
+                        "stop_reason": str(controlled_continuation.get("stop_reason") or "").strip(),
+                        "stop_detail": str(controlled_continuation.get("stop_detail") or "").strip(),
+                    },
+                    "tod_dispatch": tod_dispatch,
+                    "mim_interface_next_action_override": next_action_text,
+                    "mim_interface_result_override": combined_result,
+                    "mim_interface_reply_override": (
+                        f"Request {request_id}. I understood: {event.raw_input}. "
+                        f"Next action: {next_action_text}. "
+                        f"Status: done. Result: {combined_result}"
+                    ).strip(),
+                }
+                resolution.metadata_json = resolution_meta
+                resolution.outcome = "store_only"
+                resolution.safety_decision = "store_only"
+                resolution.clarification_prompt = combined_result
+                is_conversation_override = False
+            elif _looks_like_bounded_tod_bridge_warning_recommendation_request(
+                event.raw_input,
+                event.parsed_intent,
+                event.safety_flags,
+            ):
+                tod_dispatch = dispatch_bounded_tod_bridge_warning_recommendation_request(
+                    request_id=request_id,
+                    session_key=str(payload_metadata.get("conversation_session_id") or "").strip(),
+                    content=event.raw_input,
+                    actor="mim",
+                )
+                resolution.reason = "tod_bridge_warning_recommendation_dispatch"
+            elif _looks_like_bounded_tod_bridge_warning_request(
+                event.raw_input,
+                event.parsed_intent,
+                event.safety_flags,
+            ):
+                primary_dispatch = dispatch_bounded_tod_bridge_warning_request(
+                    request_id=request_id,
+                    session_key=str(payload_metadata.get("conversation_session_id") or "").strip(),
+                    content=event.raw_input,
+                    actor="mim",
+                )
+                controlled_continuation = _build_bounded_controlled_continuation(
+                    primary_dispatch=primary_dispatch,
+                    request_id=request_id,
+                    session_key=str(payload_metadata.get("conversation_session_id") or "").strip(),
+                    actor="mim",
+                )
+                tod_dispatch = (
+                    controlled_continuation.get("final_dispatch")
+                    if isinstance(controlled_continuation.get("final_dispatch"), dict)
+                    else primary_dispatch
+                )
+                synchronize_latest_result_artifact_from_dispatch(tod_dispatch)
+                next_action_text = (
+                    "execute a bounded TOD continuation chain of up to 3 existing steps and surface the chained result"
+                )
+                combined_result = _format_bounded_controlled_continuation_result(
+                    primary_result_label="Bridge-warning explanation",
+                    continuation=controlled_continuation,
+                )
+                resolution.reason = "tod_bridge_warning_next_step_dispatch"
+                resolution_meta = {
+                    **resolution_meta,
+                    "route_preference": "goal_system",
+                    "conversation_override": False,
+                    "tod_primary_dispatch": primary_dispatch,
+                    "tod_selected_next_step": controlled_continuation.get("selected_next_step", {}),
+                    "tod_controlled_continuation": {
+                        "max_depth": int(controlled_continuation.get("max_depth", 3) or 3),
+                        "step_count": int(controlled_continuation.get("step_count", 0) or 0),
+                        "steps": controlled_continuation.get("steps", []),
+                        "stop_reason": str(controlled_continuation.get("stop_reason") or "").strip(),
+                        "stop_detail": str(controlled_continuation.get("stop_detail") or "").strip(),
+                    },
+                    "tod_dispatch": tod_dispatch,
+                    "mim_interface_next_action_override": next_action_text,
+                    "mim_interface_result_override": combined_result,
+                    "mim_interface_reply_override": (
+                        f"Request {request_id}. I understood: {event.raw_input}. "
+                        f"Next action: {next_action_text}. "
+                        f"Status: done. Result: {combined_result}"
+                    ).strip(),
+                }
+                resolution.metadata_json = resolution_meta
+                resolution.outcome = "store_only"
+                resolution.safety_decision = "store_only"
+                resolution.clarification_prompt = combined_result
+                is_conversation_override = False
+            elif _looks_like_bounded_tod_warnings_summary_request(
+                event.raw_input,
+                event.parsed_intent,
+                event.safety_flags,
+            ):
+                tod_dispatch = dispatch_bounded_tod_warnings_summary_request(
+                    request_id=request_id,
+                    session_key=str(payload_metadata.get("conversation_session_id") or "").strip(),
+                    content=event.raw_input,
+                    actor="mim",
+                )
+                resolution.reason = "tod_warnings_summary_dispatch"
+            elif _looks_like_bounded_tod_objective_summary_request(
+                event.raw_input,
+                event.parsed_intent,
+                event.safety_flags,
+            ):
+                primary_dispatch = dispatch_bounded_tod_objective_summary_request(
+                    request_id=request_id,
+                    session_key=str(payload_metadata.get("conversation_session_id") or "").strip(),
+                    content=event.raw_input,
+                    actor="mim",
+                )
+                controlled_continuation = _build_bounded_controlled_continuation(
+                    primary_dispatch=primary_dispatch,
+                    request_id=request_id,
+                    session_key=str(payload_metadata.get("conversation_session_id") or "").strip(),
+                    actor="mim",
+                )
+                tod_dispatch = (
+                    controlled_continuation.get("final_dispatch")
+                    if isinstance(controlled_continuation.get("final_dispatch"), dict)
+                    else primary_dispatch
+                )
+                synchronize_latest_result_artifact_from_dispatch(tod_dispatch)
+                next_action_text = (
+                    "execute a bounded TOD continuation chain of up to 3 existing steps and surface the chained result"
+                )
+                combined_result = _format_bounded_controlled_continuation_result(
+                    primary_result_label="Current-objective summary",
+                    continuation=controlled_continuation,
+                )
+                resolution.reason = "tod_objective_summary_next_step_dispatch"
+                resolution_meta = {
+                    **resolution_meta,
+                    "route_preference": "goal_system",
+                    "conversation_override": False,
+                    "tod_primary_dispatch": primary_dispatch,
+                    "tod_selected_next_step": controlled_continuation.get("selected_next_step", {}),
+                    "tod_controlled_continuation": {
+                        "max_depth": int(controlled_continuation.get("max_depth", 3) or 3),
+                        "step_count": int(controlled_continuation.get("step_count", 0) or 0),
+                        "steps": controlled_continuation.get("steps", []),
+                        "stop_reason": str(controlled_continuation.get("stop_reason") or "").strip(),
+                        "stop_detail": str(controlled_continuation.get("stop_detail") or "").strip(),
+                    },
+                    "tod_dispatch": tod_dispatch,
+                    "mim_interface_next_action_override": next_action_text,
+                    "mim_interface_result_override": combined_result,
+                    "mim_interface_reply_override": (
+                        f"Request {request_id}. I understood: {event.raw_input}. "
+                        f"Next action: {next_action_text}. "
+                        f"Status: done. Result: {combined_result}"
+                    ).strip(),
+                }
+                resolution.metadata_json = resolution_meta
+                resolution.outcome = "store_only"
+                resolution.safety_decision = "store_only"
+                resolution.clarification_prompt = combined_result
+                is_conversation_override = False
+            elif _looks_like_bounded_tod_recent_changes_request(
+                event.raw_input,
+                event.parsed_intent,
+                event.safety_flags,
+            ):
+                primary_dispatch = dispatch_bounded_tod_recent_changes_request(
+                    request_id=request_id,
+                    session_key=str(payload_metadata.get("conversation_session_id") or "").strip(),
+                    content=event.raw_input,
+                    actor="mim",
+                )
+                controlled_continuation = _build_bounded_controlled_continuation(
+                    primary_dispatch=primary_dispatch,
+                    request_id=request_id,
+                    session_key=str(payload_metadata.get("conversation_session_id") or "").strip(),
+                    actor="mim",
+                )
+                tod_dispatch = (
+                    controlled_continuation.get("final_dispatch")
+                    if isinstance(controlled_continuation.get("final_dispatch"), dict)
+                    else primary_dispatch
+                )
+                synchronize_latest_result_artifact_from_dispatch(tod_dispatch)
+                next_action_text = (
+                    "execute a bounded TOD continuation chain of up to 3 existing steps and surface the chained result"
+                )
+                combined_result = _format_bounded_controlled_continuation_result(
+                    primary_result_label="Recent-changes summary",
+                    continuation=controlled_continuation,
+                )
+                resolution.reason = "tod_recent_changes_next_step_dispatch"
+                resolution_meta = {
+                    **resolution_meta,
+                    "route_preference": "goal_system",
+                    "conversation_override": False,
+                    "tod_primary_dispatch": primary_dispatch,
+                    "tod_selected_next_step": controlled_continuation.get("selected_next_step", {}),
+                    "tod_controlled_continuation": {
+                        "max_depth": int(controlled_continuation.get("max_depth", 3) or 3),
+                        "step_count": int(controlled_continuation.get("step_count", 0) or 0),
+                        "steps": controlled_continuation.get("steps", []),
+                        "stop_reason": str(controlled_continuation.get("stop_reason") or "").strip(),
+                        "stop_detail": str(controlled_continuation.get("stop_detail") or "").strip(),
+                    },
+                    "tod_dispatch": tod_dispatch,
+                    "mim_interface_next_action_override": next_action_text,
+                    "mim_interface_result_override": combined_result,
+                    "mim_interface_reply_override": (
+                        f"Request {request_id}. I understood: {event.raw_input}. "
+                        f"Next action: {next_action_text}. "
+                        f"Status: done. Result: {combined_result}"
+                    ).strip(),
+                }
+                resolution.metadata_json = resolution_meta
+                resolution.outcome = "store_only"
+                resolution.safety_decision = "store_only"
+                resolution.clarification_prompt = combined_result
+                is_conversation_override = False
+            else:
+                initiative_run = await _maybe_dispatch_repeated_tod_status_loop_recovery(
+                    event=event,
+                    request_id=request_id,
+                    session_id=str(payload_metadata.get("conversation_session_id") or "").strip(),
+                    db=db,
+                )
+                if initiative_run is not None:
+                    resolution.reason = str(initiative_run.get("reason") or "").strip()
+                    resolution.outcome = str(initiative_run.get("outcome") or "store_only").strip()
+                    resolution.resolution_status = str(
+                        initiative_run.get("resolution_status") or resolution.outcome
+                    ).strip()
+                    resolution.safety_decision = str(
+                        initiative_run.get("safety_decision") or resolution.outcome
+                    ).strip()
+                    resolution.clarification_prompt = str(
+                        initiative_run.get("clarification_prompt") or ""
+                    ).strip()
+                    resolution_meta = {
+                        **resolution_meta,
+                        "route_preference": "goal_system",
+                        "conversation_override": False,
+                        "initiative_auto_execute": True,
+                        "initiative_run": initiative_run.get("initiative_run", {}),
+                        "initiative_status": initiative_run.get("initiative_status", {}),
+                        "stale_status_loop_recovery": True,
+                        "status_loop_repeat_count": int(
+                            initiative_run.get("status_loop_repeat_count", 0) or 0
+                        ),
+                        "mim_interface_status_override": str(
+                            initiative_run.get("interface_status") or ""
+                        ).strip(),
+                        "mim_interface_next_action_override": str(
+                            initiative_run.get("interface_next_action") or ""
+                        ).strip(),
+                        "mim_interface_result_override": str(
+                            initiative_run.get("interface_result") or ""
+                        ).strip(),
+                        "mim_interface_reply_override": str(
+                            initiative_run.get("interface_reply") or ""
+                        ).strip(),
+                        "communication_reply_contract": {
+                            "reply_text": str(initiative_run.get("interface_reply") or "").strip(),
+                            "topic_hint": "initiative_execution",
+                            "composer_mode": "gateway_override",
+                            "should_store_memory": True,
+                            "memory_topics": [],
+                            "memory_people": [],
+                            "memory_events": [],
+                            "memory_experiences": [],
+                        },
+                    }
+                    governance = (
+                        resolution_meta.get("governance")
+                        if isinstance(resolution_meta.get("governance"), dict)
+                        else {}
+                    )
+                    resolution_meta["governance"] = {
+                        **governance,
+                        "applied_reason": resolution.reason,
+                        "applied_outcome": resolution.outcome,
+                        "summary": str(resolution.reason or "").replace("_", " "),
+                    }
+                    resolution.metadata_json = resolution_meta
+                else:
+                    tod_dispatch = dispatch_bounded_tod_status_request(
+                        request_id=request_id,
+                        session_key=str(payload_metadata.get("conversation_session_id") or "").strip(),
+                        content=event.raw_input,
+                        actor="mim",
+                    )
+                    resolution.reason = "tod_status_dispatch"
+                if initiative_run is None:
+                    resolution_meta = {
+                        **resolution_meta,
+                        "route_preference": "goal_system",
+                        "conversation_override": False,
+                        "tod_dispatch": tod_dispatch,
+                    }
+                    resolution.metadata_json = resolution_meta
+                    resolution.outcome = "store_only"
+                    resolution.safety_decision = "store_only"
+                    resolution.clarification_prompt = str(
+                        tod_dispatch.get("result_reason")
+                        or tod_dispatch.get("decision_detail")
+                        or ""
+                    ).strip()
+                is_conversation_override = False
+        elif event.source == "text" and _looks_like_bounded_implementation_request(
+            event.raw_input,
+            event.parsed_intent,
+            event.safety_flags,
+        ):
+            initiative_run = await _maybe_dispatch_authorized_text_initiative(
+                event=event,
+                request_id=request_id,
+                session_id=str(payload_metadata.get("conversation_session_id") or "").strip(),
+                db=db,
+            )
+            if initiative_run is not None:
+                resolution.reason = str(initiative_run.get("reason") or "").strip()
+                resolution.outcome = str(initiative_run.get("outcome") or "store_only").strip()
+                resolution.resolution_status = str(
+                    initiative_run.get("resolution_status") or resolution.outcome
+                ).strip()
+                resolution.safety_decision = str(
+                    initiative_run.get("safety_decision") or resolution.outcome
+                ).strip()
+                resolution.clarification_prompt = str(
+                    initiative_run.get("clarification_prompt") or ""
+                ).strip()
+                resolution_meta = {
+                    **resolution_meta,
+                    "route_preference": "goal_system",
+                    "conversation_override": False,
+                    "clarification_prompt_key": "",
+                    "initiative_auto_execute": bool(
+                        initiative_run.get("initiative_auto_execute")
+                    ),
+                    "initiative_run": initiative_run.get("initiative_run", {}),
+                    "initiative_status": initiative_run.get("initiative_status", {}),
+                    "mim_interface_status_override": str(
+                        initiative_run.get("interface_status") or ""
+                    ).strip(),
+                    "mim_interface_next_action_override": str(
+                        initiative_run.get("interface_next_action") or ""
+                    ).strip(),
+                    "mim_interface_result_override": str(
+                        initiative_run.get("interface_result") or ""
+                    ).strip(),
+                    "mim_interface_reply_override": str(
+                        initiative_run.get("interface_reply") or ""
+                    ).strip(),
+                    "communication_reply_contract": {
+                        "reply_text": str(initiative_run.get("interface_reply") or "").strip(),
+                        "topic_hint": "initiative_execution",
+                        "composer_mode": "gateway_override",
+                        "should_store_memory": True,
+                        "memory_topics": [],
+                        "memory_people": [],
+                        "memory_events": [],
+                        "memory_experiences": [],
+                    },
+                }
+                governance = (
+                    resolution_meta.get("governance")
+                    if isinstance(resolution_meta.get("governance"), dict)
+                    else {}
+                )
+                resolution_meta["governance"] = {
+                    **governance,
+                    "applied_reason": resolution.reason,
+                    "applied_outcome": resolution.outcome,
+                    "summary": str(resolution.reason or "").replace("_", " "),
+                }
+                resolution.metadata_json = resolution_meta
+            else:
+                handoff_submission = await submit_handoff_payload(
+                    await _build_conversation_handoff_payload_async(
+                        request_id=request_id,
+                        text=event.raw_input,
+                        session_id=str(payload_metadata.get("conversation_session_id") or "").strip(),
+                        db=db,
+                    )
+                )
+                interface_status = _handoff_submission_interface_status(handoff_submission)
+                next_action_text = (
+                    "route one bounded implementation task through the handoff engine and surface its current status"
+                )
+                result_text = _handoff_submission_result_summary(handoff_submission)
+                resolution.reason = "conversation_bounded_implementation_dispatch"
+                resolution_meta = {
+                    **resolution_meta,
+                    "route_preference": "goal_system",
+                    "conversation_override": False,
+                    "handoff_submission": handoff_submission,
+                    "mim_interface_status_override": interface_status,
+                    "mim_interface_next_action_override": next_action_text,
+                    "mim_interface_result_override": result_text,
+                    "mim_interface_reply_override": (
+                        f"Request {request_id}. I understood: {event.raw_input}. "
+                        f"Next action: {next_action_text}. "
+                        f"Status: {interface_status}. Result: {result_text}"
+                    ).strip(),
+                }
+                resolution.metadata_json = resolution_meta
+                resolution.outcome = "blocked" if interface_status == "blocked" else "store_only"
+                resolution.safety_decision = (
+                    "blocked" if interface_status == "blocked" else "store_only"
+                )
+                resolution.clarification_prompt = result_text
+        is_conversation_override = False
+        if is_conversation_override and event.source == "text" and not skip_conversation_memory:
+            _append_gateway_trace_event(trace, "conversation_memory_start")
+            interaction_memory_id = await _store_interaction_learning(
+                transcript=event.raw_input,
+                confidence=float(event.confidence or 0.0),
+                source=None,
+                payload_metadata=event.metadata_json
+                if isinstance(event.metadata_json, dict)
+                else {},
+                db=db,
+                source_name="conversation_text",
+                session_id=str(
+                    (event.metadata_json or {}).get("conversation_session_id", "")
+                ).strip(),
+            )
+            await _store_conversation_memory(
+                db=db,
+                event=event,
+                resolution=resolution,
+                interaction_memory_id=interaction_memory_id,
+            )
+            _append_gateway_trace_event(trace, "conversation_memory_end")
+        execution = None
+        if (
+            not is_conversation_override
+            and tod_dispatch is None
+            and handoff_submission is None
+            and initiative_run is None
+        ):
+            execution = await _create_or_update_execution_binding(
+                event=event,
+                resolution=resolution,
+                capability_name=resolution.capability_name,
+                db=db,
+                arguments_json=_default_execution_arguments(
+                    event, resolution.capability_name
+                ),
+            )
+
+        _append_gateway_trace_event(trace, "interface_state_start")
+        await _store_conversation_interface_state(
             db=db,
             event=event,
             resolution=resolution,
-            interaction_memory_id=interaction_memory_id,
+            execution=execution,
         )
-    execution = None
-    if not is_conversation_override:
-        execution = await _create_or_update_execution_binding(
-            event=event,
-            resolution=resolution,
-            capability_name=resolution.capability_name,
-            db=db,
-            arguments_json=_default_execution_arguments(
-                event, resolution.capability_name
-            ),
+        _append_gateway_trace_event(trace, "interface_state_end")
+
+        _append_gateway_trace_event(trace, "db_commit_start")
+        await db.commit()
+        _append_gateway_trace_event(trace, "db_commit_end")
+        await db.refresh(event)
+        await db.refresh(resolution)
+        event_out = _to_input_out(event)
+        event_out["request_id"] = request_id
+        event_out["resolution"] = _to_resolution_out(resolution)
+        if execution is not None:
+            await db.refresh(execution)
+            event_out["execution"] = _to_execution_out(execution)
+        if tod_dispatch is not None:
+            event_out["tod_dispatch"] = tod_dispatch
+        if handoff_submission is not None:
+            event_out["handoff_submission"] = handoff_submission
+        if initiative_run is not None:
+            event_out["initiative_run"] = initiative_run.get("initiative_run", {})
+            event_out["initiative_status"] = initiative_run.get("initiative_status", {})
+        if str(event.source or "").strip().lower() == "text":
+            derived_initiative_status = _initiative_status_from_resolution_metadata(
+                resolution.metadata_json
+                if isinstance(resolution.metadata_json, dict)
+                else {}
+            )
+            existing_initiative_status = event_out.get("initiative_status")
+            if isinstance(existing_initiative_status, dict) and existing_initiative_status:
+                if derived_initiative_status:
+                    merged_initiative_status = dict(existing_initiative_status)
+                    if not str(merged_initiative_status.get("summary") or "").strip() and str(
+                        derived_initiative_status.get("summary") or ""
+                    ).strip():
+                        merged_initiative_status["summary"] = str(
+                            derived_initiative_status.get("summary") or ""
+                        ).strip()
+                    if not isinstance(merged_initiative_status.get("program_status"), dict) and isinstance(
+                        derived_initiative_status.get("program_status"), dict
+                    ):
+                        merged_initiative_status["program_status"] = derived_initiative_status.get(
+                            "program_status"
+                        )
+                    event_out["initiative_status"] = merged_initiative_status
+            elif derived_initiative_status:
+                event_out["initiative_status"] = derived_initiative_status
+            event_out["mim_interface"] = _build_mim_interface_response(
+                event=event,
+                resolution=resolution,
+                execution=execution,
+            )
+
+        total_elapsed_seconds = time.perf_counter() - started_monotonic
+        trace["elapsed_seconds"] = round(total_elapsed_seconds, 4)
+        gateway_diagnostic = (
+            resolution.metadata_json.get("gateway_diagnostic")
+            if isinstance(resolution.metadata_json, dict)
+            and isinstance(resolution.metadata_json.get("gateway_diagnostic"), dict)
+            else {}
         )
-
-    await _store_conversation_interface_state(
-        db=db,
-        event=event,
-        resolution=resolution,
-        execution=execution,
-    )
-
-    await db.commit()
-    await db.refresh(event)
-    await db.refresh(resolution)
-    event_out = _to_input_out(event)
-    event_out["resolution"] = _to_resolution_out(resolution)
-    if execution is not None:
-        await db.refresh(execution)
-        event_out["execution"] = _to_execution_out(execution)
-    return event_out
+        if gateway_diagnostic:
+            event_out["gateway_diagnostic"] = gateway_diagnostic
+            trace["gateway_diagnostic"] = gateway_diagnostic
+        _append_gateway_trace_event(trace, "response_ready")
+        if gateway_diagnostic or total_elapsed_seconds >= GATEWAY_INTAKE_DIAGNOSTIC_THRESHOLD_SECONDS:
+            _write_gateway_intake_diagnostic(trace, final_status="completed")
+        return event_out
+    except Exception as exc:
+        _append_gateway_trace_event(
+            trace,
+            "exception",
+            error_type=type(exc).__name__,
+            error_message=_compact_text(str(exc), 240),
+        )
+        trace["elapsed_seconds"] = round(time.perf_counter() - started_monotonic, 4)
+        _write_gateway_intake_diagnostic(trace, final_status="exception")
+        raise
 
 
 def _hash_payload(parts: list[str]) -> str:
@@ -9352,9 +14405,13 @@ def _clean_identity_value(raw: str) -> str:
         "there",
         "that",
         "this",
+        "here",
         "hello",
         "hi",
         "hey",
+        "not sure",
+        "not fully sure",
+        "not totally sure",
         "mim",
         "tod",
     }
@@ -9363,6 +14420,39 @@ def _clean_identity_value(raw: str) -> str:
     parts = cleaned.split(" ")[:4]
     normalized = " ".join(part[:40] for part in parts).strip()
     return normalized[:80]
+
+
+def _extract_session_display_name(transcript: str) -> str:
+    text = _normalize_text_for_learning(transcript)
+    if not text:
+        return ""
+
+    match = re.match(
+        r"^(?:(?:hi|hello|hey)[,\s]+)?(?:i am|i'm|call me|my name is)\s+([A-Za-z][A-Za-z'\- ]{0,60})[.!?]?$",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return ""
+    return _clean_identity_value(match.group(1))
+
+
+def _address_session_reply(reply: str, display_name: str) -> str:
+    response = str(reply or "").strip()
+    name = _clean_identity_value(display_name)
+    if not response or not name:
+        return response
+
+    lowered = response.lower()
+    if name.lower() in lowered:
+        return response
+    if response.startswith("Hi. "):
+        return f"Hi, {name}. {response[4:]}"
+    if response.startswith("Hello. "):
+        return f"Hello, {name}. {response[7:]}"
+    if response.startswith("Understood. "):
+        return f"Understood, {name}. {response[12:]}"
+    return f"{name}, {response}"
 
 
 async def _get_or_create_actor(
@@ -9976,22 +15066,64 @@ async def intake_normalized(
 
 @router.post("/intake/text")
 async def intake_text(
-    payload: TextInputAdapterRequest, db: AsyncSession = Depends(get_db)
+    payload: TextInputAdapterRequest, request: Request, db: AsyncSession = Depends(get_db)
 ) -> dict:
+    ensure_authenticated_mimtod_api_request(request)
+    classifier_outcome = classify_console_intent(payload.text, payload.parsed_intent)
+    local_route = route_console_text_input(payload.text, payload.parsed_intent)
+    requested_route_preference = str(
+        (payload.metadata_json if isinstance(payload.metadata_json, dict) else {}).get(
+            "route_preference", ""
+        )
+        or ""
+    ).strip().lower()
     route_preference = _text_route_preference(
-        text=payload.text, parsed_intent=payload.parsed_intent
+        text=payload.text,
+        parsed_intent=payload.parsed_intent,
+        safety_flags=payload.safety_flags,
+    )
+    if requested_route_preference in {"conversation_layer", "goal_system"}:
+        route_preference = requested_route_preference
+    if local_route.route_preference == "goal_system":
+        route_preference = "goal_system"
+    if _should_force_conversation_eval_route(
+        requested_goal=payload.requested_goal,
+        metadata_json=payload.metadata_json,
+        safety_flags=payload.safety_flags,
+    ):
+        route_preference = "conversation_layer"
+    if local_route.route_preference == "goal_system":
+        route_preference = "goal_system"
+    parsed_intent = (
+        classifier_outcome
+        if classifier_outcome in {
+            "execution_capability_request",
+            "robotics_supervised_probe",
+            "unclear_requires_clarification",
+        }
+        else payload.parsed_intent
+    )
+    metadata_json = payload.metadata_json if isinstance(payload.metadata_json, dict) else {}
+    capability_metadata = (
+        {"capability": local_route.capability_name}
+        if local_route.capability_name
+        else {}
     )
     normalized = NormalizedInputCreate(
         source="text",
         raw_input=payload.text,
-        parsed_intent=payload.parsed_intent,
+        parsed_intent=parsed_intent,
         confidence=payload.confidence,
         target_system=payload.target_system,
         requested_goal=payload.requested_goal,
         safety_flags=payload.safety_flags,
         metadata_json={
-            **payload.metadata_json,
+            **metadata_json,
+            **capability_metadata,
             "adapter": "text",
+            "classifier_outcome": classifier_outcome,
+            "web_search_guarded": bool(robotics_web_guard_blocks_search(payload.text)),
+            "routing_path": list(local_route.routing_path),
             "route_preference": route_preference,
         },
     )

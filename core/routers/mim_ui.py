@@ -96,7 +96,6 @@ from core.operator_resolution_service import (
 from core.policy_conflict_resolution_service import list_workspace_policy_conflict_profiles
 from core.proposal_policy_convergence_service import list_workspace_proposal_policy_preferences
 from core.self_evolution_service import build_self_evolution_briefing
-from core.training_routine_service import build_training_routine_snapshot, control_training_routine
 from core.runtime_recovery_service import RuntimeRecoveryService
 from core.primitive_request_recovery_service import load_authoritative_request_status
 from core.ui_health_service import (
@@ -140,10 +139,6 @@ class FrontendMediaStatusRequest(BaseModel):
   permission_state: str | None = None
   selected_device_id: str | None = None
   selected_device_label: str | None = None
-
-
-class MimUiTrainingActionRequest(BaseModel):
-  action: str
 
 
 MIM_UI_FRONTEND_MEDIA_TTL_SECONDS = 900.0
@@ -911,7 +906,6 @@ def _is_mim_ui_db_unavailable(exc: Exception) -> bool:
 def _build_mim_ui_degraded_state(*, db_error_text: str = "") -> dict[str, object]:
   now = datetime.now(timezone.utc)
   frontend_media = _frontend_media_snapshot(now)
-  routine_training = build_training_routine_snapshot()
   frontend_media_issue = _frontend_media_issue_summary(frontend_media)
   authoritative_request = load_authoritative_request_status(shared_root=SHARED_RUNTIME_ROOT)
   runtime_health_summary = "Database-backed MIM state is temporarily unavailable. Chat remains available while shared-runtime artifacts continue to load."
@@ -1041,8 +1035,6 @@ def _build_mim_ui_degraded_state(*, db_error_text: str = "") -> dict[str, object
       "chat_first_operator_surface",
       "runtime_artifact_fallback",
       "database_connectivity_degraded_mode",
-      "routine_training_status",
-      "routine_training_controls",
     ],
     "inquiry_prompt": "MIM storage is temporarily offline. Use this thread for status, coordination, and bounded next steps while runtime state recovers.",
     "operator_reasoning": operator_reasoning,
@@ -1054,7 +1046,6 @@ def _build_mim_ui_degraded_state(*, db_error_text: str = "") -> dict[str, object
     "mim_arm_dispatch_telemetry": {},
     "primitive_request": authoritative_request,
     "chat_thread": chat_thread,
-    "routine_training": routine_training,
     "frontend_media": frontend_media,
     "conversation_context": {
       "environment_now": "Database connectivity unavailable.",
@@ -1069,7 +1060,6 @@ def _build_mim_ui_degraded_state(*, db_error_text: str = "") -> dict[str, object
       "initiative_activity_summary": str(initiative_driver.get("activity", {}).get("summary") or runtime_health_summary).strip(),
       "operator_reasoning_summary": runtime_health_summary,
       "runtime_health_summary": runtime_health_summary,
-      "routine_training_summary": str(routine_training.get("summary") or "").strip(),
       "open_question": "",
       "memory_hint": "",
       "recent_user_input": "No recent database-backed input available.",
@@ -6705,17 +6695,17 @@ async def mim_ui_page(request: Request, db: AsyncSession = Depends(get_db)):
     <header class="hero mim-hero">
       <div class="console-nav">
         <a class="console-link utility" href="/"><span>Public Home</span></a>
-        <a class="console-link active" href="/mim"><span id="mimConsoleLight" class="console-nav-light"></span><span>MIM Primary Operator Surface</span></a>
-        <a class="console-link" href="/tod"><span id="todConsoleLight" class="console-nav-light"></span><span>TOD Console</span></a>
+        <a class="console-link active" href="/mim"><span id="mimConsoleLight" class="console-nav-light"></span><span>MIM Coordination Console</span></a>
+        <a class="console-link" href="/tod"><span id="todConsoleLight" class="console-nav-light"></span><span>TOD Execution Console</span></a>
         <a class="console-link utility" href="/chat"><span>Direct Chat</span></a>
         <button id="settingsBtn" class="console-link utility" type="button"><span>Settings</span></button>
         <a class="console-link utility" href="/mim/logout"><span>Logout</span></a>
       </div>
-      <div class="surface-kicker">MIM Primary Operator Surface</div>
+      <div class="surface-kicker">MIM Coordination Console</div>
       <div class="hero-row">
         <div class="hero-copy">
           <h1 id="mimIcon" class="mim-icon">MIM</h1>
-          <div class="summary">Persistent operator conversation, voice, camera, and TOD bridge telemetry stay on this surface.</div>
+          <div class="summary">Persistent coordination conversation, training guidance, and TOD handoff telemetry stay on this surface.</div>
         </div>
         <div class="hero-status-cluster">
           <div id="buildTag" class="status-chip subtle">UI_BUILD_ID = unified-console-recovery-v1</div>
@@ -6730,7 +6720,7 @@ async def mim_ui_page(request: Request, db: AsyncSession = Depends(get_db)):
           <button id="debugModeBtn" class="mode-chip" type="button">Debug</button>
         </div>
         <div class="thread-tools">
-          <div id="threadStatusChip" class="status-chip subtle">Thread loading…</div>
+          <div id="threadStatusChip" class="status-chip subtle">Conversation loading…</div>
           <div id="voiceHintChip" class="status-chip subtle">Voice replies stay in this thread.</div>
           <button id="chatClearBtn" class="thread-clear" type="button">Clear View</button>
         </div>
@@ -6783,11 +6773,11 @@ async def mim_ui_page(request: Request, db: AsyncSession = Depends(get_db)):
     <div class="system-activity-banner">
       <div class="system-activity-banner-head">
         <div class="system-activity-banner-copy">
-          <div class="surface-kicker">System Activity Status</div>
-          <strong id="systemActivityHeadlineText">Loading…</strong>
-          <div id="systemActivitySummaryText" class="system-activity-banner-summary">Checking whether MIM is actually progressing work right now…</div>
+          <div class="surface-kicker">Agent Communication Status</div>
+          <strong id="systemActivityHeadlineText">Loading communication timeline…</strong>
+          <div id="systemActivitySummaryText" class="system-activity-banner-summary">Checking request, acknowledgement, execution, and result consumption across TOD and MIM…</div>
         </div>
-        <div id="systemActivityBadge" class="status-chip subtle" data-tone="warn">Checking…</div>
+        <div id="systemActivityBadge" class="status-chip subtle" data-tone="warn">Syncing…</div>
       </div>
       <div class="progress-meter activity-truth-meter" aria-hidden="true">
         <div id="systemActivityFill" class="progress-meter-fill"></div>
@@ -6806,7 +6796,7 @@ async def mim_ui_page(request: Request, db: AsyncSession = Depends(get_db)):
         <div id="coordinationStateCard" class="activity-feed-card" data-tone="warn">
           <div class="activity-feed-head">
             <div>
-              <div class="activity-feed-label">TOD Coordination</div>
+              <div class="activity-feed-label">TOD Acknowledgement</div>
               <strong id="coordinationStateText">Checking…</strong>
             </div>
           </div>
@@ -6846,17 +6836,17 @@ async def mim_ui_page(request: Request, db: AsyncSession = Depends(get_db)):
       </div>
       <div class="system-relation-grid">
         <div class="status-tile">
-          <span>Objective Alignment</span>
+          <span>Task Request</span>
           <strong id="relationObjectiveText">Loading…</strong>
           <div id="relationObjectiveDetailText" class="status-subtext">Checking MIM and TOD objective agreement…</div>
         </div>
         <div class="status-tile">
-          <span>Bridge Health</span>
+          <span>TOD Acknowledgement</span>
           <strong id="relationBridgeText">Loading…</strong>
           <div id="relationBridgeDetailText" class="status-subtext">Checking handoff bridge health…</div>
         </div>
         <div class="status-tile">
-          <span>Execution Flow</span>
+          <span>Execution State</span>
           <strong id="relationFlowText">Loading…</strong>
           <div id="relationFlowDetailText" class="status-subtext">Checking whether work is flowing or blocked…</div>
         </div>
@@ -6866,7 +6856,7 @@ async def mim_ui_page(request: Request, db: AsyncSession = Depends(get_db)):
           <div id="relationHandoffDetailText" class="status-subtext">Checking last request or bridge receive…</div>
         </div>
         <div class="status-tile">
-          <span>Last Feedback</span>
+          <span>Result Consumption</span>
           <strong id="relationFeedbackText">Loading…</strong>
           <div id="relationFeedbackDetailText" class="status-subtext">Checking last TOD feedback or completion…</div>
         </div>
@@ -7203,18 +7193,6 @@ async def mim_ui_page(request: Request, db: AsyncSession = Depends(get_db)):
     const openQuestionText = document.getElementById('openQuestionText');
     const memoryHintText = document.getElementById('memoryHintText');
     const runtimeHealthText = document.getElementById('runtimeHealthText');
-    const trainingRoutineSummaryText = document.getElementById('trainingRoutineSummaryText');
-    const trainingRoutinePhaseChip = document.getElementById('trainingRoutinePhaseChip');
-    const trainingRoutineRuntimeChip = document.getElementById('trainingRoutineRuntimeChip');
-    const trainingRoutineNextChip = document.getElementById('trainingRoutineNextChip');
-    const trainingRoutineWindowText = document.getElementById('trainingRoutineWindowText');
-    const trainingRoutineBudgetText = document.getElementById('trainingRoutineBudgetText');
-    const trainingRoutineScoreText = document.getElementById('trainingRoutineScoreText');
-    const trainingRoutineFailuresText = document.getElementById('trainingRoutineFailuresText');
-    const trainingRoutineDetailText = document.getElementById('trainingRoutineDetailText');
-    const trainingRoutineStartBtn = document.getElementById('trainingRoutineStartBtn');
-    const trainingRoutineRestartBtn = document.getElementById('trainingRoutineRestartBtn');
-    const trainingRoutineStopBtn = document.getElementById('trainingRoutineStopBtn');
     const mediaGrid = document.getElementById('mediaGrid');
     const selfTestSummaryChip = document.getElementById('selfTestSummaryChip');
     const selfTestRunBtn = document.getElementById('selfTestRunBtn');
@@ -7351,7 +7329,7 @@ async def mim_ui_page(request: Request, db: AsyncSession = Depends(get_db)):
     function renderSystemActivityTruth(systemActivity = {}) {
       const state = safeText(systemActivity.status_code || systemActivity.state, 'idle').toLowerCase();
       const headline = safeText(systemActivity.headline || systemActivity.label, 'IDLE - healthy, no live task right now');
-      const summary = safeText(systemActivity.summary, 'No active work is currently required.');
+      const summary = safeText(systemActivity.summary, 'No active communication work is currently required.');
       const shouldBeWorking = Boolean(systemActivity.should_be_working);
       const lastActivity = safeText(systemActivity.last_activity_at || systemActivity.mim_last_activity_at || systemActivity.tod_last_activity_at);
       const lastTaskProgress = safeText(systemActivity.last_task_progress_at);
@@ -7362,12 +7340,12 @@ async def mim_ui_page(request: Request, db: AsyncSession = Depends(get_db)):
       const stalenessDetail = safeText(systemActivity.staleness_detail, 'No current staleness evidence.');
       const relation = (systemActivity.relation && typeof systemActivity.relation === 'object') ? systemActivity.relation : {};
       const relationObjective = safeText(relation.objective_alignment, 'Aligned');
-      const relationObjectiveDetail = safeText(relation.objective_alignment_detail, 'MIM and TOD agree on the active objective.');
+      const relationObjectiveDetail = safeText(relation.objective_alignment_detail, 'MIM and TOD agree on the active request context.');
       const relationBridge = safeText(relation.bridge_health, 'Healthy');
-      const relationBridgeDetail = safeText(relation.summary, 'The MIM↔TOD bridge looks healthy.');
-      const relationFlow = safeText(relation.execution_flow, 'Flowing');
+      const relationBridgeDetail = safeText(relation.summary, 'The MIM/TOD acknowledgement lane looks healthy.');
+      const relationFlow = safeText(relation.execution_flow, 'Running');
       const relationFlowDetail = shouldBeWorking
-        ? 'Work is expected to move through the current objective.'
+        ? 'Execution is expected to move through the current request.'
         : 'No live execution flow is required right now.';
       const relationHandoffAt = safeText(relation.last_handoff_at);
       const relationFeedbackAt = safeText(relation.last_feedback_at);
@@ -8875,96 +8853,6 @@ async def mim_ui_page(request: Request, db: AsyncSession = Depends(get_db)):
           </li>
         `;
       }).join('');
-
-
-    function formatTrainingWindowLabel(totalSeconds) {
-      const seconds = Number(totalSeconds || 0);
-      if (!Number.isFinite(seconds) || seconds <= 0) return 'Unknown';
-      const hours = Math.floor(seconds / 3600);
-      const minutes = Math.max(1, Math.round((seconds % 3600) / 60));
-      if (hours > 0) {
-        return `${hours}h ${minutes}m`;
-      }
-      return `${minutes}m`;
-    }
-
-    async function postRoutineTrainingAction(action) {
-      if (!trainingRoutineDetailText) return;
-      trainingRoutineDetailText.textContent = `Running ${action}...`;
-      const res = await fetch('/mim/ui/training/action', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action }),
-      });
-      if (!res.ok) {
-        let detail = 'Training action failed.';
-        try {
-          const payload = await res.json();
-          detail = safeText(payload.detail || payload.message || detail, detail);
-        } catch (_) {
-        }
-        trainingRoutineDetailText.textContent = detail;
-        return;
-      }
-      const payload = await res.json();
-      const training = payload && typeof payload.training === 'object' ? payload.training : {};
-      renderRoutineTrainingPanel(training);
-      refreshState();
-    }
-
-    function renderRoutineTrainingPanel(training = {}) {
-      if (!trainingRoutineSummaryText) return;
-      const nextPlan = (training && typeof training.next_cycle_plan === 'object') ? training.next_cycle_plan : {};
-      const latestCycle = (training && typeof training.latest_cycle === 'object') ? training.latest_cycle : {};
-      const controls = (training && typeof training.controls === 'object') ? training.controls : {};
-      trainingRoutineSummaryText.textContent = safeText(training.summary, 'Routine training is unavailable.');
-      trainingRoutinePhaseChip.textContent = `Status: ${safeText(training.state_label, 'unknown')}`;
-      trainingRoutineRuntimeChip.textContent = `Runtime: ${training.runtime_service_active ? 'ready' : 'offline'}`;
-      trainingRoutineNextChip.textContent = `Next batch: ${safeText(nextPlan.target_conversations, 'n/a')} conversations`;
-      trainingRoutineWindowText.textContent = formatTrainingWindowLabel(nextPlan.target_window_seconds);
-      trainingRoutineBudgetText.textContent = `${safeText(nextPlan.min_conversations, 'n/a')}-${safeText(nextPlan.max_conversations, 'n/a')}`;
-      trainingRoutineScoreText.textContent = Number.isFinite(Number(latestCycle.overall)) ? Number(latestCycle.overall).toFixed(3) : 'No cycle';
-      trainingRoutineFailuresText.textContent = Number.isFinite(Number(latestCycle.failure_count)) ? String(Number(latestCycle.failure_count)) : 'Unknown';
-      trainingRoutineDetailText.textContent = safeText(training.detail, 'Run this during idle windows on the dedicated training runtime.');
-      trainingRoutineStartBtn.disabled = !Boolean(controls.can_start);
-      trainingRoutineRestartBtn.disabled = !Boolean(controls.can_restart);
-      trainingRoutineStopBtn.disabled = !Boolean(controls.can_stop);
-    }
-        <div id="secondaryPanelTraining" class="secondary-section">
-          <div class="sidebar-card">
-            <h2>Routine Training</h2>
-            <div id="trainingRoutineSummaryText" class="sidebar-copy">Loading routine training status…</div>
-            <div class="sidebar-list">
-              <div id="trainingRoutinePhaseChip" class="status-chip subtle">Status: loading…</div>
-              <div id="trainingRoutineRuntimeChip" class="status-chip subtle">Runtime: loading…</div>
-              <div id="trainingRoutineNextChip" class="status-chip subtle">Next batch: loading…</div>
-            </div>
-            <div class="status-grid" style="margin-top:12px;">
-              <div class="status-tile">
-                <span>Window</span>
-                <strong id="trainingRoutineWindowText">Loading…</strong>
-              </div>
-              <div class="status-tile">
-                <span>Budget</span>
-                <strong id="trainingRoutineBudgetText">Loading…</strong>
-              </div>
-              <div class="status-tile">
-                <span>Last Overall</span>
-                <strong id="trainingRoutineScoreText">Loading…</strong>
-              </div>
-              <div class="status-tile">
-                <span>Failures</span>
-                <strong id="trainingRoutineFailuresText">Loading…</strong>
-              </div>
-            </div>
-            <div id="trainingRoutineDetailText" class="sidebar-copy" style="margin-top:12px;">Use this during idle or evening windows.</div>
-            <div class="sidebar-list" style="margin-top:12px;">
-              <button id="trainingRoutineStartBtn" class="secondary-action" type="button">Start Routine</button>
-              <button id="trainingRoutineRestartBtn" class="secondary-action" type="button">Restart Routine</button>
-              <button id="trainingRoutineStopBtn" class="secondary-action" type="button">Stop Routine</button>
-            </div>
-          </div>
-        </div>
     }
 
     function collectSystemReasoningEntries(reasoning = {}) {
@@ -12565,7 +12453,6 @@ async def mim_ui_page(request: Request, db: AsyncSession = Depends(get_db)):
         renderChatThread(threadMessages);
         renderPrimaryStatus(data);
         renderObjectMemoryPanel(conversationContext);
-        renderRoutineTrainingPanel((data && typeof data.routine_training === 'object') ? data.routine_training : {});
         renderSystemReasoningPanel(operatorReasoning);
         await maybeRecoverRuntimeHealth(data);
         const cameraIdentityKnown = !isUnknownOrMissingIdentity(cameraLabel);
@@ -13421,15 +13308,6 @@ async def mim_ui_page(request: Request, db: AsyncSession = Depends(get_db)):
       listenOnce();
     });
     chatSendBtn.addEventListener('click', sendTextChat);
-    if (trainingRoutineStartBtn) {
-      trainingRoutineStartBtn.addEventListener('click', () => postRoutineTrainingAction('start'));
-    }
-    if (trainingRoutineRestartBtn) {
-      trainingRoutineRestartBtn.addEventListener('click', () => postRoutineTrainingAction('restart'));
-    }
-    if (trainingRoutineStopBtn) {
-      trainingRoutineStopBtn.addEventListener('click', () => postRoutineTrainingAction('stop'));
-    }
     chatClearBtn.addEventListener('click', () => {
       chatLocallyCleared = true;
       chatLocalClearCutoffIso = new Date().toISOString();
@@ -14902,7 +14780,6 @@ async def _build_live_mim_ui_state(request: Request, db: AsyncSession) -> dict:
       operator_reasoning=operator_reasoning,
       generated_at=now.isoformat(),
     )
-    routine_training = build_training_routine_snapshot()
 
     return {
         "speaking": speaking,
@@ -14942,8 +14819,6 @@ async def _build_live_mim_ui_state(request: Request, db: AsyncSession) -> dict:
             "runtime_health_visibility",
             "initiative_driver_visibility",
             "activity_truth_visibility",
-            "routine_training_status",
-            "routine_training_controls",
         ],
         "inquiry_prompt": inquiry_prompt,
         "operator_reasoning": operator_reasoning,
@@ -14955,7 +14830,6 @@ async def _build_live_mim_ui_state(request: Request, db: AsyncSession) -> dict:
         "mim_arm_dispatch_telemetry": dispatch_telemetry,
         "primitive_request": authoritative_request,
         "chat_thread": chat_thread,
-        "routine_training": routine_training,
         "frontend_media": frontend_media,
         "conversation_context": {
             "environment_now": environment_now,
@@ -15127,7 +15001,6 @@ async def _build_live_mim_ui_state(request: Request, db: AsyncSession) -> dict:
             "runtime_health_summary": str(operator_reasoning.get("runtime_health", {}).get("summary") or "").strip()
             if isinstance(operator_reasoning.get("runtime_health", {}), dict)
             else "",
-            "routine_training_summary": str(routine_training.get("summary") or "").strip(),
             "frontend_media_summary": frontend_media_issue_summary,
             "runtime_recovery_summary": str(operator_reasoning.get("runtime_recovery", {}).get("summary") or "").strip()
             if isinstance(operator_reasoning.get("runtime_recovery", {}), dict)
@@ -15189,13 +15062,17 @@ async def _build_live_mim_ui_state(request: Request, db: AsyncSession) -> dict:
 
 @router.get("/mim/ui/state")
 async def mim_ui_state(request: Request, db: AsyncSession = Depends(get_db)) -> dict:
+  ensure_authenticated_mimtod_api_request(request)
   try:
     return await _build_live_mim_ui_state(request, db)
   except Exception as exc:  # noqa: BLE001
-    if not _is_mim_ui_db_unavailable(exc):
-      raise
-    logger.warning("MIM UI state degraded because database connectivity is unavailable: %s", exc)
-    ensure_authenticated_mimtod_api_request(request)
+    db_unavailable = _is_mim_ui_db_unavailable(exc)
+    logger.warning(
+      "MIM UI state degraded due to %s (%s): %s",
+      "database unavailability" if db_unavailable else "unexpected exception",
+      type(exc).__name__,
+      exc,
+    )
     return _build_mim_ui_degraded_state(db_error_text=str(exc))
 
 
@@ -15203,22 +15080,6 @@ async def mim_ui_state(request: Request, db: AsyncSession = Depends(get_db)) -> 
 async def get_runtime_recovery_summary(request: Request) -> dict:
   ensure_authenticated_mimtod_api_request(request)
   return runtime_recovery_service.get_summary()
-
-
-@router.get("/mim/ui/training")
-async def get_mim_ui_training_status(request: Request) -> dict:
-  ensure_authenticated_mimtod_api_request(request)
-  return {"training": build_training_routine_snapshot()}
-
-
-@router.post("/mim/ui/training/action")
-async def post_mim_ui_training_action(request: Request, payload: MimUiTrainingActionRequest) -> dict:
-  ensure_authenticated_mimtod_api_request(request)
-  try:
-    result = control_training_routine(payload.action)
-  except ValueError as exc:
-    raise HTTPException(status_code=400, detail=str(exc)) from exc
-  return result
 
 
 @router.post("/mim/ui/runtime-recovery-events")

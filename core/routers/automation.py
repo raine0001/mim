@@ -1,10 +1,15 @@
 from datetime import datetime, timezone
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from core.autonomy_driver_service import (
+    build_initiative_status,
+    continue_initiative,
+    drive_initiative_from_intent,
+)
 from core.config import settings
 from core.db import get_db
 from core.journal import write_journal
@@ -34,6 +39,8 @@ from core.schemas import (
     AutomationRecoveryRetryRequest,
     AutomationRunCarrierStatusUpdateRequest,
     AutomationRunCreateRequest,
+    InitiativeContinueRequest,
+    InitiativeDriveRequest,
     AutomationWebActionRequest,
     AutomationWebNavigateRequest,
     AutomationWebSessionCreateRequest,
@@ -46,6 +53,53 @@ router = APIRouter(tags=["automation"])
 def _ensure_enabled() -> None:
     if not settings.automation_enabled:
         raise HTTPException(status_code=503, detail="automation_disabled")
+
+
+@router.post("/initiative/drive")
+async def drive_initiative(
+    payload: InitiativeDriveRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    result = await drive_initiative_from_intent(
+        db,
+        actor=payload.actor,
+        source=payload.source,
+        user_intent=payload.user_intent,
+        objective_title=payload.objective_title,
+        priority=payload.priority,
+        managed_scope=payload.managed_scope,
+        expected_outputs=payload.expected_outputs,
+        verification_commands=payload.verification_commands,
+        continue_chain=payload.continue_chain,
+        max_auto_steps=payload.max_auto_steps,
+        metadata_json=payload.metadata_json,
+    )
+    await db.commit()
+    return result
+
+
+@router.post("/initiative/continue")
+async def continue_initiative_endpoint(
+    payload: InitiativeContinueRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    result = await continue_initiative(
+        db,
+        objective_id=payload.objective_id,
+        actor=payload.actor,
+        source=payload.source,
+        max_auto_steps=payload.max_auto_steps,
+    )
+    await db.commit()
+    return result
+
+
+@router.get("/initiative/status")
+async def initiative_status(
+    objective_id: int | None = Query(default=None),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    return await build_initiative_status(db=db, objective_id=objective_id)
 
 
 @router.post("/web/sessions")

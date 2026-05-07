@@ -15,6 +15,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.db import get_db
+from core.config import settings
 from core.execution_trace_service import append_execution_trace_event
 from core.execution_lane_service import TARGET_MIM_ARM, build_execution_target_profile, submit_execution_request
 from core.journal import write_journal
@@ -22,12 +23,65 @@ from core.mim_arm_dispatch_telemetry import (
     record_dispatch_telemetry_from_publish,
     refresh_dispatch_telemetry_record,
 )
+from core.primitive_request_recovery_service import load_authoritative_request_status
 from core.models import (
+    ArmEnvelopeProbeAttempt,
+    ArmProbeAuthorization,
+    ArmServoEnvelope,
+    SupervisedMicroStepExecution,
+    SupervisedPhysicalMicroStepExecution,
     CapabilityExecution,
     CapabilityRegistration,
     ExecutionTaskOrchestration,
     InputEvent,
     InputEventResolution,
+)
+from core.arm_envelope_service import (
+    approve_probe_authorization,
+    begin_supervised_micro_step_execution,
+    check_physical_micro_step_allowed,
+    create_supervised_micro_step_authorization,
+    execute_physical_micro_step,
+    expire_pending_probe_authorizations,
+    get_physical_execution,
+    get_probe_authorization,
+    get_supervised_execution,
+    generate_dry_run_commands_for_servo,
+    generate_dry_run_plan,
+    generate_simulation_probe_plan_for_servo,
+    get_envelope,
+    get_envelopes,
+    get_probe_attempts,
+    initialize_envelopes,
+    is_stale,
+    DirectArmHttpAdapter,
+    MockServoAdapter,
+    record_supervised_probe_outcome,
+    ServoHardwareAdapter,
+    reject_probe_authorization,
+    trigger_safe_home_fallback,
+)
+from core.schemas import (
+    ArmDryRunCommandRequest,
+    ArmDryRunCommandSequence,
+    ArmEnvelopeProbeAttemptRead,
+    ArmEnvelopeProbePlanPreview,
+    ArmProbeAuthorizationApproveRequest,
+    ArmProbeAuthorizationRead,
+    ArmProbeAuthorizationRejectRequest,
+    ArmProbeAuthorizationRequest,
+    ArmProbeExecutionGateResult,
+    ArmServoEnvelopeRead,
+    ArmServoEnvelopeUpdateRequest,
+    ArmSimulationProbePlan,
+    ArmSimulationProbeRequest,
+    PhysicalMicroStepExecutionRead,
+    PhysicalMicroStepExecutionRequest,
+    RecordProbeOutcomeRead,
+    RecordProbeOutcomeRequest,
+    SafeHomeTriggerRequest,
+    SupervisedMicroStepExecutionRead,
+    SupervisedMicroStepExecutionRequest,
 )
 from core.routers.self_awareness_router import health_monitor as _mim_health_monitor
 from core.routers import gateway as gateway_router
@@ -221,6 +275,29 @@ MIM_ARM_CAPABILITY_DEFINITIONS = [
             "executor": "tod",
             "allowed_targets": ["capture_frame"],
             "operator_approval_required_for_execution": True,
+        },
+    },
+    {
+        "capability_name": "mim_arm.supervised_probe",
+        "category": "manipulation",
+        "description": "Prepare a governed supervised servo-envelope probe goal for TOD/operator review before any motion.",
+        "requires_confirmation": True,
+        "enabled": True,
+        "safety_policy": {
+            "stage": "supervised_probe_prep",
+            "mode": "operator_guarded",
+            "executor": "tod",
+            "allowed_targets": ["servo_envelope_probe"],
+            "operator_approval_required_for_execution": True,
+            "guard_terms": [
+                "servo",
+                "gripper",
+                "arm",
+                "safe_home",
+                "motion_allowed",
+                "estop_ok",
+                "learned_bounds",
+            ],
         },
     },
 ]
@@ -1594,6 +1671,18 @@ def load_mim_arm_status_surface(*, shared_root: Path = DEFAULT_SHARED_ROOT) -> d
         and estop_ok is True
         and not bool(health.get("requires_confirmation", False))
     )
+    authoritative_request = load_authoritative_request_status(shared_root=shared_root)
+
+    if authoritative_request:
+        last_command_result = {
+            **last_command_result,
+            "request_id": authoritative_request.get("request_id"),
+            "task_id": authoritative_request.get("task_id"),
+            "objective_id": authoritative_request.get("objective_id"),
+            "decision_code": authoritative_request.get("decision_code"),
+            "result_status": authoritative_request.get("result_status"),
+            "result_reason": authoritative_request.get("result_reason"),
+        }
 
     return {
         "generated_at": _utcnow(),
@@ -1642,6 +1731,7 @@ def load_mim_arm_status_surface(*, shared_root: Path = DEFAULT_SHARED_ROOT) -> d
             "communication_dispatch_gate": communication_dispatch_gate,
         },
         "self_health": health,
+        "current_request": authoritative_request,
         "source_artifacts": {
             "arm_status": str(shared_root / ARM_STATUS_ARTIFACT),
             "arm_host_state": str(shared_root / ARM_HOST_STATE_ARTIFACT),
@@ -2756,4 +2846,1016 @@ async def bootstrap_mim_arm_capabilities(
             }
             for row in rows
         ],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Servo envelope endpoints  (Objective 173 — no hardware movement)
+# ---------------------------------------------------------------------------
+
+
+def _arm_id_from_status() -> str:
+    """Derive arm_id from the live status surface (host IP) or fall back to 'default'."""
+    try:
+        status = load_mim_arm_status_surface()
+        url: str = str(status.get("arm_state_probe", {}).get("url") or "")
+        # url looks like "http://192.168.1.90:5000/arm_state"
+        if "://" in url:
+            host = url.split("://")[1].split(":")[0].split("/")[0]
+            if host:
+                return host
+    except Exception:
+        pass
+    return "default"
+
+
+@router.post("/envelopes/initialize")
+async def initialize_arm_envelopes(
+    db: AsyncSession = Depends(get_db),
+    arm_id: str | None = None,
+    force: bool = False,
+) -> dict[str, object]:
+    """
+    Seed ArmServoEnvelope rows (servos 0–5) from configured servo limits.
+    Safe to call multiple times — skips rows that already exist unless force=True.
+    Learned values are never overwritten during initialization.
+    NO hardware movement.
+    """
+    resolved_arm_id = arm_id or _arm_id_from_status()
+    rows = await initialize_envelopes(db, arm_id=resolved_arm_id, actor="api", force=force)
+    await db.commit()
+    for row in rows:
+        await db.refresh(row)
+    return {
+        "arm_id": resolved_arm_id,
+        "initialized_count": len(rows),
+        "force": force,
+        "envelopes": [
+            {
+                "servo_id": r.servo_id,
+                "servo_name": r.servo_name,
+                "configured_min": r.configured_min,
+                "configured_max": r.configured_max,
+                "status": r.status,
+            }
+            for r in sorted(rows, key=lambda r: r.servo_id)
+        ],
+    }
+
+
+@router.get("/envelopes")
+async def list_arm_envelopes(
+    db: AsyncSession = Depends(get_db),
+    arm_id: str | None = None,
+) -> dict[str, object]:
+    """
+    Return all servo envelope records for the arm.
+    Read-only.  No hardware interaction.
+    """
+    resolved_arm_id = arm_id or _arm_id_from_status()
+    rows = await get_envelopes(db, arm_id=resolved_arm_id)
+    return {
+        "arm_id": resolved_arm_id,
+        "count": len(rows),
+        "envelopes": [
+            {
+                "id": r.id,
+                "servo_id": r.servo_id,
+                "servo_name": r.servo_name,
+                "configured_min": r.configured_min,
+                "configured_max": r.configured_max,
+                "learned_soft_min": r.learned_soft_min,
+                "learned_soft_max": r.learned_soft_max,
+                "preferred_min": r.preferred_min,
+                "preferred_max": r.preferred_max,
+                "unstable_regions": r.unstable_regions,
+                "confidence": r.confidence,
+                "evidence_count": r.evidence_count,
+                "last_verified_at": r.last_verified_at.isoformat() if r.last_verified_at else None,
+                "last_probe_phase": r.last_probe_phase,
+                "status": r.status,
+                "is_stale": is_stale(r),
+                "stale_after_seconds": r.stale_after_seconds,
+                "actor": r.actor,
+                "source": r.source,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+                "updated_at": r.updated_at.isoformat() if r.updated_at else None,
+            }
+            for r in rows
+        ],
+    }
+
+
+@router.get("/envelopes/{servo_id}")
+async def get_arm_envelope(
+    servo_id: int,
+    db: AsyncSession = Depends(get_db),
+    arm_id: str | None = None,
+) -> dict[str, object]:
+    """
+    Return the servo envelope for a specific servo (0–5).
+    Read-only.  No hardware interaction.
+    """
+    if servo_id < 0 or servo_id > 5:
+        raise HTTPException(status_code=400, detail="servo_id must be 0–5")
+
+    resolved_arm_id = arm_id or _arm_id_from_status()
+    row = await get_envelope(db, servo_id, arm_id=resolved_arm_id)
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No envelope found for servo_id={servo_id} arm_id={resolved_arm_id}. "
+                   "Call POST /mim/arm/envelopes/initialize first.",
+        )
+    return {
+        "id": row.id,
+        "arm_id": row.arm_id,
+        "servo_id": row.servo_id,
+        "servo_name": row.servo_name,
+        "configured_min": row.configured_min,
+        "configured_max": row.configured_max,
+        "learned_soft_min": row.learned_soft_min,
+        "learned_soft_max": row.learned_soft_max,
+        "preferred_min": row.preferred_min,
+        "preferred_max": row.preferred_max,
+        "unstable_regions": row.unstable_regions,
+        "confidence": row.confidence,
+        "evidence_count": row.evidence_count,
+        "last_verified_at": row.last_verified_at.isoformat() if row.last_verified_at else None,
+        "last_probe_phase": row.last_probe_phase,
+        "status": row.status,
+        "is_stale": is_stale(row),
+        "stale_after_seconds": row.stale_after_seconds,
+        "actor": row.actor,
+        "source": row.source,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+    }
+
+
+@router.get("/envelopes/{servo_id}/probe-attempts")
+async def list_probe_attempts(
+    servo_id: int,
+    db: AsyncSession = Depends(get_db),
+    arm_id: str | None = None,
+    limit: int = 50,
+    phase: str | None = None,
+) -> dict[str, object]:
+    """
+    Return the probe attempt log for a specific servo, newest first.
+    Optionally filter by phase (simulation|dry_run|supervised_micro|autonomous).
+    Read-only.  No hardware interaction.
+    """
+    if servo_id < 0 or servo_id > 5:
+        raise HTTPException(status_code=400, detail="servo_id must be 0–5")
+    if limit < 1 or limit > 500:
+        raise HTTPException(status_code=400, detail="limit must be 1–500")
+
+    resolved_arm_id = arm_id or _arm_id_from_status()
+    attempts = await get_probe_attempts(
+        db, servo_id, arm_id=resolved_arm_id, limit=limit, phase=phase
+    )
+    return {
+        "arm_id": resolved_arm_id,
+        "servo_id": servo_id,
+        "phase_filter": phase,
+        "count": len(attempts),
+        "attempts": [
+            {
+                "id": a.id,
+                "probe_id": a.probe_id,
+                "envelope_id": a.envelope_id,
+                "servo_id": a.servo_id,
+                "phase": a.phase,
+                "commanded_angle": a.commanded_angle,
+                "prior_angle": a.prior_angle,
+                "observed_angle": a.observed_angle,
+                "step_degrees": a.step_degrees,
+                "stop_condition": a.stop_condition,
+                "stop_condition_flags": a.stop_condition_flags,
+                "simulation_id": a.simulation_id,
+                "execution_id": a.execution_id,
+                "result": a.result,
+                "confidence_delta": a.confidence_delta,
+                "created_at": a.created_at.isoformat() if a.created_at else None,
+            }
+            for a in attempts
+        ],
+    }
+
+
+@router.get("/envelopes/probe-plan/dry-run")
+async def get_envelope_dry_run_plan(
+    db: AsyncSession = Depends(get_db),
+    arm_id: str | None = None,
+) -> dict[str, object]:
+    """
+    Generate a Phase-2 dry-run probe plan for all servos.
+    Returns the plan as a preview — no hardware command is dispatched.
+    """
+    resolved_arm_id = arm_id or _arm_id_from_status()
+    rows = await get_envelopes(db, arm_id=resolved_arm_id)
+    if not rows:
+        raise HTTPException(
+            status_code=404,
+            detail="No envelopes found. Call POST /mim/arm/envelopes/initialize first.",
+        )
+    plan = generate_dry_run_plan(rows, arm_id=resolved_arm_id)
+    return plan
+
+
+@router.post("/envelopes/{servo_id}/probe-plan/simulate")
+async def post_simulation_probe_plan(
+    servo_id: int,
+    request: ArmSimulationProbeRequest,
+    db: AsyncSession = Depends(get_db),
+    arm_id: str | None = None,
+) -> dict[str, object]:
+    """
+    Generate a detailed simulation-only probe plan for a single servo.
+
+    NO hardware dispatch.  NO actuation.
+
+    Request body: ArmSimulationProbeRequest with options for plan configuration.
+    Response: Detailed ArmSimulationProbePlan with step-by-step probe sequence.
+
+    If persist_planned_attempts=true, saves probe steps as planned_only attempts
+    in the probe_attempts table (no execution_id, result='planned_only').
+    """
+    if servo_id < 0 or servo_id > 5:
+        raise HTTPException(status_code=400, detail="servo_id must be 0–5")
+
+    resolved_arm_id = arm_id or _arm_id_from_status()
+
+    # Fetch the envelope for this servo
+    envelope = await get_envelope(db, servo_id, arm_id=resolved_arm_id)
+    if envelope is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Envelope for servo {servo_id} not found. Call POST /mim/arm/envelopes/initialize first.",
+        )
+
+    # Generate the detailed simulation-only plan
+    plan = generate_simulation_probe_plan_for_servo(
+        envelope,
+        arm_id=resolved_arm_id,
+        max_target_angles=request.max_target_angles,
+        skip_unstable_regions=request.skip_unstable_regions,
+    )
+
+    # Optionally persist planned attempts
+    if request.persist_planned_attempts and plan.get("probe_steps"):
+        from uuid import uuid4
+        for step in plan["probe_steps"]:
+            attempt = ArmEnvelopeProbeAttempt(
+                probe_id=str(uuid4()),
+                envelope_id=envelope.id,
+                servo_id=servo_id,
+                phase="simulation_only",
+                commanded_angle=step["target_angle"],
+                prior_angle=step["current_angle"],
+                observed_angle=None,
+                step_degrees=step["step_degrees"],
+                stop_condition="",
+                stop_condition_flags={"applicable": step["stop_conditions_applicable"]},
+                simulation_id=None,
+                execution_id="",  # No execution in simulation-only
+                result="planned_only",
+                confidence_delta=0.0,
+            )
+            db.add(attempt)
+        await db.commit()
+
+    return plan
+
+
+# ---------------------------------------------------------------------------
+# Objective 175 — POST /envelopes/{servo_id}/probe-commands/dry-run
+# ---------------------------------------------------------------------------
+
+
+@router.post("/envelopes/{servo_id}/probe-commands/dry-run")
+async def post_dry_run_probe_commands(
+    servo_id: int,
+    request: ArmDryRunCommandRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, object]:
+    """
+    Generate a dry-run command sequence for a single servo.
+
+    Internally calls generate_simulation_probe_plan_for_servo() to obtain
+    simulation plan steps, then converts each step into a structured
+    ArmProbeCommandStep with command_id, rollback, stop_conditions, etc.
+
+    dry_run=True and physical_execution_allowed=False always.
+    NO hardware dispatch.  NO actuation.
+
+    If persist_as_attempts=True, each command step is saved as an
+    ArmEnvelopeProbeAttempt row with result='dry_run_generated'.
+    """
+    if servo_id < 0 or servo_id > 5:
+        raise HTTPException(status_code=400, detail="servo_id must be 0–5")
+
+    resolved_arm_id = request.arm_id or _arm_id_from_status()
+
+    envelope = await get_envelope(db, servo_id, arm_id=resolved_arm_id)
+    if envelope is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Envelope for servo {servo_id} not found. Call POST /mim/arm/envelopes/initialize first.",
+        )
+
+    # Step 1: generate simulation plan to get probe steps
+    sim_plan = generate_simulation_probe_plan_for_servo(
+        envelope,
+        arm_id=resolved_arm_id,
+        max_target_angles=request.max_target_angles,
+        skip_unstable_regions=request.skip_unstable_regions,
+    )
+    probe_steps = sim_plan.get("probe_steps", [])
+
+    # Step 2: convert simulation steps into dry-run command objects
+    command_sequence = generate_dry_run_commands_for_servo(
+        envelope,
+        probe_steps,
+        arm_id=resolved_arm_id,
+    )
+
+    # Step 3: optionally persist as dry_run_generated attempts
+    if request.persist_as_attempts and command_sequence.get("commands"):
+        from uuid import uuid4
+        for cmd in command_sequence["commands"]:
+            attempt = ArmEnvelopeProbeAttempt(
+                probe_id=cmd["command_id"],
+                envelope_id=envelope.id,
+                servo_id=servo_id,
+                phase="dry_run",
+                commanded_angle=cmd["target_angle"],
+                prior_angle=cmd["prior_angle"],
+                observed_angle=None,
+                step_degrees=cmd["step_degrees"],
+                stop_condition="",
+                stop_condition_flags={
+                    "stop_conditions": cmd["stop_conditions"],
+                    "dry_run": bool(cmd.get("dry_run", True)),
+                    "physical_execution_allowed": False,
+                    "safe_home_fallback": command_sequence.get("safe_home_fallback", {}),
+                },
+                simulation_id=None,
+                execution_id="",
+                result="dry_run_generated",
+                confidence_delta=0.0,
+            )
+            db.add(attempt)
+        await db.commit()
+
+    return command_sequence
+
+
+@router.post("/envelopes/{servo_id}/probe-authorizations/request", response_model=ArmProbeAuthorizationRead)
+async def post_probe_authorization_request(
+    servo_id: int,
+    request: ArmProbeAuthorizationRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, object]:
+    """
+    Create a supervised micro-step authorization request from one dry-run command.
+
+    No movement is executed. This endpoint only stages authorization state.
+    """
+    if servo_id < 0 or servo_id > 5:
+        raise HTTPException(status_code=400, detail="servo_id must be 0–5")
+
+    resolved_arm_id = request.arm_id or _arm_id_from_status()
+    envelope = await get_envelope(db, servo_id, arm_id=resolved_arm_id)
+    if envelope is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Envelope for servo {servo_id} not found. Call POST /mim/arm/envelopes/initialize first.",
+        )
+
+    try:
+        auth = await create_supervised_micro_step_authorization(
+            db,
+            envelope,
+            arm_id=resolved_arm_id,
+            dry_run_command_id=request.dry_run_command_id,
+            operator_id=request.operator_id,
+            expires_in_seconds=request.expires_in_seconds,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    await db.commit()
+
+    return auth
+
+
+@router.post("/probe-authorizations/{authorization_id}/approve", response_model=ArmProbeAuthorizationRead)
+async def post_probe_authorization_approve(
+    authorization_id: str,
+    request: ArmProbeAuthorizationApproveRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, object]:
+    """Approve one pending supervised probe authorization (no movement execution)."""
+    await expire_pending_probe_authorizations(db)
+    authorization = await get_probe_authorization(db, authorization_id)
+    if authorization is None:
+        raise HTTPException(status_code=404, detail="Authorization not found")
+
+    try:
+        result = await approve_probe_authorization(
+            db,
+            authorization,
+            authorized_by=request.authorized_by,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    await db.commit()
+
+    return result
+
+
+@router.post("/probe-authorizations/{authorization_id}/reject", response_model=ArmProbeAuthorizationRead)
+async def post_probe_authorization_reject(
+    authorization_id: str,
+    request: ArmProbeAuthorizationRejectRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, object]:
+    """Reject one pending supervised probe authorization (no movement execution)."""
+    await expire_pending_probe_authorizations(db)
+    authorization = await get_probe_authorization(db, authorization_id)
+    if authorization is None:
+        raise HTTPException(status_code=404, detail="Authorization not found")
+
+    try:
+        result = await reject_probe_authorization(db, authorization)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    await db.commit()
+    return result
+
+
+@router.get("/probe-authorizations/{authorization_id}", response_model=ArmProbeAuthorizationRead)
+async def get_probe_authorization_state(
+    authorization_id: str,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, object]:
+    """Fetch one authorization state, applying expiry transition when needed."""
+    await expire_pending_probe_authorizations(db)
+    await db.commit()
+    authorization = await get_probe_authorization(db, authorization_id)
+    if authorization is None:
+        raise HTTPException(status_code=404, detail="Authorization not found")
+
+    return {
+        "authorization_id": authorization.authorization_id,
+        "arm_id": authorization.arm_id,
+        "servo_id": authorization.servo_id,
+        "dry_run_command_id": authorization.dry_run_command_id,
+        "requested_angle": authorization.requested_angle,
+        "prior_angle": authorization.prior_angle,
+        "step_degrees": authorization.step_degrees,
+        "direction": authorization.direction,
+        "operator_id": authorization.operator_id,
+        "authorized_by": authorization.authorized_by,
+        "authorization_status": authorization.authorization_status,
+        "expires_at": authorization.expires_at.isoformat() if authorization.expires_at else None,
+        "stop_conditions": authorization.stop_conditions if isinstance(authorization.stop_conditions, list) else [],
+        "safe_home_required": bool(authorization.safe_home_required),
+        "physical_execution_allowed": bool(authorization.physical_execution_allowed),
+        "created_at": authorization.created_at.isoformat() if authorization.created_at else None,
+        "updated_at": authorization.updated_at.isoformat() if authorization.updated_at else None,
+    }
+
+
+@router.post("/probe-authorizations/{authorization_id}/gate-check", response_model=ArmProbeExecutionGateResult)
+async def post_probe_authorization_gate_check(
+    authorization_id: str,
+    consume: bool = False,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, object]:
+    """
+    Execution gate stub.
+
+    This endpoint only evaluates gate status; it never dispatches servo movement.
+    If consume=true and authorization is valid, status transitions to consumed.
+    """
+    await expire_pending_probe_authorizations(db)
+    await db.commit()
+    authorization = await get_probe_authorization(db, authorization_id)
+    if authorization is None:
+        raise HTTPException(status_code=404, detail="Authorization not found")
+
+    result = await check_physical_micro_step_allowed(db, authorization, consume=consume)
+    await db.commit()
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Objective 177 — Supervised Micro-Step Execution Stub
+# ---------------------------------------------------------------------------
+
+@router.post(
+    "/probe-authorizations/{authorization_id}/execute",
+    response_model=SupervisedMicroStepExecutionRead,
+)
+async def post_supervised_micro_step_execute(
+    authorization_id: str,
+    request: SupervisedMicroStepExecutionRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, object]:
+    """
+    Begin one operator-triggered supervised micro-step execution stub.
+
+    Requires an approved, unexpired, unconsumed authorization.
+    Atomically consumes the authorization and creates an execution record.
+
+    No hardware movement is dispatched.  physical_movement_dispatched is always False.
+    """
+    await expire_pending_probe_authorizations(db)
+    authorization = await get_probe_authorization(db, authorization_id)
+    if authorization is None:
+        raise HTTPException(status_code=404, detail="Authorization not found")
+
+    try:
+        result = await begin_supervised_micro_step_execution(
+            db,
+            authorization,
+            operator_id=request.operator_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    await db.commit()
+    return result
+
+
+@router.post(
+    "/supervised-executions/{execution_id}/safe-home",
+    response_model=SupervisedMicroStepExecutionRead,
+)
+async def post_supervised_execution_safe_home(
+    execution_id: str,
+    request: SafeHomeTriggerRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, object]:
+    """
+    Operator-triggered safe-home fallback for a running supervised execution.
+
+    Transitions execution status to 'safe_home_triggered' and records the event
+    in the execution log.  No hardware command is dispatched.
+    """
+    execution = await get_supervised_execution(db, execution_id)
+    if execution is None:
+        raise HTTPException(status_code=404, detail="Execution not found")
+
+    try:
+        result = await trigger_safe_home_fallback(
+            db,
+            execution,
+            operator_id=request.operator_id,
+            reason=request.reason,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    await db.commit()
+    return result
+
+
+@router.get(
+    "/supervised-executions/{execution_id}",
+    response_model=SupervisedMicroStepExecutionRead,
+)
+async def get_supervised_execution_state(
+    execution_id: str,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, object]:
+    """Fetch the full state of one supervised micro-step execution record."""
+    execution = await get_supervised_execution(db, execution_id)
+    if execution is None:
+        raise HTTPException(status_code=404, detail="Execution not found")
+    from core.arm_envelope_service import _execution_to_dict
+    return _execution_to_dict(execution)
+
+
+# ---------------------------------------------------------------------------
+# Objective 178 — Supervised Physical Micro-Step Execution endpoint
+# ---------------------------------------------------------------------------
+
+@router.post(
+    "/probe-authorizations/{authorization_id}/execute-physical-micro-step",
+    response_model=PhysicalMicroStepExecutionRead,
+)
+async def post_physical_micro_step_execute(
+    authorization_id: str,
+    request: PhysicalMicroStepExecutionRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, object]:
+    """
+    Execute exactly one supervised physical servo micro-step.
+
+    Requires MIM_ARM_PHYSICAL_MICRO_STEP_ENABLED=true, an approved, unexpired,
+    unconsumed authorization with stop conditions and a safe-home fallback.
+
+    Uses MockServoAdapter in test environments; DirectArmHttpAdapter when
+    MIM_ARM_PHYSICAL_MICRO_STEP_ENABLED=true and real hardware is available.
+
+    Atomically consumes the authorization on execution.  No replay possible.
+    """
+    await expire_pending_probe_authorizations(db)
+    authorization = await get_probe_authorization(db, authorization_id)
+    if authorization is None:
+        raise HTTPException(status_code=404, detail="Authorization not found")
+
+    if settings.mim_arm_physical_micro_step_enabled:
+        adapter: ServoHardwareAdapter = DirectArmHttpAdapter()
+    else:
+        adapter = MockServoAdapter()
+    try:
+        result = await execute_physical_micro_step(
+            db,
+            authorization,
+            operator_id=request.operator_id,
+            adapter=adapter,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    await db.commit()
+    return result
+
+
+@router.get(
+    "/physical-executions/{execution_id}",
+    response_model=PhysicalMicroStepExecutionRead,
+)
+async def get_physical_execution_state(
+    execution_id: str,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, object]:
+    """Fetch the full state of one supervised physical micro-step execution record."""
+    execution = await get_physical_execution(db, execution_id)
+    if execution is None:
+        raise HTTPException(status_code=404, detail="Physical execution not found")
+    from core.arm_envelope_service import _physical_execution_to_dict
+    return _physical_execution_to_dict(execution)
+
+
+# ---------------------------------------------------------------------------
+# Objective 179 — Record supervised probe outcome (envelope learning update)
+# ---------------------------------------------------------------------------
+
+@router.post(
+    "/physical-executions/{execution_id}/record-probe-outcome",
+    response_model=RecordProbeOutcomeRead,
+)
+async def post_record_probe_outcome(
+    execution_id: str,
+    request: RecordProbeOutcomeRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, object]:
+    """
+    Record the envelope learning outcome from a completed supervised physical micro-step.
+
+    Looks up the execution by execution_id (path param), validates it matches
+    the request body execution_id, creates an ArmEnvelopeProbeAttempt with
+    phase="supervised_micro", and updates the ArmServoEnvelope confidence,
+    evidence_count, and learned bounds as appropriate.
+
+    Safe to call only once per execution (idempotency not enforced at this layer —
+    call sites should ensure single invocation).
+    """
+    if request.execution_id != execution_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Path execution_id does not match request body execution_id",
+        )
+    execution = await get_physical_execution(db, execution_id)
+    if execution is None:
+        raise HTTPException(status_code=404, detail="Physical execution not found")
+
+    try:
+        outcome = await record_supervised_probe_outcome(db, execution)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    await db.commit()
+    return outcome
+
+
+# ---------------------------------------------------------------------------
+# Objective 180 — ARM envelope learning UI/operator workflow surface
+# ---------------------------------------------------------------------------
+
+def _iso_or_none(value: datetime | None) -> str | None:
+    return value.isoformat() if value is not None else None
+
+
+def _auth_to_ui_dict(row: ArmProbeAuthorization | None) -> dict[str, object] | None:
+    if row is None:
+        return None
+    return {
+        "authorization_id": row.authorization_id,
+        "arm_id": row.arm_id,
+        "servo_id": row.servo_id,
+        "dry_run_command_id": row.dry_run_command_id,
+        "requested_angle": row.requested_angle,
+        "prior_angle": row.prior_angle,
+        "step_degrees": row.step_degrees,
+        "direction": row.direction,
+        "operator_id": row.operator_id,
+        "authorized_by": row.authorized_by,
+        "authorization_status": row.authorization_status,
+        "expires_at": _iso_or_none(row.expires_at),
+        "stop_conditions": row.stop_conditions if isinstance(row.stop_conditions, list) else [],
+        "safe_home_required": bool(row.safe_home_required),
+        "physical_execution_allowed": bool(row.physical_execution_allowed),
+        "created_at": _iso_or_none(row.created_at),
+        "updated_at": _iso_or_none(row.updated_at),
+    }
+
+
+def _execution_feedback_to_ui_dict(row: SupervisedPhysicalMicroStepExecution | None) -> dict[str, object] | None:
+    if row is None:
+        return None
+    return {
+        "execution_id": row.execution_id,
+        "authorization_id": row.authorization_id,
+        "arm_id": row.arm_id,
+        "servo_id": row.servo_id,
+        "operator_id": row.operator_id,
+        "execution_status": row.execution_status,
+        "prior_angle": row.prior_angle,
+        "commanded_angle": row.commanded_angle,
+        "target_angle": row.target_angle,
+        "step_degrees": row.step_degrees,
+        "direction": row.direction,
+        "physical_movement_dispatched": bool(row.physical_movement_dispatched),
+        "dispatch_result": row.dispatch_result,
+        "movement_duration_ms": row.movement_duration_ms,
+        "stop_condition_triggered": row.stop_condition_triggered,
+        "safe_home_triggered": bool(row.safe_home_triggered),
+        "safe_home_outcome": row.safe_home_outcome,
+        "error_message": row.error_message,
+        "log_entries": row.log_entries if isinstance(row.log_entries, list) else [],
+        "completed_at": _iso_or_none(row.completed_at),
+        "created_at": _iso_or_none(row.created_at),
+        "updated_at": _iso_or_none(row.updated_at),
+    }
+
+
+def _attempt_to_ui_dict(row: ArmEnvelopeProbeAttempt | None) -> dict[str, object] | None:
+    if row is None:
+        return None
+    return {
+        "attempt_id": row.id,
+        "probe_id": row.probe_id,
+        "phase": row.phase,
+        "result": row.result,
+        "execution_id": row.execution_id,
+        "commanded_angle": row.commanded_angle,
+        "prior_angle": row.prior_angle,
+        "observed_angle": row.observed_angle,
+        "step_degrees": row.step_degrees,
+        "stop_condition": row.stop_condition,
+        "confidence_delta": row.confidence_delta,
+        "stop_condition_flags": row.stop_condition_flags if isinstance(row.stop_condition_flags, dict) else {},
+        "created_at": _iso_or_none(row.created_at),
+    }
+
+
+@router.get("/operator-workflow/envelopes/{servo_id}")
+async def get_envelope_learning_operator_workflow(
+    servo_id: int,
+    db: AsyncSession = Depends(get_db),
+    arm_id: str | None = None,
+    authorization_id: str | None = None,
+    execution_id: str | None = None,
+    max_preview_targets: int = 12,
+) -> dict[str, object]:
+    """
+    UI/operator workflow surface for supervised envelope learning.
+
+    This endpoint exposes the full operator flow in one response:
+      1) show envelope state
+      2) preview probe plan
+      3) generate dry-run (action endpoint)
+      4) request authorization (action endpoint)
+      5) approve/reject (action endpoints)
+      6) execute one micro-step (action endpoint)
+      7) show execution feedback
+      8) show learned envelope update
+    """
+    if servo_id < 0 or servo_id > 5:
+        raise HTTPException(status_code=400, detail="servo_id must be 0–5")
+    if max_preview_targets < 1 or max_preview_targets > 50:
+        raise HTTPException(status_code=400, detail="max_preview_targets must be 1–50")
+
+    resolved_arm_id = arm_id or _arm_id_from_status()
+    envelope = await get_envelope(db, servo_id, arm_id=resolved_arm_id)
+    if envelope is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Envelope for servo {servo_id} not found. Call POST /mim/arm/envelopes/initialize first.",
+        )
+
+    preview_plan = generate_simulation_probe_plan_for_servo(
+        envelope,
+        arm_id=resolved_arm_id,
+        max_target_angles=max_preview_targets,
+        skip_unstable_regions=True,
+    )
+
+    latest_dry_run_result = await db.execute(
+        select(ArmEnvelopeProbeAttempt)
+        .where(
+            ArmEnvelopeProbeAttempt.envelope_id == envelope.id,
+            ArmEnvelopeProbeAttempt.servo_id == servo_id,
+            ArmEnvelopeProbeAttempt.phase == "dry_run",
+            ArmEnvelopeProbeAttempt.result == "dry_run_generated",
+        )
+        .order_by(ArmEnvelopeProbeAttempt.id.desc())
+        .limit(1)
+    )
+    latest_dry_run = latest_dry_run_result.scalar_one_or_none()
+
+    selected_auth: ArmProbeAuthorization | None
+    if authorization_id:
+        auth_result = await db.execute(
+            select(ArmProbeAuthorization).where(
+                ArmProbeAuthorization.authorization_id == authorization_id,
+                ArmProbeAuthorization.arm_id == resolved_arm_id,
+                ArmProbeAuthorization.servo_id == servo_id,
+            )
+        )
+        selected_auth = auth_result.scalar_one_or_none()
+    else:
+        auth_result = await db.execute(
+            select(ArmProbeAuthorization)
+            .where(
+                ArmProbeAuthorization.arm_id == resolved_arm_id,
+                ArmProbeAuthorization.servo_id == servo_id,
+            )
+            .order_by(ArmProbeAuthorization.updated_at.desc(), ArmProbeAuthorization.created_at.desc())
+            .limit(1)
+        )
+        selected_auth = auth_result.scalar_one_or_none()
+
+    selected_exec: SupervisedPhysicalMicroStepExecution | None
+    if execution_id:
+        exec_result = await db.execute(
+            select(SupervisedPhysicalMicroStepExecution).where(
+                SupervisedPhysicalMicroStepExecution.execution_id == execution_id,
+                SupervisedPhysicalMicroStepExecution.arm_id == resolved_arm_id,
+                SupervisedPhysicalMicroStepExecution.servo_id == servo_id,
+            )
+        )
+        selected_exec = exec_result.scalar_one_or_none()
+    else:
+        exec_result = await db.execute(
+            select(SupervisedPhysicalMicroStepExecution)
+            .where(
+                SupervisedPhysicalMicroStepExecution.arm_id == resolved_arm_id,
+                SupervisedPhysicalMicroStepExecution.servo_id == servo_id,
+            )
+            .order_by(
+                SupervisedPhysicalMicroStepExecution.updated_at.desc(),
+                SupervisedPhysicalMicroStepExecution.created_at.desc(),
+            )
+            .limit(1)
+        )
+        selected_exec = exec_result.scalar_one_or_none()
+
+    latest_learned_result = await db.execute(
+        select(ArmEnvelopeProbeAttempt)
+        .where(
+            ArmEnvelopeProbeAttempt.envelope_id == envelope.id,
+            ArmEnvelopeProbeAttempt.servo_id == servo_id,
+            ArmEnvelopeProbeAttempt.phase == "supervised_micro",
+        )
+        .order_by(ArmEnvelopeProbeAttempt.id.desc())
+        .limit(1)
+    )
+    latest_learning_attempt = latest_learned_result.scalar_one_or_none()
+
+    current_auth = _auth_to_ui_dict(selected_auth)
+    can_approve_reject = bool(current_auth and current_auth.get("authorization_status") == "pending")
+    can_execute = bool(current_auth and current_auth.get("authorization_status") == "approved")
+    can_record_outcome = bool(selected_exec is not None)
+
+    return {
+        "arm_id": resolved_arm_id,
+        "servo_id": servo_id,
+        "servo_name": envelope.servo_name,
+        "workflow_id": "mim_arm_envelope_learning_operator_workflow",
+        "workflow_steps": [
+            "show_envelope_state",
+            "preview_probe_plan",
+            "generate_dry_run",
+            "request_authorization",
+            "approve_or_reject",
+            "execute_one_micro_step",
+            "show_feedback",
+            "show_learned_envelope_update",
+        ],
+        "envelope_state": {
+            "id": envelope.id,
+            "configured_min": envelope.configured_min,
+            "configured_max": envelope.configured_max,
+            "learned_soft_min": envelope.learned_soft_min,
+            "learned_soft_max": envelope.learned_soft_max,
+            "preferred_min": envelope.preferred_min,
+            "preferred_max": envelope.preferred_max,
+            "unstable_regions": envelope.unstable_regions if isinstance(envelope.unstable_regions, list) else [],
+            "confidence": envelope.confidence,
+            "evidence_count": envelope.evidence_count,
+            "last_verified_at": _iso_or_none(envelope.last_verified_at),
+            "last_probe_phase": envelope.last_probe_phase,
+            "status": envelope.status,
+            "is_stale": is_stale(envelope),
+            "stale_after_seconds": envelope.stale_after_seconds,
+            "updated_at": _iso_or_none(envelope.updated_at),
+        },
+        "probe_plan_preview": {
+            "phase": preview_plan.get("phase"),
+            "estimated_total_steps": preview_plan.get("estimated_total_steps"),
+            "risk_assessment": preview_plan.get("risk_assessment"),
+            "start_angle": preview_plan.get("start_angle"),
+            "target_angles": preview_plan.get("target_angles", []),
+            "probe_steps": preview_plan.get("probe_steps", []),
+        },
+        "latest_dry_run": _attempt_to_ui_dict(latest_dry_run),
+        "latest_authorization": current_auth,
+        "latest_execution_feedback": _execution_feedback_to_ui_dict(selected_exec),
+        "latest_learned_envelope_update": _attempt_to_ui_dict(latest_learning_attempt),
+        "actions": {
+            "generate_dry_run": {
+                "method": "POST",
+                "endpoint": f"/mim/arm/envelopes/{servo_id}/probe-commands/dry-run",
+                "request_template": {
+                    "arm_id": resolved_arm_id,
+                    "skip_unstable_regions": True,
+                    "max_target_angles": max_preview_targets,
+                    "persist_as_attempts": True,
+                },
+            },
+            "request_authorization": {
+                "method": "POST",
+                "endpoint": f"/mim/arm/envelopes/{servo_id}/probe-authorizations/request",
+                "request_template": {
+                    "arm_id": resolved_arm_id,
+                    "dry_run_command_id": latest_dry_run.probe_id if latest_dry_run is not None else "",
+                    "operator_id": "operator.test",
+                    "expires_in_seconds": 300,
+                },
+            },
+            "approve": {
+                "enabled": can_approve_reject,
+                "method": "POST",
+                "endpoint": (
+                    f"/mim/arm/probe-authorizations/{current_auth['authorization_id']}/approve"
+                    if current_auth is not None
+                    else ""
+                ),
+                "request_template": {"authorized_by": "supervisor.test"},
+            },
+            "reject": {
+                "enabled": can_approve_reject,
+                "method": "POST",
+                "endpoint": (
+                    f"/mim/arm/probe-authorizations/{current_auth['authorization_id']}/reject"
+                    if current_auth is not None
+                    else ""
+                ),
+                "request_template": {"rejected_by": "supervisor.test", "reason": "operator_rejected"},
+            },
+            "execute_one_micro_step": {
+                "enabled": can_execute,
+                "method": "POST",
+                "endpoint": (
+                    f"/mim/arm/probe-authorizations/{current_auth['authorization_id']}/execute-physical-micro-step"
+                    if current_auth is not None
+                    else ""
+                ),
+                "request_template": {"operator_id": "operator.test"},
+            },
+            "record_probe_outcome": {
+                "enabled": can_record_outcome,
+                "method": "POST",
+                "endpoint": (
+                    f"/mim/arm/physical-executions/{selected_exec.execution_id}/record-probe-outcome"
+                    if selected_exec is not None
+                    else ""
+                ),
+                "request_template": {
+                    "execution_id": selected_exec.execution_id if selected_exec is not None else "",
+                },
+            },
+        },
+        "updated_at": datetime.now(timezone.utc).isoformat(),
     }

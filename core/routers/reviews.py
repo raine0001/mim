@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from core.autonomy_driver_service import continue_initiative
 from core.db import get_db
 from core.journal import write_journal
 from core.models import Task, TaskReview
@@ -45,6 +46,13 @@ async def create_review(
         summary=f"Review recorded for task {payload.task_id}: {payload.decision}",
     )
     await recompute_objective_state(db, task.objective_id)
+    continuation = await continue_initiative(
+        db,
+        objective_id=task.objective_id,
+        actor="tod",
+        source="reviews_route",
+        max_auto_steps=3,
+    )
     await db.commit()
     await db.refresh(review)
     return {
@@ -54,6 +62,7 @@ async def create_review(
         "rationale": review.notes,
         "continue_allowed": review.continue_allowed,
         "escalate_to_user": review.escalate_to_user,
+        "initiative": continuation,
         "created_at": review.created_at,
     }
 

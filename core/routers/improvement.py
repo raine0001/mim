@@ -32,6 +32,10 @@ from core.self_evolution_service import (
     build_self_evolution_briefing,
     build_self_evolution_next_action,
     build_self_evolution_snapshot,
+    evaluate_natural_language_development_progress,
+    get_natural_language_development_progress,
+    reset_natural_language_development_progress,
+    _build_natural_language_development_packet,
 )
 from core.schemas import (
     ImprovementBacklogRefreshRequest,
@@ -39,6 +43,8 @@ from core.schemas import (
     ImprovementProposalReviewRequest,
     ImprovementRecommendationGenerateRequest,
     ImprovementRecommendationReviewRequest,
+    SelfEvolutionNaturalLanguageEvaluationRequest,
+    SelfEvolutionNaturalLanguageProgressResetRequest,
 )
 
 router = APIRouter()
@@ -517,4 +523,63 @@ async def get_self_evolution_briefing_endpoint(
     )
     if refresh:
         await db.commit()
+    return result
+
+
+@router.get("/improvement/self-evolution/natural-language/progress")
+async def get_self_evolution_natural_language_progress_endpoint(
+    actor: str = Query(default="workspace"),
+    source: str = Query(default="objective173"),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    packet = _build_natural_language_development_packet(snapshot={"status": "active"})
+    progress = await get_natural_language_development_progress(
+        actor=actor,
+        source=source,
+        slices=packet.get("slices", []) if isinstance(packet.get("slices", []), list) else [],
+        db=db,
+    )
+    return {
+        "progress": progress,
+    }
+
+
+@router.post("/improvement/self-evolution/natural-language/reset")
+async def reset_self_evolution_natural_language_progress_endpoint(
+    payload: SelfEvolutionNaturalLanguageProgressResetRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    progress = await reset_natural_language_development_progress(
+        actor=payload.actor,
+        source=payload.source,
+        db=db,
+    )
+    await db.commit()
+    return {
+        "progress": progress,
+    }
+
+
+@router.post("/improvement/self-evolution/natural-language/evaluate")
+async def evaluate_self_evolution_natural_language_progress_endpoint(
+    payload: SelfEvolutionNaturalLanguageEvaluationRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    try:
+        result = await evaluate_natural_language_development_progress(
+            actor=payload.actor,
+            source=payload.source,
+            slice_id=payload.slice_id,
+            outcome_mode=payload.outcome_mode,
+            metrics_json=payload.metrics_json,
+            failure_tags=payload.failure_tags,
+            proof_summary=payload.proof_summary,
+            discovered_skill_candidates=payload.discovered_skill_candidates,
+            blocked_reason=payload.blocked_reason,
+            metadata_json=payload.metadata_json,
+            db=db,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    await db.commit()
     return result

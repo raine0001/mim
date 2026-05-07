@@ -67,6 +67,11 @@ from core.models import (
     WorkspaceZone,
     WorkspaceZoneRelation,
 )
+from core.models import WorkspaceReachSimulation
+from core.safe_reach_simulation_service import (
+    run_simulation as _run_safe_reach_simulation,
+    STALE_OBJECT_STATUSES as _STALE_OBJECT_STATUSES,
+)
 from core.preferences import (
     DEFAULT_USER_ID,
     apply_learning_signal,
@@ -107,6 +112,7 @@ from core.schemas import (
     WorkspaceTargetConfirmRequest,
     WorkspaceTargetResolveRequest,
 )
+from core.schemas import WorkspaceTargetSimulateRequest
 
 router = APIRouter()
 
@@ -1093,6 +1099,15 @@ def _autonomy_risk_score(proposal_type: str) -> float:
 
 def _autonomy_simulation_safe(proposal: WorkspaceProposal) -> tuple[bool, str]:
     trigger = proposal.trigger_json if isinstance(proposal.trigger_json, dict) else {}
+
+    # Prefer the explicit simulation_gate_passed boolean written by the
+    # safe-reach simulation endpoint over legacy outcome string checks.
+    if "simulation_gate_passed" in trigger:
+        gate = bool(trigger["simulation_gate_passed"])
+        stored_outcome = str(trigger.get("simulation_outcome", "plan_safe" if gate else "plan_blocked"))
+        return gate, stored_outcome
+
+    # Legacy: outcome string in trigger root or preconditions sub-dict
     if "simulation_outcome" in trigger:
         outcome = str(trigger.get("simulation_outcome", ""))
     elif isinstance(trigger.get("preconditions", {}), dict):
@@ -6676,6 +6691,224 @@ async def confirm_workspace_target_resolution(
         "status": row.status,
         "policy_outcome": row.policy_outcome,
         "proposal_id": proposal.id,
+    }
+
+
+@router.post("/targets/{target_resolution_id}/simulate")
+async def simulate_workspace_target(
+    target_resolution_id: int,
+    payload: WorkspaceTargetSimulateRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """
+    Run safe-reach simulation for a directed target resolution.
+
+    Computes reachability and collision risk using the safe_reach_simulation_service,
+    persists a WorkspaceReachSimulation record, optionally updates any linked
+    WorkspaceActionPlan simulation fields, and returns a structured result with
+    blocked_reason and recovery_action when the gate does not pass.
+    """
+    target = await db.get(WorkspaceTargetResolution, target_resolution_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="workspace target resolution not found")
+
+    # Resolve zone hazard level
+    zone_name = str(target.requested_zone or "").strip()
+    mapped_zone = _normalize_zone_for_map(zone_name)
+    zone_row: WorkspaceZone | None = (
+        (
+            await db.execute(
+                select(WorkspaceZone).where(WorkspaceZone.zone_name == mapped_zone)
+            )
+        )
+        .scalars()
+        .first()
+        if mapped_zone
+        else None
+    )
+    zone_hazard_level: int | None = int(zone_row.hazard_level) if zone_row else None
+
+    # Check explicit unsafe_zones list from payload
+    explicit_unsafe = {str(z).strip() for z in payload.unsafe_zones if z}
+    if mapped_zone and mapped_zone in explicit_unsafe:
+        zone_hazard_level = max(zone_hazard_level or 0, 1)
+
+    # Resolve target object status
+    related_object: WorkspaceObjectMemory | None = (
+        await db.get(WorkspaceObjectMemory, target.related_object_id)
+        if target.related_object_id
+        else None
+    )
+    target_object_status = str(related_object.status) if related_object else "active"
+
+    # Collect obstacles in target zone (active, high-confidence, not the target)
+    nearby_objects: list[dict] = []
+    if zone_name:
+        candidates = (
+            (
+                await db.execute(
+                    select(WorkspaceObjectMemory).where(
+                        WorkspaceObjectMemory.zone == zone_name,
+                        WorkspaceObjectMemory.status == "active",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        target_obj_id = target.related_object_id
+        for item in candidates:
+            if target_obj_id and item.id == target_obj_id:
+                continue
+            if item.confidence < 0.8:
+                continue
+            nearby_objects.append(
+                {
+                    "id": item.id,
+                    "canonical_name": item.canonical_name,
+                    "zone": item.zone,
+                    "status": item.status,
+                    "confidence": item.confidence,
+                }
+            )
+
+    # Run simulation
+    sim_result = _run_safe_reach_simulation(
+        target_zone=zone_name,
+        target_object_status=target_object_status,
+        target_confidence=float(target.confidence),
+        zone_hazard_level=zone_hazard_level,
+        safety_envelope=payload.safety_envelope,
+        nearby_objects=nearby_objects,
+        collision_risk_threshold=payload.collision_risk_threshold,
+    )
+
+    # Persist WorkspaceReachSimulation record
+    sim_record = WorkspaceReachSimulation(
+        target_resolution_id=target_resolution_id,
+        target_zone=zone_name,
+        simulation_outcome=sim_result.simulation_outcome,
+        simulation_status=sim_result.simulation_status,
+        simulation_gate_passed=sim_result.simulation_gate_passed,
+        reachability_result=sim_result.reachability.reason,
+        reachability_confidence=sim_result.reachability.confidence,
+        collision_risk_score=sim_result.collision_risk.risk_score,
+        blocked_reason=sim_result.blocked_reason,
+        recovery_action=sim_result.recovery_action,
+        simulation_json={
+            **sim_result.simulation_json,
+            "simulated_by": payload.actor,
+            "simulate_reason": payload.reason,
+            "simulated_at": datetime.now(timezone.utc).isoformat(),
+        },
+        actor=payload.actor,
+        source="target_simulate",
+        metadata_json=payload.metadata_json,
+    )
+    db.add(sim_record)
+    await db.flush()  # get sim_record.id before commit
+
+    # If a WorkspaceActionPlan exists for this target, update its simulation fields too.
+    linked_plan: WorkspaceActionPlan | None = (
+        (
+            await db.execute(
+                select(WorkspaceActionPlan)
+                .where(WorkspaceActionPlan.target_resolution_id == target_resolution_id)
+                .order_by(WorkspaceActionPlan.id.desc())
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if linked_plan and linked_plan.status not in {"queued", "rejected"}:
+        linked_plan.simulation_outcome = sim_result.plan_outcome
+        linked_plan.simulation_status = "completed"
+        linked_plan.simulation_gate_passed = sim_result.simulation_gate_passed
+        linked_plan.simulation_json = {
+            **sim_result.simulation_json,
+            "simulated_by": payload.actor,
+            "simulate_reason": payload.reason,
+            "simulated_at": datetime.now(timezone.utc).isoformat(),
+            "reach_simulation_id": sim_record.id,
+        }
+        sim_record.action_plan_id = linked_plan.id
+
+    # Update linked proposals' trigger_json with gate result so
+    # _autonomy_simulation_safe can read it without a DB query.
+    linked_proposals = (
+        (
+            await db.execute(
+                select(WorkspaceProposal).where(
+                    WorkspaceProposal.related_object_id == target.related_object_id
+                    if target.related_object_id
+                    else WorkspaceProposal.id == -1  # no match
+                )
+            )
+        )
+        .scalars()
+        .all()
+        if target.related_object_id
+        else []
+    )
+    for proposal in linked_proposals:
+        if proposal.status in {"accepted", "rejected"}:
+            continue
+        existing_trigger = proposal.trigger_json if isinstance(proposal.trigger_json, dict) else {}
+        proposal.trigger_json = {
+            **existing_trigger,
+            "simulation_gate_passed": sim_result.simulation_gate_passed,
+            "simulation_outcome": sim_result.plan_outcome,
+            "reach_simulation_id": sim_record.id,
+        }
+        flag_modified(proposal, "trigger_json")
+
+    await write_journal(
+        db,
+        actor=payload.actor,
+        action="workspace_target_simulate",
+        target_type="workspace_target_resolution",
+        target_id=str(target_resolution_id),
+        summary=(
+            f"Safe-reach simulation for target {target_resolution_id}: "
+            f"{sim_result.simulation_outcome} (gate={'passed' if sim_result.simulation_gate_passed else 'blocked'})"
+        ),
+        metadata_json={
+            "outcome": sim_result.simulation_outcome,
+            "gate_passed": sim_result.simulation_gate_passed,
+            "collision_risk": sim_result.collision_risk.risk_score,
+            "collision_risk_threshold": payload.collision_risk_threshold,
+            "blocked_reason": sim_result.blocked_reason,
+            "recovery_action": sim_result.recovery_action,
+            "reach_simulation_id": sim_record.id,
+        },
+    )
+
+    await db.commit()
+    await db.refresh(sim_record)
+
+    return {
+        "target_resolution_id": target_resolution_id,
+        "reach_simulation_id": sim_record.id,
+        "simulation_outcome": sim_result.simulation_outcome,
+        "plan_outcome": sim_result.plan_outcome,
+        "simulation_status": sim_result.simulation_status,
+        "simulation_gate_passed": sim_result.simulation_gate_passed,
+        "blocked_reason": sim_result.blocked_reason,
+        "recovery_action": sim_result.recovery_action,
+        "reachability": {
+            "reachable": sim_result.reachability.reachable,
+            "confidence": sim_result.reachability.confidence,
+            "reason": sim_result.reachability.reason,
+        },
+        "collision_risk": {
+            "risk_score": sim_result.collision_risk.risk_score,
+            "obstacle_count": sim_result.collision_risk.obstacle_count,
+            "obstacle_names": sim_result.collision_risk.obstacle_names,
+            "warnings": sim_result.collision_risk.warnings,
+            "blocked_vectors": sim_result.collision_risk.blocked_vectors,
+        },
+        "simulation": sim_record.simulation_json,
+        "action_plan_id": linked_plan.id if linked_plan else None,
     }
 
 

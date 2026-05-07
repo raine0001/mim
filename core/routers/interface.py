@@ -16,6 +16,7 @@ from core.interface_service import (
     upsert_interface_session,
 )
 from core.journal import write_journal
+from core.primitive_request_recovery_service import create_primitive_request_recovery
 from core.schemas import (
     InterfaceApprovalRequest,
     InterfaceMessageCreateRequest,
@@ -116,6 +117,48 @@ async def append_interface_message_endpoint(
         db=db,
     )
 
+    recovery_request = None
+    recovery_message = None
+    if message.direction == "inbound" and message.role == "operator":
+        recovery_request = create_primitive_request_recovery(
+            session_key=session.session_key,
+            message_id=int(message.id),
+            content=message.content,
+            actor=payload.actor,
+        )
+        session.context_json = {
+            **(session.context_json if isinstance(session.context_json, dict) else {}),
+            "active_request_id": recovery_request["request_id"],
+            "active_objective_id": recovery_request["objective_id"],
+            "last_decision_code": str(recovery_request["decision"].get("code") or "").strip(),
+        }
+        session.metadata_json = {
+            **(session.metadata_json if isinstance(session.metadata_json, dict) else {}),
+            "last_request_id": recovery_request["request_id"],
+        }
+        await db.flush()
+        _, recovery_message = await append_interface_message(
+            session_key=session.session_key,
+            actor="mim",
+            source="primitive_request_recovery",
+            direction="outbound",
+            role="mim",
+            content=(
+                f"Decision {recovery_request['decision']['code']}: "
+                f"{recovery_request['decision']['detail']} "
+                f"request_id={recovery_request['request_id']}"
+            ),
+            parsed_intent="primitive_request_decision",
+            confidence=1.0,
+            requires_approval=False,
+            metadata_json={
+                "request_id": recovery_request["request_id"],
+                "objective_id": recovery_request["objective_id"],
+                "decision": recovery_request["decision"],
+            },
+            db=db,
+        )
+
     await write_journal(
         db,
         actor=payload.actor,
@@ -153,6 +196,8 @@ async def append_interface_message_endpoint(
     return {
         "session": to_interface_session_out(session),
         "message": to_interface_message_out(message),
+        "decision_message": to_interface_message_out(recovery_message) if recovery_message is not None else None,
+        "recovery_request": recovery_request,
         "auto_approval": to_interface_approval_out(auto_approval) if auto_approval is not None else None,
     }
 
