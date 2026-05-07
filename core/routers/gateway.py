@@ -13658,9 +13658,15 @@ async def _store_normalized(payload: NormalizedInputCreate, db: AsyncSession) ->
             event.raw_input
         )
 
-        if event.source == "text" and not continuation_validation_request and not _looks_like_bounded_choice_decision_prompt(
-            event.raw_input
-        ) and (
+        if (
+            event.source == "text"
+            and not route_console_text_input(
+                event.raw_input,
+                event.parsed_intent,
+            ).capability_name
+            and not continuation_validation_request
+            and not _looks_like_bounded_choice_decision_prompt(event.raw_input)
+            and (
             _looks_like_bounded_warning_care_request(
                 event.raw_input,
                 event.parsed_intent,
@@ -13695,6 +13701,7 @@ async def _store_normalized(payload: NormalizedInputCreate, db: AsyncSession) ->
                 event.raw_input,
                 event.parsed_intent,
                 event.safety_flags,
+            )
             )
         ):
             if _looks_like_bounded_warning_care_request(
@@ -14042,10 +14049,17 @@ async def _store_normalized(payload: NormalizedInputCreate, db: AsyncSession) ->
                         or ""
                     ).strip()
                 is_conversation_override = False
-        elif event.source == "text" and _looks_like_bounded_implementation_request(
-            event.raw_input,
-            event.parsed_intent,
-            event.safety_flags,
+        elif (
+            event.source == "text"
+            and not route_console_text_input(
+                event.raw_input,
+                event.parsed_intent,
+            ).capability_name
+            and _looks_like_bounded_implementation_request(
+                event.raw_input,
+                event.parsed_intent,
+                event.safety_flags,
+            )
         ):
             initiative_run = await _maybe_dispatch_authorized_text_initiative(
                 event=event,
