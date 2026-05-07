@@ -1,0 +1,28 @@
+{
+  "thresholds": {
+    "high": 0.85,
+    "medium": 0.6
+  },
+  "allow_auto_propose": true,
+  "auto_execute_safe_intents": [
+    "observe_workspace"
+  ],
+  "blocked_capability_implications": [
+    "arm_movement",
+    "unsafe_motion"
+  ],
+  "label_overrides": {
+    "unknown_object": {
+      "requires_confirmation": true,
+      "escalation_reasons": [
+        "unknown_object"
+      ]
+    },
+    "ambiguous_label": {
+      "requires_confirmation": true,
+      "escalation_reasons": [
+        "ambiguous_label"
+      ]
+    }
+  }
+}

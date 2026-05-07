@@ -1,0 +1,14 @@
+[Unit]
+Description=MIM Watch Objective 75 Milestone Summaries (User)
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/testpilot/mim
+Environment=POLL_SECONDS=20
+ExecStart=/home/testpilot/mim/scripts/watch_objective75_milestone_summary.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

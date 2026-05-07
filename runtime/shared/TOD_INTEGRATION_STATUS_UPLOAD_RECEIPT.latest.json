@@ -1,0 +1,26 @@
+{
+    "generated_at":  "2026-03-12T21:01:22.8028777Z",
+    "source":  "tod-integration-status-upload-receipt-v1",
+    "local":  {
+                  "path":  "E:\\TOD\\shared_state\\integration_status.json",
+                  "bytes":  6617,
+                  "sha256":  "1AE020A4B773D4EC5A7F8163C10FACC059BCD8AF7B0BB2C16F1FE087A9011018"
+              },
+    "remote":  {
+                   "path":  "/home/testpilot/mim/runtime/shared/TOD_INTEGRATION_STATUS.latest.json",
+                   "bytes":  6617,
+                   "sha256":  "1AE020A4B773D4EC5A7F8163C10FACC059BCD8AF7B0BB2C16F1FE087A9011018"
+               },
+    "verification":  {
+                         "bytes_match":  true,
+                         "sha_match":  true,
+                         "uploaded":  true
+                     },
+    "integration_snapshot":  {
+                                 "generated_at":  "2026-03-12T20:39:20.4738758Z",
+                                 "alignment_status":  "mismatch",
+                                 "tod_current_objective":  "16",
+                                 "mim_objective_active":  "74",
+                                 "alignment_source":  "handshake_packet"
+                             }
+}

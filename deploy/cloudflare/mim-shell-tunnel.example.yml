@@ -1,0 +1,10 @@
+tunnel: YOUR_TUNNEL_UUID
+credentials-file: /home/testpilot/.cloudflared/mim-travel-shell.json
+
+ingress:
+  - hostname: mim.yourdomain.com
+    service: http://127.0.0.1:18001
+    originRequest:
+      httpHostHeader: 127.0.0.1:18001
+      noTLSVerify: true
+  - service: http_status:404

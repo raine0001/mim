@@ -1,0 +1,14 @@
+[Unit]
+Description=MIM Watch Shared Triggers (User)
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/testpilot/mim
+Environment=POLL_SECONDS=2
+ExecStart=/home/testpilot/mim/scripts/watch_shared_triggers.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

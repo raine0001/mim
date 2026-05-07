@@ -1,0 +1,20 @@
+[Unit]
+Description=MIM Cloudflared Travel Shell Tunnel
+After=network-online.target mim-mobile-web.service
+Wants=network-online.target mim-mobile-web.service
+ConditionPathExists=/home/testpilot/.local/bin/cloudflared
+ConditionPathExists=/home/testpilot/mim/deploy/cloudflare/mim-shell-tunnel.yml
+
+[Service]
+Type=simple
+WorkingDirectory=/home/testpilot/mim
+Environment=PATH=/home/testpilot/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=MIM_CLOUDFLARED_BIN=/home/testpilot/.local/bin/cloudflared
+Environment=MIM_CLOUDFLARED_CONFIG=/home/testpilot/mim/deploy/cloudflare/mim-shell-tunnel.yml
+Environment=MIM_CLOUDFLARED_TUNNEL_NAME=mim-travel-shell
+ExecStart=/usr/bin/env bash /home/testpilot/mim/scripts/run_cloudflared_tunnel.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

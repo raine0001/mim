@@ -1,0 +1,32 @@
+[
+    {
+        "profile_id": "concise_user",
+        "description": "Short direct turns with minimal filler",
+        "style": "concise",
+        "default_confidence": 0.92
+    },
+    {
+        "profile_id": "rambling_user",
+        "description": "Longer turns with extra context and mild digressions",
+        "style": "rambling",
+        "default_confidence": 0.84
+    },
+    {
+        "profile_id": "frustrated_user",
+        "description": "Impatient tone and repeated urgency cues",
+        "style": "frustrated",
+        "default_confidence": 0.82
+    },
+    {
+        "profile_id": "uncertain_user",
+        "description": "Hedging language and vague requests",
+        "style": "uncertain",
+        "default_confidence": 0.8
+    },
+    {
+        "profile_id": "typo_heavy_user",
+        "description": "Typing errors and compressed wording",
+        "style": "typo_heavy",
+        "default_confidence": 0.76
+    }
+]

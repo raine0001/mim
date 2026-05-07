@@ -10,7 +10,7 @@ check_target() {
   if [[ "$target" == "prod" ]]; then
     base_url="http://127.0.0.1:8000"
   else
-    base_url="http://127.0.0.1:8001"
+    base_url="http://127.0.0.1:18001"
   fi
 
   curl -fsS "$base_url/health" >/dev/null

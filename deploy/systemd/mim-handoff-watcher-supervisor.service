@@ -1,0 +1,22 @@
+[Unit]
+Description=MIM Handoff Watcher Supervisor
+After=network-online.target mim-handoff-watcher.service
+Wants=network-online.target mim-handoff-watcher.service
+
+[Service]
+Type=simple
+User=testpilot
+Group=testpilot
+WorkingDirectory=/home/testpilot/mim
+Environment=MIM_HANDOFF_ROOT=/home/testpilot/mim/handoff
+Environment=MIM_HANDOFF_WATCHER_SERVICE_SCOPE=system
+Environment=MIM_HANDOFF_WATCHER_SERVICE_NAME=mim-handoff-watcher.service
+Environment=MIM_HANDOFF_RECOVERY_POLL_SECONDS=10
+Environment=MIM_HANDOFF_RECOVERY_COOLDOWN_SECONDS=60
+Environment=MIM_HANDOFF_RECOVERY_STARTUP_GRACE_SECONDS=3
+ExecStart=/home/testpilot/mim/.venv/bin/python /home/testpilot/mim/scripts/watch_handoff_watcher_supervisor.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

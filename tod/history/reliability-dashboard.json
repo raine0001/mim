@@ -1,6 +1,6 @@
 {
-  "generated_at": "2026-03-10T18:55:58.168433+00:00",
-  "window_runs": 2,
+  "generated_at": "2026-04-17T16:03:49.484767+00:00",
+  "window_runs": 4,
   "engine_success_rate": 1.0,
   "engine_retry_rate": 0.0,
   "guardrail_block_rate": 0.0,

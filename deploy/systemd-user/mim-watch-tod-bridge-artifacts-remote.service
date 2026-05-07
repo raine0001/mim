@@ -1,0 +1,14 @@
+[Unit]
+Description=MIM Watch TOD Bridge Artifacts Remote Sync (User)
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/testpilot/mim
+Environment=POLL_SECONDS=15
+ExecStart=/home/testpilot/mim/scripts/watch_tod_bridge_artifacts_remote.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

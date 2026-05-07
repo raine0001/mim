@@ -1,0 +1,16 @@
+[Unit]
+Description=MIM Mobile Web Runtime
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/testpilot/mim
+Environment=MIM_BIND_HOST=0.0.0.0
+Environment=MIM_PORT=18001
+ExecStart=/usr/bin/env bash /home/testpilot/mim/scripts/run_mim_mobile_web.sh
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

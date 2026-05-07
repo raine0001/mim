@@ -1,0 +1,17 @@
+[Unit]
+Description=MIM Watch TOD Console Probe
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=testpilot
+Group=testpilot
+WorkingDirectory=/home/testpilot/mim
+Environment=POLL_SECONDS=60
+ExecStart=/home/testpilot/mim/scripts/watch_tod_console_probe.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

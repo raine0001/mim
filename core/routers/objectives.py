@@ -19,6 +19,11 @@ async def create_objective(payload: ObjectiveCreate, db: AsyncSession = Depends(
         constraints_json=payload.constraints,
         success_criteria=payload.success_criteria,
         state=payload.status,
+        owner=payload.owner,
+        execution_mode=payload.execution_mode,
+        auto_continue=payload.auto_continue,
+        boundary_mode=payload.boundary_mode,
+        metadata_json=payload.metadata_json,
     )
     db.add(objective)
     await db.flush()
@@ -40,6 +45,11 @@ async def create_objective(payload: ObjectiveCreate, db: AsyncSession = Depends(
         "constraints": objective.constraints_json,
         "success_criteria": objective.success_criteria,
         "status": objective.state,
+        "owner": objective.owner,
+        "execution_mode": objective.execution_mode,
+        "auto_continue": objective.auto_continue,
+        "boundary_mode": objective.boundary_mode,
+        "metadata_json": objective.metadata_json,
         "created_at": objective.created_at,
     }
 
@@ -56,6 +66,11 @@ async def list_objectives(db: AsyncSession = Depends(get_db)) -> list[dict]:
             "constraints": item.constraints_json,
             "success_criteria": item.success_criteria,
             "status": item.state,
+            "owner": item.owner,
+            "execution_mode": item.execution_mode,
+            "auto_continue": item.auto_continue,
+            "boundary_mode": item.boundary_mode,
+            "metadata_json": item.metadata_json,
             "created_at": item.created_at,
         }
         for item in rows

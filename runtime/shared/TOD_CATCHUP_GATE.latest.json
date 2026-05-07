@@ -1,0 +1,28 @@
+{
+  "generated_at": "2026-03-16T16:20:10Z",
+  "type": "tod_catchup_gate_signal_v1",
+  "objective": 76,
+  "promotion_ready": false,
+  "gate_pass": false,
+  "confidence": "medium",
+  "streak": {
+    "pass_streak": 0,
+    "target": 3
+  },
+  "evidence": {
+    "integration_status_file": "/home/testpilot/mim/runtime/shared/TOD_INTEGRATION_STATUS.latest.json",
+    "catchup_status_file": "/home/testpilot/mim/runtime/logs/tod_catchup_status.latest.json"
+  },
+  "details": {
+    "compatible": true,
+    "aligned": true,
+    "refresh_ok": true,
+    "fresh": false,
+    "alignment_status": "in_sync",
+    "tod_current_objective": "75",
+    "mim_objective_active": "75",
+    "refresh_failure_reason": "",
+    "freshness_age_seconds": 8188,
+    "freshness_max_age_seconds": 900
+  }
+}

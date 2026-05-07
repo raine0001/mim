@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+if command -v systemctl >/dev/null 2>&1 \
+  && systemctl --user show-environment >/dev/null 2>&1 \
+  && systemctl --user cat mim-mobile-web.service >/dev/null 2>&1; then
+  exec systemctl --user restart mim-mobile-web.service
+else
+  pkill -f 'uvicorn core.app:app.*18001' 2>/dev/null || true
+  exec "$ROOT_DIR/scripts/run_mim_mobile_web.sh"
+fi

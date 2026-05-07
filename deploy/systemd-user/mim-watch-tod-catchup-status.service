@@ -1,0 +1,18 @@
+[Unit]
+Description=MIM Watch TOD Catch-up Status (User)
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/testpilot/mim
+Environment=POLL_SECONDS=30
+Environment=MAX_STATUS_AGE_SECONDS=900
+Environment=CONSECUTIVE_PASS_TARGET=3
+Environment=AUTO_REBUILD_INTEGRATION_STATUS=1
+Environment=AUTO_RECONCILE_TASK_RESULT=1
+ExecStart=/home/testpilot/mim/scripts/watch_tod_catchup_status.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

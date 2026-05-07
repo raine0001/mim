@@ -10,3 +10,52 @@ node_modules/
 tod-tests-summary.json
 tod/state/
 runtime/prod/backups/
+*.log
+coverage/
+state.json
+runtime/**/state.json
+runtime/mim-shell-profile/
+runtime/shared/.bridge_sequence_state.json
+runtime/shared/.bridge_sequence_state.lock
+runtime/shared/.shared_trigger_state
+runtime/shared/SHARED_TRIGGER_EVENTS.latest.jsonl
+runtime/shared/TOD_TO_MIM_TRIGGER.latest.json
+runtime/shared/.tod_liveness_state
+
+# ── Runtime artifacts (live state, not source) ──────────────────────────────
+runtime/shared/
+runtime/diagnostics/
+runtime/history/
+runtime/phase1_browser_proof/
+runtime/phase2_browser_proof/
+runtime/prod/data/
+runtime/test/data/
+runtime/restore/
+runtime/formal_program_drive_response.json
+runtime/formal_program_user_intent.txt
+runtime/post_formal_program.py
+runtime/recover_objective_2900_completion_once.py
+
+# ── Handoff inbox (live coordination, not source) ────────────────────────────
+handoff/
+
+# ── Context export artifacts ─────────────────────────────────────────────────
+MIM_CONTEXT_EXPORT.latest.json
+MIM_CONTEXT_EXPORT.latest.yaml
+phase2_stability_report.json
+
+# ── Editor / tooling state ───────────────────────────────────────────────────
+.vscode/
+.wrangler/
+
+# ── Backup debris (*.bak*, *.bak) ────────────────────────────────────────────
+*.bak
+*.bak_*
+*.bak-*
+*.bak.*
+
+# ── Miscellaneous top-level artifacts ────────────────────────────────────────
+MIM_AUTHORITY_CONSUMER_MAP.json
+MIM_AUTHORITY_CONSUMER_MAP.md
+SHARED_LINEAGE_CONTRACT_PROPOSAL.json
+

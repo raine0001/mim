@@ -1,0 +1,15 @@
+{
+  "version": "1.0",
+  "source": "MIM",
+  "target": "TOD",
+  "generated_at": "2026-03-16T16:01:15Z",
+  "objective_id": "objective-75",
+  "correlation_id": "obj75-task3139",
+  "task_id": "objective-75-task-3139",
+  "decision": "accepted",
+  "decision_rationale": "Automated overnight checkpoint: strict suite PASS and objective gate PASS.",
+  "required_followups": [
+    "Proceed to next overnight cycle"
+  ],
+  "closeout_notes": "Auto-accepted by overnight runner"
+}

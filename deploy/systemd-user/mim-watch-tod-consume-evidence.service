@@ -1,0 +1,15 @@
+[Unit]
+Description=MIM Watch TOD Consume Evidence (User)
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/testpilot/mim
+Environment=POLL_SECONDS=5
+Environment=WATCH_WINDOW_SECONDS=900
+ExecStart=/home/testpilot/mim/scripts/watch_tod_consume_evidence.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

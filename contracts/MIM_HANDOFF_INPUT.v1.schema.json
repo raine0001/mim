@@ -1,0 +1,82 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "MIM_HANDOFF_INPUT.v1.schema.json",
+  "title": "MIM Handoff Input v1",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema_version",
+    "handoff_id",
+    "created_at",
+    "source",
+    "topic",
+    "summary",
+    "requested_outcome",
+    "constraints",
+    "next_bounded_steps",
+    "bounded_actions_allowed",
+    "status"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "mim-handoff-input-v1"
+    },
+    "handoff_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "source": {
+      "type": "string",
+      "minLength": 1
+    },
+    "topic": {
+      "type": "string",
+      "minLength": 1
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1
+    },
+    "requested_outcome": {
+      "type": "string",
+      "minLength": 1
+    },
+    "constraints": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "next_bounded_steps": {
+      "type": "array",
+      "items": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "object"
+          }
+        ]
+      }
+    },
+    "bounded_actions_allowed": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "pending",
+        "ready",
+        "new"
+      ]
+    }
+  }
+}

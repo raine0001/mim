@@ -1,0 +1,98 @@
+{
+  "objective_id": "objective-107",
+  "title": "Remote-authoritative MIM ARM command attribution",
+  "recorded_at": "2026-04-06T15:55:05.353601Z",
+  "runtime": {
+    "base_url": "http://127.0.0.1:18001",
+    "arm_base_url": "http://192.168.1.90:5000",
+    "remote_host": "192.168.1.90",
+    "remote_command_status": "/home/testpilot/mim/runtime/shared/TOD_MIM_COMMAND_STATUS.latest.json"
+  },
+  "request": {
+    "dispatch_identifier": "objective-97-task-mim-arm-safe-home-20260406155438",
+    "dispatch_identifier_kind": "bridge_request_id",
+    "request_id": "objective-97-task-mim-arm-safe-home-20260406155438",
+    "correlation_id": "obj97-mim-arm-safe-home-20260406155438",
+    "dispatch_generated_at": "2026-04-06T15:54:38Z",
+    "publish_status_code": 200,
+    "execution_id": 207867,
+    "input_event_id": 4355703,
+    "resolution_id": 4351117
+  },
+  "proof_chain": {
+    "request_submitted": true,
+    "command_dispatched": true,
+    "remote_publish_succeeded": true,
+    "host_received_same_request": true,
+    "host_executed_same_request": true,
+    "result_attributed_to_same_request": true
+  },
+  "acceptance_boundary": {
+    "status": "met",
+    "criteria": [
+      "aligned_local_attribution",
+      "clarified_remote_surface_semantics",
+      "readiness_surface_not_treated_as_dispatch_consumption_proof"
+    ],
+    "aligned_local_attribution": true,
+    "clarified_remote_surface_semantics": true,
+    "readiness_surface_not_treated_as_dispatch_consumption_proof": true,
+    "boundary_statement": "Objective 107 is complete once local request, ACK, RESULT, and host-state attribution align; the remote command-status surface is explicitly classified by role; and readiness files are no longer interpreted as bounded dispatch-consumption proof."
+  },
+  "host_side_evidence": {
+    "remote_command_status_before": {
+      "request_id": "dispatch-attribution-refresh-1775490864",
+      "task_id": "dispatch-attribution-refresh-1775490864",
+      "status": "ready",
+      "action": "safe_home",
+      "generated_at": "2026-04-06T15:54:24.906177Z"
+    },
+    "remote_command_status_after": {
+      "request_id": "dispatch-attribution-refresh-1775490877",
+      "task_id": "dispatch-attribution-refresh-1775490877",
+      "status": "ready",
+      "action": "safe_home",
+      "generated_at": "2026-04-06T15:54:37.382110Z"
+    },
+    "remote_match_summary": {
+      "trigger_saw_fresh_dispatch_identifier": false,
+      "consumed_fresh_dispatch_identifier": false,
+      "authoritative_fresh_dispatch_identifier_matches": [],
+      "surface_kind": "readiness_preflight",
+      "dispatch_identifier_expected_on_surface": false,
+      "supports_dispatch_consumption_proof": false,
+      "status": "reachable_readiness_surface",
+      "reason": "The authoritative remote command-status surface is now directly readable from this shell. It reflects readiness refresh attribution rather than the bounded safe_home dispatch identifier, so fresh dispatch consumption is proven by the aligned remote publication boundary, synced authoritative ACK and RESULT, and refreshed host-state attribution surfaces."
+    },
+    "arm_state_before": {
+      "current_pose": [90, 90, 90, 90, 90, 90],
+      "commands_total": 10355,
+      "acks_total": 10355,
+      "last_command_sent": "MOVE 5 90",
+      "last_command_sent_at": "2026-04-05T16:54:04.891151+00:00",
+      "request_id": "objective-97-task-mim-arm-safe-home-20260405164802",
+      "task_id": "objective-97-task-mim-arm-safe-home-20260405164802",
+      "correlation_id": "obj97-mim-arm-safe-home-20260405164802"
+    },
+    "arm_state_after": {
+      "current_pose": [90, 90, 90, 90, 90, 90],
+      "commands_total": 10361,
+      "acks_total": 10361,
+      "last_command_sent": "MOVE 5 90",
+      "last_command_sent_at": "2026-04-06T15:54:59.294340+00:00",
+      "request_id": "objective-97-task-mim-arm-safe-home-20260406155438",
+      "task_id": "objective-97-task-mim-arm-safe-home-20260406155438",
+      "correlation_id": "obj97-mim-arm-safe-home-20260406155438"
+    }
+  },
+  "final_classification": {
+    "status": "complete_remote_authoritative_attribution",
+    "reason": "The 2026-04-06 proof run completed with remote command-status reachable from this shell, remote publication boundary aligned to the fresh dispatch identifier, synced authoritative ACK and RESULT aligned to the same request and task ids, and refreshed host-state attribution aligned to the same request, task, and correlation ids.",
+    "root_gap": "None. The previous shell-level SSH access blocker is resolved."
+  },
+  "artifacts": {
+    "raw_report": "runtime/diagnostics/mim_arm_dispatch_attribution_check.objective-97-task-mim-arm-safe-home-20260406155438.json",
+    "baseline": "docs/MIM_TOD_SYSTEM_BASELINE.v1.md",
+    "golden_run": "docs/MIM_TOD_GOLDEN_RUN_2026-04-04.json"
+  }
+}

@@ -1,0 +1,10 @@
+tunnel: 1e885c72-e6fb-48cd-b48c-f9bc8ba958e1
+credentials-file: /home/testpilot/.cloudflared/mim-travel-shell.json
+
+ingress:
+  - hostname: mim.mimtod.com
+    service: http://127.0.0.1:18001
+    originRequest:
+      httpHostHeader: 127.0.0.1:18001
+      noTLSVerify: true
+  - service: http_status:404
