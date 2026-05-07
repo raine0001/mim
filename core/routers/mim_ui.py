@@ -8403,10 +8403,8 @@ async def mim_ui_page(request: Request, db: AsyncSession = Depends(get_db)):
         if (chatInput && interactionMode !== 'voice') {
           chatInput.value = '';
         }
-        await refreshState();
-        if (!latestUiState?.chat_thread) {
-          appendChatMessage('mim', summarizeTextResolution(result));
-        }
+        appendChatMessage('mim', summarizeTextResolution(result));
+        refreshState().catch(() => {});
       } catch (error) {
         const detail = error && error.message ? String(error.message) : 'request_failed';
         appendChatMessage('mim', `Text chat is temporarily unavailable (${detail}).`);
