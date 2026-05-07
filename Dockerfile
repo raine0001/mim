@@ -10,6 +10,7 @@ COPY . /app
 RUN pip install --no-cache-dir \
     fastapi \
     uvicorn \
+    python-multipart \
     pydantic \
     pydantic-settings \
     python-dotenv \

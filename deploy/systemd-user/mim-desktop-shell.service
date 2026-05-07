@@ -1,6 +1,7 @@
 [Unit]
 Description=MIM Desktop Shell
-After=default.target
+After=mim-mobile-web.service
+Wants=mim-mobile-web.service
 
 [Service]
 Type=simple

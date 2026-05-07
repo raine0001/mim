@@ -4,14 +4,14 @@ This is a native desktop shell for MIM interaction.
 
 ## What it does
 
-- Launches a dedicated desktop app window for MIM (`http://127.0.0.1:8001/mim` by default).
+- Launches a dedicated desktop app window for MIM (`http://127.0.0.1:18001/mim` by default).
 - Grants camera/microphone/media permissions at the app shell level.
 - Runs independently from a normal browser tab workflow.
 
 ## Requirements
 
 - Node.js 20+
-- MIM backend reachable at `http://127.0.0.1:8001`
+- MIM backend reachable at `http://127.0.0.1:18001`
 
 ## Run
 
@@ -26,7 +26,7 @@ Optional custom URL:
 ```bash
 cd desktop/mim-shell
 npm install
-MIM_UI_URL=http://127.0.0.1:8001/mim npm start
+MIM_UI_URL=http://127.0.0.1:18001/mim npm start
 ```
 
 ## Notes

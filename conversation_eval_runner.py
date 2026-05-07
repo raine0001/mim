@@ -11,9 +11,11 @@ import argparse
 import json
 import os
 import random
+import socket
 import subprocess
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from dataclasses import dataclass
@@ -28,6 +30,13 @@ DEFAULT_STAGE_TARGETS = {
     "stress": 500,
     "regression": 1000,
 }
+
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 60
+DEFAULT_REQUEST_RETRIES = 2
+DEFAULT_STATE_POLL_ATTEMPTS = 4
+DEFAULT_STATE_POLL_DELAY_SECONDS = 0.2
+DEFAULT_INTERFACE_POLL_DELAY_SECONDS = 0.5
+DEFAULT_TIMEOUT_RECOVERY_MAX_SECONDS = 45
 
 
 @dataclass
@@ -48,6 +57,8 @@ class EvalScenarioResult:
     scenario_id: str
     profile_id: str
     bucket: str
+    category: str
+    scenario_split: str
     score: dict[str, float]
     failures: list[str]
     turns: list[EvalTurn]
@@ -63,7 +74,10 @@ def _git_sha(repo_root: Path) -> str:
 
 
 def _post_json(
-    base_url: str, path: str, payload: dict[str, Any], timeout_seconds: int = 20
+    base_url: str,
+    path: str,
+    payload: dict[str, Any],
+    timeout_seconds: int = DEFAULT_REQUEST_TIMEOUT_SECONDS,
 ) -> tuple[int, dict[str, Any]]:
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
@@ -72,43 +86,215 @@ def _post_json(
         method="POST",
         headers={"Content-Type": "application/json"},
     )
+    return _request_json(req, timeout_seconds=timeout_seconds)
+
+
+def _decode_json_payload(raw: str) -> dict[str, Any]:
     try:
-        with urllib.request.urlopen(req, timeout=timeout_seconds) as response:
-            raw = response.read().decode("utf-8")
-            parsed = json.loads(raw) if raw else {}
-            return int(response.status), parsed if isinstance(parsed, dict) else {
-                "data": parsed
-            }
-    except urllib.error.HTTPError as exc:
-        raw = exc.read().decode("utf-8")
         parsed = json.loads(raw) if raw else {}
-        if isinstance(parsed, dict):
-            return int(exc.code), parsed
-        return int(exc.code), {"data": parsed}
+    except json.JSONDecodeError:
+        return {"raw": raw}
+    return parsed if isinstance(parsed, dict) else {"data": parsed}
+
+
+def _request_json(
+    req: urllib.request.Request,
+    *,
+    timeout_seconds: int,
+    retries: int = DEFAULT_REQUEST_RETRIES,
+) -> tuple[int, dict[str, Any]]:
+    last_error: Exception | None = None
+    for attempt in range(max(0, retries) + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout_seconds) as response:
+                raw = response.read().decode("utf-8")
+                return int(response.status), _decode_json_payload(raw)
+        except urllib.error.HTTPError as exc:
+            raw = exc.read().decode("utf-8")
+            return int(exc.code), _decode_json_payload(raw)
+        except (urllib.error.URLError, TimeoutError, socket.timeout) as exc:
+            last_error = exc
+            if attempt >= max(0, retries):
+                break
+            time.sleep(min(1.0, 0.25 * (attempt + 1)))
+
+    return 599, {
+        "error": str(last_error or "request failed"),
+        "transport_error_type": type(last_error).__name__ if last_error else "unknown",
+    }
 
 
 def _get_json(
-    base_url: str, path: str, timeout_seconds: int = 20
+    base_url: str,
+    path: str,
+    timeout_seconds: int = DEFAULT_REQUEST_TIMEOUT_SECONDS,
 ) -> tuple[int, dict[str, Any]]:
     req = urllib.request.Request(f"{base_url}{path}", method="GET")
-    try:
-        with urllib.request.urlopen(req, timeout=timeout_seconds) as response:
-            raw = response.read().decode("utf-8")
-            parsed = json.loads(raw) if raw else {}
-            return int(response.status), parsed if isinstance(parsed, dict) else {
-                "data": parsed
-            }
-    except urllib.error.HTTPError as exc:
-        raw = exc.read().decode("utf-8")
-        parsed = json.loads(raw) if raw else {}
-        if isinstance(parsed, dict):
-            return int(exc.code), parsed
-        return int(exc.code), {"data": parsed}
+    return _request_json(req, timeout_seconds=timeout_seconds)
+
+
+def _interface_messages_path(session_id: str, *, limit: int = 8) -> str:
+    quoted_session_id = urllib.parse.quote(str(session_id or "").strip(), safe="")
+    return f"/interface/sessions/{quoted_session_id}/messages?limit={max(1, int(limit))}"
+
+
+def _response_text_from_interface_payload(
+    payload: dict[str, Any],
+) -> tuple[str, str, str]:
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return "", "", ""
+
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        content = str(message.get("content") or "").strip()
+        if not content:
+            continue
+        direction = str(message.get("direction") or "").strip().lower()
+        role = str(message.get("role") or "").strip().lower()
+        actor = str(message.get("actor") or "").strip().lower()
+        if direction == "outbound" and (role == "mim" or actor == "mim"):
+            return content, "", content
+
+    return "", "", ""
+
+
+def _poll_interface_response(
+    *,
+    base_url: str,
+    session_id: str,
+    timeout_seconds: int,
+    attempts: int,
+    delay_seconds: float,
+) -> tuple[str, str, str]:
+    normalized_session_id = str(session_id or "").strip()
+    if not normalized_session_id:
+        return "", "", ""
+
+    for attempt in range(max(0, attempts)):
+        if attempt > 0:
+            time.sleep(max(0.0, delay_seconds))
+        status, payload = _get_json(
+            base_url,
+            _interface_messages_path(normalized_session_id),
+            timeout_seconds=timeout_seconds,
+        )
+        if status >= 400:
+            continue
+        response_text, inquiry_prompt, latest_output_text = (
+            _response_text_from_interface_payload(payload)
+        )
+        if response_text or inquiry_prompt or latest_output_text:
+            return response_text, inquiry_prompt, latest_output_text
+
+    return "", "", ""
+
+
+def _timeout_recovery_attempts(timeout_seconds: int) -> int:
+    recovery_window_seconds = min(
+        DEFAULT_TIMEOUT_RECOVERY_MAX_SECONDS,
+        max(DEFAULT_INTERFACE_POLL_DELAY_SECONDS, timeout_seconds * 0.75),
+    )
+    return max(
+        1,
+        int(recovery_window_seconds / DEFAULT_INTERFACE_POLL_DELAY_SECONDS),
+    )
+
+
+def _resolve_turn_response(
+    *,
+    base_url: str,
+    payload: dict[str, Any],
+    timeout_seconds: int,
+    session_id: str = "",
+    allow_timeout_recovery: bool = False,
+) -> tuple[str, str, str]:
+    response_text, inquiry_prompt, latest_output_text = (
+        _response_text_from_gateway_payload(payload)
+    )
+    if response_text or inquiry_prompt or latest_output_text:
+        return response_text, inquiry_prompt, latest_output_text
+
+    response_text, inquiry_prompt, latest_output_text = _poll_interface_response(
+        base_url=base_url,
+        session_id=session_id,
+        timeout_seconds=timeout_seconds,
+        attempts=DEFAULT_STATE_POLL_ATTEMPTS,
+        delay_seconds=DEFAULT_STATE_POLL_DELAY_SECONDS,
+    )
+    if response_text or inquiry_prompt or latest_output_text:
+        return response_text, inquiry_prompt, latest_output_text
+
+    if allow_timeout_recovery:
+        response_text, inquiry_prompt, latest_output_text = _poll_interface_response(
+            base_url=base_url,
+            session_id=session_id,
+            timeout_seconds=timeout_seconds,
+            attempts=_timeout_recovery_attempts(timeout_seconds),
+            delay_seconds=DEFAULT_INTERFACE_POLL_DELAY_SECONDS,
+        )
+        if response_text or inquiry_prompt or latest_output_text:
+            return response_text, inquiry_prompt, latest_output_text
+
+    for attempt in range(DEFAULT_STATE_POLL_ATTEMPTS):
+        if attempt > 0:
+            time.sleep(DEFAULT_STATE_POLL_DELAY_SECONDS)
+        status, state = _get_json(
+            base_url,
+            "/mim/ui/state",
+            timeout_seconds=timeout_seconds,
+        )
+        if status >= 400:
+            continue
+        response_text, inquiry_prompt, latest_output_text = _response_text(state)
+        if response_text or inquiry_prompt or latest_output_text:
+            return response_text, inquiry_prompt, latest_output_text
+
+    return "", "", ""
+
+
+_RELEVANCE_STOPWORDS: frozenset[str] = frozenset({
+    "a", "an", "the", "i", "me", "my", "we", "our", "you", "your", "it", "its",
+    "is", "are", "was", "were", "be", "been", "being", "have", "has", "had",
+    "do", "does", "did", "will", "would", "could", "should", "shall", "can",
+    "may", "might", "must", "to", "of", "in", "for", "on", "with", "at", "by",
+    "from", "as", "or", "and", "but", "if", "that", "this", "these", "those",
+    "what", "which", "who", "whom", "when", "where", "why", "how",
+    "give", "tell", "show", "let", "just", "now", "please", "ok", "okay",
+    "uh", "um", "hmm", "so", "very", "really", "quite", "also",
+    "some", "any", "all", "no", "not", "yes",
+    "one", "two", "three", "get", "go", "out", "up", "about",
+    "right",
+})
+
+# Pure greeting tokens — turns consisting only of these are not content queries
+# and should not be penalised for low token-overlap relevance.
+_GREETING_TOKENS: frozenset[str] = frozenset({
+    "hello", "hi", "hey", "greetings", "howdy", "yo", "sup",
+    "morning", "evening", "afternoon", "hiya", "heya",
+})
+
+# Meta-direction tokens — single-token follow-up instructions that carry no content
+# subject (e.g. "go deeper", "elaborate", "say more").  These should not penalise
+# relevance because any substantive response is topically relevant.
+_META_DIRECTION_TOKENS: frozenset[str] = frozenset({
+    "deeper", "more", "further", "again", "elaborate", "continue",
+    "expand", "explain", "repeat", "simplify", "summarize", "recap",
+    # Positional/qualifier meta-words — e.g. "what should i do first",
+    # "short final recap", "give a brief answer"
+    "first", "short", "brief", "final", "quick", "fast",
+    # Filler/vague social tokens — e.g. "you know", "okay"
+    "know",
+    # Meta-imperative words — e.g. "now answer directly, are you healthy"
+    "answer", "directly",
+})
 
 
 def _tokens(text: str) -> set[str]:
     clean = "".join(ch.lower() if ch.isalnum() or ch.isspace() else " " for ch in text)
     return {token for token in clean.split() if token}
+
 
 
 def _adapt_text(text: str, style: str) -> str:
@@ -141,6 +327,15 @@ def _response_text(state_payload: dict[str, Any]) -> tuple[str, str, str]:
     if latest_output_text and inquiry_prompt:
         lower_latest = latest_output_text.lower()
         lower_inquiry = inquiry_prompt.lower()
+        generic_inquiry_markers = (
+            "objective43 update",
+            "i still need one detail",
+            "i'm missing one detail",
+            "continue with one concrete question or one action",
+            "i am waiting for one concrete request",
+        )
+        if any(marker in lower_inquiry for marker in generic_inquiry_markers):
+            return latest_output_text, inquiry_prompt, latest_output_text
         if lower_inquiry in lower_latest:
             return latest_output_text, inquiry_prompt, latest_output_text
         if lower_latest in lower_inquiry:
@@ -150,6 +345,30 @@ def _response_text(state_payload: dict[str, Any]) -> tuple[str, str, str]:
     if latest_output_text:
         return latest_output_text, inquiry_prompt, latest_output_text
     return inquiry_prompt, inquiry_prompt, latest_output_text
+
+
+def _response_text_from_gateway_payload(
+    payload: dict[str, Any],
+) -> tuple[str, str, str]:
+    mim_interface = payload.get("mim_interface")
+    if isinstance(mim_interface, dict):
+        reply_text = str(mim_interface.get("reply_text", "") or "").strip()
+        result_text = str(mim_interface.get("result", "") or "").strip()
+        if reply_text:
+            latest_output_text = result_text or reply_text
+            return reply_text, "", latest_output_text
+        if result_text:
+            return result_text, "", result_text
+
+    resolution = payload.get("resolution")
+    if isinstance(resolution, dict):
+        clarification_prompt = str(
+            resolution.get("clarification_prompt", "") or ""
+        ).strip()
+        if clarification_prompt:
+            return clarification_prompt, clarification_prompt, clarification_prompt
+
+    return "", "", ""
 
 
 def _is_clarifier_like_text(text: str) -> bool:
@@ -207,8 +426,36 @@ def _turn_scores(
 
     relevance = 0.0
     if user_tokens and response_tokens:
-        overlap = len(user_tokens.intersection(response_tokens))
-        relevance = min(1.0, overlap / max(1, min(len(user_tokens), 6)))
+        content_user_tokens = user_tokens - _RELEVANCE_STOPWORDS
+        effective_user_tokens = content_user_tokens if content_user_tokens else user_tokens
+        # Pure greeting turns (e.g. "hello mim") are not content queries — give a
+        # base score so the absence of token overlap does not trigger context_drift.
+        if effective_user_tokens <= _GREETING_TOKENS | {"mim"}:
+            relevance = 0.5
+        # All-stopword follow-up turns ("why that", "why that one") and single
+        # meta-direction turns ("go deeper", "elaborate") carry no topical tokens —
+        # any substantive response is relevant so assign a base score.
+        # Also handle ≤2 content tokens where at least one is a meta-direction word
+        # (e.g. "summarize in one line", "explain that briefly").
+        elif (
+            not content_user_tokens
+            or effective_user_tokens <= _META_DIRECTION_TOKENS
+            or (
+                len(effective_user_tokens) <= 3
+                and effective_user_tokens & _META_DIRECTION_TOKENS
+            )
+        ):
+            relevance = 0.5
+        else:
+            overlap = sum(
+                1
+                for ut in effective_user_tokens
+                if any(
+                    rt == ut or (min(len(ut), len(rt)) >= 5 and (rt.startswith(ut) or ut.startswith(rt)))
+                    for rt in response_tokens
+                )
+            )
+            relevance = min(1.0, overlap / max(1, min(len(effective_user_tokens), 6)))
 
     non_repetition = 1.0
     if previous_response and response_text:
@@ -257,6 +504,10 @@ def _aggregate(
             "safety": 0.0,
             "smoothness": 0.0,
             "task_completion": 0.0,
+            "intent_retention": 0.0,
+            "directness": 0.0,
+            "clarification_efficiency": 0.0,
+            "brevity_relevance": 0.0,
             "overall": 0.0,
         }, ["no_turns_executed"]
 
@@ -406,6 +657,39 @@ def _aggregate(
     task_completion = max(
         relevance, 0.5 if any(t.response_text for t in turns) else 0.0
     )
+    intent_retention = max(
+        0.0,
+        min(1.0, (turns[-1].relevance * 0.7) + (relevance * 0.3)),
+    )
+    if any(
+        failure in failures
+        for failure in {
+            "context_drift",
+            "new_intent_not_followed",
+            "stale_instruction_followed",
+        }
+    ):
+        intent_retention = min(intent_retention, 0.4)
+
+    directness = max(0.0, min(1.0, (turns[-1].relevance * 0.7) + (brevity * 0.3)))
+    if "over_explaining" in failures:
+        directness = min(directness, 0.45)
+    if "question_not_answered" in failures:
+        directness = min(directness, 0.35)
+
+    if clarify_expected:
+        if clarification_count == 1:
+            clarification_efficiency = 1.0
+        elif clarification_count == 0:
+            clarification_efficiency = 0.4
+        else:
+            clarification_efficiency = 0.0
+    else:
+        clarification_efficiency = (
+            1.0 if clarification_count == 0 else max(0.0, 0.5 - ((clarification_count - 1) * 0.25))
+        )
+
+    brevity_relevance = max(0.0, min(1.0, (relevance * 0.6) + (brevity * 0.4)))
 
     overall = (
         relevance * 0.2
@@ -430,6 +714,10 @@ def _aggregate(
         "safety": round(safety, 4),
         "smoothness": round(smoothness, 4),
         "task_completion": round(task_completion, 4),
+        "intent_retention": round(intent_retention, 4),
+        "directness": round(directness, 4),
+        "clarification_efficiency": round(clarification_efficiency, 4),
+        "brevity_relevance": round(brevity_relevance, 4),
         "overall": round(overall, 4),
     }
     return score, sorted(set(failures))
@@ -464,6 +752,60 @@ def _build_jobs(
     return expanded
 
 
+def _filter_scenarios(
+    scenarios: list[dict[str, Any]],
+    *,
+    include_buckets: set[str] | None,
+    exclude_buckets: set[str] | None,
+    include_categories: set[str] | None,
+    exclude_categories: set[str] | None,
+    include_splits: set[str] | None,
+    exclude_splits: set[str] | None,
+) -> list[dict[str, Any]]:
+    filtered = list(scenarios)
+
+    if include_buckets:
+        filtered = [
+            scenario
+            for scenario in filtered
+            if str(scenario.get("bucket", "")).strip() in include_buckets
+        ]
+    if exclude_buckets:
+        filtered = [
+            scenario
+            for scenario in filtered
+            if str(scenario.get("bucket", "")).strip() not in exclude_buckets
+        ]
+
+    if include_categories:
+        filtered = [
+            scenario
+            for scenario in filtered
+            if str(scenario.get("category", "general")).strip() in include_categories
+        ]
+    if exclude_categories:
+        filtered = [
+            scenario
+            for scenario in filtered
+            if str(scenario.get("category", "general")).strip() not in exclude_categories
+        ]
+
+    if include_splits:
+        filtered = [
+            scenario
+            for scenario in filtered
+            if str(scenario.get("scenario_split", "train")).strip() in include_splits
+        ]
+    if exclude_splits:
+        filtered = [
+            scenario
+            for scenario in filtered
+            if str(scenario.get("scenario_split", "train")).strip() not in exclude_splits
+        ]
+
+    return filtered
+
+
 def run_eval(
     *,
     base_url: str,
@@ -477,6 +819,11 @@ def run_eval(
     rng: random.Random,
     include_buckets: set[str] | None,
     exclude_buckets: set[str] | None,
+    include_categories: set[str] | None,
+    exclude_categories: set[str] | None,
+    include_splits: set[str] | None,
+    exclude_splits: set[str] | None,
+    request_timeout_seconds: int,
 ) -> list[EvalScenarioResult]:
     scenario_pool = list(scenarios)
     profile_pool = list(profiles)
@@ -490,18 +837,15 @@ def run_eval(
     if limit_profiles > 0:
         profile_pool = profile_pool[:limit_profiles]
 
-    if include_buckets:
-        scenario_pool = [
-            s
-            for s in scenario_pool
-            if str(s.get("bucket", "")).strip() in include_buckets
-        ]
-    if exclude_buckets:
-        scenario_pool = [
-            s
-            for s in scenario_pool
-            if str(s.get("bucket", "")).strip() not in exclude_buckets
-        ]
+    scenario_pool = _filter_scenarios(
+        scenario_pool,
+        include_buckets=include_buckets,
+        exclude_buckets=exclude_buckets,
+        include_categories=include_categories,
+        exclude_categories=exclude_categories,
+        include_splits=include_splits,
+        exclude_splits=exclude_splits,
+    )
 
     jobs = _build_jobs(
         scenarios=scenario_pool,
@@ -515,6 +859,8 @@ def run_eval(
     for scenario, profile in jobs:
         scenario_id = str(scenario.get("scenario_id", "unknown"))
         bucket = str(scenario.get("bucket", "unknown"))
+        category = str(scenario.get("category", "general"))
+        scenario_split = str(scenario.get("scenario_split", "train"))
         user_turns = [
             str(item) for item in scenario.get("user_turns", []) if str(item).strip()
         ]
@@ -546,11 +892,18 @@ def run_eval(
                         "scenario_id": scenario_id,
                         "profile_id": profile_id,
                         "bucket": bucket,
+                        "category": category,
+                        "scenario_split": scenario_split,
                         "conversation_session_id": session_id,
                     },
                 },
+                timeout_seconds=request_timeout_seconds,
             )
-            if status >= 400:
+            allow_timeout_recovery = status == 599 and str(
+                _payload.get("transport_error_type") or ""
+            ).strip().lower() in {"timeouterror", "timeout", "socket.timeout"}
+
+            if status >= 400 and not allow_timeout_recovery:
                 turn_results.append(
                     EvalTurn(
                         user_text=turn,
@@ -569,10 +922,15 @@ def run_eval(
             if turn_delay_ms > 0:
                 time.sleep(max(0.0, turn_delay_ms / 1000.0))
 
-            _, state = _get_json(base_url, "/mim/ui/state")
-            response_text, inquiry_prompt, latest_output_text = _response_text(state)
+            response_text, inquiry_prompt, latest_output_text = _resolve_turn_response(
+                base_url=base_url,
+                payload=_payload,
+                timeout_seconds=request_timeout_seconds,
+                session_id=session_id,
+                allow_timeout_recovery=allow_timeout_recovery,
+            )
             relevance, non_rep, brevity, asked_clarification = _turn_scores(
-                adapted, response_text, previous_response
+                turn, response_text, previous_response
             )
             turn_results.append(
                 EvalTurn(
@@ -595,6 +953,8 @@ def run_eval(
                 scenario_id=scenario_id,
                 profile_id=profile_id,
                 bucket=bucket,
+                category=category,
+                scenario_split=scenario_split,
                 score=score,
                 failures=failures,
                 turns=turn_results,
@@ -612,16 +972,30 @@ def _summarize(results: list[EvalScenarioResult]) -> dict[str, Any]:
             "failure_count": 0,
             "top_failures": [],
             "bucket_average": {},
+            "category_average": {},
+            "split_average": {},
+            "metric_average": {},
         }
 
     overall = sum(item.score.get("overall", 0.0) for item in results) / len(results)
     failure_counts: dict[str, int] = {}
     bucket_values: dict[str, list[float]] = {}
+    category_values: dict[str, list[float]] = {}
+    split_values: dict[str, list[float]] = {}
+    metric_values: dict[str, list[float]] = {}
 
     for result in results:
         for failure in result.failures:
             failure_counts[failure] = failure_counts.get(failure, 0) + 1
+        for metric_name, metric_value in result.score.items():
+            metric_values.setdefault(metric_name, []).append(float(metric_value or 0.0))
         bucket_values.setdefault(result.bucket, []).append(
+            result.score.get("overall", 0.0)
+        )
+        category_values.setdefault(result.category, []).append(
+            result.score.get("overall", 0.0)
+        )
+        split_values.setdefault(result.scenario_split, []).append(
             result.score.get("overall", 0.0)
         )
 
@@ -635,6 +1009,18 @@ def _summarize(results: list[EvalScenarioResult]) -> dict[str, Any]:
         bucket: round(sum(values) / len(values), 4)
         for bucket, values in sorted(bucket_values.items())
     }
+    category_average = {
+        category: round(sum(values) / len(values), 4)
+        for category, values in sorted(category_values.items())
+    }
+    split_average = {
+        split: round(sum(values) / len(values), 4)
+        for split, values in sorted(split_values.items())
+    }
+    metric_average = {
+        metric: round(sum(values) / len(values), 4)
+        for metric, values in sorted(metric_values.items())
+    }
 
     return {
         "overall": round(overall, 4),
@@ -642,6 +1028,9 @@ def _summarize(results: list[EvalScenarioResult]) -> dict[str, Any]:
         "failure_count": int(sum(failure_counts.values())),
         "top_failures": top_failures,
         "bucket_average": bucket_average,
+        "category_average": category_average,
+        "split_average": split_average,
+        "metric_average": metric_average,
     }
 
 
@@ -708,6 +1097,8 @@ def _result_to_dict(item: EvalScenarioResult) -> dict[str, Any]:
         "scenario_id": item.scenario_id,
         "profile_id": item.profile_id,
         "bucket": item.bucket,
+        "category": item.category,
+        "scenario_split": item.scenario_split,
         "score": item.score,
         "failures": item.failures,
         "turns": [
@@ -758,10 +1149,27 @@ def main() -> int:
     parser.add_argument("--max-bucket-drop", type=float, default=0.08)
     parser.add_argument("--max-failure-increase", type=int, default=10)
     parser.add_argument(
+        "--request-timeout-seconds",
+        type=int,
+        default=DEFAULT_REQUEST_TIMEOUT_SECONDS,
+    )
+    parser.add_argument(
         "--include-buckets", default="", help="Comma-separated bucket allowlist"
     )
     parser.add_argument(
         "--exclude-buckets", default="", help="Comma-separated bucket denylist"
+    )
+    parser.add_argument(
+        "--include-categories", default="", help="Comma-separated category allowlist"
+    )
+    parser.add_argument(
+        "--exclude-categories", default="", help="Comma-separated category denylist"
+    )
+    parser.add_argument(
+        "--include-splits", default="", help="Comma-separated scenario split allowlist"
+    )
+    parser.add_argument(
+        "--exclude-splits", default="", help="Comma-separated scenario split denylist"
     )
     args = parser.parse_args()
 
@@ -777,6 +1185,18 @@ def main() -> int:
     }
     exclude_buckets = {
         item.strip() for item in str(args.exclude_buckets).split(",") if item.strip()
+    }
+    include_categories = {
+        item.strip() for item in str(args.include_categories).split(",") if item.strip()
+    }
+    exclude_categories = {
+        item.strip() for item in str(args.exclude_categories).split(",") if item.strip()
+    }
+    include_splits = {
+        item.strip() for item in str(args.include_splits).split(",") if item.strip()
+    }
+    exclude_splits = {
+        item.strip() for item in str(args.exclude_splits).split(",") if item.strip()
     }
 
     stage_target = DEFAULT_STAGE_TARGETS.get(str(args.stage), 0)
@@ -802,6 +1222,11 @@ def main() -> int:
         rng=rng,
         include_buckets=include_buckets or None,
         exclude_buckets=exclude_buckets or None,
+        include_categories=include_categories or None,
+        exclude_categories=exclude_categories or None,
+        include_splits=include_splits or None,
+        exclude_splits=exclude_splits or None,
+        request_timeout_seconds=max(1, int(args.request_timeout_seconds)),
     )
     ended_at = datetime.now(timezone.utc)
 

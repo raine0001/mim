@@ -1,0 +1,6 @@
+Cmnd_Alias MIM_PRIVILEGED_ACTIONS = \
+    /usr/local/bin/mim-privileged-action disable-system-tod-liveness-watcher, \
+    /usr/local/bin/mim-privileged-action enable-system-tod-liveness-watcher, \
+    /usr/local/bin/mim-privileged-action status-system-tod-liveness-watcher
+
+testpilot ALL=(root) NOPASSWD: MIM_PRIVILEGED_ACTIONS

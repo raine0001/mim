@@ -2,5 +2,11 @@ name = "mim"
 main = "deploy/cloudflare/worker.mjs"
 compatibility_date = "2026-04-16"
 
+routes = [
+	{ pattern = "mimtod.com/*", zone_name = "mimtod.com" },
+	{ pattern = "www.mimtod.com/*", zone_name = "mimtod.com" },
+]
+
 [vars]
 MIM_REMOTE_SHELL_TITLE = "MIM Travel Shell"
+MIM_REMOTE_SHELL_ORIGIN = "https://mim.mimtod.com"

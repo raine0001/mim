@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "MIM_HANDOFF_STATUS.v1.schema.json",
+  "title": "MIM Handoff Status v1",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "handoff_id",
+    "status",
+    "active_step_id",
+    "updated_at",
+    "execution_owner",
+    "assistance_mode",
+    "latest_result"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "mim-handoff-status-v1"
+    },
+    "handoff_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "status": {
+      "type": "string",
+      "minLength": 1
+    },
+    "active_step_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "execution_owner": {
+      "type": "string",
+      "minLength": 1
+    },
+    "assistance_mode": {
+      "type": "string",
+      "minLength": 1
+    },
+    "result_authority": {
+      "type": "string"
+    },
+    "latest_result": {
+      "type": "object"
+    }
+  }
+}

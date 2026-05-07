@@ -1,16 +1,16 @@
 [Unit]
 Description=MIM Watch UI Health
-After=mim-desktop-shell.service
+After=mim-mobile-web.service
 
 [Service]
 Type=simple
 WorkingDirectory=/home/testpilot/mim
-Environment=HEALTH_URL=http://127.0.0.1:8001/mim/ui/health
-Environment=TARGET_SERVICE=mim-desktop-shell.service
+Environment=HEALTH_URL=http://127.0.0.1:18001/mim/ui/health
+Environment=TARGET_SERVICE=mim-mobile-web.service
 Environment=POLL_SECONDS=8
-Environment=DEGRADED_THRESHOLD=4
-Environment=RESTART_COOLDOWN_SECONDS=180
-Environment=STARTUP_GRACE_SECONDS=45
+Environment=DEGRADED_THRESHOLD=12
+Environment=RESTART_COOLDOWN_SECONDS=300
+Environment=STARTUP_GRACE_SECONDS=60
 ExecStart=/usr/bin/env bash /home/testpilot/mim/scripts/watch_mim_ui_health.sh
 Restart=on-failure
 RestartSec=3

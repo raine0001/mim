@@ -121,6 +121,7 @@ export default {
     const origin = normalizeOrigin(env.MIM_REMOTE_SHELL_ORIGIN);
     const pathPrefix = String(env.MIM_REMOTE_SHELL_PATH_PREFIX || "").trim();
     const url = new URL(request.url);
+    const incomingHost = String(url.hostname || "").trim().toLowerCase();
 
     if (url.pathname === "/healthz") {
       return jsonResponse({

@@ -1,0 +1,56 @@
+{
+  "scenario_library": "conversation_scenarios/mim_evolution_training_set.json",
+  "profile_library": "conversation_profiles_evolution.json",
+  "categories": [
+    {
+      "category_id": "leadership",
+      "description": "Status framing, risk explanation, and follow-up reasoning under operator leadership prompts."
+    },
+    {
+      "category_id": "initiative",
+      "description": "Action confirmation, interruption handling, and safe initiative continuation."
+    },
+    {
+      "category_id": "project_management",
+      "description": "Ambiguity resolution, prioritization, and execution recap quality."
+    },
+    {
+      "category_id": "social_engagement",
+      "description": "Greeting quality, casual interaction, and noisy conversational recovery."
+    },
+    {
+      "category_id": "software_planning",
+      "description": "Capability communication, external-task handling, and planning-safe boundary behavior."
+    }
+  ],
+  "stages": [
+    {
+      "stage_id": "pilot",
+      "train_target": 1000,
+      "holdout_target": 200,
+      "max_overall_drop": 0.02,
+      "max_failure_increase": 12
+    },
+    {
+      "stage_id": "optimize",
+      "train_target": 10000,
+      "holdout_target": 1000,
+      "max_overall_drop": 0.02,
+      "max_failure_increase": 25
+    },
+    {
+      "stage_id": "scale",
+      "train_target": 100000,
+      "holdout_target": 5000,
+      "max_overall_drop": 0.015,
+      "max_failure_increase": 50
+    },
+    {
+      "stage_id": "full",
+      "train_target": 1000000,
+      "holdout_target": 10000,
+      "max_overall_drop": 0.01,
+      "max_failure_increase": 100
+    }
+  ]
+}
