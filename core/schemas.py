@@ -16,6 +16,11 @@ class ObjectiveCreate(BaseModel):
     constraints: list[str] = Field(default_factory=list)
     success_criteria: str = ""
     status: str = "new"
+    owner: str = "mim"
+    execution_mode: str = "auto"
+    auto_continue: bool = True
+    boundary_mode: str = "soft"
+    metadata_json: dict = Field(default_factory=dict)
 
 
 class ObjectiveOut(BaseModel):
@@ -26,6 +31,11 @@ class ObjectiveOut(BaseModel):
     constraints: list[str]
     success_criteria: str
     status: str
+    owner: str
+    execution_mode: str
+    auto_continue: bool
+    boundary_mode: str
+    metadata_json: dict
     created_at: datetime
 
 
@@ -37,6 +47,16 @@ class TaskCreate(BaseModel):
     assigned_to: str = "unassigned"
     status: str = "queued"
     objective_id: int | None = None
+    readiness: str = "queued"
+    boundary_mode: str = "soft"
+    start_now: bool = False
+    human_prompt_required: bool = False
+    execution_scope: str = "bounded"
+    expected_outputs: list[str] = Field(default_factory=list)
+    verification_commands: list[str] = Field(default_factory=list)
+    dispatch_status: str = "pending"
+    dispatch_artifact_json: dict = Field(default_factory=dict)
+    metadata_json: dict = Field(default_factory=dict)
 
 
 class TaskOut(BaseModel):
@@ -48,7 +68,38 @@ class TaskOut(BaseModel):
     acceptance_criteria: str
     status: str
     assigned_to: str
+    readiness: str
+    boundary_mode: str
+    start_now: bool
+    human_prompt_required: bool
+    execution_scope: str
+    expected_outputs: list[str]
+    verification_commands: list[str]
+    dispatch_status: str
+    dispatch_artifact_json: dict
+    metadata_json: dict
     created_at: datetime
+
+
+class InitiativeDriveRequest(BaseModel):
+    actor: str = "mim"
+    source: str = "automation_initiative"
+    user_intent: str = Field(min_length=1)
+    objective_title: str = ""
+    priority: str = "high"
+    managed_scope: str = "workspace"
+    continue_chain: bool = True
+    max_auto_steps: int = Field(default=3, ge=1, le=8)
+    expected_outputs: list[str] = Field(default_factory=list)
+    verification_commands: list[str] = Field(default_factory=list)
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class InitiativeContinueRequest(BaseModel):
+    actor: str = "mim"
+    source: str = "automation_initiative"
+    objective_id: int | None = None
+    max_auto_steps: int = Field(default=3, ge=1, le=8)
 
 
 class ResultCreate(BaseModel):
@@ -1496,6 +1547,20 @@ class WorkspaceActionPlanSimulationRequest(BaseModel):
     metadata_json: dict = Field(default_factory=dict)
 
 
+class WorkspaceTargetSimulateRequest(BaseModel):
+    """Request body for POST /workspace/targets/{id}/simulate."""
+
+    actor: str = "operator"
+    reason: str = ""
+    # Safety envelope: describes reachable workspace bounds for the arm.
+    # Must be non-empty for simulation_gate_passed to be True.
+    safety_envelope: dict = Field(default_factory=dict)
+    # Zones the operator has explicitly marked as off-limits.
+    unsafe_zones: list[str] = Field(default_factory=list)
+    collision_risk_threshold: float = Field(default=0.45, ge=0.0, le=1.0)
+    metadata_json: dict = Field(default_factory=dict)
+
+
 WorkspaceExecutionCapability = Literal[
     "reach_target",
     "arm_move_safe",
@@ -1822,6 +1887,24 @@ class ImprovementBacklogRefreshRequest(BaseModel):
     min_occurrence_count: int = Field(default=2, ge=2, le=500)
     max_items: int = Field(default=50, ge=1, le=500)
     auto_experiment_limit: int = Field(default=3, ge=0, le=50)
+    metadata_json: dict = Field(default_factory=dict)
+
+
+class SelfEvolutionNaturalLanguageProgressResetRequest(BaseModel):
+    actor: str = "workspace"
+    source: str = "objective173"
+
+
+class SelfEvolutionNaturalLanguageEvaluationRequest(BaseModel):
+    actor: str = "workspace"
+    source: str = "objective173"
+    slice_id: str = ""
+    outcome_mode: str = "auto"
+    metrics_json: dict = Field(default_factory=dict)
+    failure_tags: list[str] = Field(default_factory=list)
+    proof_summary: str = ""
+    discovered_skill_candidates: list[str] = Field(default_factory=list)
+    blocked_reason: str = ""
     metadata_json: dict = Field(default_factory=dict)
 
 
@@ -2855,3 +2938,375 @@ class AutomationReconciliationEvaluateRequest(BaseModel):
     present_carriers: list[str] = Field(default_factory=list)
     anomaly_threshold_pct: float = Field(default=25.0, ge=0.0, le=500.0)
     metadata_json: dict = Field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# Arm servo envelope schemas (Objective 173 — schema layer for Obj 172 plan)
+# ---------------------------------------------------------------------------
+
+
+class ArmServoEnvelopeRead(BaseModel):
+    """Read DTO for a single ArmServoEnvelope row."""
+
+    id: int
+    arm_id: str
+    servo_id: int
+    servo_name: str
+    configured_min: int
+    configured_max: int
+    learned_soft_min: int | None
+    learned_soft_max: int | None
+    preferred_min: int | None
+    preferred_max: int | None
+    unstable_regions: list
+    confidence: float
+    evidence_count: int
+    last_verified_at: datetime | None
+    last_probe_phase: str
+    status: str
+    stale_after_seconds: int
+    actor: str
+    source: str
+    created_at: datetime
+    updated_at: datetime | None
+
+    class Config:
+        from_attributes = True
+
+
+class ArmServoEnvelopeUpdateRequest(BaseModel):
+    """
+    Request body for operator-driven manual envelope updates.
+    All fields are optional; only provided fields are applied.
+    No hardware dispatch is triggered by this schema.
+    """
+
+    preferred_min: int | None = None
+    preferred_max: int | None = None
+    unstable_regions: list | None = None
+    stale_after_seconds: int | None = None
+    actor: str = "operator"
+    reason: str = ""
+
+
+class ArmEnvelopeProbeAttemptRead(BaseModel):
+    """Read DTO for a single ArmEnvelopeProbeAttempt row."""
+
+    id: int
+    probe_id: str
+    envelope_id: int | None
+    servo_id: int
+    phase: str
+    commanded_angle: int
+    prior_angle: int | None
+    observed_angle: int | None
+    step_degrees: int
+    stop_condition: str
+    stop_condition_flags: dict
+    simulation_id: int | None
+    execution_id: str
+    result: str
+    confidence_delta: float
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class ArmEnvelopeProbePlanStep(BaseModel):
+    """A single step in a dry-run probe plan (no hardware dispatch)."""
+
+    servo_id: int
+    servo_name: str
+    target_angle: int
+    prior_angle: int
+    step_degrees: int
+    phase: str = "dry_run"
+    would_dispatch: bool = False
+    notes: str = ""
+
+
+class ArmEnvelopeProbePlanPreview(BaseModel):
+    """Response DTO for the dry-run probe plan endpoint."""
+
+    arm_id: str
+    generated_at: str
+    phase: str = "dry_run"
+    hardware_command_issued: bool = False
+    steps: list[ArmEnvelopeProbePlanStep]
+    stop_conditions_checked: list[str]
+    notes: str = ""
+
+
+class ArmProbeTargetAngle(BaseModel):
+    """A single target angle in a simulation-only probe plan."""
+
+    angle: int
+    direction: str  # "up" or "down"
+    is_unstable: bool = False  # True if in unstable region
+    estimated_risk: str = "low"  # low, medium, high
+    safety_check_status: str = "unknown"  # unknown, safe, unsafe, flagged
+
+
+class ArmSimulationProbeStep(BaseModel):
+    """Detailed step in a simulation-only probe sequence."""
+
+    sequence_index: int
+    servo_id: int
+    servo_name: str
+    current_angle: int | None
+    target_angle: int
+    direction: str
+    step_degrees: int
+    estimated_risk: str
+    stop_conditions_applicable: list[str]
+    allow_physical_probing: bool = False
+    required_authorization_level: str = "operator"  # operator, supervisor, system
+    notes: str = ""
+
+
+class ArmSimulationProbePlan(BaseModel):
+    """Complete simulation-only probe plan for a servo."""
+
+    arm_id: str
+    servo_id: int
+    servo_name: str
+    generated_at: str
+    phase: str = "simulation_only"
+    hardware_command_issued: bool = False
+    allow_physical_execution: bool = False
+    configured_range: dict  # {min, max}
+    learned_range: dict | None  # {min, max} or null
+    unstable_regions: list[dict]  # [{start, end}, ...]
+    stale_recommendation: str = ""  # empty or reason to re-verify
+    start_angle: int
+    target_angles: list[ArmProbeTargetAngle]
+    probe_steps: list[ArmSimulationProbeStep]
+    estimated_total_steps: int
+    total_stop_conditions: int
+    risk_assessment: str
+    notes: str = ""
+
+
+class ArmSimulationProbeRequest(BaseModel):
+    """Request to generate a simulation-only probe plan."""
+
+    servo_id: int
+    phase: str = "simulation_only"
+    persist_planned_attempts: bool = False  # if True, save as planned_only attempts
+    max_target_angles: int = 50  # limit plan size for safety
+    skip_unstable_regions: bool = True  # exclude unstable regions from targets
+
+
+# ---------------------------------------------------------------------------
+# Objective 175 — MIM-ARM-DRY-RUN-PROBE-COMMAND-GENERATION schemas
+# ---------------------------------------------------------------------------
+
+
+class ArmProbeCommandStep(BaseModel):
+    """Single dry-run command step derived from a simulation plan."""
+
+    command_id: str  # uuid4
+    servo_id: int
+    prior_angle: int
+    target_angle: int
+    step_degrees: int
+    direction: str  # "up" | "down"
+    estimated_duration_ms: int
+    safety_gate_required: bool
+    stop_conditions: list[str]
+    expected_feedback_fields: list[str]
+    rollback_command: dict  # {"target_angle": safe_home, "reason": "rollback"}
+    dry_run: bool = True
+
+
+class ArmDryRunCommandSequence(BaseModel):
+    """Full dry-run command sequence for a single servo."""
+
+    arm_id: str
+    servo_id: int
+    servo_name: str
+    generated_at: str
+    dry_run: bool = True
+    physical_execution_allowed: bool = False
+    commands: list[ArmProbeCommandStep]
+    safe_home_fallback: dict  # {"target_angle": int, "reason": str}
+    stop_conditions_checked: list[str]
+    total_commands: int
+    notes: str = ""
+
+
+class ArmDryRunCommandRequest(BaseModel):
+    """Request to generate dry-run probe commands for a servo."""
+
+    arm_id: str | None = None
+    skip_unstable_regions: bool = True
+    max_target_angles: int = 50
+    persist_as_attempts: bool = False
+
+
+# ---------------------------------------------------------------------------
+# Objective 176 — MIM-ARM-SUPERVISED-MICRO-STEP-AUTHORIZATION schemas
+# ---------------------------------------------------------------------------
+
+
+class ArmProbeAuthorizationRequest(BaseModel):
+    """Create one supervised authorization request from one dry-run command."""
+
+    arm_id: str | None = None
+    dry_run_command_id: str
+    operator_id: str
+    expires_in_seconds: int = 300
+
+
+class ArmProbeAuthorizationApproveRequest(BaseModel):
+    """Approve a pending supervised authorization."""
+
+    authorized_by: str
+
+
+class ArmProbeAuthorizationRejectRequest(BaseModel):
+    """Reject a pending supervised authorization."""
+
+    rejected_by: str
+    reason: str = ""
+
+
+class ArmProbeAuthorizationRead(BaseModel):
+    """Authorization state for a single micro-step request."""
+
+    authorization_id: str
+    arm_id: str
+    servo_id: int
+    dry_run_command_id: str
+    requested_angle: int
+    prior_angle: int
+    step_degrees: int
+    direction: str
+    operator_id: str
+    authorized_by: str
+    authorization_status: str
+    expires_at: str | None
+    stop_conditions: list[str]
+    safe_home_required: bool
+    physical_execution_allowed: bool
+    created_at: str | None
+    updated_at: str | None
+
+
+class ArmProbeExecutionGateResult(BaseModel):
+    """Result of execution authorization gate check (no movement performed)."""
+
+    authorization_id: str
+    allowed: bool
+    reason: str
+    authorization_status: str
+    physical_execution_allowed: bool
+
+
+class SupervisedMicroStepExecutionRequest(BaseModel):
+    """Begin one operator-triggered supervised micro-step execution stub."""
+
+    operator_id: str
+
+
+class SupervisedMicroStepExecutionRead(BaseModel):
+    """Full state of one supervised micro-step execution record."""
+
+    execution_id: str
+    authorization_id: str
+    arm_id: str
+    servo_id: int
+    requested_angle: int
+    prior_angle: int
+    step_degrees: int
+    direction: str
+    operator_id: str
+    execution_status: str
+    stop_conditions: list
+    safe_home_required: bool
+    safe_home_triggered: bool
+    safe_home_target_angle: int | None
+    safe_home_triggered_at: str | None
+    physical_movement_dispatched: bool
+    log_entries: list
+    abort_reason: str
+    completed_at: str | None
+    created_at: str | None
+    updated_at: str | None
+
+
+class SafeHomeTriggerRequest(BaseModel):
+    """Operator-issued request to trigger safe-home fallback on a running execution."""
+
+    operator_id: str
+    reason: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Objective 178 — Supervised Physical Micro-Step Execution
+# ---------------------------------------------------------------------------
+
+class PhysicalMicroStepExecutionRequest(BaseModel):
+    """Operator-triggered request to execute one supervised physical micro-step."""
+
+    operator_id: str
+
+
+class PhysicalMicroStepExecutionRead(BaseModel):
+    """Full state of one supervised physical micro-step execution record."""
+
+    execution_id: str
+    authorization_id: str
+    arm_id: str
+    servo_id: int
+    operator_id: str
+    prior_angle: int
+    commanded_angle: int
+    target_angle: int
+    step_degrees: int
+    direction: str
+    stop_conditions: list
+    safe_home_required: bool
+    safe_home_triggered: bool
+    safe_home_target_angle: int | None
+    safe_home_triggered_at: str | None
+    safe_home_outcome: str
+    execution_status: str
+    physical_movement_dispatched: bool
+    dispatch_started_at: str | None
+    dispatch_completed_at: str | None
+    dispatch_result: str
+    movement_duration_ms: int | None
+    stop_condition_triggered: str
+    error_message: str
+    log_entries: list
+    abort_reason: str
+    completed_at: str | None
+    created_at: str | None
+    updated_at: str | None
+
+
+# ---------------------------------------------------------------------------
+# Objective 179 — Envelope Learning Update schemas
+# ---------------------------------------------------------------------------
+
+class RecordProbeOutcomeRequest(BaseModel):
+    """Body for the record-probe-outcome endpoint."""
+
+    execution_id: str
+
+
+class RecordProbeOutcomeRead(BaseModel):
+    """Response DTO for a recorded supervised probe outcome."""
+
+    probe_attempt_id: int
+    probe_id: str
+    envelope_updated: bool
+    confidence_delta: float
+    confidence_after: float
+    evidence_count_after: int
+    learned_soft_min: int | None
+    learned_soft_max: int | None
+    result: str
+    reason: str

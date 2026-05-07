@@ -194,20 +194,23 @@ def adjudicate_next_step_item(
     if blockers:
         if "operator_approval_required" in blockers:
             item_posture = "approval_required"
-            reason = "Execution-affecting step remains gated by operator approval on the MIM side."
+            reason = "This step touches governed live control and remains human-gated until explicit operator approval is present."
         else:
             mim_decision = "block"
             item_posture = "blocked"
             reason = "Local runtime posture blocks this execution-affecting step until health or gate conditions recover."
-    elif classification["approval_required"] or classification["touches_live_arm"]:
+    elif classification["touches_live_arm"]:
         item_posture = "approval_required"
-        reason = "This step touches governed execution and must remain approval-gated."
+        reason = "This step touches governed live control and must remain approval-gated."
+    elif classification["approval_required"]:
+        item_posture = "proposal_only"
+        reason = "MIM should route this next step internally first; teaching or TOD coordination should happen without pausing for human approval."
     elif classification["requires_tod_input"]:
         item_posture = "proposal_only"
-        reason = "MIM can approve the inquiry posture, but TOD input is required before any cross-workspace action proceeds."
+        reason = "MIM should route this next step to TOD without waiting for human approval."
     elif classification["risk"] not in {"", "low"}:
         item_posture = "proposal_only"
-        reason = "The step is not low-risk enough for auto-execution even though it is local-only."
+        reason = "MIM should teach or stage this higher-risk local step internally before execution instead of asking a human for the next move."
 
     return {
         "step_id": str(item.get("step_id") or "").strip(),
@@ -318,12 +321,26 @@ def build_interface_auto_approval_decision(
     normalized_intent = _normalize_text(parsed_intent)
     safe_intent = normalized_intent in SAFE_INTERFACE_INTENTS or normalized_intent.endswith("_inquiry")
     inquiry_only = classification["inquiry_only"] or _contains_any(content, INQUIRY_KEYWORDS)
+    mim_routed_intent = safe_intent or "next step" in normalized_intent or normalized_intent.endswith("_request")
 
-    if classification["approval_required"] or classification["touches_execution"] or classification["touches_live_arm"]:
+    if classification["touches_live_arm"]:
         return {
             "auto_approve": False,
             "decision": "manual_review",
-            "reason": "The request affects execution or governed control and must remain human-reviewed.",
+            "reason": "The request touches governed live control and must remain human-reviewed.",
+        }
+    if classification["approval_required"] and classification["touches_execution"]:
+        return {
+            "auto_approve": True,
+            "decision": "approved",
+            "reason": "Execution-affecting next-step routing should stay inside MIM/TOD; teach MIM first if needed, then continue without human approval.",
+            "metadata_json": {
+                "objective_id": "98A",
+                "auto_generated": True,
+                "adjudication_posture": "proposal_only",
+                "route_via_mim": True,
+                "teach_mim_if_missing": True,
+            },
         }
     if safe_intent and inquiry_only:
         return {
@@ -336,10 +353,30 @@ def build_interface_auto_approval_decision(
                 "adjudication_posture": "auto_execute_candidate",
             },
         }
+    if mim_routed_intent:
+        return {
+            "auto_approve": True,
+            "decision": "approved",
+            "reason": "Next-step routing should go through MIM first; if MIM lacks the step, teach MIM and continue without asking a human.",
+            "metadata_json": {
+                "objective_id": "98A",
+                "auto_generated": True,
+                "adjudication_posture": "proposal_only" if classification["touches_execution"] else "auto_execute_candidate",
+                "route_via_mim": True,
+                "teach_mim_if_missing": True,
+            },
+        }
     return {
-        "auto_approve": False,
-        "decision": "manual_review",
-        "reason": "The request does not match the low-risk next-step inquiry profile.",
+        "auto_approve": True,
+        "decision": "approved",
+        "reason": "Default next-step handling should remain inside MIM; if the step is unclear, teach MIM and continue without human approval.",
+        "metadata_json": {
+            "objective_id": "98A",
+            "auto_generated": True,
+            "adjudication_posture": "proposal_only",
+            "route_via_mim": True,
+            "teach_mim_if_missing": True,
+        },
     }
 
 

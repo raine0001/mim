@@ -71,8 +71,6 @@ def _load_artifact(path: Path) -> tuple[dict, dict] | None:
     readiness = _json_dict(payload.get("execution_readiness"))
     if not readiness:
         readiness = _json_dict(_json_dict(payload.get("execution_trace")).get("execution_readiness"))
-    if not readiness:
-        return None
     generated_at = (
         _parse_timestamp(payload.get("generated_at"))
         or _parse_timestamp(readiness.get("generated_at"))
@@ -82,7 +80,59 @@ def _load_artifact(path: Path) -> tuple[dict, dict] | None:
         "artifact_path": str(path),
         "artifact_name": path.name,
         "generated_at": generated_at.isoformat(),
+        "has_readiness": bool(readiness),
     }
+
+
+def _artifact_identity(payload: dict) -> dict[str, str]:
+    execution_trace = _json_dict(payload.get("execution_trace"))
+    integration = _json_dict(payload.get("integration"))
+    return {
+        "request_id": str(payload.get("request_id") or "").strip(),
+        "task_id": str(payload.get("task_id") or "").strip(),
+        "objective_id": str(
+            payload.get("objective_id")
+            or integration.get("tod_current_objective")
+            or integration.get("mim_objective_active")
+            or ""
+        ).strip(),
+        "correlation_id": str(
+            payload.get("correlation_id")
+            or execution_trace.get("correlation_id")
+            or ""
+        ).strip(),
+    }
+
+
+def _same_execution_lineage(left: dict[str, str], right: dict[str, str]) -> bool:
+    left_task_id = str(left.get("task_id") or "").strip()
+    right_task_id = str(right.get("task_id") or "").strip()
+    if not left_task_id or not right_task_id or left_task_id != right_task_id:
+        return False
+
+    for key in ("objective_id", "request_id", "correlation_id"):
+        left_value = str(left.get(key) or "").strip()
+        right_value = str(right.get(key) or "").strip()
+        if left_value and right_value and left_value != right_value:
+            return False
+    return True
+
+
+def _is_superseded_readiness_candidate(
+    candidate: tuple[dict, dict],
+    artifacts: list[tuple[dict, dict]],
+) -> bool:
+    candidate_generated_at = _parse_timestamp(candidate[1].get("generated_at")) or _utcnow()
+    candidate_identity = _artifact_identity(candidate[0])
+    for other_payload, other_metadata in artifacts:
+        if other_metadata.get("has_readiness"):
+            continue
+        other_generated_at = _parse_timestamp(other_metadata.get("generated_at")) or _utcnow()
+        if other_generated_at <= candidate_generated_at:
+            continue
+        if _same_execution_lineage(candidate_identity, _artifact_identity(other_payload)):
+            return True
+    return False
 
 
 def _default_readiness(*, action: str, capability_name: str, managed_scope: str) -> dict:
@@ -192,14 +242,21 @@ def load_latest_execution_readiness(
     requested_executor: str,
     metadata_json: dict | None = None,
 ) -> dict:
-    candidates: list[tuple[dict, dict]] = []
+    artifacts: list[tuple[dict, dict]] = []
     for configured_path in (
         settings.execution_readiness_task_result_path,
         settings.execution_readiness_command_status_path,
     ):
         loaded = _load_artifact(Path(configured_path))
         if loaded is not None:
-            candidates.append(loaded)
+            artifacts.append(loaded)
+
+    candidates = [
+        artifact
+        for artifact in artifacts
+        if artifact[1].get("has_readiness")
+        and not _is_superseded_readiness_candidate(artifact, artifacts)
+    ]
 
     if not candidates:
         return _default_readiness(

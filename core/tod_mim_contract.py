@@ -35,6 +35,9 @@ CONTRACT_RECEIPT_PATH = RUNTIME_SHARED_DIR / CONTRACT_RECEIPT_ARTIFACT
 CONTRACT_LOCK_PATH = RUNTIME_SHARED_DIR / CONTRACT_LOCK_ARTIFACT
 CONTRACT_VALIDATION_FAILURE_PATH = RUNTIME_SHARED_DIR / CONTRACT_VALIDATION_FAILURE_ARTIFACT
 CONTRACT_ACTIVATION_REPORT_PATH = RUNTIME_SHARED_DIR / CONTRACT_ACTIVATION_REPORT_ARTIFACT
+TASK_ACK_PATH = RUNTIME_SHARED_DIR / "TOD_MIM_TASK_ACK.latest.json"
+TASK_RESULT_PATH = RUNTIME_SHARED_DIR / "TOD_MIM_TASK_RESULT.latest.json"
+TASK_STATUS_REVIEW_PATH = RUNTIME_SHARED_DIR / "MIM_TASK_STATUS_REVIEW.latest.json"
 
 PRIMARY_TRANSPORT_ID = "mim_server_shared_artifact_boundary"
 PRIMARY_TRANSPORT_SURFACE = "/home/testpilot/mim/runtime/shared"
@@ -626,13 +629,67 @@ def ensure_runtime_contract_lock() -> dict[str, Any]:
     return status
 
 
+def _build_ack_result_binding_status() -> dict[str, Any]:
+    task_ack = _read_json(TASK_ACK_PATH)
+    task_result = _read_json(TASK_RESULT_PATH)
+    task_review = _read_json(TASK_STATUS_REVIEW_PATH)
+
+    review_task = task_review.get("task") if isinstance(task_review.get("task"), dict) else {}
+    ack_request_id = str(task_ack.get("request_id") or "").strip()
+    result_request_id = str(task_result.get("request_id") or "").strip()
+    review_ack_request_id = str(review_task.get("task_ack_request_id") or "").strip()
+    review_result_request_id = str(review_task.get("result_request_id") or "").strip()
+    authoritative_task_id = str(review_task.get("authoritative_task_id") or "").strip()
+    ack_task_id = str(task_ack.get("task_id") or task_ack.get("task") or "").strip()
+    result_task_id = str(task_result.get("task_id") or task_result.get("task") or "").strip()
+    terminal_result = bool(task_result.get("terminal") is True)
+    review_completed = str(task_review.get("state") or "").strip() == "completed"
+    review_gate = task_review.get("gate") if isinstance(task_review.get("gate"), dict) else {}
+    promotion_ready = bool(review_gate.get("promotion_ready") is True)
+
+    request_id_aligned = bool(
+        ack_request_id
+        and result_request_id
+        and ack_request_id == result_request_id == review_ack_request_id == review_result_request_id
+    )
+    task_id_aligned = bool(
+        authoritative_task_id
+        and ack_task_id
+        and result_task_id
+        and authoritative_task_id == ack_task_id == result_task_id
+    )
+    bound = request_id_aligned and task_id_aligned and terminal_result and review_completed and promotion_ready
+
+    status = "bound" if bound else "pending_runtime_binding"
+    reason = (
+        "Current ACK, RESULT, and review artifacts agree on request/task identity and terminal completion."
+        if bound
+        else "Current ACK, RESULT, and review artifacts do not yet prove one bound terminal execution lane."
+    )
+    return {
+        "status": status,
+        "bound": bound,
+        "reason": reason,
+        "request_id_aligned": request_id_aligned,
+        "task_id_aligned": task_id_aligned,
+        "terminal_result": terminal_result,
+        "review_completed": review_completed,
+        "promotion_ready": promotion_ready,
+        "authoritative_task_id": authoritative_task_id,
+        "ack_request_id": ack_request_id,
+        "result_request_id": result_request_id,
+    }
+
+
 def build_activation_report() -> dict[str, Any]:
     signature = load_contract_signature()
     receipt = receipt_status()
     receipt_accepted = receipt.get("status") == "accepted"
+    ack_result_binding = _build_ack_result_binding_status()
     active_request_writers = [
         writer for writer in CANONICAL_WRITERS if writer.get("artifact_domain") == "execution_request"
     ]
+    cutover_ready = bool(receipt_accepted and ack_result_binding.get("bound") is True)
     report = {
         "generated_at": utc_now(),
         "packet_type": "tod-mim-contract-activation-report-v1",
@@ -644,9 +701,16 @@ def build_activation_report() -> dict[str, Any]:
         "active_writer_count": len([writer for writer in active_request_writers if writer.get("status") == "active"]),
         "schema_enforcement": {
             "request_writer_binding": "enabled",
-            "ack_result_runtime_binding": "ready_for_tod_runtime_binding" if receipt_accepted else "pending_tod_contract_acceptance",
+            "ack_result_runtime_binding": (
+                "bound_to_live_runtime"
+                if ack_result_binding.get("bound") is True
+                else "ready_for_tod_runtime_binding"
+                if receipt_accepted
+                else "pending_tod_contract_acceptance"
+            ),
             "heartbeat_fallback_binding": "validator_available",
         },
+        "ack_result_binding": ack_result_binding,
         "shadow_mode": {
             "status": "tod_exact_match_confirmed" if receipt_accepted else "pending_tod_exact_match_confirmation",
             "comparison_ready": receipt_accepted,
@@ -657,9 +721,11 @@ def build_activation_report() -> dict[str, Any]:
             ),
         },
         "cutover_readiness": {
-            "ready": False,
+            "ready": cutover_ready,
             "reason": (
-                "TOD exact-match receipt is confirmed; request writer enforcement is active, but ack/result cutover is still pending runtime binding."
+                "TOD exact-match receipt is confirmed and the live ACK/RESULT lane is bound to the current authoritative task."
+                if cutover_ready
+                else "TOD exact-match receipt is confirmed; request writer enforcement is active, but ack/result cutover is still pending runtime binding."
                 if receipt_accepted
                 else "TOD exact-match receipt is still pending."
             ),

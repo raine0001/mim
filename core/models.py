@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import JSON, DateTime, ForeignKey, String, Text, func
+from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from core.db import Base
@@ -22,6 +22,11 @@ class Objective(Base, TimestampMixin):
     constraints_json: Mapped[list[str]] = mapped_column(JSON, default=list)
     success_criteria: Mapped[str] = mapped_column(Text, default="")
     state: Mapped[str] = mapped_column(String(40), default="new")
+    owner: Mapped[str] = mapped_column(String(120), default="mim")
+    execution_mode: Mapped[str] = mapped_column(String(40), default="auto")
+    auto_continue: Mapped[bool] = mapped_column(Boolean, default=True)
+    boundary_mode: Mapped[str] = mapped_column(String(40), default="soft")
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
 class Task(Base, TimestampMixin):
@@ -37,6 +42,16 @@ class Task(Base, TimestampMixin):
     acceptance_criteria: Mapped[str] = mapped_column(Text, default="")
     assigned_to: Mapped[str] = mapped_column(String(120), default="unassigned")
     state: Mapped[str] = mapped_column(String(40), default="queued")
+    readiness: Mapped[str] = mapped_column(String(40), default="queued")
+    boundary_mode: Mapped[str] = mapped_column(String(40), default="soft")
+    start_now: Mapped[bool] = mapped_column(Boolean, default=False)
+    human_prompt_required: Mapped[bool] = mapped_column(Boolean, default=False)
+    execution_scope: Mapped[str] = mapped_column(String(120), default="bounded")
+    expected_outputs_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    verification_commands_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    dispatch_status: Mapped[str] = mapped_column(String(40), default="pending")
+    dispatch_artifact_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
 class TaskResult(Base, TimestampMixin):
@@ -2285,6 +2300,194 @@ class AutomationFileArtifact(Base, TimestampMixin):
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
+
+class WorkspaceReachSimulation(Base, TimestampMixin):
+    """
+    Standalone safe-reach simulation record produced by the
+    safe_reach_simulation_service.  Linked to a WorkspaceTargetResolution
+    and optionally to the WorkspaceActionPlan whose simulation fields are
+    also updated in-place.
+    """
+
+    __tablename__ = "workspace_reach_simulations"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    target_resolution_id: Mapped[int | None] = mapped_column(
+        ForeignKey("workspace_target_resolutions.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    action_plan_id: Mapped[int | None] = mapped_column(
+        ForeignKey("workspace_action_plans.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    target_zone: Mapped[str] = mapped_column(String(120), default="", index=True)
+    # "safe" | "unsafe" | "uncertain"
+    simulation_outcome: Mapped[str] = mapped_column(
+        String(40), default="not_run", index=True
+    )
+    # "completed" | "not_run"
+    simulation_status: Mapped[str] = mapped_column(
+        String(40), default="not_run", index=True
+    )
+    simulation_gate_passed: Mapped[bool] = mapped_column(default=False)
+    # "clear" | "unknown_zone" | "unsafe_zone" | "no_safety_envelope"
+    reachability_result: Mapped[str] = mapped_column(String(40), default="")
+    reachability_confidence: Mapped[float] = mapped_column(default=0.0)
+    collision_risk_score: Mapped[float] = mapped_column(default=0.0)
+    blocked_reason: Mapped[str] = mapped_column(Text, default="")
+    # "reobserve" | "confirm" | "resimulate" | ""
+    recovery_action: Mapped[str] = mapped_column(String(80), default="")
+    simulation_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    actor: Mapped[str] = mapped_column(String(120), default="operator")
+    source: Mapped[str] = mapped_column(String(80), default="api")
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class ArmServoEnvelope(Base, TimestampMixin):
+    """
+    Per-servo learned safe envelope record.
+    One row per servo (0–5) per arm identity.
+    Initialized from MIM_ARM_SERVO_LIMITS; learned bounds updated via probing.
+    """
+
+    __tablename__ = "arm_servo_envelopes"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    # Arm identity — host IP or configured string, e.g. "192.168.1.90"
+    arm_id: Mapped[str] = mapped_column(String(120), default="default", index=True)
+    # Servo index 0–5
+    servo_id: Mapped[int] = mapped_column(index=True)
+    # Human-readable role: "base"|"shoulder"|"elbow"|"wrist_pitch"|"wrist_roll"|"gripper"
+    servo_name: Mapped[str] = mapped_column(String(40), default="")
+    # Configured hard limits from MIM_ARM_SERVO_LIMITS
+    configured_min: Mapped[int] = mapped_column(default=0)
+    configured_max: Mapped[int] = mapped_column(default=180)
+    # Learned soft limits narrowed from physical probing (nullable until probed)
+    learned_soft_min: Mapped[int | None] = mapped_column(nullable=True, default=None)
+    learned_soft_max: Mapped[int | None] = mapped_column(nullable=True, default=None)
+    # Operator/simulation-validated comfortable operating range
+    preferred_min: Mapped[int | None] = mapped_column(nullable=True, default=None)
+    preferred_max: Mapped[int | None] = mapped_column(nullable=True, default=None)
+    # JSON list of {"from": int, "to": int, "reason": str} spans
+    unstable_regions: Mapped[list] = mapped_column(JSON, default=list)
+    # 0.0–1.0 confidence in the learned envelope
+    confidence: Mapped[float] = mapped_column(default=0.0)
+    # Number of successful probe confirmations
+    evidence_count: Mapped[int] = mapped_column(default=0)
+    # Most recent successful physical probe timestamp
+    last_verified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, default=None
+    )
+    # "none"|"simulation"|"dry_run"|"supervised_micro"|"autonomous"
+    last_probe_phase: Mapped[str] = mapped_column(String(40), default="none")
+    # "initializing"|"simulation_only"|"dry_run_ready"|"supervised"|"autonomous"|"stale"
+    status: Mapped[str] = mapped_column(String(40), default="initializing", index=True)
+    # Seconds before envelope is considered stale and must be re-verified
+    stale_after_seconds: Mapped[int] = mapped_column(default=86400)
+    # Who created/last-updated the record
+    actor: Mapped[str] = mapped_column(String(120), default="system")
+    # "initialization"|"simulation"|"dry_run"|"supervised_probe"|"autonomous_probe"
+    source: Mapped[str] = mapped_column(String(80), default="initialization")
+    updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, default=None
+    )
+
+
+class ArmEnvelopeProbeAttempt(Base, TimestampMixin):
+    """
+    Audit log of every servo probe step, across all phases.
+    One row per individual probe command (or simulated probe).
+    """
+
+    __tablename__ = "arm_envelope_probe_attempts"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    # Stable UUID surfaced externally
+    probe_id: Mapped[str] = mapped_column(
+        String(36), unique=True, index=True, default=""
+    )
+    # FK to ArmServoEnvelope (nullable to allow orphan logging on init failure)
+    envelope_id: Mapped[int | None] = mapped_column(
+        ForeignKey("arm_servo_envelopes.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    servo_id: Mapped[int] = mapped_column(index=True)
+    # "simulation"|"dry_run"|"supervised_micro"|"autonomous"
+    phase: Mapped[str] = mapped_column(String(40), default="simulation", index=True)
+    # Angle that was commanded (or would have been, for dry_run/simulation)
+    commanded_angle: Mapped[int] = mapped_column(default=0)
+    # Angle before the command
+    prior_angle: Mapped[int | None] = mapped_column(nullable=True, default=None)
+    # Angle actually observed from after_state (None if no dispatch occurred)
+    observed_angle: Mapped[int | None] = mapped_column(nullable=True, default=None)
+    # Increment size used for this probe step
+    step_degrees: Mapped[int] = mapped_column(default=5)
+    # Name of first stop condition that fired, or "" if none
+    stop_condition: Mapped[str] = mapped_column(String(80), default="")
+    # JSON dict of all stop condition boolean flags
+    stop_condition_flags: Mapped[dict] = mapped_column(JSON, default=dict)
+    # FK to WorkspaceReachSimulation if a sim was linked
+    simulation_id: Mapped[int | None] = mapped_column(
+        ForeignKey("workspace_reach_simulations.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    # Opaque execution trace / dispatch ID for Phase 3–4 live probes
+    execution_id: Mapped[str] = mapped_column(String(120), default="")
+    # "safe"|"stopped"|"error"|"skipped"|"dry_run"
+    result: Mapped[str] = mapped_column(String(40), default="skipped", index=True)
+    # How much this attempt changed envelope confidence (positive or negative)
+    confidence_delta: Mapped[float] = mapped_column(default=0.0)
+
+
+class ArmProbeAuthorization(Base, TimestampMixin):
+    """
+    Authorization record for one supervised physical micro-step probe.
+
+    Strictly one authorization per dry-run command step.
+    Approval enables only a single future gate pass and never triggers movement
+    directly in this objective.
+    """
+
+    __tablename__ = "arm_probe_authorizations"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    authorization_id: Mapped[str] = mapped_column(
+        String(36), unique=True, index=True, default=""
+    )
+    arm_id: Mapped[str] = mapped_column(String(120), default="default", index=True)
+    servo_id: Mapped[int] = mapped_column(index=True)
+    dry_run_command_id: Mapped[str] = mapped_column(String(36), index=True, default="")
+    requested_angle: Mapped[int] = mapped_column(default=0)
+    prior_angle: Mapped[int] = mapped_column(default=0)
+    step_degrees: Mapped[int] = mapped_column(default=5)
+    direction: Mapped[str] = mapped_column(String(12), default="up")
+    operator_id: Mapped[str] = mapped_column(String(120), default="")
+    authorized_by: Mapped[str] = mapped_column(String(120), default="")
+    # "pending"|"approved"|"rejected"|"expired"|"consumed"
+    authorization_status: Mapped[str] = mapped_column(
+        String(20), default="pending", index=True
+    )
+    expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, default=None, index=True
+    )
+    stop_conditions: Mapped[list[str]] = mapped_column(JSON, default=list)
+    safe_home_required: Mapped[bool] = mapped_column(default=True)
+    physical_execution_allowed: Mapped[bool] = mapped_column(default=False)
+    consumed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, default=None
+    )
+    created_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, default=None
+    )
+    updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, default=None
+    )
+
+
 class AutomationEmailMessage(Base, TimestampMixin):
     __tablename__ = "automation_email_messages"
 
@@ -2300,3 +2503,131 @@ class AutomationEmailMessage(Base, TimestampMixin):
     )
     extracted_codes_json: Mapped[list[str]] = mapped_column(JSON, default=list)
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class SupervisedMicroStepExecution(Base, TimestampMixin):
+    """
+    Stub execution record for one operator-triggered supervised physical micro-step.
+
+    Objective 177: No hardware movement is dispatched.  This record captures the
+    full lifecycle of one execution attempt — creation, log entries, safe-home
+    fallback trigger, and final status — without ever sending a servo command.
+
+    Invariants:
+      - physical_movement_dispatched is always False.
+      - One execution consumes exactly one ArmProbeAuthorization (authorization
+        transitions to 'consumed' atomically with this record's creation).
+      - Every state transition appends a structured entry to log_entries.
+      - safe_home_fallback_angle is copied from the source dry-run command at
+        creation time so the safe-home trigger is self-contained.
+    """
+
+    __tablename__ = "supervised_micro_step_executions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    execution_id: Mapped[str] = mapped_column(
+        String(36), unique=True, index=True, default=""
+    )
+    authorization_id: Mapped[str] = mapped_column(String(36), index=True, default="")
+    arm_id: Mapped[str] = mapped_column(String(120), index=True, default="default")
+    servo_id: Mapped[int] = mapped_column(index=True, default=0)
+    requested_angle: Mapped[int] = mapped_column(default=0)
+    prior_angle: Mapped[int] = mapped_column(default=0)
+    step_degrees: Mapped[int] = mapped_column(default=5)
+    direction: Mapped[str] = mapped_column(String(12), default="up")
+    operator_id: Mapped[str] = mapped_column(String(120), default="")
+    # "pending" | "executing" | "complete" | "safe_home_triggered" | "aborted"
+    execution_status: Mapped[str] = mapped_column(
+        String(30), default="pending", index=True
+    )
+    stop_conditions: Mapped[list] = mapped_column(JSON, default=list)
+    safe_home_required: Mapped[bool] = mapped_column(default=True)
+    safe_home_triggered: Mapped[bool] = mapped_column(default=False)
+    safe_home_target_angle: Mapped[int | None] = mapped_column(nullable=True, default=None)
+    safe_home_triggered_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, default=None
+    )
+    # Always False in this objective — stub never dispatches movement
+    physical_movement_dispatched: Mapped[bool] = mapped_column(default=False)
+    log_entries: Mapped[list] = mapped_column(JSON, default=list)
+    abort_reason: Mapped[str] = mapped_column(String(400), default="")
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, default=None
+    )
+    created_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, default=None
+    )
+    updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, default=None
+    )
+
+
+# ---------------------------------------------------------------------------
+# Objective 178 — Supervised Physical Micro-Step Execution
+# ---------------------------------------------------------------------------
+
+class SupervisedPhysicalMicroStepExecution(Base, TimestampMixin):
+    """
+    Execution record for one operator-triggered supervised physical micro-step.
+
+    Objective 178: Gates through the existing authorization and execution-stub
+    layers, then dispatches a single real servo command through the hardware
+    adapter interface.  physical_movement_dispatched is True only if the
+    adapter dispatch succeeds.
+
+    Invariants:
+      - Feature flag MIM_ARM_PHYSICAL_MICRO_STEP_ENABLED must be True.
+      - One authorization consumed → one servo command dispatched at most.
+      - All feedback fields captured from adapter response.
+      - safe_home fallback triggered/logged on dispatch failure.
+    """
+
+    __tablename__ = "supervised_physical_micro_step_executions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    execution_id: Mapped[str] = mapped_column(
+        String(36), unique=True, index=True, default=""
+    )
+    authorization_id: Mapped[str] = mapped_column(String(36), index=True, default="")
+    arm_id: Mapped[str] = mapped_column(String(120), index=True, default="default")
+    servo_id: Mapped[int] = mapped_column(index=True, default=0)
+    operator_id: Mapped[str] = mapped_column(String(120), default="")
+    prior_angle: Mapped[int] = mapped_column(default=0)
+    commanded_angle: Mapped[int] = mapped_column(default=0)
+    target_angle: Mapped[int] = mapped_column(default=0)
+    step_degrees: Mapped[int] = mapped_column(default=5)
+    direction: Mapped[str] = mapped_column(String(12), default="up")
+    stop_conditions: Mapped[list] = mapped_column(JSON, default=list)
+    safe_home_required: Mapped[bool] = mapped_column(default=True)
+    safe_home_triggered: Mapped[bool] = mapped_column(default=False)
+    safe_home_target_angle: Mapped[int | None] = mapped_column(nullable=True, default=None)
+    safe_home_triggered_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, default=None
+    )
+    safe_home_outcome: Mapped[str] = mapped_column(String(60), default="")
+    # "pending" | "executing" | "complete" | "failed_dispatch" | "safe_home_triggered" | "aborted"
+    execution_status: Mapped[str] = mapped_column(
+        String(30), default="pending", index=True
+    )
+    physical_movement_dispatched: Mapped[bool] = mapped_column(default=False)
+    dispatch_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, default=None
+    )
+    dispatch_completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, default=None
+    )
+    dispatch_result: Mapped[str] = mapped_column(String(60), default="")
+    movement_duration_ms: Mapped[int | None] = mapped_column(nullable=True, default=None)
+    stop_condition_triggered: Mapped[str] = mapped_column(String(60), default="")
+    error_message: Mapped[str] = mapped_column(String(800), default="")
+    log_entries: Mapped[list] = mapped_column(JSON, default=list)
+    abort_reason: Mapped[str] = mapped_column(String(400), default="")
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, default=None
+    )
+    created_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, default=None
+    )
+    updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, default=None
+    )

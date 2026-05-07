@@ -21,6 +21,10 @@ from core.runtime_recovery_service import RuntimeRecoveryService
 logger = logging.getLogger(__name__)
 
 
+def _utc_now_iso() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
 @dataclasses.dataclass
 class HealthMetric:
     """Single point-in-time health measurement."""
@@ -244,6 +248,10 @@ class SelfHealthMonitor:
             (item for item in diagnostics if item.code == "shared_export_stale_or_misaligned"),
             None,
         )
+        coordination_ack_issue = next(
+            (item for item in diagnostics if item.code == "coordination_ack_stale_or_misaligned"),
+            None,
+        )
         if stale_export is not None:
             recommendations.append(
                 OptimizationRecommendation(
@@ -256,6 +264,46 @@ class SelfHealthMonitor:
                     expected_benefit="Restore canonical shared-state freshness so TOD/MIM coordination reflects the live objective and release metadata.",
                     requires_approval=True,
                     estimated_impact_percent=30,
+                    rollback_action="none_required",
+                )
+            )
+        if stale_export is not None or coordination_ack_issue is not None:
+            primary_issue = stale_export or coordination_ack_issue
+            recommendations.append(
+                OptimizationRecommendation(
+                    recommendation_id="opt-recover-bridge-coordination",
+                    category="runtime",
+                    severity=(primary_issue.severity if primary_issue is not None else "high"),
+                    title="Recover stalled TOD bridge coordination",
+                    description=(
+                        primary_issue.detail
+                        if primary_issue is not None
+                        else "The TOD bridge needs a bounded republish and watcher recovery cycle."
+                    ),
+                    proposed_action="recover_bridge_coordination",
+                    expected_benefit="Republish the active objective request surface, refresh shared artifacts, verify the bridge state, and restart the coordination watchers without waiting for manual approval.",
+                    requires_approval=False,
+                    estimated_impact_percent=35,
+                    rollback_action="none_required",
+                )
+            )
+
+        direct_execution_takeover = next(
+            (item for item in diagnostics if item.code == "tod_direct_execution_takeover_ready"),
+            None,
+        )
+        if direct_execution_takeover is not None:
+            recommendations.append(
+                OptimizationRecommendation(
+                    recommendation_id="opt-direct-execution-takeover",
+                    category="runtime",
+                    severity=direct_execution_takeover.severity,
+                    title="Take over TOD-silent execution locally",
+                    description=direct_execution_takeover.detail,
+                    proposed_action="fallback_to_codex_direct_execution",
+                    expected_benefit="Stops indefinite TOD waiting by letting MIM claim bounded fallback authority and continue the active task through the local Codex/OpenAI handoff path.",
+                    requires_approval=False,
+                    estimated_impact_percent=40,
                     rollback_action="none_required",
                 )
             )
@@ -470,7 +518,7 @@ class SelfHealthMonitor:
         recommendations = self.analyze_and_recommend()
 
         return {
-            "generated_at": datetime.datetime.utcnow().isoformat() + "Z",
+            "generated_at": _utc_now_iso(),
             "uptime_seconds": int(uptime),
             "metrics_sampled": len(self.metrics_history),
             "health_window_seconds": self.memory_window,
@@ -511,6 +559,9 @@ class SelfHealthMonitor:
         publication_boundary = self._read_json(self.state_dir / "MIM_TOD_PUBLICATION_BOUNDARY.latest.json")
         coordination_request = self._read_json(self.state_dir / "TOD_MIM_COORDINATION_REQUEST.latest.json")
         coordination_ack = self._read_json(self.state_dir / "MIM_TOD_COORDINATION_ACK.latest.json")
+        task_review = self._read_json(self.state_dir / "MIM_TASK_STATUS_REVIEW.latest.json")
+        next_action = self._read_json(self.state_dir / "MIM_TASK_STATUS_NEXT_ACTION.latest.json")
+        fallback_activation = self._read_json(self.state_dir / "MIM_TOD_FALLBACK_ACTIVATION.latest.json")
         authoritative_request = publication_boundary.get("authoritative_request") if isinstance((publication_boundary or {}).get("authoritative_request"), dict) else None
         effective_task_request = authoritative_request if authoritative_request else task_request
 
@@ -605,6 +656,40 @@ class SelfHealthMonitor:
                         },
                     )
                 )
+
+        review_idle = task_review.get("idle") if isinstance((task_review or {}).get("idle"), dict) else {}
+        review_task = task_review.get("task") if isinstance((task_review or {}).get("task"), dict) else {}
+        selected_action = next_action.get("selected_action") if isinstance((next_action or {}).get("selected_action"), dict) else {}
+        direct_execution_ready = bool(review_idle.get("direct_execution_ready") is True)
+        selected_action_code = self._text(selected_action.get("code")).lower()
+        active_task_id = self._text(review_task.get("active_task_id"))
+        fallback_task_id = self._text((fallback_activation or {}).get("task_id"))
+        fallback_state = self._text((fallback_activation or {}).get("execution_state")).lower()
+        fallback_active = bool(
+            fallback_task_id
+            and active_task_id
+            and fallback_task_id == active_task_id
+            and fallback_state in {"accepted", "running", "completed"}
+        )
+        if direct_execution_ready and selected_action_code == "fallback_to_codex_direct_execution" and not fallback_active:
+            latest_progress_age = review_idle.get("latest_progress_age_seconds")
+            diagnostics.append(
+                RuntimeDiagnostic(
+                    code="tod_direct_execution_takeover_ready",
+                    severity="high",
+                    summary="TOD silence exceeded the direct-execution threshold; MIM should take over.",
+                    detail=(
+                        f"Task-status review marked {active_task_id or 'the active task'} as direct-execution ready after "
+                        f"{latest_progress_age if latest_progress_age is not None else 'an extended'} seconds of TOD silence. "
+                        "Claim bounded fallback authority and continue the task locally instead of waiting for TOD confirmation."
+                    ),
+                    metadata={
+                        "active_task_id": active_task_id,
+                        "selected_action_code": selected_action_code,
+                        "latest_progress_age_seconds": latest_progress_age,
+                    },
+                )
+            )
 
         return diagnostics
 

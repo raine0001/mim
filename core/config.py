@@ -46,6 +46,10 @@ class Settings(BaseSettings):
     execution_readiness_command_status_path: str = str(
         PROJECT_ROOT / "runtime" / "shared" / "TOD_MIM_COMMAND_STATUS.latest.json"
     )
+    mim_full_autonomous_authority: bool = Field(
+        default=True,
+        alias="MIM_FULL_AUTONOMOUS_AUTHORITY",
+    )
 
     # Automation/browser controls
     automation_enabled: bool = True
@@ -118,6 +122,46 @@ class Settings(BaseSettings):
     sms_provider: str = ""
     sms_api_key: str = ""
     sms_sender_id: str = ""
+
+    # Remote shell / travel mode
+    remote_shell_enabled: bool = True
+    remote_shell_title: str = Field(default="MIM Travel Shell", alias="MIM_REMOTE_SHELL_TITLE")
+    remote_shell_domain: str = Field(default="", alias="MIM_REMOTE_SHELL_DOMAIN")
+    remote_shell_hostname: str = Field(default="", alias="MIM_REMOTE_SHELL_HOSTNAME")
+    remote_shell_zone: str = Field(default="", alias="MIM_REMOTE_SHELL_ZONE")
+    remote_shell_poll_interval_ms: int = Field(
+        default=2500,
+        alias="MIM_REMOTE_SHELL_POLL_INTERVAL_MS",
+    )
+    travel_mode_enabled: bool = Field(default=True, alias="MIM_TRAVEL_MODE_ENABLED")
+    travel_mode_allow_destructive: bool = Field(
+        default=False,
+        alias="MIM_TRAVEL_MODE_ALLOW_DESTRUCTIVE",
+    )
+    travel_mode_allow_large_refactors: bool = Field(
+        default=False,
+        alias="MIM_TRAVEL_MODE_ALLOW_LARGE_REFACTORS",
+    )
+    travel_mode_allow_hardware_actions: bool = Field(
+        default=False,
+        alias="MIM_TRAVEL_MODE_ALLOW_HARDWARE_ACTIONS",
+    )
+    mimtod_login_enabled: bool = Field(default=True, alias="MIMTOD_LOGIN_ENABLED")
+    mimtod_user: str = Field(default="", alias="MIMTOD_USER")
+    mimtod_password: str = Field(default="", alias="MIMTOD_PASSWORD")
+    mimtod_session_hours: int = Field(default=12, alias="MIMTOD_SESSION_HOURS")
+    mim_privileged_actions_enabled: bool = Field(
+        default=False,
+        alias="MIM_PRIVILEGED_ACTIONS_ENABLED",
+    )
+    mim_privileged_action_command: str = Field(
+        default="",
+        alias="MIM_PRIVILEGED_ACTION_COMMAND",
+    )
+    mim_arm_physical_micro_step_enabled: bool = Field(
+        default=False,
+        alias="MIM_ARM_PHYSICAL_MICRO_STEP_ENABLED",
+    )
 
 
 settings = Settings()

@@ -308,7 +308,7 @@ def _is_actionable_session(session_entry: dict[str, Any]) -> bool:
     if recipient != "mim":
         return False
 
-    if status == "awaiting_reply":
+    if status in {"awaiting_reply", "open"}:
         return True
 
     if status == "timed_out":
@@ -361,7 +361,7 @@ def find_pending_handoff_request(session_path: Path) -> dict[str, Any] | None:
         session_path,
         request_message_type="handoff_request",
         response_message_type="handoff_response",
-        intent="next_step_consensus",
+        intent={"next_step_consensus", "tod_ui_copilot_handoff"},
     )
 
 
@@ -370,17 +370,22 @@ def _find_pending_request(
     *,
     request_message_type: str,
     response_message_type: str,
-    intent: str | None = None,
+    intent: str | set[str] | None = None,
 ) -> dict[str, Any] | None:
     events = _read_jsonl(session_path)
     last_request_index: int | None = None
     session_id = ""
+    allowed_intents = {
+        _normalize_text(value)
+        for value in (intent if isinstance(intent, set) else {intent} if intent else set())
+        if _normalize_text(value)
+    }
     for index, event in enumerate(events):
         event_type = _event_type(event)
         event_intent = _event_intent(event)
         if event_type != request_message_type:
             continue
-        if intent and event_intent and event_intent != intent:
+        if allowed_intents and event_intent and event_intent not in allowed_intents:
             continue
         last_request_index = index
         session_id = _extract_session_id(event, session_path)
@@ -573,12 +578,23 @@ def _status_value(*values: Any) -> str:
     return ""
 
 
+def _requested_command_objective(request_event: dict[str, Any]) -> str:
+    payload = _extract_event_payload(request_event)
+    request_kind = _normalize_text(payload.get("request_kind") or request_event.get("request_kind"))
+    source_surface = _normalize_text(payload.get("source_surface") or request_event.get("source_surface"))
+    if request_kind != "mim_command" and source_surface != "tod_browser_console":
+        return ""
+    return _status_value(payload.get("objective_id"), request_event.get("objective_id"))
+
+
 def _current_objective(shared_root: Path, request_event: dict[str, Any]) -> str:
     integration = _read_json(shared_root / "TOD_INTEGRATION_STATUS.latest.json")
     alignment = integration.get("objective_alignment") if isinstance(integration.get("objective_alignment"), dict) else {}
     context_export = _read_json(shared_root / "MIM_CONTEXT_EXPORT.latest.json")
     payload = _extract_event_payload(request_event)
+    requested_objective = _requested_command_objective(request_event)
     return _status_value(
+        requested_objective,
         alignment.get("mim_objective_active"),
         context_export.get("objective_active"),
         payload.get("objective_id"),

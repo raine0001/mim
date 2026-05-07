@@ -27,6 +27,7 @@ from core.objective_lifecycle import (
     task_execution_tracking_snapshot,
     task_has_completion_evidence,
 )
+from core.objective_history_service import persist_program_status_snapshot
 from core.self_evolution_service import (
     build_self_evolution_next_action,
     reset_natural_language_development_progress,
@@ -44,6 +45,7 @@ HARD_BOUNDARY = "hard"
 READY_STATES = {"ready", "in_progress", "queued", "waiting_on_tod"}
 ACTIVE_TASK_STATES = {"in_progress", "running", "accepted", "dispatched"}
 INITIATIVE_OWNER = "mim"
+INITIATIVE_STATUS_OBJECTIVE_SCAN_LIMIT = 200
 DEFAULT_POLICY_VERSION = "mim_initiative_v1"
 CONTINUATION_VALIDATION_OBJECTIVE_TITLE = "Drive autonomous continuation validation"
 SELF_CORRECTION_STALE_PREVENTION_OBJECTIVE_TITLE = "Drive self-correction and stale-state prevention"
@@ -403,6 +405,14 @@ def _looks_like_self_correction_stale_prevention_request(user_intent: str) -> bo
         and "progress classification" in lower_intent
         and "code-oriented remediation" in lower_intent
     )
+
+
+def _has_real_recovery_transition(report: dict[str, Any]) -> bool:
+    transition = report.get("recovery_transition")
+    if not isinstance(transition, dict):
+        return False
+    transition_type = _normalize_text(transition.get("type")).lower()
+    return bool(transition_type and transition_type != "synthetic_monitor_only")
 
 
 def _continuation_validation_task_plans(*, actor: str, source: str, managed_scope: str) -> list[InitiativeTaskPlan]:
@@ -1111,7 +1121,10 @@ async def _recover_completed_codex_tasks_from_dispatch_artifacts(
             terminal_result_status = ""
             if _result_artifact_matches_task(task, submission, result_payload):
                 terminal_result_status = _terminal_result_status(result_payload)
-            if not terminal_result_status:
+            has_local_completion_evidence = task_has_completion_evidence(task)
+            if not terminal_result_status and (
+                not has_local_completion_evidence or result_artifact == shared_result_artifact
+            ):
                 terminal_result_status = shared_terminal_result_status
             if terminal_result_status in FAILURE_STATES:
                 task.dispatch_status = terminal_result_status
@@ -1126,7 +1139,7 @@ async def _recover_completed_codex_tasks_from_dispatch_artifacts(
                     summary=f"Recovered Codex task {task.id} to {terminal_result_status} from its persisted handoff result artifact",
                     metadata_json={"objective_id": objective.id, "source": source},
                 )
-            elif task_has_completion_evidence(task) or terminal_result_status in SUCCESS_STATES:
+            elif has_local_completion_evidence or terminal_result_status in SUCCESS_STATES:
                 task.dispatch_status = "completed"
                 task.state = "completed"
                 objective_recovered = True
@@ -1565,6 +1578,33 @@ def _objective_is_planning_only(objective: Objective) -> bool:
     return bool(metadata_json.get("planning_only"))
 
 
+def _task_movement_score(
+    task: Task,
+    *,
+    has_result: bool = False,
+) -> float:
+    tracking = task_execution_tracking_snapshot(task, has_result=has_result)
+    if _task_success(task) and task_has_completion_evidence(task, has_result=has_result):
+        return 1.0
+    if (
+        tracking.get("execution_result") is not None
+        or bool(tracking.get("has_result_record"))
+        or bool(tracking.get("result_artifact"))
+    ):
+        return 0.8
+    if bool(tracking.get("execution_started")):
+        return 0.6
+    if (
+        bool(tracking.get("task_dispatched"))
+        or bool(tracking.get("request_id"))
+        or bool(tracking.get("execution_trace"))
+    ):
+        return 0.35
+    if bool(tracking.get("task_created")):
+        return 0.1
+    return 0.0
+
+
 def _build_initiative_progress_payload(
     *,
     tasks: list[Task],
@@ -1578,15 +1618,41 @@ def _build_initiative_progress_payload(
         and task_has_completion_evidence(task, has_result=task.id in result_task_ids)
     )
     percent = int(round((completed_task_count / task_count) * 100)) if task_count else 0
+    movement_percent = (
+        int(
+            round(
+                (
+                    sum(
+                        _task_movement_score(
+                            task,
+                            has_result=task.id in result_task_ids,
+                        )
+                        for task in tasks
+                    )
+                    / task_count
+                )
+                * 100
+            )
+        )
+        if task_count
+        else 0
+    )
     summary = (
         f"{completed_task_count}/{task_count} bounded tasks completed ({percent}%)."
         if task_count
         else "No bounded tasks are registered yet."
     )
+    movement_summary = (
+        "Small-movement marker tracks bounded task creation, dispatch, execution, and result evidence."
+        if task_count
+        else "Movement stays at 0% until bounded tasks exist."
+    )
     return {
         "task_count": task_count,
         "completed_task_count": completed_task_count,
         "percent": percent,
+        "movement_percent": movement_percent,
+        "movement_summary": movement_summary,
         "summary": summary,
     }
 
@@ -2147,7 +2213,7 @@ async def _execute_local_mim_task(
                 result = "No recent blocked readiness condition was present, so a bounded monitor-only recovery transition was recorded."
             continuation_count += 1
         elif step_number == 5:
-            if prior_reports and any(isinstance(report.get("recovery_transition"), dict) for report in prior_reports):
+            if prior_reports and any(_has_real_recovery_transition(report) for report in prior_reports):
                 result = "Execution resumed after the recorded recovery transition and no idle stall was detected."
             else:
                 continuation_status = "stalled"
@@ -2938,9 +3004,12 @@ async def build_initiative_status(
     db: AsyncSession,
     objective_id: int | None = None,
 ) -> dict[str, Any]:
+    objective_stmt = select(Objective).order_by(Objective.created_at.desc(), Objective.id.desc())
+    if objective_id is None:
+        objective_stmt = objective_stmt.limit(INITIATIVE_STATUS_OBJECTIVE_SCAN_LIMIT)
     objective_rows = list(
         (
-            await db.execute(select(Objective).order_by(Objective.created_at.desc(), Objective.id.desc()))
+            await db.execute(objective_stmt)
         )
         .scalars()
         .all()
@@ -3022,6 +3091,7 @@ async def build_initiative_status(
         follow_on_snapshot = None
     if selected_objective is None:
         program_status = build_program_status_snapshot()
+        persist_program_status_snapshot(program_status)
         return {
             "summary": "No active MIM initiative is currently queued.",
             "status": "idle",
@@ -3212,6 +3282,8 @@ async def build_initiative_status(
     superseded_by = {}
     if str(activity.get("state") or "").strip().lower() == "superseded":
         superseded_by = _initiative_supersession_snapshot(getattr(selected_objective, "id", None))
+
+    persist_program_status_snapshot(program_status)
 
     return {
         "summary": " ".join(summary_parts),
